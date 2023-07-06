@@ -4,12 +4,1240 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 06 Jul 2023 06:00:03 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 06 Jul 2023 07:00:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Wash trading gone wrong – how a $100M/day crypto exchange bankrupted itself (129 pts)]]></title>
+            <title><![CDATA[Cloud Backed SQLite (142 pts)]]></title>
+            <link>https://sqlite.org/cloudsqlite/doc/trunk/www/index.wiki</link>
+            <guid>36610595</guid>
+            <pubDate>Thu, 06 Jul 2023 03:09:56 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://sqlite.org/cloudsqlite/doc/trunk/www/index.wiki">https://sqlite.org/cloudsqlite/doc/trunk/www/index.wiki</a>, See on <a href="https://news.ycombinator.com/item?id=36610595">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><h2>Page Contents</h2>
+
+<ul>
+  <li> <a href="#overview">Overview</a>
+  <ul>
+    <li> <a href="#storage_format">Storage Format</a>
+    </li><li> <a href="#system_components">System Components</a>
+  </li></ul>
+  </li><li> <a href="#build">Building, Deployment and Testing</a>
+  </li><li> <a href="#usage">Usage</a>
+  <ul>
+    <li> <a href="#usage1">Uploading Databases</a>
+    </li><li> <a href="#usage2">Accessing Databases</a>
+    </li><li> <a href="#secure">Secure Containers</a>
+  </li></ul>
+  </li><li> <a href="#modules">Cloud Storage Modules</a>
+  <ul>
+    <li> <a href="#azure">The Built-in "azure" Module</a>
+    </li><li> <a href="#google">The Built-in "google" Module</a>
+  </li></ul>
+  </li><li> <a href="#details">Details and Caveats</a>
+  <ul>
+    <li> <a href="#concurrent">Concurrent Access From Multiple Clients</a>
+    </li><li> <a href="#cleanup">Deleting Unused Block Files</a>
+    </li><li> <a href="#sharing">Block Sharing</a>
+    </li><li> <a href="#pragma">Pragma Interface</a>
+    </li><li> <a href="#vtab">Virtual Table Interface</a>
+  </li></ul>
+  </li><li> <a href="#commandline">Command Line Reference</a>
+  </li><li> <a href="#daemon">Daemon Command Reference</a>
+</li></ul>
+
+<h2 id="overview">1. Overview </h2>
+
+<p>The "Cloud Backed SQLite" (CBS) system allows databases to be stored within
+cloud storage accounts such that they can be read and written by storage
+clients without first downloading the entire database to the client. This
+document should be read in concert with the detailed API documentation present
+in the two main public header files:
+
+</p><ul>
+  <li> <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/blockcachevfs.h">blockcachevfs.h</a>
+  </li><li> <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/bcvutil.h">bcvutil.h</a>
+</li></ul>
+
+<p>Databases may be accessed concurrently by multiple clients, although ensuring
+that only a single client is writing to a database at any time is (mostly) left
+to the application. A "client" is a single operating system process system -
+within a single client process there may be multiple SQLite handles reading and
+writing a database using the usual SQLite WAL-mode read/write locking to 
+manage concurrent access between themselves. Existing clients do not see
+changes made by writers automatically, they are obliged to explicitly poll
+cloud storage to do so.
+
+</p><p>The system currently supports 
+<a href="https://azure.microsoft.com/en-us/services/storage/blobs/">Azure Blob Storage</a>
+and <a href="https://cloud.google.com/storage">Google Cloud Storage</a>. It also features
+<a href="https://sqlite.org/cloudsqlite/doc/trunk/www/module.wiki">an API that may be used to implement</a> support to other 
+cloud storage systems.
+
+</p><p>The software is currently developed on Linux with stock gcc, and on Windows-10
+using the MSVC-compatible mingw64 gcc compiler. Other platforms are quite
+likely to work too, but have not been tested.
+
+</p><h2 id="storage_format">1.1. Storage Format</h2>
+
+<p>SQLite databases are not stored within the blob storage system in the usual
+format. Instead, each database is divided into one or more fixed-size blocks.
+The default block-size is 4MB, although this is configurable. Each block is
+assigned an id between 16 and 32 bytes (128 and 256 bits) in size (all blocks
+in a single container have the same sized ids). The name of each block file
+is created by encoding its id in hexadecimal format and adding the extension
+".bcv". For example:
+
+</p><pre>  787A5B026DBF882F89748C37AED04CCD.bcv
+</pre>
+
+<p>For containers that use ids smaller than 24 bytes in size, each block id is
+randomly generated. For manifests that use ids 24 bytes or larger, the first
+16 bytes of each id may contain the md5 hash of the block contents, with
+the remainder of the id made up by pseudo-random values. See the
+section on <a href="#sharing">block sharing</a> below for further details.
+
+</p><p>Along with the block files is a "manifest" file, which contains, amongst other
+things, a machine-readable description of how the various block files may be
+assembled into into one or more SQLite databases. The name of the manifest
+file is always:
+
+</p><pre>  manifest.bcv
+</pre>
+
+<p>There is also an SQLite database used to store the contents of the "bcv_kv"
+virtual table <span color="red">MAKE THIS LINK SOMEWHERE!</span> named:
+
+</p><pre>  bcv_kv.bcv
+</pre>
+
+<p>At present, manifest and block files may only be stored in the root directory
+of a blob storage container, not in any sub-directory. This means that each
+container contains at most a single manifest file. It may be that this
+limitation can be removed if desirable. Other files may be stored in a
+container along with the CBS files, but they must not use the ".bcv" extension.
+Files that end with ".bcv" may be mistaken for surplus block or other files and
+deleted or overwritten by CBS clients. 
+
+</p><p><b>Note:</b> CBS documentation uses the Azure terminology "container" to refer
+to the cloud storage virtual receptacle in which block files and manifests are
+stored. In Google Storage documentation the analagous concept is a "bucket".
+Other cloud storage systems may use their own vernacular.
+
+</p><h2 id="system_components">1.2. System Components</h2>
+
+<p>There are three components to the system:
+
+</p><ol>
+  <li> <b>Primitives</b> to:
+    <ul><li> Create blob storage containers and populate them
+             with empty manifest files (manifest files indicating that the
+             container contains no databases).
+        </li><li> Destroy entire blob storage containers and their contents.
+        </li><li> Upload databases to cloud storage.
+        </li><li> Download databases from cloud storage.
+        </li><li> Create copies of existing databases within cloud storage.
+        </li><li> Delete databases from cloud storage.
+        </li><li> List the databases within a cloud storage container.
+        </li><li> Clean up (remove) unused blocks from cloud storage.
+    </li></ul>
+    <p>
+      Each primitive is available both as an 
+      <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/bcvutil.h">C API</a> that can be called by
+      applications, and as a <a href="#commandline">command-line tool</a>.
+  </p></li><li> <b>A daemon process</b> that, while running, provides local SQLite
+       database clients in the same or different OS process with read-only
+       access to databases stored in remote blob storage containers.
+
+<blockquote></blockquote></li><li> <b>A VFS module</b> that may be used in two modes, as follows:
+  <ul>
+    <li> For read-only access of cloud databases via a running daemon process,
+         or
+    </li><li> For read/write access of cloud databases in "daemonless" mode.
+  </li></ul>
+  <p>
+  The advantage of using a daemon over daemonless mode is that a single 
+  local cache of downloaded database blocks may be shared by multiple
+  processes. In daemonless mode, each process is obliged to maintain its 
+  own separate cache.
+</p></li></ol>
+
+<p>Both the daemon and command line tools are packaged as a single binary
+executable - "blockcachevfsd".
+
+</p><h2 id="build">2. Building, Deployment and Testing</h2>
+
+<p>command from the root directory of the source tree.
+
+
+</p><h3>Adding Application Support </h3>
+
+<div><p>
+To add support for the VFS and various primitives, the following C files from
+the source code distribution must be built into the application:
+
+</p><pre>    bcvutil.c
+    bcvmodule.c
+    blockcachevfs.c
+    simplexml.c
+    bcvencrypt.c
+</pre>
+
+<p>The following header files from the source code distribution are required:
+</p><pre>    bcvutil.h
+    bcvmodule.h
+    blockcachevfs.h
+    simplexml.h
+    bcv_int.h
+    bcvencrypt.h
+</pre>
+
+<p>As well as SQLite, the application must be linked against libcurl and openssl.
+
+</p><p>The application should not include either "bcv_int.h" or "simplexml.h"
+directly. They are required by the build, but are not intended to be used
+directly. The other three header files are intended to be used by applications,
+they container declarations for APIs that provide the following functionality:
+
+</p><ul>
+  <li> Header file <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/blockcachevfs.h">blockcachevfs.h</a> 
+       contains APIs required to use the VFS module to access cloud databases
+       via usual SQLite interfaces.
+  </li><li> Header file <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/bcvutil.h">bcvutil.h</a> 
+       contains APIs required to use the various cloud storage primitives.
+  </li><li> Header file <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/blockcachevfs.h">bcvmodule.h</a> 
+       contains APIs required to extend blockcachevfs to access new
+       cloud storage systems (other than Azure Blob Storage and Google Cloud
+       Storage, for which there is built-in support).  
+</li></ul>
+</div>
+
+<h3>Building blockcachevfsd:</h3>
+<div><p>
+The easiest way to build the "blockcachevfsd" executable that contains both
+the daemon and the command line tools is using the standard:
+
+</p><pre>  ./configure &amp;&amp; make
+</pre>
+
+<p>Alternatively, it may be built from all sources listed above as required
+for adding blockcachevfs support for an application, along with file
+"blockcachevfsd.c", which contains the main routine.  
+</p></div>
+
+<h3>Testing the system:</h3>
+<p>
+The blockcachevfs system has an automated test suite. Notes describing its
+use may be <a href="https://sqlite.org/cloudsqlite/doc/trunk/www/testing.wiki">found here</a>.
+</p>
+
+<h2 id="usage">3. Usage </h2>
+
+<h2 id="usage1">3.1. Uploading Databases</h2>
+
+<p>This section illustrates how to upload databases to a blob storage account 
+and begin using them. It assumes that cloud storage module name and
+authentication details, for example an account name and access key are stored
+in a file named "account.txt" in the current directory. Example account.txt
+contents for Azure Blob Storage:
+
+</p><pre>  -module azure
+  -user devstoreaccount1
+  -auth Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+</pre>
+
+<p>The command-line options above can just as easily be specified directly on the
+command-line. But storing them in a file, and then using the 
+"-f &lt;file&gt;" option supported by all commands to treat the contents 
+of the named file as if they were specified directly on the command-line can
+be less cumbersome.
+
+</p><p>To begin, create a container and an empty manifest to which databases may be
+uploaded, where $CONTAINER is the container name:
+
+</p><pre>  $ blockcachevfsd create -f account.txt $CONTAINER
+</pre>
+
+<p>If the named blob storage container already exists, CBS will clobber any
+manifest file within it with a new, empty, manifest file, effectively
+deleting any databases in the container.
+
+</p><p>Next, upload one or more databases from the local file system to the blob
+storage account. In the following, $LOCALDB is an absolute or relative path
+to an SQLite database file and $DBNAME is the name used to access the 
+database after it has been uploaded. It is an error if there is already
+a database named $DBNAME in the manifest:
+
+</p><pre>  $ blockcachevfsd upload -f account.txt -container $CONTAINER $LOCALDB $DBNAME
+</pre>
+
+<h2 id="usage2">3.2. Accessing Databases</h2>
+
+<p>This section explains, by way of example code, how to access a blockcachevfs
+datbase stored in cloud storage using an SQL client. The full program is
+<a href="https://sqlite.org/cloudsqlite/doc/trunk/www/cloudsql.c">available here</a>. It should be read together with
+the API documentation in file <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/blockcachevfs.h">blockcachevfs.h</a>
+
+</p><p>The example code implement a program that accepts four arguments on the command
+line:
+
+</p><ul>
+  <li> A path to an existing directory to use for a blockcachevfs cache
+       directory, 
+  </li><li> The name of a container to attach to the new blockcachevfs VFS
+       the program creates,
+  </li><li> A path to a database to open using the blockcachevfs VFS, and
+  </li><li> An SQL script to evaluate against that database.
+</li></ul>
+
+<p>The program creates a VFS, attaches the container, opens a database handle
+and then executes the supplied SQL script. The code as presented below omits 
+several uninteresting features for brevity - there is no main() routine for
+example. But the full version, linked above, contains everything required
+for a working application.
+
+</p><p>The following block contains the required #include directives and the
+authentication callback for the example application. All applications
+require an authentication callback, as there is no other way to provide
+authentication tokens to system. And there are currently no implementations
+of cloud storage modules that do not require authentication tokens.
+
+</p><div>
+<pre>/*
+** The code in this file creates and uses a VFS, but it doesn't use any 
+** cloud storage primitives or implement a new cloud storage module, so 
+** it only needs to include "blockcachevfs.h". And "sqlite3.h" of course.
+*/
+#include "blockcachevfs.h"
+#include "sqlite3.h"
+
+/*
+** This program is hardcoded to access an Azure emulator running on port
+** 10000 (the default for Azurite) of the localhost. It is also hardcoded
+** to the demo account - the account built-in to the emulator with the
+** well-known credentials reproduced below. 
+*/ 
+#define CS_STORAGE "azure?emulator=127.0.0.1:10000"
+#define CS_ACCOUNT "devstoreaccount1"
+#define CS_KEY "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+
+/*
+** Authentication callback. A real application would return a different 
+** authentication token based on the storage system, account name and 
+** container name parameters, but since the credentials used by this
+** application are hard coded, it just returns a copy of constant string
+** CS_KEY.
+**
+** Because the API is defined such that this function must return a buffer
+** allocated using sqlite3_malloc() or compatible, this implementation
+** uses sqlite3_mprintf() to make a copy of the authentication token.
+*/
+static int csAuthCb(
+  void *pCtx,
+  const char *zStorage,
+  const char *zAccount,
+  const char *zContainer,
+  char **pzAuthToken
+){
+  *pzAuthToken = sqlite3_mprintf("%s", CS_KEY);
+  return (*pzAuthToken) ? SQLITE_OK : SQLITE_NOMEM;
+}
+</pre>
+</div>
+
+<p>The next block contains the start of the cloudsql() function, which does the
+bulk of the work for this application. It begins by creating the VFS object.
+Note that, like almost all other blockcachevfs APIs, if an error occurs the
+sqlite3_bcvfs_create() function returns an error message in a buffer that
+must be freed by the caller using sqlite3_free().
+
+</p><p>Once the VFS has been created successfully, the application can use the
+sqlite3_bcvfs_isdaemon() API to see if the VFS has connected to a daemon or
+is running in daemonless mode.
+
+</p><p>If, when sqlite3_bcvfs_create() is called, there is a daemon process using the
+specified directory as its cache directory, then the VFS created by the
+sqlite3_bcvfs_create() call automatically connects to the daemon and 
+provides read-only access. The daemon can be started using the following
+command line:
+
+</p><pre>    blockcachevfsd daemon $DIRECTORY
+</pre>
+
+<p>where $DIRECTORY above must be the same string as passed to cloudsql()
+function below via the zDir parameter. If a daemon process was using the
+directory for its cache directory, but has since exited, the
+sqlite3_bcvfs_create() call will fail. 
+
+</p><p>If there has never been a daemon running in the directory, then the call to
+sqlite3_bcvfs_create() creates a VFS running in daemonless mode. In this mode
+it requires exclusive access to the directory. If there is some other
+daemonless VFS already running in the specified directory, the call to
+sqlite3_bcvfs_create() fails with SQLITE_BUSY.
+
+</p><div>
+<pre>/*
+** Open a VFS that uses directory zDir as its cache directory. Then attach
+** container zCont. Next, open an SQLite handle on path zPath using the new 
+** VFS and execute SQL script zSql.
+*/
+static int cloudsql(
+  const char *zDir,               /* Directory to use for blockcachevfs cache */
+  const char *zCont,              /* Container to attach */
+  const char *zPath,              /* Path to open */
+  const char *zSql                /* SQL to execute */
+){
+  int rc = SQLITE_OK;             /* Error code */
+  char *zErr = 0;                 /* Error message */
+  sqlite3_bcvfs *pVfs = 0;        /* VFS handle */
+  sqlite3 *db = 0;                /* Database handle open on zPath */
+
+  /* Create a VFS object. Directory zDir must already exist. If it exists
+  ** and there is a daemon running in that directory, the new VFS connects
+  ** to the daemon for read-only access. Or, if there is no such daemon,
+  ** the new VFS will provide read-write daemonless access.  */
+  rc = sqlite3_bcvfs_create(zDir, "myvfs", &amp;pVfs, &amp;zErr);
+
+  /* Check if this is a daemon VFS or not */
+  if( rc==SQLITE_OK ){
+    if( sqlite3_bcvfs_isdaemon(pVfs) ){
+      printf("VFS is using a daemon\n");
+    }else{
+      printf("VFS is in daemonless mode\n");
+    }
+  }
+</pre>
+</div>
+
+<p>Following this, assuming it was create successfully, the code connects the
+authorization callback to the new VFS. And then "attaches" the cloud 
+storage container specified by the user to the VFS. 
+
+</p><p>Before the databases in a cloud storage container can be accessed, it must 
+be attached to the VFS. Once it has been attached, SQL clients may access
+the databases within the container by opening paths of the form
+"/$CONTAINER/$DATABASE" using the blockcachevfs VFS.
+
+</p><div>
+<pre>  /* Configure the authorization callback. */
+  if( rc==SQLITE_OK ){
+    sqlite3_bcvfs_auth_callback(pVfs, 0, csAuthCb);
+  }
+
+  /* Attach the container. Specify the SQLITE_BCV_ATTACH_IFNOT flag so that
+  ** it is not an error if the container is already attached. 
+  **
+  ** There are two reasons the container might already be attached, even
+  ** though the VFS was only just created. Firstly, if this VFS is connected
+  ** to a running daemon process, then some other client may have already
+  ** attached the container to the daemon. Secondly, VFS objects store their
+  ** state in the cache directory so that if they are restarted, all
+  ** containers are automatically reattached. So if this (or some other
+  ** blockcachevfs application) has run before specifying the same 
+  ** cache directory, the container may already be attached.  */
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_bcvfs_attach(pVfs, CS_STORAGE, CS_ACCOUNT, zCont, 0,
+        SQLITE_BCV_ATTACH_IFNOT, &amp;zErr
+    );
+  }
+</pre>
+</div>
+
+<p>Once the container is attached to the VFS, the database handle is opened
+and the SQL script executed. Before the script is executed though,
+sqlite3_bcvfs_register_vtab() is called to make the virtual tables available
+to the database handle.
+
+</p><p>For the sake of brevity, the code below omits the sqlite3_exec() callback
+that is part of the <a href="https://sqlite.org/cloudsqlite/doc/trunk/www/cloudsql.c">full version</a>.
+
+</p><div>
+<pre>  /* Open a database handle on a cloud database. */
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_open_v2(zPath, &amp;db, SQLITE_OPEN_READWRITE, "myvfs");
+    if( rc!=SQLITE_OK ){
+      zErr = sqlite3_mprintf("%s", sqlite3_errmsg(db));
+    }
+  }
+
+  /* Enable the virtual table interface. */
+  if( rc==SQLITE_OK ){
+    rc = sqlite3_bcvfs_register_vtab(db);
+  }
+
+  /* Execute the provided SQL script. */
+  if( rc==SQLITE_OK ){
+    sqlite3_exec(db, zSql, 0, 0, &amp;zErr);
+  }
+</pre>
+</div>
+
+<p>Finally, the cloudsql() function cleans up the two handles it allocated,
+outputs any error message and returns.
+
+</p><div>
+<pre>  sqlite3_close(db);
+  sqlite3_bcvfs_destroy(pVfs);
+
+  /* Output any error, free any error message and return. */
+  if( rc!=SQLITE_OK ){
+    fprintf(stderr, "Error: (%d) %s\n", rc, zErr);
+  }
+  sqlite3_free(zErr);
+  return rc;
+}
+</pre>
+</div>
+
+<h2 id="secure">3.3. Secure Containers </h2>
+
+<p>When running in daemon mode, containers may be attached either securely or
+insecurly. By default, containers are attached to a daemon insecurely. This
+means that:
+
+</p><ul>
+  <li><p>Any local process that can connect to the daemon's listening socket 
+       may read and write the database, and that
+  </p></li><li><p>Even after the daemon process has stopped, any cached parts of 
+       databases in attached containers may be read directly from the 
+       cache file.
+</p></li></ul>
+
+<p>When containers are attached securely, all data stored in the cache file
+is encrypted using 128-bit AES OFB encryption. Local clients obtain the
+encryption key from the daemon process by supplying valid cloud storage
+credentials - a client is granted the encryption key only if it can prove 
+that it already has permission to access the database within cloud storage.
+Cloud storage credentials are verified only once, when the client first
+connects, so it is quite possible for a client to remain connected to a
+daemon process and accessing a database long after its supplied credentials 
+have expired.
+
+</p><p>A container is nominated as secure when it is first attached to a daemon,
+by specifying the SQLITE_BCV_ATTACH_SECURE flag along with the
+sqlite3_bcvfs_attach() call.
+
+</p><p>There are two known disadvantages to attaching containers securely:
+
+</p><ul>
+  <li><p>Blocks are stored unencrypted in cloud storage. This means that as
+       well as local clients encrypting and decrypting individual database 
+       pages as they are read, each time a block is downloaded the entire block
+       must be encrypted before it can be stored in the cache file.  Under some
+       cirumstances this overhead may be significant.
+
+</p><blockquote></blockquote></li><li><p> If the daemon process crashes or is killed after data is written 
+       to a secure container database but before said data has been uploaded
+       to cloud storage, the data is lost.
+</p></li></ul>
+
+<h2 id="modules">4. Cloud Storage Modules and Authentication</h2>
+
+<p>All CBS APIs and command-line tools accept a "module" specification, which
+determines the cloud storage system that the system operates on and how
+it operates. There are two built-in modules, "azure", which works with
+Azure Storage, and "google", which works with Google Cloud Storage. There
+is also <a href="https://sqlite.org/cloudsqlite/doc/trunk/www/module.wiki">an API</a> that may be used to add new cloud
+storage modules.
+
+</p><p>A module specification consists of the module name optionally followed by
+one or more URI style key/value parameters. For example:
+
+</p><pre>  azure
+  azure?sas=1
+  azure?emulator=127.0.0.1:10000&amp;sas=1
+</pre>
+
+<p>There is no default module. It must always be specified explicitly.
+
+</p><p>As well as a module specification, CBS APIs and command-line tools require
+a user-name and an authentication value - a string containing cloud storage
+authentication information. Exactly how these are interpreted depends on the
+module specification. The values expected by the two built-in modules, and how
+they are used, are described in the following two sections.
+
+</p><h2 id="azure">4.1 The Built-In "azure" Module</h2>
+
+<p>The "azure" module is used to interface with Azure Storage. The value provided
+as a user-name is used as the Azure user name when connecting. The
+authentication value may either be the corresponding 
+<a href="https://docs.microsoft.com/en-us/azure/storage/common/storage-account-keys-manage">
+account access-key</a> (shared-key access), or an 
+<a href="https://docs.microsoft.com/en-us/azure/storage/common/storage-sas-overview">
+Azure Shared Access Signature token</a>, depending on the URI style parameters
+provided along with the module name.
+
+</p><p>One way to generate an SAS token for Azure is to use the "az" command line
+tool. For example, given account $ACCOUNT with access-key $ACCESSKEY, to
+generate an SAS token that allows read/write access to container $CONTAINER and
+expires on the 15th of April, 2020:
+
+</p><pre>  az storage container generate-sas -o tsv 
+      --account-name $ACCOUNT 
+      --account-key $ACCESSKEY 
+      --expiry 2020-04-15 
+      --name $CONTAINER 
+      --permissions dlrw
+</pre>
+
+<p>The daemon process and some command-line commands may also use read-only SAS
+tokens. To generate a read-only token, the --permissions option in the command
+above should be passed "lr" instead of "dlrw".
+
+</p><p>The following URI style parameters may be used to modify the behaviour of the
+azure module:
+</p><table>
+  <tbody><tr><th>Option</th><td></td><th> Interpretation
+  </th></tr><tr><td>emulator</td><td></td><td>
+          If this option is present, it indicates that CBS should connect to an
+          Azure emulator instead of to a real Azure cloud storage account. Both
+          the open source <a href="https://docs.microsoft.com/en-us/azure/storage/common/storage-use-azurite">azurite</a>
+          and the 
+          <a href="https://docs.microsoft.com/en-us/azure/storage/common/storage-use-emulator">legacy emulator</a> 
+          are supported. The value of this option should be set to the
+          "host:portnumber" address of the port on which the emulated Azure
+          blob service is running. If using either supported emulator on the
+          local machine with default options, this address is
+          "127.0.0.1:10000".
+</td></tr><tr><td>sas</td><td></td><td>This option must be set to either "0" (the
+          default) or "1". If it is set to 1, then the module expects the
+          provided authentication value to be an SAS token. Otherwise, it
+          assumes it to be an access-key.
+</td></tr><tr><td>customuri</td><td></td><td>This option may only be present if "sas=1"
+          is also specified. Similarly, it may only be set to "0" (the
+          default), or "1". If it is set to 1, then a base URI for the
+          container must be specified in place of the account name parameter.
+          If the specified container name is NULL or a zero-length string,
+          then the base URI is used as is as the URI for the remote container.
+          Otherwise, the specified container name is appended as a directory
+          component to the base URI. For example, if the string value passed as
+          the account name for an "customuri=1" module is:
+
+<blockquote><pre>https://photos.contoso.com</pre></blockquote>
+
+<p>and the container name "myforms", then the URI used to access the container manifest is:
+
+</p><blockquote><pre>https://photos.contoso.com/myforms/manifest.bcv</pre></blockquote>
+
+<p>Alternatively, the same container can be accessed by specifying a NULL container name and:
+
+</p><blockquote><pre>https://photos.contoso.com/myforms</pre></blockquote>
+
+<p>as the custom URI value.
+</p></td></tr></tbody></table>
+
+<p>For example, to connect to a real Azure account using an SAS token for 
+authentication purposes:
+</p><pre>  azure?sas=1
+</pre><p>
+To connect to an Azure blob emulator running on localhost port 10000 (the
+default) using an access-key for authentication, either of the following
+may be used:
+</p><pre>  azure?emulator=127.0.0.1:10000
+  azure?emulator=127.0.0.1:10000&amp;sas=0
+</pre><p>
+Or, to connect to a real Azure account using an access-key for authentication:
+</p><pre>  azure
+</pre><p>
+may be used.
+
+</p><h2 id="google">4.2 The Built-In "google" Module</h2>
+
+<p>The "google" module is used to connect CBS to Google Cloud Storage. The
+user-name parameter should be passed the 
+<a href="https://support.google.com/googleapi/answer/7014113?hl=en">project-id
+</a> for the project that owns the storage bucket or buckets to be operated on.
+In practice, this is only required for CBS's "create" primitive, and only
+then if it needs to 
+<a href="https://cloud.google.com/storage/docs/xml-api/reference-headers#xgoogprojectid"> create a new cloud storage container (bucket)</a>. In all other 
+cases, an empty string may be specified for the CBS user-name parameter.
+
+</p><p>The authorization value parameter must be passed the text of a 
+<a href="https://cloud.google.com/storage/docs/authentication#oauth">
+Google Cloud access token</a>.
+
+</p><p>The google module does not accept any URI style parameters.
+
+</p><h2 id="details">5. Details and Caveats </h2>
+<h2 id="concurrent">5.1. Concurrent Access From Multiple Clients </h2>
+
+<p>The system supports any number of concurrent readers using either daemonless
+or daemon mode. Even though no locks are taken, read transactions are not
+usually interfered with, even if a new version of the database is pushed by
+another host while they are ongoing. This is because block files are never
+modified after they are created; new block files are uploaded for each change.
+And old block files are not deleted immediately (<a href="#cleanup">see
+below</a>), so ongoing read transactions can usually continue to access them
+for as long as required.
+
+</p><p>If a database is modified within the cloud storage system, the modifications
+do not become automatically visible to existing clients. Until the container
+is "polled", clients continue to see the old versions of all databases. A
+container may be polled either by calling the sqlite3_bcvfs_poll() API:
+
+</p><pre>    int sqlite3_bcvfs_poll(sqlite3_bcvfs *pFs, const char *zCont, char **pzErr);
+</pre>
+
+<p>or the equivalent <a href="#pragma">PRAGMA interface</a>. To be clear, any 
+changes made are immediately visible to other SQL clients using the same
+read-write daemonless VFS object, but are not visible to SQL clients using
+other VFS objects until the container has been polled.
+
+</p><p>Similarly, after changes are made to a cloud storage database via a read-write
+daemonless VFS object, the new version of the database is not automatically
+uploaded to cloud storage. In order to upload changes to cloud storage so
+that they are available to new clients or existing clients after they have
+polled the container, use the sqlite3_bcvfs_upload() API:
+
+</p><pre>    int sqlite3_bcvfs_upload(
+      sqlite3_bcvfs *pFs,             /* VFS handle */
+      const char *zCont,              /* Container (alias) to upload databases of */
+      int (*xBusy)(void*,int),        /* Busy-handler callback */
+      void *pBusyArg,                 /* First argument passed to xBusy */
+      char **pzErr                    /* OUT: Error message */
+    );
+</pre>
+
+<p>or the equivalent <a href="#pragma">PRAGMA interface</a>.
+
+</p><p>At present, it is not possible to upload changes to a database if there have
+been changes made to *any* database in the container since the most recent
+poll operation. This is not usually a problem, the container can be polled
+and then the upload reattempted.
+
+</p><p>However, the poll operation will fail if there have been changes to one or
+more databases in cloud storage for which there are also local changes yet
+to be uploaded, or if there are local changes to a database that has been
+deleted from cloud storage. It is the responsibility of the user to avoid
+this situation - concurrent modifications being made to the same database
+at multiple sites - perhaps by using the <a href="#vtab">bcv_kv virtual table</a>.
+
+</p><h2 id="cleanup">5.2. Deleting Old Blocks</h2>
+
+<p>Once they have been uploaded, blocks are never modified within cloud storage.
+Instead, when a database is modified, new block files are uploaded for the
+modified regions and the manifest updated to refer to the new list of blocks.
+This makes managing reader/writer concurrency easier, and facilitates 
+<a href="#sharing">block sharing</a>, but also means that as time passes a 
+large number of unused block files may accumuate within cloud storage.
+
+</p><p>Unused block files may be removed by invoking the sqlite3_bcv_cleanup()
+interface from <a href="https://sqlite.org/cloudsqlite/doc/trunk/src/bcvutil.h">bcvutil.h</a>:
+
+</p><pre>    int sqlite3_bcv_cleanup(sqlite3_bcv *p, int nSecond);
+</pre>
+
+<p>In order to avoid disturbing existing read clients, the second parameter
+may be used to specify the minimum number of seconds the block must have
+been unused for to be considered eligible for cleanup.
+
+</p><h2 id="sharing">5.3. Block Sharing</h2>
+
+<p>Sometimes, a single block may be used by multiple databases within a 
+manifest, saving cloud storage space and bandwidth. This is known as
+"block sharing". Block sharing occurs in two scenarios:
+
+</p><ul>
+  <li> If a copy of a database is made using the 
+       <a href="#copy_command">command line copy primitive</a>, then the copy
+       shares all of its blocks with the original. This takes place regardless
+       of the configured size of block ids for the manifest file.
+
+<blockquote></blockquote></li><li> If the configured block-id size for a manifest file is greater than
+       or equal to 24 bytes, then the first 16 bytes of each block id is
+       an md5 hash of the block contents. In this case, before each new 
+       block is uploaded, the system checks to see if there already exists a
+       block with the same md5 hash (and hence, we assume, the same content)
+       that can be used in its place.
+       <p>
+       This usually only occurs when a database being uploaded is a copy or
+       slightly modified copy of an existing database, or when an existing
+       database is overwritten with a copy of another database using the
+       SQLite backup API.
+       </p>
+</li></ul>
+
+<p>The block id size used by a manifest file must be configured when the 
+manifest is first created using the 
+<a href="#create_command">command line create command</a> or equivalent
+API. If block sharing using md5 hash values is required, then the block id size
+should be set to 24 bytes. Otherwise, it is best left set to the default value
+of 16 bytes to save space.
+
+</p><h2 id="pragma">5.4. Pragma Interface</h2>
+
+<p>Blockcachevfs currently supports three PRAGMA statements - "PRAGMA bcv_upload"
+, "PRAGMA bcv_poll" and "PRAGMA bcv_client". If further PRAGMA commands are
+added in the future, the names of the new commands will begin with "bcv_".
+
+</p><p><b> PRAGMA bcv_upload </b>
+
+</p><p>Blockcachevfs database clients may execute the following PRAGMA statement
+to force any changes made locally to be uploaded to the cloud storage
+account:
+
+</p><pre>  PRAGMA [database].bcv_upload
+</pre>
+
+<p>The PRAGMA statements does not return until the upload is complete. If
+successful, an empty string is returned. If an error occurs and the upload
+cannot be completed, an SQLite error code is returned and the error message
+set to an English language explanation of the error.
+
+</p><p>Invoking this PRAGMA is different to using the sqlite3_bcvfs_upload() 
+interface in that this command only uploads changes for the current database,
+whereas sqlite3_bcvfs_upload() uploads all locally modified databases in
+the container.
+
+</p><p><b> PRAGMA bcv_poll </b>
+
+</p><p>Invoking "PRAGMA bcv_poll":
+
+</p><pre>  PRAGMA [database].bcv_poll
+</pre>
+
+<p>is the equivalent to calling sqlite3_bcvfs_poll() on the container that the
+database is a part of. If successful, an empty string is returned. Otherwise,
+an SQLite error code is returned and the error message set to an English
+language explanation of the error.
+
+</p><p><b id="pragma_bcv_client"> PRAGMA bcv_client </b>
+
+</p><p>Invoking "PRAGMA bcv_client":
+
+</p><pre>  PRAGMA [database].bcv_client
+  PRAGMA [database].bcv_client = NAME
+</pre>
+
+<p>This PRAGMA is used to set or query a cloudsqlite database connection's client
+name. The configured client name appears in the "client" column of the
+<a href="#bcv_http_log">bcv_http_log</a> virtual table for requests associated
+with the current database connection. It may also appear in log messages. It is
+not used for any other purpose. The default client name is an empty string.
+
+</p><h2 id="vtab">5.5. Virtual Table Interface</h2>
+
+<p>The virtual table interface consists of three eponymous virtual tables
+(or two in daemon mode). It is not available automatically, but must be
+made available to each SQLite connection explicitly by calling the
+sqlite3_bcvfs_register_vtab() API from 
+<a href="https://sqlite.org/cloudsqlite/doc/trunk/src/blockcachevfs.h">blockcachevfs.h</a>:
+
+</p><pre>    int sqlite3_bcvfs_register_vtab(sqlite3*);
+</pre>
+
+<p><b>The bcv_container table:</b>
+
+</p><p>The read-only "bcv_container" table contains one row for each container
+attached to the VFS. It has the equivalent of the following schema:
+
+</p><pre>    CREATE TABLE bcv_container(
+      name      TEXT,          -- local name (alias) of container 
+      storage   TEXT,          -- cloud storage system (e.g. "azure")
+      user      TEXT,          -- cloud storage username
+      container TEXT,          -- container name in cloud storage
+      ncleanup  INTEGER        -- number of blocks eligible for cleanup
+    )
+</pre>
+
+<p>Column "name" contains the local alias of the attached container (this
+may be the same as the remove container name). Columns "storage", "user"
+and "container" contain the storage module, account and cloud storage
+container names as specified to sqlite3_bcvfs_attach() when the container
+was attached.
+
+</p><p>The "ncleanup" column usually contains the number of blocks that will 
+be deleted from cloud storage if a cleanup operation (see the 
+sqlite3_bcv_cleanup() API)is run on the container. However, if
+errors or client crashes have occurred while uploading changes to
+cloud storage, then there may be extra unused blocks left in the
+cloud storage container. In this case those blocks will be deleted
+by the next cleanup operation, but are not included in the value
+stored in the "ncleanup" column of the "bcv_container" table.
+
+</p><p>The bcv_container table is available in both daemon and daemonless
+mode.
+
+</p><p><b>The bcv_database table:</b>
+
+</p><p>The read-only "bcv_database" table contains one row for each database in each
+attached container. It has the equivalent of the following schema:
+
+</p><pre>    CREATE TABLE bcv_database(
+      container TEXT,          -- local name (alias) of container
+      database  TEXT,          -- name of database
+      nblock INTEGER,          -- total number of blocks in database
+      ncache INTEGER,          -- number of blocks in cache
+      ndirty INTEGER,          -- number of dirty blocks in cache
+      walfile BOOLEAN,         -- true if transactions in local wal file
+      state TEXT               -- state of database (see below)
+    )
+</pre>
+
+<p>The "container" column contains the local alias of the container (the
+same value that is stored in the "name" column of the bcv_container
+table). Column "database" contains the database name.
+
+</p><p>Columns "nblock", "ncache" and "ndirty" contain the total number of
+blocks in the database, the number of those blocks that are currently
+cached locally, and the number of those cached blocks that are dirty
+and require uploding. It is always true that:
+
+</p><pre>    nblock &gt;= ncache &gt;= ndirty
+</pre>
+
+<p>Boolean column "walfile" is set to true if there are currently write
+transactions in a local wal file (blockcachevfs databases are always
+in wal mode). To determine whether or not there have been local 
+changes to a database, an application might use a query similar to:
+
+</p><pre>    SELECT (walfile OR ndirty&gt;0) AS has_local_changes FROM bcv_database WHERE...
+</pre>
+
+<p>The "state" column usually contains an empty string. There are two
+exceptions:
+
+</p><ul><li>If the database has been created using sqlite3_bcvfs_copy() but
+       not yet uploaded, then this column contains the text 'copied'.</li></ul>
+
+<ul><li>If the database has been deleted using sqlite3_bcvfs_delete() but
+       the delete operation has not yet uploaded, then this column contains the
+       text 'deleted'.</li></ul>
+
+<p>The bcv_database table is available in both daemon and daemonless
+mode.
+
+</p><p><b id="bcv_http_log">The bcv_http_log table:</b>
+
+</p><p>The "bcv_http_log" table contains one row for each HTTP request made
+by the VFS or connected daemon. It has the equivalent of the following
+for a schema:
+
+</p><pre>     CREATE TABLE bcv_http_log(
+       id INTEGER,              -- Unique, monotonically increasing id value
+       start_time TEXT,         -- Time request was made, as iso-8601
+       end_time TEXT,           -- Time reply received, as iso-8601 (or NULL)
+       method TEXT,             -- "PUT", "GET" etc.
+       client TEXT,             -- Name of client that caused request
+       logmsg TEXT,             -- Log message associated with request
+       uri TEXT,                -- URI of request
+       httpcode INTEGER         -- HTTP response code (e.g. 200)
+     ) 
+</pre>
+
+<p>For those requests that can be associated with a single SQLite database
+handle, the contents of the "client" column is the client name as
+configured using the <a href="#pragma_bcv_client">PRAGMA bcv_client</a> command.
+For requests associated with a prefetch operation, it contains the string
+'prefetch'.
+
+</p><p>To prevent it from consuming an ever-increasing amount of memory, entries 
+are automatically removed from the bcv_http_log on a first-in/first-out
+according to the values configured for the SQLITE_BCV_HTTPLOG_TIMEOUT 
+and SQLITE_BCV_HTTPLOG_NENTRY parameters. Or, in daemon mode, according
+to the values passed via the --httplogtimeout and --httplognentry 
+command-line options.
+
+</p><p>Including various overheads, each entry may be assumed to consume 
+256 bytes of memory or less. So allowing 4096 entries to accumulate in
+the bcv_http_log table may require up to 1MiB of memory.
+
+</p><p><b>The bcv_kv table:</b>
+
+</p><p>The schema of the "bcv_kv" table is:
+
+</p><pre>    CREATE TABLE bcv_kv(
+      name TEXT PRIMARY KEY,   -- Key value 
+      value                    -- Associated payload value
+    )
+</pre>
+
+<p>Unlike the other two eponymous virtual tables described in this section, the
+bcv_kv table is read-write. Applications may write arbitrary data to the table
+to be stored in the cloud storage container. The table is empty when the
+container is first created.
+
+</p><p>The contents of the bcv_kv table is stored as a separate file (an
+SQLite database) in the cloud container - "bcv_kv.bcv". 
+
+</p><p>The bcv_kv table implements transaction-like properties. As follows:
+
+</p><ul>
+  <li> The first time in a database transaction that the bcv_kv table 
+       is read or written, the file is downloaded from cloud storage and cached
+       for the duration of the transaction. All user queries - read and write -
+       are executed against this cached version of the bcv_kv table. This
+       ensures that each transaction sees a consistent version of the table
+       contents.
+  </li><li> When a read/write transaction is committed, a new version of the bcv_kv
+       table data is uploaded to cloud storage. At this point, if it is found
+       that the file has been modified within cloud storage since it was
+       downloaded at the beginning of the transaction (because some other
+       client wrote to it), the commit fails and the transaction is rolled
+       back. The extended error code in this case is SQLITE_BUSY_SNAPSHOT.
+</li></ul>
+
+<p>Because the entire bcv_kv table is downloaded (and, for write transactions,
+uploaded) for each transaction, applications should avoid storing large
+amounts of data within it.
+
+</p><p><b id="bcv_kv_meta">The bcv_kv_meta table:</b>
+
+</p><p>The schema of the "bcv_kv_meta" table is:
+
+</p><pre>    CREATE TABLE bcv_kv_meta(
+      name TEXT PRIMARY KEY,   -- Header field name
+      value                    -- Header field value
+    )
+</pre>
+
+<p>The bcv_kv_meta table is similar to the bcv_kv table, in that querying it
+causes cloudsqlite to download the bcv_kv.bcv database file and cache it
+for the remainder of the transaction. Instead of providing read/write access
+to the contents of the bcv_kv.bcv database, it provides read-only access
+to two of the http headers recieved from the cloud storage server when the
+file was downloaded - "Date" and "Last-Modified".
+
+</p><p>The bcv_kv_meta table always contains exactly two rows. The first contains
+the string 'date' in the "name" column, and the value of the timestamp from the
+HTTP "Date:" header, in ISO-8601 format, in the "value" column. The second row
+contains 'last-modified' in the "name" column, and the ISO-8601 equivalent
+of the timestamp from the HTTP "Last-Modified:" header in "value".
+
+</p><p>If, for some reason, the cloud storage server does not provide a "Date:" or
+"Last-Modified:" header, or if the contents of that header cannot be parsed,
+the corresponding "value" field in the bcv_kv_meta table is set to NULL.
+
+</p><h2 id="commandline">6. Command Line Reference </h2>
+
+<p>The following options are supported by all or most of the commands enumerated
+below. All commands accept unique prefixes of any option in place of the full
+option string.
+</p><table>
+<tbody><tr><td>Option
+    </td><td>Argument
+</td></tr><tr><td>-user</td><td>USER-NAME
+</td></tr><tr><td colspan="2"><p>
+    The user or account name to use when accessing cloud storage.
+</p></td></tr><tr><td>-auth</td><td>ACCESS-KEY
+</td></tr><tr><td colspan="2"><p>
+    The authentication information to use when accessing cloud 
+    storage. The form of this depends on the cloud storage module in use.
+</p></td></tr><tr><td>-container</td><td>CONTAINER-NAME
+</td></tr><tr><td colspan="2"><p>
+    The blob storage container to read from or write to. This option is 
+    accepted (and required) by the commands "upload", "delete", "list" 
+    and "download" only. 
+</p></td></tr><tr><td>-file</td><td>PATH
+</td></tr><tr><td colspan="2"><p>
+    This option tells the comand to read the local text file at relative or
+    absolute path PATH and treat its contents as whitespace separated command
+    line arguments. 
+</p></td></tr><tr><td>-module</td><td>MODULE-NAME
+</td></tr><tr><td colspan="2"><p>
+    The cloud storage module to use to access the remote container. This may
+    be a simple module name (e.g. "google") or a module name followed by
+    URI style parameters (e.g. "azure?emulator=127.0.0.1:10000&amp;sas=1").
+</p></td></tr><tr><td>-log</td><td>STRING
+</td></tr><tr><td colspan="3"><p>
+    The argument to this option determines when log messages are output
+    to stdout. If the value contains an "h" character, a message is output 
+    each time an HTTP(S) request is issued or a reply received. If a "v"
+    is present in the string, libcurl verbose logging is enabled. All other
+    characters are ignored. The intepretation of the argument to this
+    option is subject to revision at any point. The default value is an
+    empty string (no log messages at all).
+</p></td></tr></tbody></table>
+
+<p>The following commands are supported:
+
+</p><pre id="copy_command"> blockcachevfsd <b>copy</b> <i>?OPTIONS?</i> <i>DATABASE1</i> <i>DATABASE2</i></pre>
+<p> Make a copy of database <i>DATABASE1</i> named <i>DATABASE2</i>. If
+      <i>DATABASE2</i> exists it is clobbered by the copy. This operation
+      always uses <a href="#sharing">block sharing</a> to avoid uploading any
+      new block files.
+</p>
+<pre id="create_command"> blockcachevfsd <b>create</b> <i>?OPTIONS?</i> <i>CONTAINER</i></pre>
+<div>
+  <p> Create a new container and add an empty manifest file containing zero
+  databases to it. It is not an error if the container already exists. In this
+  case any existing manifest is clobbered by the new, empty, manifest,
+  effectively deleting any databases currently stored in the container.
+  </p><p> The following extra options are supported:
+  </p><pre>      -blocksize BlOCK-SIZE
+      -namebytes BLOCKID-SIZE
+</pre>
+  <p> The "-blocksize" option is used to set the size of each block file
+  stored within cloud storage. The default size is 4MiB. If the argument
+  is an integer value it is interpreted as a size in bytes. If an integer value
+  followed by a 'k' or 'K' character, a size in KiB. Or, if the argument
+  is an integer value followed by an 'm' or 'M' character, a size in MiB.
+  The specified size must be a power of two in bytes. The following switches
+  all serve to set the block-size to 2MiB: 
+  </p><pre>      -blocksize 2M
+      -blocksize 2048k
+      -blocksize 2097152
+</pre>
+  <p> The "-namebytes" option may be passed an integer value between
+  16 and 32, inclusive, to set the size in bytes of the block ids that
+  will be used by the manifest file. The default value is 16. The block id size
+  has implications for <a href="#sharing">block sharing</a>.
+</p></div>
+<pre> blockcachevfsd <b>delete</b> <i>?OPTIONS?</i> <i>NAME</i></pre>
+<p> Remove database NAME from the container identified by the -container
+  option. 
+</p>
+<pre> blockcachevfsd <b>destroy</b> <i>?OPTIONS?</i> <i>CONTAINER</i></pre>
+<div>
+  <p> Delete an entire blob storage container and its contents.
+  </p><p> WARNING: Deleting a container from Azure blob storage is (apparently) a
+      lazily executed operation. Even though the container appears to be removed
+      immediately, it still exists in some senses as Azure prevents a new 
+      container with the same name from being created for some time. Sometimes
+      this condition persists for up to 24 hours or longer. For this reason, it
+      is better to "create -clobber" a container instead of attempting to
+      delete and then recreate it.
+</p></div>
+<pre> blockcachevfsd <b>download</b> <i>?OPTIONS?</i> <i>NAME</i> ?<i>LOCALFILE</i>?</pre>
+<div>
+  <p> Download the named database from the container specified by the
+  -container option to the local file-system. If the <i>LOCALFILE</i> argument
+  is specified, then it is the local file-system path to store the downloaded
+  database at. If no <i>LOCALFILE</i> argument is specified, the downloaded
+  database is stored in the current directory using the same name as is used
+  in cloud storage.
+  </p><p> The download command supports the following additional option:
+  </p><pre>      -nrequest N
+</pre><p>
+  This option sets the number of HTTP(S) requests that are allowed to be
+  outstanding at any one time. The default value is 1. Using a higher value
+  might increase throughput.
+</p></div>
+<pre> blockcachevfsd <b>upload</b> <i>?OPTIONS?</i> <i>DATABASE-FILE</i> <i>?NAME?</i></pre>
+<div>
+  <p> Upload the specified local database file to and add it to the manifest in
+  the container identified by the -container option. If the NAME parameter is
+  present then it is used as the name of the uploaded remote database. Otherwise,
+  the remote database takes the same name as the local file, with any directory
+  components removed.
+  </p><p> The upload command supports the following additional option:
+  </p><pre>      -nrequest N
+</pre><p>
+  This option sets the number of HTTP(S) requests that are allowed to be
+  outstanding at any one time. The default value is 1. Using a higher value
+  might increase throughput.
+
+</p></div>
+
+<p>The eight commands above mirror the eight APIs made available to database
+clients (attach and detach by blockcachevfs.h, the others by bcvutil.h).
+The following commands are also supported, but are considered a convenience
+only. The command-line options and the output of the following are subject
+to change at any time:
+
+</p><pre> blockcachevfsd <b>files</b> <i>?OPTIONS?</i> <i>CONTAINER</i></pre>
+<p> List the files in the specified container, one per line. All files 
+      are listed, even those that are not part of blockcachevfs databases.
+</p>
+<pre> blockcachevfsd <b>list</b> <i>?OPTIONS?</i> </pre>
+<p> If there is no -container option, list all databases in all containers in
+  the blob storage account. Or, if the -container option is passed, list only
+  the databases in the specified container.
+</p>
+<pre> blockcachevfsd <b>manifest</b> <i>?OPTIONS?</i> <i>CONTAINER</i></pre>
+<p> Output a human-readable version of the manifest file found in the
+      specified container.
+</p>
+
+<h2 id="daemon">7. Daemon Command Reference </h2>
+
+<p>The daemon process is started as follows:
+
+</p><pre> blockcachevfsd <b>daemon</b> <i>?OPTIONS?</i> <i>DIRECTORY</i> </pre>
+
+<p>The daemon command supports the following options:
+</p><table>
+<tbody><tr><td>Option
+    </td><td>Argument
+    </td><td>Default Value
+</td></tr><tr><td>-addr</td><td>IPV4-ADDRESS</td><td>(default - "127.0.0.1")
+</td></tr><tr><td colspan="3"><p>
+    Normally, the daemon listens and accepts connections from client on
+    the localhost address (127.0.0.1). This option allows the daemon to
+    listen for connections on some other local address.
+</p></td></tr><tr><td>-cachesize</td><td>CACHE-FILE-SIZE</td><td>(default 1G)
+</td></tr><tr><td colspan="3"><p>
+    Database file blocks downloaded from the blob storage account are cached
+    locally. The cache is allowed to grow up to the size configured by this
+    option, then blocks are expelled on a least-recently-used basis as new
+    blocks are downloaded. The argument to this option must be a positive 
+    integer followed by a single "M" or "G" (or "m" or "g") character to
+    indicate whether the integer value should be interpreted as a number
+    of MiB or GiB. For example, to use a 1GiB cache, either "-cachesize 1024M"
+    or "-cachesize 1G" may be specified.
+</p></td></tr><tr><td>-httptimeout</td><td>SECONDS</td><td>(default value 600
+</td></tr><tr><td colspan="3"><p>
+    The number of seconds to wait before assuming an HTTPS request made to
+    cloud storage has been lost. 
+</p></td></tr><tr><td>-log</td><td>STRING</td><td>(default value "")
+</td></tr><tr><td colspan="3"><p>
+    The argument to this option determines when log messages are output
+    to stdout by the daemon process. Each character in the argument string
+    turns on different log messages. Characters not listed in the following
+    table are ignored. The interpretation of the argument passed to this 
+    option is subject to revision at any time.
+
+</p><blockquote><table>
+      <tbody><tr> <td> Character</td><td></td><td> Interpretation
+      </td></tr><tr><td>m</td><td></td><td>Output a log message each time a message is received
+                    from or sent to a connected database client.
+      </td></tr><tr><td>h</td><td></td><td>Output a log message each time an HTTP(S) request is
+                    set or a reply received.
+      </td></tr><tr><td>e</td><td></td><td>Output a log message when various internal "events"
+                       occur.  
+      </td></tr><tr><td>v</td><td></td><td>Turn on libcurl CURLOPT_VERBOSE logging.
+    </td></tr></tbody></table>
+</blockquote></td></tr><tr><td>-notimestamps
+</td></tr><tr><td colspan="3"><p>
+    This option causes the daemon process to omit the high-resolution 
+    timestamps from the log messages it outputs.
+</p></td></tr><tr><td>-port</td><td>PORT-NUMBER</td><td>(default - first free tcp port &gt;= 22002)
+</td></tr><tr><td colspan="3"><p>
+    The localhost port on which to listen for connections from local
+    database clients.
+</p></td></tr><tr><td>-httplogtimeout</td><td>SECONDS</td><td>(default value 3600)
+</td></tr><tr><td colspan="3"><p>
+    The number of seconds after which entries are automatically removed from
+    the <a href="#bcv_http_log">bcv_http_log</a> virtual table. A value of less
+    than zero means entries are never removed.
+</p></td></tr><tr><td>-httplognentry</td><td>INTEGER</td><td>(default value -1)
+</td></tr><tr><td colspan="3"><p>
+    The maximum number of entries allowed in the
+    <a href="#bcv_http_log">bcv_http_log</a> virtual table. Once this limit has
+    been reached old entries are automatically removed to make way for new.
+</p></td></tr><tr><td>-autoexit
+</td></tr><tr><td colspan="3"><p>
+    This <b>debugging option</b> causes the daemon process to exit 
+    cleanly when the number of local database clients drops to zero.
+</p></td></tr><tr><td>-delay</td><td>MS</td><td>0
+</td></tr><tr><td colspan="3"><p>
+    This <b>debugging option</b> causes the daemon process to 
+    to pause for the specified number of milliseconds before beginning to
+    listen for incoming connections.
+</p></td></tr><tr><td>-readymessage
+</td></tr><tr><td colspan="3"><p>
+    This <b>debugging option</b> causes the daemon process to print "READY\n"
+    to stdout when it is ready to accept incoming client connections. This
+    makes it easier to write test scripts that start and stop daemon processes.
+</p></td></tr></tbody></table>
+
+
+
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Wash trading gone wrong – how a $100M/day crypto exchange bankrupted itself (147 pts)]]></title>
             <link>https://blog.everstrike.io/wash-trading-gone-wrong-how-a-crypto-exchange-accidentally-obliterated-itself/</link>
             <guid>36610006</guid>
             <pubDate>Thu, 06 Jul 2023 01:57:21 GMT</pubDate>
@@ -19,7 +1247,7 @@
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Tell HN: Nearly all of Evernote’s remaining staff has been laid off (371 pts)]]></title>
+            <title><![CDATA[HNInternal: Tell HN: Nearly all of Evernote’s remaining staff has been laid off (431 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=36609641</link>
             <guid>36609641</guid>
             <pubDate>Thu, 06 Jul 2023 01:17:21 GMT</pubDate>
@@ -389,7 +1617,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
                         </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Threads has passed 2M sign ups in the first 2 hours (218 pts)]]></title>
+            <title><![CDATA[Threads has passed 2M sign ups in the first 2 hours (224 pts)]]></title>
             <link>https://www.threads.net/t/CuVjWxcJ22Z</link>
             <guid>36609632</guid>
             <pubDate>Thu, 06 Jul 2023 01:15:18 GMT</pubDate>
@@ -397,7 +1625,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Ban on recording without consent is unconstitutional, US court rules (181 pts)]]></title>
+            <title><![CDATA[Ban on recording without consent is unconstitutional, US court rules (199 pts)]]></title>
             <link>https://www.documentcloud.org/documents/23867036-appeals-court-ruling-in-project-veritas-v-schmidt</link>
             <guid>36609560</guid>
             <pubDate>Thu, 06 Jul 2023 01:04:21 GMT</pubDate>
@@ -447,7 +1675,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rejected GitHub profile achievements (342 pts)]]></title>
+            <title><![CDATA[Rejected GitHub profile achievements (367 pts)]]></title>
             <link>https://github.com/Flet/rejected-github-profile-achievements</link>
             <guid>36607439</guid>
             <pubDate>Wed, 05 Jul 2023 21:30:09 GMT</pubDate>
@@ -541,7 +1769,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The U.S. Copyright Office Requires Libraries to Lie to Users about Fair Use (210 pts)]]></title>
+            <title><![CDATA[The U.S. Copyright Office Requires Libraries to Lie to Users about Fair Use (212 pts)]]></title>
             <link>https://scholarlykitchen.sspnet.org/2023/07/05/why-does-the-u-s-copyright-office-require-libraries-to-lie-to-users-about-their-fair-use-rights-they-wont-say/</link>
             <guid>36606323</guid>
             <pubDate>Wed, 05 Jul 2023 20:08:10 GMT</pubDate>
@@ -580,7 +1808,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Fast (695 pts)]]></title>
+            <title><![CDATA[Fast (719 pts)]]></title>
             <link>https://patrickcollison.com/fast</link>
             <guid>36605912</guid>
             <pubDate>Wed, 05 Jul 2023 19:34:55 GMT</pubDate>
@@ -670,7 +1898,7 @@ heavily discounted on Amazon,  it was almost cheaper to combine the notebooks wi
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Tell HN: People forget that you can stick any data at the end of a bash script (204 pts)]]></title>
+            <title><![CDATA[HNInternal: Tell HN: People forget that you can stick any data at the end of a bash script (222 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=36605869</link>
             <guid>36605869</guid>
             <pubDate>Wed, 05 Jul 2023 19:32:01 GMT</pubDate>
@@ -816,7 +2044,7 @@ And Base64 in one of my Python programs.<p>What are their pros and cons, in your
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[With plugins, GPT-4 posts GitHub issue without being instructed to (141 pts)]]></title>
+            <title><![CDATA[With plugins, GPT-4 posts GitHub issue without being instructed to (146 pts)]]></title>
             <link>https://chat.openai.com/share/ed8044da-22c5-4c5e-ba82-4353f67d553f</link>
             <guid>36605806</guid>
             <pubDate>Wed, 05 Jul 2023 19:27:26 GMT</pubDate>
@@ -824,7 +2052,7 @@ And Base64 in one of my Python programs.<p>What are their pros and cons, in your
 Couldn't get https://chat.openai.com/share/ed8044da-22c5-4c5e-ba82-4353f67d553f: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Hacker News User Blogroll (620 pts)]]></title>
+            <title><![CDATA[Show HN: Hacker News User Blogroll (646 pts)]]></title>
             <link>https://dm.hn</link>
             <guid>36605493</guid>
             <pubDate>Wed, 05 Jul 2023 19:06:43 GMT</pubDate>
@@ -7201,7 +8429,7 @@ RSS: https://taylor.town/feed.xmlspam: https://newsletter.taylor.town</td>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Overflowing Brain: Information overload and the limits of working memory (194 pts)]]></title>
+            <title><![CDATA[The Overflowing Brain: Information overload and the limits of working memory (205 pts)]]></title>
             <link>https://tertulia-moderna.blogspot.com/2010/12/overflowing-brain-by-torkel-klingberg.html</link>
             <guid>36605085</guid>
             <pubDate>Wed, 05 Jul 2023 18:40:04 GMT</pubDate>
@@ -7245,7 +8473,7 @@ Story on <i>NRP: </i><a href="http://www.npr.org/templates/story/story.php?story
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[LLama.cpp now has a web interface (300 pts)]]></title>
+            <title><![CDATA[LLama.cpp now has a web interface (303 pts)]]></title>
             <link>https://github.com/ggerganov/llama.cpp/pull/1998</link>
             <guid>36603816</guid>
             <pubDate>Wed, 05 Jul 2023 17:33:04 GMT</pubDate>
@@ -7265,7 +8493,7 @@ Story on <i>NRP: </i><a href="http://www.npr.org/templates/story/story.php?story
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Introducing Superalignment (190 pts)]]></title>
+            <title><![CDATA[Introducing Superalignment (194 pts)]]></title>
             <link>https://openai.com/blog/introducing-superalignment</link>
             <guid>36603382</guid>
             <pubDate>Wed, 05 Jul 2023 17:04:29 GMT</pubDate>
@@ -7273,7 +8501,7 @@ Story on <i>NRP: </i><a href="http://www.npr.org/templates/story/story.php?story
 <div id="readability-page-1" class="page"><div id="content"><!--[--><div><p>Superintelligence will be the most impactful technology humanity has ever invented, and could help us solve many of the world’s most important problems. But the vast power of superintelligence could also be very dangerous, and could lead to the disempowerment of humanity or even human extinction.</p><p>While superintelligence<span><sup><span>[^superintelligence]</span></sup><!----></span> seems far off now, we believe it could arrive this decade.</p><p>Managing these risks will require, among <a href="https://openai.com/blog/how-should-ai-systems-behave" rel="noopener noreferrer" target="_blank">other things</a>, <a href="https://openai.com/blog/governance-of-superintelligence" rel="noopener noreferrer" target="_blank">new institutions for governance</a> and solving the problem of superintelligence alignment:</p><p><br><em>How do we ensure AI systems much smarter than humans follow human intent?</em></p><p><br>Currently, we don't have a solution for steering or controlling a potentially superintelligent AI, and preventing it from going rogue. Our current techniques for aligning AI, such as <a href="https://openai.com/research/instruction-following" rel="noopener noreferrer" target="_blank">reinforcement learning from human feedback</a>, rely on humans’ ability to supervise AI. But humans won’t be able to reliably supervise AI systems much smarter than us,<span><sup><span>[^smarter]</span></sup><!----></span> and so our current alignment techniques will not scale to superintelligence. We need new scientific and technical breakthroughs.<br></p></div><div id="our-approach" data-heading=""><p><h2>Our approach</h2></p></div><div><p>Our goal is to build a roughly human-level <a href="https://openai.com/blog/our-approach-to-alignment-research" rel="noopener noreferrer" target="_blank">automated alignment researcher</a>. We can then use vast amounts of compute to scale our efforts, and iteratively align superintelligence.</p><p>To align the first automated alignment researcher, we will need to 1) develop a scalable training method, 2) validate the resulting model, and 3) stress test our entire alignment pipeline:</p><ol><li>To provide a training signal on tasks that are difficult for humans to evaluate, we can leverage AI systems to <a href="https://openai.com/research/critiques" rel="noopener noreferrer" target="_blank">assist evaluation of other AI systems</a>&nbsp;(<em>scalable oversight). </em>In addition, we want to understand and control how our models generalize our oversight to tasks we can’t supervise&nbsp;(<em>generalization)</em>.</li><li>To validate the alignment of our systems, we <a href="https://www.deepmind.com/blog/red-teaming-language-models-with-language-models" rel="noopener noreferrer" target="_blank">automate search for problematic behavior</a>&nbsp;(<em>robustness) </em>and problematic internals&nbsp;(<a href="https://openai.com/research/language-models-can-explain-neurons-in-language-models" rel="noopener noreferrer" target="_blank"><em>automated interpretability</em></a>).</li><li>Finally, we can test our entire pipeline by deliberately training misaligned models, and confirming that our techniques detect the worst kinds of misalignments&nbsp;(<em>adversarial testing</em>).</li></ol><p>We expect our research priorities will evolve substantially as we learn more about the problem and we’ll likely add entirely new research areas. We are planning to share more on our roadmap in the future.<br></p></div><div id="the-new-team" data-heading=""><p><h2>The new team</h2></p></div><div><p>We are assembling a team of top machine learning researchers and engineers to work on this problem.&nbsp;</p><p>We are dedicating 20% of the compute we’ve secured to date over the next four years to solving the problem of superintelligence alignment. Our chief basic research bet is our new Superalignment team, but getting this right is critical to achieve our mission and we expect many teams to contribute, from developing new methods to scaling them up to deployment.<br></p></div><div><figure><blockquote><p><span>Our goal is to solve the core technical challenges of superintelligence alignment in four years.</span></p></blockquote><!----></figure></div><div><p>While this is an incredibly ambitious goal and we’re not guaranteed to succeed, we are optimistic that a focused, concerted effort can solve this problem:<span><sup><span>[^problem]</span></sup><!----></span> There are many ideas that have shown promise in preliminary experiments, we have increasingly useful metrics for progress, and we can use today’s models to study many of these problems empirically.&nbsp;</p><p>Ilya Sutskever (cofounder and Chief Scientist of OpenAI) has made this his core research focus, and will be co-leading the team with Jan Leike (Head of Alignment). Joining the team are researchers and engineers from our previous alignment team, as well as researchers from other teams across the company.</p><p>We’re also looking for outstanding new researchers and engineers to join this effort. Superintelligence alignment is fundamentally a machine learning problem, and we think great machine learning experts—even if they’re not already working on alignment—will be critical to solving it.</p><p>We plan to share the fruits of this effort broadly and view contributing to alignment and safety of non-OpenAI models as an important part of our work.</p><p>This new team’s work is in addition to existing work at OpenAI aimed at improving the <a href="https://openai.com/blog/our-approach-to-ai-safety" rel="noopener noreferrer" target="_blank">safety of current models</a> like ChatGPT, as well as understanding and mitigating other risks from AI such as misuse, economic disruption, disinformation, bias and discrimination, addiction and overreliance, and others. While this new team will focus on the machine learning challenges of aligning superintelligent AI systems with human intent, there are related sociotechnical problems on which we are <a href="https://openai.com/blog/democratic-inputs-to-ai" rel="noopener noreferrer" target="_blank">actively engaging with interdisciplinary experts</a> to make sure our technical solutions consider broader human and societal concerns.<br></p></div><div id="join-us" data-heading=""><p><h2>Join us</h2></p></div><div><p>Superintelligence alignment is one of the most important unsolved technical problems of our time. We need the world’s best minds to solve this problem.</p><p>If you’ve been successful in machine learning, but you haven’t worked on alignment before, this is your time to make the switch! We believe this is a tractable machine learning problem, and you could make enormous contributions.</p><p><em><br>If you’re interested, we’d love to hear from you! Please apply for our </em><a href="https://openai.com/careers/research-engineer-superalignment" rel="noopener noreferrer" target="_blank"><em>research engineer</em></a><em>, </em><a href="https://openai.com/careers/research-scientist-superalignment" rel="noopener noreferrer" target="_blank"><em>research scientist</em></a><em>, and </em><a href="https://openai.com/careers/research-manager-superalignment" rel="noopener noreferrer" target="_blank"><em>research manager</em></a><em> positions.</em><br></p></div><!--]--></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ottawa pulls advertising, escalating showdown with Facebook and Instagram (141 pts)]]></title>
+            <title><![CDATA[Ottawa pulls advertising, escalating showdown with Facebook and Instagram (143 pts)]]></title>
             <link>https://nationalpost.com/news/canada/canadian-government-suspends-advertising-on-facebook-instagram</link>
             <guid>36603263</guid>
             <pubDate>Wed, 05 Jul 2023 16:57:51 GMT</pubDate>
@@ -7281,7 +8509,7 @@ Story on <i>NRP: </i><a href="http://www.npr.org/templates/story/story.php?story
 Couldn't get https://nationalpost.com/news/canada/canadian-government-suspends-advertising-on-facebook-instagram: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[LiteFS Cloud: Distributed SQLite with Managed Backups (207 pts)]]></title>
+            <title><![CDATA[LiteFS Cloud: Distributed SQLite with Managed Backups (212 pts)]]></title>
             <link>https://fly.io/blog/litefs-cloud/</link>
             <guid>36602970</guid>
             <pubDate>Wed, 05 Jul 2023 16:41:50 GMT</pubDate>
@@ -7289,7 +8517,7 @@ Couldn't get https://nationalpost.com/news/canada/canadian-government-suspends-a
 <div id="readability-page-1" class="page"><article> <dl> <dt>Author</dt> <dd> <img src="https://fly.io/static/images/darla.webp" alt="Darla Magdalene Shockley" srcset=""> <dl> <dt>Name</dt> <dd> Darla Magdalene Shockley </dd> <dt>Social Media</dt> <dd> </dd> </dl> </dd> <dt>Author</dt> <dd> <img src="https://fly.io/static/images/ben.webp" alt="Ben Johnson" srcset=""> <dl> <dt>Name</dt> <dd> Ben Johnson </dd> <dt>Social Media</dt> <dd> <a href="https://twitter.com/benbjohnson" target="_blank" rel="noopener noreferrer">  <span>View Twitter Profile</span> </a> </dd> </dl> </dd> </dl> <section> <figure> <img src="https://fly.io/blog/2023-07-05/litefs-cloud-cover.webp" alt="Cartoon clouds floating in the air."> <figcaption> <span>Image by</span> <svg role="img" style="pointer-events: none; width: 17px; height: 17px;" viewBox="0 0 20 20" fill="currentColor" fill-rule="evenodd"> <g buffered-rendering="static"> <path fill-rule="evenodd" d="M1 8a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 018.07 3h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0016.07 6H17a2 2 0 012 2v7a2 2 0 01-2 2H3a2 2 0 01-2-2V8zm13.5 3a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM10 14a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"></path> </g> </svg> <a href="https://annieruygtillustration.com/" target="_blank"> Annie Ruygt </a> </figcaption> </figure> <p> With Fly.io, <a href="https://fly.io/docs/speedrun/">you can get your app running globally in a matter of minutes</a>, and with LiteFS, you can run SQLite alongside your app! Now we're introducing LiteFS Cloud: managed backups and point-in-time restores for LiteFS—whether your app is running on Fly.io or anywhere else. <a href="https://fly.io/docs/litefs/speedrun/">Try it out for yourself</a>!</p><p>We love <a href="https://fly.io/blog/all-in-on-sqlite-litestream/">SQLite in production</a>, and we're all about running apps close to users. That's why we created LiteFS: an open source distributed SQLite database that lives on the same filesystem as your application, and replicates data to all the nodes in your app cluster.</p> <p>With LiteFS, you get the simplicity, flexibility, and lightning-fast local reads of working with vanilla SQLite, but distributed (so it's close to your users)! It's especially great for read-heavy web applications. Learn more about LiteFS in the <a href="https://fly.io/docs/litefs/">LiteFS docs</a> and in <a href="https://fly.io/blog/introducing-litefs/">our blog post introducing LiteFS</a>.</p> <p>At Fly.io we've been using LiteFS internally for a while now, and it's awesome!</p> <p>However, something is missing: disaster recovery. Because it's local to your app, you don't need to—indeed can't—pay someone to manage your LiteFS cluster, which means no managed backups. Until now, you've had to <a href="https://fly.io/docs/litefs/backup/">build your own</a>: take regular snapshots, store them somewhere, figure out a retention policy, that sort of thing.</p> <p>This also means you can only restore from a point in time when you happen to have taken a snapshot, and you likely need to limit how frequently you snapshot for cost reasons. Wouldn't it be cool if you could have super-frequent reliable backups to restore from, without having to implement it yourself?</p> <p>Well, that's why we're launching, in preview, LiteFS Cloud: backups and restores for LiteFS, managed by Fly.io. It gives you painless and reliable backups, with the equivalent of a snapshot every five minutes (8760 snapshots per month!), whether your database is hosted with us, or anywhere else.</p> <h2 id="how-do-i-use-litefs-cloud"><a href="#how-do-i-use-litefs-cloud" aria-label="Anchor"></a>How do I use LiteFS Cloud?</h2><p>There's a few steps to get started:</p> <ul> <li>Upgrade LiteFS to version 0.5.1 or greater </li><li>Create a LiteFS Cloud cluster in the Fly.io dashboard, <a href="https://fly.io/dashboard/personal/litefs">LiteFS Cloud section</a> </li><li>Make the LiteFS Cloud auth token available to your LiteFS </li></ul> <p><img src="https://fly.io/blog/2023-07-05/screenshot1.png" alt="Screenshot of Fly.io dashboard, with a red arrow pointing to &quot;LiteFS Cloud&quot; in the left navbar, and another red arrow pointing to the &quot;Create&quot; button on the top right for creating a LiteFS Cloud cluster"></p> <p><a href="https://fly.io/docs/litefs/cloud-backups">There are some docs here</a>, but that’s literally it. Then your database will start automagically backing up, we’ll manage the backups for you, and you’ll be able to restore your database near instantaneously to any point in time in the last 30 days (with 5 minute granularity).</p> <p>I want to say that again because I think it’s just wild – you can restore your database to <em>any point in time, with 5 minute granularity</em>. <strong><em>Near instantaneously</em></strong>.</p> <p>Speaking of restores—you can do those in the dashboard too. You pick a date and time, and we’ll take the most recent snapshot before that timestamp and restore it. This will take a couple of seconds (or less).</p> <p><img src="https://fly.io/blog/2023-07-05/screenshot2.png" alt="Screenshot of popup modal on Fly.io dashboard, with a date and time selector, and a text field with &quot;lfsc-test-runner/db&quot; typed in it, and a red button at the bottom with text &quot;I understand the consequences. Restore from this snapshot.&quot;"></p> <p>We'll introduce pricing in the coming months, but for now LiteFS Cloud is in preview and is free to use. Please go check it out, and let us know how it goes!</p> <h2 id="the-secret-sauce-ltx-compactions"><a href="#the-secret-sauce-ltx-compactions" aria-label="Anchor"></a>The secret sauce: LTX &amp; compactions</h2><p>LiteFS is built on a simple file format called <a href="https://github.com/superfly/ltx">Lite Transaction File (LTX)</a> which is designed for fast, flexible replication and recovery in LiteFS itself and in LiteFS Cloud.</p> <p>But first, let's start off with what an LTX file represents: <em>a change set of database pages</em>.</p> <p>When you commit a write transaction in SQLite, it updates one or more fixed-sized blocks called pages. By default, these are 4KB in size. An LTX file is simply a sorted list of these changed pages. Whenever you perform a transaction in SQLite, LiteFS will build an LTX file for that transaction.</p> <p>The interesting part of LTX is that contiguous sets of LTX files can be merged together into one LTX file. This merge process is called <em>compaction</em>.</p> <p>For example, let's say you have 3 transactions in a row that update the following set of pages:</p> <ul> <li>LTX A: Pages 1, 5, 7 </li><li>LTX B: Pages 5, 6 </li><li>LTX C: Pages 5, 7 </li></ul> <p>With LTX compaction, you avoid the duplicate work that comes from overwriting the same pages one transaction at a time. Instead, one LTX file for transactions A through C contains the last version of each page, so the pages are stored and updated only once:</p> <p><img src="https://fly.io/blog/2023-07-05/single-level-compaction.png" alt="Compacting three contiguous LTX files into a single LTX file."></p> <p>That, in a nutshell, is how a single-level compaction works.</p> <h2 id="it-s-ltx-all-the-way-down"><a href="#it-s-ltx-all-the-way-down" aria-label="Anchor"></a>It's LTX all the way down</h2><p>Compactions let us take changes for a bunch of transactions and smoosh them down into a single, small file. That's cool and all but how does that give us fast point-in-time restores? By the magic of multi-level compactions!</p> <p>Compaction levels are progressively larger time intervals that we roll up transaction data. In the following illustration, you can see that the highest level (L3) starts with a full snapshot of the database. This occurs daily and it's our starting point during a restore.</p> <p>Next, we have an hourly compaction level called L2 so there will be an LTX file with page changes between midnight and 1am, and then another file for 1am to 2am, etc. Below that is L1 which holds 5-minute intervals of data.</p> <p><img src="https://fly.io/blog/2023-07-05/multi-level-compaction.png" alt="Compaction levels for snapshots (L3), hourly (L2), &amp; every five minutes (L1)."></p> <p>When a restore is requested for a specific timestamp, we can determine a minimal set of LTX files to replay. For example, if we restored to January 10th at 8:15am we would grab the following files:</p> <ul> <li>Start with the snapshot for January 10th. </li><li>Fetch the eight hourly LTX files from midnight to 8am. </li><li>Fetch the three 5-minute interval LTX files from 8:00am to 8:15am. </li></ul> <p>Since LTX files are sorted by page number, we can perform a streaming merge of these twelve files and end up with the state of the database at the given timestamp.</p> <h2 id="department-of-redundancy-department"><a href="#department-of-redundancy-department" aria-label="Anchor"></a>Department of Redundancy Department</h2><p>One of the primary goals of LiteFS is to be simple to use. However, that's not an easy goal for a distributed database when our industry is moving more and more towards highly dynamic and ephemeral infrastructure. Traditional consensus algorithms require stable membership and adjusting the member set can be complicated.</p> <p>With LiteFS, we chose to use async replication as the primary mode of operation. This has some trade-offs in durability guarantees but it makes the cluster much simpler to operate. LiteFS Cloud alleviates many of the durability trade-offs of async replication by writing data out to S3 which provides eleven 9s of durability. That's pretty dang durable!</p> <p>However, we don't write every individual LTX file to S3 immediately. The latency is too high and it's not cost effective when you write a lot of transactions. Instead, the LiteFS primary node will batch up its changes every second and send a single, compacted LTX file to LiteFS Cloud. Once there, LiteFS Cloud will batch these 1-second files together and flush them to S3 periodically.</p> <p>We track the highest transaction ID of LTX files pushed to S3 and we call this the "high water mark" or HWM. This transaction ID is propagated back down to the nodes of the LiteFS cluster so we can ensure that the transaction file is not removed from any node until it is safely persisted on S3. With this approach, we have multiple layers of redundancy in case your LiteFS cluster can't communicate with LiteFS Cloud or if we can't communicate with S3.</p> <h2 id="what-s-next-for-litefs-cloud"><a href="#what-s-next-for-litefs-cloud" aria-label="Anchor"></a>What's next for LiteFS Cloud?</h2><p>We have a small team dedicated to LiteFS Cloud, and we're chugging away at new exciting features! Right now, LiteFS Cloud is really just backups and restores, but we are working on a lot of other cool stuff:</p> <ul> <li>Upload your database in the Fly.io dashboard. This way you don't have to worry about figuring out how to initialize your database when you first deploy it, just upload the database in the dashboard and LiteFS will pull it from LiteFS Cloud. </li><li>Download a point-in-time snapshot of your database from the Fly.io dashboard. You can use this to spin up a local dev env (with production data), do some local analysis, etc. </li><li>Clone your LiteFS Cloud cluster to a new cluster, which you could use for a staging environment (or on-demand test environments for your CI pipelines) with real data. </li><li>Features to support apps that run on serverless platforms like Vercel, Google Cloud Run, Deno, and more. We'll need to develop a number of different features for this, stay tuned for more information in the coming weeks! </li></ul> <p>We're really excited about the future of LiteFS Cloud, so we wanted to share what we're thinking. We'd also love to hear any feedback you have about these ideas that might inform our work.</p>  </section> <dl> <dt> Previous post&nbsp;&nbsp;↓ </dt> <dd> <a href="https://fly.io/blog/we-raised-a-bunch-of-money/"> We Raised A Bunch Of Money </a> </dd> </dl> </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Why is desalination so difficult? (478 pts)]]></title>
+            <title><![CDATA[Why is desalination so difficult? (489 pts)]]></title>
             <link>https://practical.engineering/blog/2023/6/28/why-is-desalination-so-difficult</link>
             <guid>36602909</guid>
             <pubDate>Wed, 05 Jul 2023 16:37:46 GMT</pubDate>
@@ -7299,7 +8527,7 @@ Couldn't get https://nationalpost.com/news/canada/canadian-government-suspends-a
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FreeBSD at 30: Its secrets to success (138 pts)]]></title>
+            <title><![CDATA[FreeBSD at 30: Its secrets to success (150 pts)]]></title>
             <link>https://issue.freebsdfoundation.org/publication/?i=794483&amp;p=24&amp;view=issueViewer&amp;pp=1</link>
             <guid>36602709</guid>
             <pubDate>Wed, 05 Jul 2023 16:25:22 GMT</pubDate>
@@ -7307,7 +8535,7 @@ Couldn't get https://nationalpost.com/news/canada/canadian-government-suspends-a
 Couldn't get https://issue.freebsdfoundation.org/publication/?i=794483&p=24&view=issueViewer&pp=1: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Firefox 115 can silently remotely disable my extension on any site (318 pts)]]></title>
+            <title><![CDATA[Firefox 115 can silently remotely disable my extension on any site (321 pts)]]></title>
             <link>https://lapcatsoftware.com/articles/2023/7/1.html</link>
             <guid>36602193</guid>
             <pubDate>Wed, 05 Jul 2023 15:52:23 GMT</pubDate>
@@ -14973,144 +16201,6 @@ Couldn't get http://demoscene-the-art-of-coding.net/2023/07/03/unescodemoscene-a
             <pubDate>Wed, 05 Jul 2023 07:05:46 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://haddadi.github.io/UKOSBOpenletter.pdf">https://haddadi.github.io/UKOSBOpenletter.pdf</a>, See on <a href="https://news.ycombinator.com/item?id=36596610">Hacker News</a></p>
 &lt;Not HTML&gt;]]></description>
-        </item>
-        <item>
-            <title><![CDATA[That Time I Posted Myself Out Of a Job (192 pts)]]></title>
-            <link>https://cohost.org/stillinbeta/post/1847579-that-time-i-posted-m</link>
-            <guid>36596193</guid>
-            <pubDate>Wed, 05 Jul 2023 06:21:27 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://cohost.org/stillinbeta/post/1847579-that-time-i-posted-m">https://cohost.org/stillinbeta/post/1847579-that-time-i-posted-m</a>, See on <a href="https://news.ycombinator.com/item?id=36596193">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-post-body="true" data-testid="post-body"><p>
-The year was 2019, the place San Diego. I was attending KubeCon on behalf of my then-employer, VMware. Kubecon is the Kubernetes Conference; If you don’t know what Kubernetes is don’t worry about it. It’s just a computers. 
-<!-- --></p>
-<!-- --><p>
-I tended to tweet a lot at conferences, as was the style at the time. Any particularly interesting talks I’d live-tweet, and generally I took a lot of photos around the event. 
-<!-- --></p>
-<!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/e7bc2314-0432-41c8-81c1-d07c2465e795/pentesting.png?width=337&amp;height=415&amp;fit=crop&amp;auto=webp&amp;dpr=2" alt="Screenshot from my twitter: Extremely hype for Ian Coldwater's keynote! Talking about pentesting Kubernetes">
-  <!-- --><figcaption>I don’t remember this talk but Ian is always incredible.
-<!-- --></figcaption>
-<!-- --></figure>
-<!-- --><p>
-Most of the tweets were pretty neutral, but some were a little more pointed. 
-<!-- --></p>
-<!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/081190db-eed6-4061-9bc5-2c4dd2fbcd73/walmartscale.png" alt="&quot;When we say walmart, the first thing that comes to mind is scale&quot; I guess if forcing workers onto foodstamps and brutally repressing unions counts as scaling #KubeCon">
-  <!-- --><figcaption>Walmart is sort of like if they made Amazon in real life
-<!-- --></figcaption>
-<!-- --></figure>
-<!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/ee8e399a-237a-4da7-a520-38330d706b60/notechforice.png" alt="&quot;No Tech For ICE&quot; written in Legos on a wall">
-  <!-- --><figcaption>Trans rights
-<!-- --></figcaption>
-<!-- --></figure>
-<!-- --><h2>Inciting Incident<!-- --></h2>
-<!-- --><p>
-<!-- --><em>&lt;extremely <!-- --><a href="https://www.youtube.com/channel/UCPxHg4192hLDpTI2w7F9rPg" target="_blank" rel="nofollow noopener noreferrer">Justin Roczniak voice<!-- --></a>&gt;<!-- --></em> At 8:08 AM on November 21st, 2019, I posted the following tweets:
-<!-- --></p>
-<!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/2b3f2974-5c38-4caf-9926-b6d428e3d74f/pasted%20image%200.png" alt="quote tweeting &quot;If kubernetes is good enough for DoD weapon systems, it's definitely good enough for your business&quot; with &quot;Fuck you&quot;">
-  <!-- --><figcaption>I don’t even usually swear much
-<!-- --></figcaption>
-<!-- --></figure><p>
-And follewed it up with
-</p><!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/2dd68775-45c5-467f-8ef2-384af9b34989/bloodwashesoff.png" alt="Thanks for this @NichChaillan, I'd shake your hand but y'know, blood never washes off">
-  <!-- --><figcaption>Anger does not really become me, but boy was I mad. <!-- --></figcaption>
-<!-- --></figure>
-<!-- --><p>
-I think absolutely nothing of this. It was a tweet-heavy day! My thumbs were sore at the end of it!
-<!-- --></p>
-<!-- --><p>
-But the next day, right before my flight home, I get a DM from a helpful colleague:
-<!-- --></p>
-<!-- --><figure>
-  <!-- --><img src="https://staging.cohostcdn.org/attachment/c8ab3389-fd41-46b9-bf3d-5ffc81fbabfc/vmwarefederal.png" alt="I saw your reply to Nic Chaillan's tweet earlier. It was pretty hilarious. However, Nic got miffed and complained to VMWARE federal about it. I don't think they are going to do anything about it, but I just wanted to warn you, just in case">
-  <!-- --><figcaption>I’m sure this is fine<!-- --></figcaption>
-<!-- --></figure>
-<!-- -->
-<!-- --><h2>They Do Something About It<!-- --></h2>
-<!-- -->
-<!-- --><p>
-And then after I landed, who should slide into my DMs but <!-- --><em>a VMware Vice President<!-- --></em>, my grand boss of a large number of levels, requested a quick chat with him and an HR representative. 
-<!-- --></p>
-<!-- --><p>
-Being as I’m not an idiot, I elect to bring a witness of my own (<!-- --><a data-testid="mention" href="https://cohost.org/lizthegrey">@<!-- -->lizthegrey<!-- --></a> ). She slightly livetweeted that conversation until VP VMware tells her to stop.  The two VMwares mention the social media guidelines. I hadn’t seen them, but they contain gems like “Avoid topics involving age, sex, race, religion, ethnicity, politics or disabilities.” 
-<!-- --></p>
-<!-- --><p>
-I’ll get right on that. 
-<!-- --></p>
-<!-- --><p>
-On the 24th, my first normal day back at work, I got another meeting request from Vice President VMware. Having learned their lesson they tell me not to bring in external witnesses. I instead invited a colleague of mine to be my witness. 
-<!-- --></p>
-<!-- --><p>
-We talked a little more about the social media guidelines, and I reiterated the impossibility of complying with how the guidelines were written. I mentioned I’d be willing to help improve them, and the guy seemed to be pretty happy with that. A few hours later I got an email from HR saying they didn’t need any more information from them. 
-<!-- --></p>
-<!-- --><p>
-At this point I’m feeling pretty good! I got chastised but mostly I won an opportunity to help improve some social media guidelines! That seemed like a pretty great outcome to me.
-<!-- --></p>
-<!-- --><h2>A less than great outcome<!-- --></h2>
-<!-- -->
-<!-- --><p>
-A week or so later, though, I’m pulled into another meeting with HR, and they present me with a “written warning,” and I have to sign a bunch of stuff saying I agreed to follow a bunch of documents I was already supposed to sign. 
-<!-- --></p>
-<!-- --><p>
-I pointed out the social media guidelines were basically impossible to follow, and they agreed to strike them.
-<!-- --></p>
-<!-- --><p>
-At this point I’d seen the writing on the wall and I’d retained a labour lawyer. He and I look over the written warning they want me to sign, and we agree I’m basically not giving anything up. So I came back and signed the document, less the provisions I didn’t think I could follow if I tried
-<!-- --></p>
-<!-- --><p>
-Surprise, though! Two days later Vice President VMware once again DMs me (lol) to summon me for a before-working-hours meeting. In it, they inform me they will be “accepting my resignation.” 
-<!-- --></p>
-<!-- --><p>
-The reason given for my termination in the meeting is explicitly my refusal to agree to the social media guidelines, the same ones their own VP agreed I could not follow. 
-<!-- --></p>
-<!-- --><p>
-I say something to this effect, ask if this is really how this is going down, and when they confirm it is, I hang up. Good thing I already have a lawyer on retainer. 
-<!-- --></p>
-<!-- --><h2>it is time for some JURISPRUDENCE my dudes<!-- --></h2>
-<!-- -->
-<!-- --><p>
-Thing was, I’d joined VMware via an acquisition, which meant I had a pretty generous retention package. Bunch of stock and the like. The severance agreement obviously didn’t include any of that.
-<!-- --></p>
-<!-- --><p>
-Now, talking about political conditions of work is <!-- --><em>sometimes<!-- --></em> protected speech. So together with my lawyer and one from the NLRB, I wrote up a very detailed complaint (which has been very helpful for making this chost honestly).
-<!-- --></p>
-<!-- --><p>
-Unfortunately we were still in the Trump administration, and even though it was the lame duck period his appointees still controlled the NLRB. We had very little leverage and not much room to negotiate. They made a big deal of not giving me a nondisclosure clause, but there was still a nondisparagement clause. Given the impossibility of telling this story in a way that makes VMware look anything but terrible, those clauses amounted to the same thing. 
-<!-- --></p>
-<!-- --><p>
-My excellent lawyer almost doubled my cash payout but the non disparagement clause stayed. I decided being able to tell this ridiculous story wasn’t worth giving up $40k, so I took the offer and only groused about this dude in private.
-<!-- --></p>
-<!-- --><h2>UNTIL NOW<!-- --></h2>
-<!-- -->
-<!-- --><p>
-Recently, there was news about an <!-- --><a href="https://www.nlrb.gov/news-outreach/news-story/board-rules-that-employers-may-not-offer-severance-agreements-requiring" target="_blank" rel="nofollow noopener noreferrer">NLRB decision<!-- --></a> that specifically impacted non disparagement clauses! And after consulting with my lawyer from this case, we agree it’s highly unlikely VMware will bring charges against me now, and even if they did it’s unlikely they’d prevail. So now I am once again free to Post. 
-<!-- --></p><p><em>Your situation may be different, this is not legal advice<!-- --></em></p>
-<!-- -->
-<!-- --><h2>So Why’d This Happen<!-- --></h2>
-<!-- -->
-<!-- --><p>
-My lawyer went through great pains to explain that I could in theory, still be liable for libel against Mr Air Force. So legally Speaking, I don’t know for sure that Nic Chaillan, then a US Government employee, pressured a private company to fire a single employee because she tweeted at him and hurt his feelings.
-<!-- --></p>
-<!-- --><p>
-What I <!-- --><em>do <!-- --></em>know is that at least one firm has <!-- --><a href="https://www.oxebridge.com/emma/oxebridge-files-ethics-complaint-against-usaf-chief-software-officer/" target="_blank" rel="nofollow noopener noreferrer">filed a complaint against him<!-- --></a> alleging he did exactly that to other parties, threatening to sic an “army of lawyers” on someone who was mean to him online. Multiple reports corroborate this.
-<!-- --></p>
-<!-- --><p>
-He is also known to be a <!-- --><a href="https://www.oxebridge.com/emma/op-ed-usafs-chaillan-knausenberger-must-resign-over-suspected-ethics-violations/" target="_blank" rel="nofollow noopener noreferrer">very bad poster<!-- --></a> (see the “Misuse of Position” section). And when he <!-- --><a href="https://www.oxebridge.com/emma/breaking-usaf-cso-nicolas-chaillan-resigns/" target="_blank" rel="nofollow noopener noreferrer">publicly resigned<!-- --></a> in 2021 he worried about how in the future “China has the drastic advantage of population over the U.S.” 
-<!-- --></p>
-<!-- --><p>
-I invite you to draw your own conclusions about this guy.
-<!-- --></p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Bret Victor update (279 pts)]]></title>
-            <link>http://worrydream.com/July2023/</link>
-            <guid>36596095</guid>
-            <pubDate>Wed, 05 Jul 2023 06:07:36 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="http://worrydream.com/July2023/">http://worrydream.com/July2023/</a>, See on <a href="https://news.ycombinator.com/item?id=36596095">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
         </item>
     </channel>
 </rss>
