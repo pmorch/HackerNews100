@@ -4,12 +4,187 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 27 Jul 2023 06:00:02 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 27 Jul 2023 07:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[It's 2023, so of course I'm learning Common Lisp (166 pts)]]></title>
+            <title><![CDATA[Tarsnap outage (July 2-3, 2023) postmortem (128 pts)]]></title>
+            <link>https://mail.tarsnap.com/tarsnap-announce/msg00050.html</link>
+            <guid>36888954</guid>
+            <pubDate>Thu, 27 Jul 2023 04:33:56 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://mail.tarsnap.com/tarsnap-announce/msg00050.html">https://mail.tarsnap.com/tarsnap-announce/msg00050.html</a>, See on <a href="https://news.ycombinator.com/item?id=36888954">Hacker News</a></p>
+<div id="readability-page-1" class="page">
+<!--X-Body-Begin-->
+<!--X-User-Header-->
+<!--X-User-Header-End-->
+<!--X-TopPNI-->
+<hr>
+[<a href="https://mail.tarsnap.com/tarsnap-announce/msg00049.html">Date Prev</a>][Date Next][<a href="https://mail.tarsnap.com/tarsnap-announce/msg00048.html">Thread Prev</a>][Thread Next][<a href="https://mail.tarsnap.com/tarsnap-announce/maillist.html#00050">Date Index</a>][<a href="https://mail.tarsnap.com/tarsnap-announce/threads.html#00050">Thread Index</a>]
+<!--X-TopPNI-End-->
+<!--X-MsgBody-->
+<!--X-Subject-Header-Begin-->
+
+<hr>
+<!--X-Subject-Header-End-->
+<!--X-Head-of-Message-->
+<ul>
+<li><em>To</em>: <a href="mailto:tarsnap-announce%40tarsnap.com">tarsnap-announce@tarsnap.com</a></li>
+<li><em>Subject</em>: 2023-07-02 -- 2023-07-03 Tarsnap outage post-mortem</li>
+<li><em>From</em>: Colin Percival &lt;<a href="mailto:cperciva%40tarsnap.com">cperciva@tarsnap.com</a>&gt;</li>
+<li><em>Date</em>: Wed, 26 Jul 2023 21:05:15 -0700</li>
+</ul>
+<!--X-Head-of-Message-End-->
+<!--X-Head-Body-Sep-Begin-->
+<hr>
+<!--X-Head-Body-Sep-End-->
+<!--X-Body-of-Message-->
+<pre>I promised a post-mortem three weeks ago after I brought the Tarsnap service
+back online.  It took me an unforgivably long time to get around to writing
+this, but here it is.
+
+At approximately 2023-07-02 13:07:58 UTC, the central Tarsnap server (hosted
+in Amazon's EC2 us-east-1 region) went offline suffering a "failed system
+status check".  As a virtual machine, this could mean many things, including
+a power outage, a hardware failure on the physical server, or an outage in
+EC2's network; all I can say is that since I haven't seen reports of any
+widespread EC2 issues at the same time, it was most likely just an isolated
+hardware fault.
+
+Tarsnap's monitoring systems detected the failure at 2023-07-02 13:10 UTC (I
+have monitoring writing/reading/deleting archives every 5 minutes from a
+different EC2 region) and alerted me.  (The text message at 13:10 UTC didn't
+wake me up, but the phone call at 13:15 UTC did.)  My initial investigation
+didn't reveal any clearly transient errors so I assumed the system was dead
+and started spinning up a replacement EC2 instance.
+
+At approximately 2023-07-02 13:52 UTC (45 minutes after the initial outage)
+Amazon restarted the failed server on a new EC2 instance; this brought up the
+operating system (FreeBSD) but did not restart the Tarsnap server code since I
+don't have the system configured to start that automatically -- if anything
+causes the system to unexpectedly reboot, I want to check things over before
+any tarsnap traffic gets handled, since "preventing data loss if something
+breaks" is far more important than "maximize service availability".
+
+The server logs after rebooting showed filesystem corruption; it's clear that
+whatever took the system offline either killed the hardware or severed it from
+the Elastic Block Store which holds its filesystems.  I decided to continue
+with setting up a new server rather than attempting to recover the old one.
+
+The Tarsnap service stores data in Amazon S3 as a log-structured filesystem
+with each S3 object consisting of a header with metadata for all of the log
+entries, followed by (optionally) data for the log entries.  For example, a
+"start write transaction" log entry has a header identifying the machine and
+transaction nonce but has no log data, while a "store data block" log entry
+has a header identifying the machine and block name, along with the block
+data.  Under normal conditions, the log entry metadata is also cached in EC2
+and is never read from Amazon S3; the only reads from Amazon S3 are to read
+block data in response to requests from the tarsnap client.
+
+The process of recovering the EC2 instance state consists of two steps: First,
+reading all of the metadata headers from S3; and second, "replaying" all of
+those operations locally.  (These cannot be performed at the same time, since
+the use of log-structured storage means that log entries are "rewritten" to
+free up storage when data is deleted; log entries contain sequence numbers
+to allow them to be replayed in the correct order, but they must be sorted
+into the correct order after being retrieved before they can be replayed.)
+
+The first step proceeded without incident, completing at 2023-07-03 01:49:49
+UTC.  In hindsight it probably could have been faster: I had the recovery
+process configured to make 250 simultaneous requests to Amazon S3 because that
+is what Amazon S3 could sustain a decade ago, but I suspect that this could be
+significantly increased now.
+
+The second step failed almost immediately, with an error telling me that a
+replayed log entry was recording data belonging to a machine which didn't
+exist.  This provoked some head-scratching until I realized that this was
+introduced by some code I wrote in 2014: Occasionally Tarsnap users need to
+move a machine between accounts, and I handle this storing a new "machine
+registration" log entry and deleting the previous one.  Unfortunately while
+I had tests for this, I never tested regenerating the server state after a
+machine is "re-owned" *while having data stored* -- and since the new machine
+"registration" log entry has a higher sequence number, the server was quite
+right in objecting that data was stored belonging to a machine which didn't
+exist... yet.
+
+Once I figured out what was going on, I disabled that "seatbelt" and resumed
+the state reconstruction process.  It then failed again almost immediately
+complaining that it couldn't find data in Amazon S3, because my attempt at
+"resuming" the process involved skipping the downloading-data-from-S3 step
+and thereby left a "maximum log entry sequence number" value uninitialized
+(and therefore set to zero).  A short time later I had that fixed and the
+state reconstruction process continued properly.
+
+This process was also somewhat slower than it should have been; had I realized
+that it was disk throughput bound I would have configured the relevant EBS
+volume for higher throughput.  Unfortunately by this point I was quite sleep
+deprived so I wasn't monitoring the process closely -- otherwise I would have
+noticed this (in both gstat(8) and Amazon CloudWatch) and reconfigured the
+EBS volume.
+
+By about 2023-07-03 15:10 UTC (I didn't record the exact time) the state
+reconstruction process had completed.  I ran some quick tests with the server
+in read-only mode and compared against the old server state (to make sure that
+things matched up aside from the old server's filesystem having lost the last
+few seconds of data when the server failed), and then I brought it online.
+The first live post-outage traffic was at 2023-07-03 15:25:58 UTC, roughly
+26 hours and 16 minutes after the outage started.
+
+Following my ill-defined "Tarsnap doesn't have an SLA but I'll give people
+credits for outages when it seems fair" policy, on 2023-07-13 (after some dust
+settled and I caught up on some sleep) I credited everyone's Tarsnap accounts
+with 50% of a month's storage costs.
+
+As always, feel free to email me if you have any questions.
+
+--
+Colin Percival
+FreeBSD Deputy Release Engineer &amp; EC2 platform maintainer
+Founder, Tarsnap | www.tarsnap.com | Online backups for the truly paranoid
+</pre><p><strong>Attachment:
+<a href="https://mail.tarsnap.com/tarsnap-announce/pgpB4rzGI6QZP.pgp"><tt>OpenPGP_signature</tt></a></strong><br>
+<em>Description:</em> OpenPGP digital signature</p>
+
+<!--X-Body-of-Message-End-->
+<!--X-MsgBody-End-->
+<!--X-Follow-Ups-->
+<hr>
+<!--X-Follow-Ups-End-->
+<!--X-References-->
+<!--X-References-End-->
+<!--X-BotPNI-->
+<ul>
+<li>Prev by Date:
+<strong><a href="https://mail.tarsnap.com/tarsnap-announce/msg00049.html">Tarsnap is back online</a></strong>
+</li>
+<li>Previous by thread:
+<strong><a href="https://mail.tarsnap.com/tarsnap-announce/msg00048.html">Tarsnap outage 2023-07-02</a></strong>
+</li>
+<li>Index(es):
+<ul>
+<li><a href="https://mail.tarsnap.com/tarsnap-announce/maillist.html#00050"><strong>Date</strong></a></li>
+<li><a href="https://mail.tarsnap.com/tarsnap-announce/threads.html#00050"><strong>Thread</strong></a></li>
+</ul>
+</li>
+</ul>
+
+<!--X-BotPNI-End-->
+<!--X-User-Footer-->
+<!--X-User-Footer-End-->
+
+
+</div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Super sorry to the guy with the username reset on GitHub (134 pts)]]></title>
+            <link>https://discuss.systems/@adrian/110783401400871208</link>
+            <guid>36888444</guid>
+            <pubDate>Thu, 27 Jul 2023 03:11:11 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://discuss.systems/@adrian/110783401400871208">https://discuss.systems/@adrian/110783401400871208</a>, See on <a href="https://news.ycombinator.com/item?id=36888444">Hacker News</a></p>
+&lt;Unparsable&gt;]]></description>
+        </item>
+        <item>
+            <title><![CDATA[It's 2023, so of course I'm learning Common Lisp (188 pts)]]></title>
             <link>https://log.schemescape.com/posts/programming-languages/learning-lisp-in-2023.html</link>
             <guid>36887091</guid>
             <pubDate>Thu, 27 Jul 2023 00:21:46 GMT</pubDate>
@@ -52,7 +227,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Exway doesn't care about USB-C conformity (127 pts)]]></title>
+            <title><![CDATA[Exway doesn't care about USB-C conformity (128 pts)]]></title>
             <link>https://ericswpark.com/blog/2023/2023-07-26-exway-doesnt-care-about-usb-c-conformity/</link>
             <guid>36886859</guid>
             <pubDate>Wed, 26 Jul 2023 23:56:19 GMT</pubDate>
@@ -164,7 +339,7 @@ Leo
 </code></pre><p>So, as of right now, it seems Exway’s stance on this issue is that it is a known issue, but not something they’re willing to address, and something they have no future plans to fix.</p><h2 id="what-is-the-problem-again">What is the problem again?</h2><p>USB-C ports are different from other ports [citation needed]. Specifically, unlike USB-A ports that give out 5 volts of power by default, USB-C requires a negotiation process before it’ll start handing out power. You may have heard about this on branding material of USB-C chargers: USB-PD, or USB Power Delivery, is the spec that devices must adhere to.</p><p>But PD negotiation chips are expensive, when compared to the overall price of the device. The electric skateboard remote in question probably costs five dollars or so to make. (In reality, it’s probably much less than that, if you mass-manufacture it.) Having a chip that costs half a dollar takes up a ton of the budget in the BoM (bill-of-materials).</p><p>But obviously, the USB-IF board thought of that, and they provide guidance on how devices should behave (or in this case, identify themselves) if they just want 5V of power, no power delivery negotiation required.</p><p>This is done by pulling down the CC pins to ground with 5.1K resistors. (Because there are two CC pins –&nbsp;CC1 and CC2 - you need two of them.) Failure to do so means that with a type-C-to-C cable and charger won’t work with said device – the charger will check the CC lines over the type-C cable, find it “floating” (as in, not pulled down with a resistor), and not send over the required 5V. (And if your device shipped with one resistor, <a href="https://medium.com/@leung.benson/how-to-design-a-proper-usb-c-power-sink-hint-not-the-way-raspberry-pi-4-did-it-f470d7a5910">or shares a resistor for the two CC pins</a> (ugh Raspberry Pi Foundation!!!), then it can lead to all sorts of wonky behavior, like the device refusing to charge if the cable is plugged in one way and charging normally when the port is flipped.)</p><p>In this case, Exway didn’t put in the required two resistors on the CC pins of the remote, and as a result it won’t charge with USB-C-to-C cables.</p><h2 id="so-what">So what?</h2><p>I know what you’re thinking. “Just charge it with a USB-A to C cable! What’s the big deal here?”</p><p>Sure, you can charge the remote with this workaround. But let’s look at the bigger picture.</p><p>These resistors cost <del>pennies</del> <a href="https://github.com/ericswpark/ericswpark.github.io-comments/issues/3#issuecomment-1652743946">a fraction of a penny</a> (thanks @rickcox on GitHub!) to include. And the instructions on how to do that is a simple Google search away. In fact, if you’re a competent electrical engineer designing circuits, you know your first job is to read the specifications before implementing them on your device.</p><p>Which means one of the following is true:</p><ul><li>Exway hired incompetent engineers that do a poor job, or</li><li>The engineers warned that the port did not follow specifications, but Exway decided not to fix it to save money, or</li><li>The engineering team at Exway made a geniune mistake and forgot to include the resistors, or didn’t know about this particular specification (I mean, the USB-C spec is really long, and probably very complicated thanks to the USB-IF committee).</li></ul><p>But I don’t think the third one is likely. Nobody caught the problem while testing this product during development? Nobody used a type-C-to-C cable to charge the remote while using engineering samples? No, it is borderline impossible for Exway to not be aware of this problem, <em>unless</em> they don’t do any sort of testing, which again I find hard to believe. (And if they don’t test their products, that’s even more horrifying.)</p><p>And now we know they’re aware of it, but they don’t care. They don’t plan to fix the problem, even when they’re made aware of it.</p><p>If they’re willing to cut corners on stuff like <em>this</em>, do you really want to risk your life and ride a electric skateboard from them, equipped with their battery? Even if we give them the benefit of the doubt and say that they did everything possible in regards to safety, I don’t think they would be very receptive to a fix if the battery spontaneously combusted, especially given the response above.</p><h2 id="so-what-can-i-do">So what can I do?</h2><p><strong>If you have an Exway board that is affected by this problem</strong>, then contact Exway and let them know that this is unacceptable. The product is defective by design, and they need to fix it.</p><p>Also, consider discontinuing the use of their skateboards.</p><p><strong>If you were considering purchasing an electric skateboard</strong>, consider alternative brands.</p><p>But most importantly, it’s important to spread the word and let manufacturers know that <strong>not conforming to USB-C spec in 2023 is absolutely unacceptable.</strong> Countless forum posts have been made about this exact issue, and there’s even a subreddit called r/USBCHardware that has constant threads on defective products like these. Help people that might not understand why their device won’t charge with certain cables by not letting these companies get away with bad design.</p><h2 id="links">Links</h2><p><a href="https://www.reddit.com/r/Exway/comments/15a5myg/exway_doesnt_care_about_usbc_conformity/">Discussion on r/Exway</a></p><p><a href="https://www.reddit.com/r/UsbCHardware/comments/15a5o3f/oc_exway_doesnt_care_about_usbc_conformity/?">Discussion on r/USBCHardware</a></p><p><a href="https://news.ycombinator.com/item?id=36886859">Discussion on Hacker News</a></p><h3>Related Posts</h3><ul><li><a href="https://ericswpark.com/blog/2021/2021-01-11-msi-laptop-usb-c-charger-design-problem/">MSI laptop USB-C charger design problem</a></li></ul></div></main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[“It works on my machine” turns to “it works in my container” (146 pts)]]></title>
+            <title><![CDATA[“It works on my machine” turns to “it works in my container” (157 pts)]]></title>
             <link>https://dwdraju.medium.com/how-it-works-in-my-machine-turns-it-works-in-my-container-1b9a340ca43d</link>
             <guid>36885598</guid>
             <pubDate>Wed, 26 Jul 2023 21:49:53 GMT</pubDate>
@@ -172,7 +347,7 @@ Leo
 <div id="readability-page-1" class="page"><div><div><a rel="noopener follow" href="https://dwdraju.medium.com/?source=post_page-----1b9a340ca43d--------------------------------"><div aria-hidden="false"><p><img alt="Raju Dawadi" src="https://miro.medium.com/v2/resize:fill:88:88/1*r7hrULSjglXP2M63J8Txug.png" width="44" height="44" loading="lazy"></p></div></a></div><p id="5b1f">You had things running with occasional glitches and there was always an excuse “It works in my machine” as there is rarely identical machine &amp; OS for all. So, you need a solution to avoid same excuse when code breaks. Now, someone told about a blue chip solution called “Container” which will have all dependencies packaged, works on any machine, maintains parity on dev to production environment, no conflicts at all. So stay chill !!!</p><figure></figure><p id="73ee">And you started building container images, grabbed the concept of writing Dockerfile, port mapping, package installation commands, decrease image size, follow best practices and yay its real !!!</p><figure></figure><p id="7bd8">Gradually, other developers also started using container and after sometime, you started using docker in production. Cool story !!!</p><h2 id="23a2">But … After a month …</h2><p id="74b7">People start to spend an hour daily on fixing container issue. And the voice starts raising — “<strong>It works in my container</strong>”</p><figure></figure><h2 id="8233">So, what happened?</h2><p id="4e61">Was it too early to adopt container technologies(like docker hype)? Do you need a professional before diving? Is there any issue from application or flaw in container? No ….</p><p id="7cc7"><strong>Let’s dive into why the “It works in my container” situation arises</strong></p><h2 id="576b"><strong>1. Using <em>latest</em> image tag</strong></h2><p id="935c">Yes. It’s number one thing to always keep in mind. While starting to learn we use <em>latest</em> tag of every image. But it’s like to put axe on your own foot. Consider an example:</p><pre><span id="9d76">From node:latest</span></pre><p id="4904">At the time you started to use docker, the <em>latest</em> tag was for NodeJS version let’s say 10 but after a month when someone formatted her laptop or a new guy is on-boarded, the <em>latest</em> tag is now version 12. But your application is best suite for the previous version. All of the people are using same Dockerfile but this is the reason why you are forced to say loud “It works in my container”.</p><p id="cf56">So, always use versioned tag. Use <code>ubuntu:16.04</code> or <code>node:12-alpine</code> but never <code>ubuntu:latest</code> or <code>node:alpine</code></p><h2 id="e641">2. <strong>Container engine and other environment version</strong>:</h2><p id="e214">In case of Docker, it tries to make releases with backward compatibility in concern and feature removal is communicated three releases in advance. This could be a reason if the engine is not upgraded since long time.</p><p id="bb0f">If you use Docker Compose, the changes and versioning of yml files is very important. While versioning docker-compose file, its always a good practice to specify minor release. Like, not use <code>version: “3”</code> but <code>version: "3.7"</code> because by default the prior means <code>version: "3.0"</code> and there are many updates on each release of docker-compose which is supported by the upgraded version only. It’s a way to avoid ping. <a href="https://docs.docker.com/compose/compose-file/compose-versioning/" rel="noopener ugc nofollow" target="_blank">Here</a> is the compose versioning and compatibility matrix guide.</p><h2 id="fc34">3. <strong>Dealing with variables</strong>:</h2><p id="24ad">In general, we read variables &amp; secret for applications through config file like: <code>config.json</code> or <code>.env</code> . But with docker, there are are multiple ways, that is run time and build time environment variables. A simple way to pass environment variable is:</p><pre><span id="c1a2">docker run -it -e KEY=VALUE --name nginx nginx:1.15-alpine /bin/sh -c "env | grep KEY"</span></pre><p id="945d">And through docker compose:</p><pre><span id="e8e1">web:<br>  environment:<br>    - KEY=VALUE</span></pre><p id="c00a">Additionally, with compose we can pass variables of a file:</p><pre><span id="47bf">web:<br>  env_file:<br>    - web-variables.env</span></pre><p id="a8a1">Also, we can use variables of file to another key:</p><pre><span id="5fda">web:<br>  image: "nginx:${NGINX_VERSION}"</span></pre><p id="a46e">In this case, by default compose reads <code>.env</code> file and checks for the value of <code>NGINX_VERSION</code> and adds it.</p><p id="db0e">One major difference in reading directly from file and environment variables is - in case of file, the changes in file are reflected immediately if volume is shared but if we use docker environment variables, it requires docker restart. So, in case of compose:</p><p id="0962"><code>$ docker-compose restart web</code></p><p id="c24e">Then only, new variables are available for the environment reading through <code>PROCESS.ENV</code></p><p id="074d">Additionally, there’s another variable called <code>ARG</code> which is available only at build time so that the variable is not available during run time. But <code>ENV</code> is available both during build &amp; run time.</p><h2 id="aaca">4. <strong>Image build process</strong>:</h2><p id="9898">Official docker images are not always enough. We need some customization and additional packages which takes long time and resources if we do each step on everyone’s system. So, we take a base image and build our own image by customization. Here, manual addition and commit of packages should always be avoided:</p><pre><span id="f27b">$ docker run -it --name alpine alpine:3.8 /bin/sh</span><span id="e60b">/ # apk add busybox-extras</span><span id="cc93">[CTRL+p CTRL+q]</span><span id="82d4">$ docker commit alpine alpine-custom</span><span id="ad51">$ docker push alpine-custom</span></pre><p id="5897">Here, you lost the track of state. Also, the version of <code>busybox-extras</code> that you installed now may not be available later. So, always use Dockerfile with versioning of package:</p><pre><span id="e4b1">FROM alpine:3.8<br>RUN apk add busybox-extras-1.28.4-r3</span></pre><h2 id="89f4">5. Files and folders permission:</h2><p id="a915">Let’s dive with an example:</p><pre><span id="dbdf">#docker-compose.yml<br>version: "3"<br>services:<br>  myapp:<br>    image: node:11-alpine<br>    container_name: "myapp"<br>    volumes:<br>      - ./:/app<br>    entrypoint: /bin/sh<br>    command: -c "sleep 5 &amp;&amp; cd /app &amp;&amp; yarn &amp;&amp; yarn start"</span></pre><p id="7201">After running <code>docker-compose up -d</code> , let’s check files &amp; folders permission</p><figure><figcaption>files &amp; folder permission in shared docker volume</figcaption></figure><p id="7d95">Here, we can see <code>node_modules</code> and <code>yarn.lock</code> is owned by root user as these folder &amp; file were created inside of docker. Similarly, if there are any uploads that would be owned by root(Same issue will arise only on Linux machine but not on MacOS). This will cause problem when you have to edit or add file from host system and also git will detect changes. We cannot afford to change permission each time but bring the owner of every files &amp; folders to current user. Here is how we can do that:</p><pre><span id="746c">#Updated docker-compose.yml<br>version: "3"<br>services:<br>  myapp:<br>    image: node:11-alpine<br>    container_name: "myapp"<br>    volumes:<br>      - ./:/app<br>    entrypoint: /bin/sh<br>    command: -c "sleep 5 &amp;&amp; cd /app &amp;&amp; yarn &amp;&amp; yarn start"<br>    user: ${CURRENT_UID}</span></pre><p id="40c2">Export a variable with current user and group id</p><pre><span id="a172">export CURRENT_UID=$(id -u):$(id -g)</span></pre><p id="1467">And start container</p><pre><span id="4680">CURRENT_UID=$CURRENT_UID docker-compose up -d</span></pre><p id="bb7c">Now, we can see all the files and folders owned by current host user.</p><h2 id="9b82">6. Sharing between host and container volume:</h2><p id="3dc9">Though docker was introduced with the concept of — run once &amp; run everywhere — while using volumes, there’s difference in case of MacOS. It uses osxfs as shared file system solution on Docker Desktop for Mac edition. While mounting host path inside container, additional step is to be performed. Let’s take an example:</p><p id="c35e">docker-compose.yml</p><pre><span id="cc85">version: "3.2"<br>services:<br>  myapp:<br>    container_name: myapp<br>    image: node:11-alpine<br>    volumes:<br>      - ./:/app</span></pre><p id="976b">If you run <code>docker-compose up</code> , it will throw error:</p><pre><span id="4350">ERROR: for myapp  Cannot start service myapp: b'Mounts denied: \r\nThe path /private/tmp/docker/myapp\r\nis not shared from OS X and is not known to Docker.\r\nYou can configure shared paths from Docker -&gt; Preferences... -&gt; File Sharing.\r\nSee <a href="https://docs.docker.com/docker-for-mac/osxfs/#namespaces" rel="noopener ugc nofollow" target="_blank">https://docs.docker.com/docker-for-mac/osxfs/#namespaces</a> for more info.\r\n.'</span></pre><p id="5808">But with same case, it runs fine on Linux environment. For mac, the path has to be added from Docker preferences menu -&gt; Preferences -&gt; File sharing.</p><figure><figcaption>Add bind mount on macOS</figcaption></figure><p id="2478">Also, if there is hard coded volume path, its common to create problem for other users.</p></div><div><p id="ad72">There are other issues which might arise like:</p><ul><li id="388e">Port conflict if you have any processes running on host machine and docker uses same port</li><li id="8413">Proxy or load balancer used for sending traffic to different containers based on virtual hosts urls. There might be upload limits, additional or modified header sent by proxy</li><li id="a1c1">Using dual packages: host installed and from inside docker commands which could have different versions.</li></ul><p id="d46a">If you have any issues faced while running applications on container which raised “It works in my container” talk, feel free to share on comment.</p><p id="5e25">Feel free to connect with me on <a href="https://www.linkedin.com/in/dwdraju/" rel="noopener ugc nofollow" target="_blank">Linkedin</a>, <a href="https://twitter.com/dwdraju" rel="noopener ugc nofollow" target="_blank">Twitter</a> where I share interesting updates.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Kids Online Safety Act is still a danger to our rights online (202 pts)]]></title>
+            <title><![CDATA[Kids Online Safety Act is still a danger to our rights online (214 pts)]]></title>
             <link>https://www.eff.org/deeplinks/2023/05/kids-online-safety-act-still-huge-danger-our-rights-online</link>
             <guid>36885040</guid>
             <pubDate>Wed, 26 Jul 2023 21:07:07 GMT</pubDate>
@@ -216,7 +391,7 @@ Leo
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[WordPress Core to start using SQLite (118 pts)]]></title>
+            <title><![CDATA[WordPress Core to start using SQLite (121 pts)]]></title>
             <link>https://make.wordpress.org/core/2023/04/19/status-update-on-the-sqlite-project/</link>
             <guid>36884806</guid>
             <pubDate>Wed, 26 Jul 2023 20:49:57 GMT</pubDate>
@@ -322,7 +497,7 @@ Leo
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Cultivating a state of mind where new ideas are born (150 pts)]]></title>
+            <title><![CDATA[Cultivating a state of mind where new ideas are born (163 pts)]]></title>
             <link>https://www.henrikkarlsson.xyz/p/good-ideas</link>
             <guid>36883436</guid>
             <pubDate>Wed, 26 Jul 2023 19:22:01 GMT</pubDate>
@@ -338,7 +513,7 @@ Leo
 <div id="readability-page-1" class="page"><div id="maincontent"><p>The US government conducted a “multi-decade” program which collected, and attempted to reverse-engineer, crashed <a href="https://www.theguardian.com/world/ufos" data-link-name="in body link" data-component="auto-linked-tag">UFOs</a>, a former American intelligence official told a remarkable congressional hearing on Wednesday.</p><p>David Grusch, who led analysis of unexplained anomalous phenomena (UAP) within a US Department of Defense agency until 2023, told the House oversight committee in Washington that “non-human” beings had been found, as the issue of alien life received its highest-profile airing to date.</p><figure id="fd0c01ab-f17e-4a8e-8d24-b8b3b3d4a013" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" deferuntil="idle" props="{&quot;richLinkIndex&quot;:2,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2023/jul/26/ufo-congressional-hearing-what-to-know&quot;,&quot;text&quot;:&quot;UFO congressional hearing: what to know and how we got here&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;elementId&quot;:&quot;fd0c01ab-f17e-4a8e-8d24-b8b3b3d4a013&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;display&quot;:0,&quot;theme&quot;:0,&quot;design&quot;:0}}"></gu-island></figure><p>The hearing was prompted by claims from Grusch in June that the government was secretly harboring alien space craft. On Wednesday, Grusch repeated some of those claims – although not all – under oath.</p><p>“I was informed, in the course of my official duties, of a multi-decade UAP crash retrieval and reverse-engineering program, to which I was denied access,” Grusch told the committee.</p><p>The hearing attracted intense global interest, and provided speculation and claims that the US is hiding evidence of alien life and technology – mixed with large doses of skepticism.</p><p>Grusch filed a whistleblower complaint in 2022. He said that in his role in the government he had been charged with investigating what military, defense and other agencies knew about aliens and alien craft, but alleged he had been prevented from accessing secret government UFO programs.</p><p>Speaking on Wednesday, Grusch said he has faced “very brutal” retaliation as a result of his allegations.</p><p>“It hurt me both professionally and personally,” Grusch said.</p><p>Under questioning, Grusch confirmed that he had knowledge of “people who have been harmed or injured” in the course of government efforts to conceal UFO information.</p><p>Asked by an oversight committee member if he had “feared for his life”, Grusch replied: “Yes definitely.”</p><p>Grusch added: “I am hopeful that my actions will ultimately lead to a positive outcome of increased transparency.”</p><p>Grusch’s allegation, aired in interviews with the Debrief and <a href="https://www.newsnationnow.com/space/ufo/we-are-not-alone-the-ufo-whistleblower-speaks/" data-link-name="in body link">NewsNation</a>, that the federal government was hiding this evidence of alien craft from Congress sparked a firestorm in June, prompting the Republican-led oversight committee to<a href="https://www.theguardian.com/world/2023/jun/08/ufo-house-representatives-hearing-investigation" data-link-name="in body link"> launch an immediate investigation</a>.</p><p>Since then, the intrigue around what evidence the government has, or doesn’t have, around UFOs has only intensified.</p><p>Tim Burchett, a Republican congressman from Tennessee who is co-leading the UFO investigation, has claimed in recent weeks that the US had evidence of technology that “defies all of our laws of physics”, and that alien craft possess technology that could “turn us into a charcoal briquette”.</p><p>On Wednesday, however, Burchett sought to downplay, somewhat, what people would hear.</p><p>“We’re not bringing little green men or flying saucers into the hearing. Sorry to disappoint about half y’all. We’re just going to get to the facts,” Burchett said.</p><p>That announcement drew a chuckle, but Burchett became more serious as he accused government agencies of a lack of cooperation with the oversight committee investigation.</p><p>“It’s been so difficult to get here today. In the Baptist church we say that the devil is in our way, and the devil has been in our way for this thing. We’ve run into roadblocks from members, the intelligence community, [and] the Pentagon.</p><p>While there were no little green men in the hearing, Grusch did claim that the US has recovered alien beings.</p><p>After Grusch had reiterated his position that the government had possession of crashed extraterrestrial vehicles, he was asked if “we have the bodies of the pilots who piloted this craft?”</p><p>“As I’ve stated publicly already in my NewsNation interview, biologics came with some of these recoveries,” Grusch said.</p><p>These biologics, Grusch said, were: “Non-human, and that was the assessment of people with direct knowledge on the program I talked to, that are currently still on the program.”</p><figure data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.NewsletterSignupBlockElement"><a data-ignore="global-link-styling" href="#EmailSignup-skip-link-23">skip past newsletter promotion</a><p id="EmailSignup-skip-link-23" tabindex="0" aria-label="after newsletter promotion" role="note">after newsletter promotion</p></figure><figure id="958eb75b-9e1e-4205-86f5-ec7e7f5269bc" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-1"><picture><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=620&amp;dpr=2&amp;s=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=620&amp;dpr=1&amp;s=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=605&amp;dpr=2&amp;s=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=605&amp;dpr=1&amp;s=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=445&amp;dpr=2&amp;s=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=445&amp;dpr=1&amp;s=none" media="(min-width: 320px)"><img alt="Tim Burchett, centre, who is co-leading the UFO investigation." src="https://i.guim.co.uk/img/media/d2811800eceecd4e7f7f394ced0fd50225ae35d4/0_273_8192_4918/master/8192.jpg?width=445&amp;dpr=1&amp;s=none" width="445" height="267.152099609375" loading="lazy"></picture></div><figcaption><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Tim Burchett, centre, who is co-leading the UFO investigation.</span> Photograph: Jim Lo Scalzo/EPA</figcaption></figure><p>He said the government had probably had knowledge of “non-human” activity since the 1930s. At times, however, Grusch was less forthcoming under oath than he had been in media interviews.</p><p>In the interview with NewsNation in June, Grusch claimed the government had “very large, like a football-field kind of size” alien craft, while he told <a href="https://www.leparisien.fr/sciences/david-grusch-lanceur-dalerte-sur-des-ovnis-ca-peut-etre-extraterrestre-ou-autre-chose-mais-pas-humain-07-06-2023-P73S2REKZJDGNGCEJQBDEIQJTU.php" data-link-name="in body link">Le Parisien</a>, a French newspaper, that the US had possession of a “bell-like craft” which Benito Mussolini’s government had recovered in northern Italy in 1933.</p><p>On Wednesday, Grusch seemed unwilling to go into details on those claims, citing issues of security. Grusch told the hearing he was prepared to elaborate in private, but his reticence prompted speculation from doubters.</p><p>Garrett Graff, a journalist and historian who is writing <a href="https://www.simonandschuster.com/books/UFO/Garrett-M-Graff/9781982196776" data-link-name="in body link">a book</a> on the government’s hunt for UFOs, tweeted: “Very interesting to me that Dave Grusch is unwilling to state and repeat under oath at the #UFOHearings the most explosive (and outlandish) of his claims from his NewsNation interview. He seems to be very carefully dancing around repeating them.”</p><p>The run-up to the hearing had been marked by accusations from Burchett and his co-investigator, Anna Paulina Luna, a Republican congresswoman from Florida, that they had been “stonewalled” by federal officials.</p><p>Yet after the hearing, Burchett, who has previously claimed alien craft possess technology that could “turn us into a charcoal briquette”, and alleged that the US has been hiding evidence of UFOs since 1947, seemed fairly satisfied.</p><p>Speaking to the Guardian, he said he had found Grusch’s claims about the recovery of “non-human” bodies to be credible.</p><p>“I don’t want to oversimplify it, but how are you going to fly one [spaceship]? You got to have somebody in it. That seems to be pretty simple,” Burchett said.</p><p>Asked what he had learned about alien craft in the course of his investigation, Burchett said: “I believe they exist. I knew that before I came in here. I didn’t learn a lot because I knew the answers already, but I was glad they put it in the record.”</p><p>The Pentagon has denied Grusch’s claims of a cover-up. In a statement, a defense department spokeswoman, Sue Gough, said investigators had not discovered “any verifiable information to substantiate claims that any programs regarding the possession or reverse-engineering of extraterrestrial materials have existed in the past or exist currently”.</p><p>Other witnesses at the hearing were David Fravor, a former navy commander who on Wednesday recalled seeing a strange object in the sky while on a training mission in 2004, and Ryan Graves, a retired navy pilot who <a href="https://www.youtube.com/watch?v=zNsxtNUeFB4" data-link-name="in body link">has claimed</a> that he saw unidentified aerial phenomena off the Atlantic coast “every day for at least a couple years”.</p><p>Graves, who has since founded Americans for Safe Aerospace, a UAP non-profit, said he was appearing “to voice the concerns of more than 30 commercial aircrews and military veterans who have confided their similar encounters with me”.</p><p>Asked if there were similarities between his sightings and others that have been reported, he said many of the UFOs reported were “dark grey or black cubes inside of clear sphere” where “the apex or tips of the cube were touching the inside of the sphere”.</p><p>For all the excitement and inevitable media speculation, some had cautioned against reading too much into what we might hear.</p><p>Grusch has not seen the alleged alien craft himself – he says his claims are based on “extensive interviews with high-level intelligence officials” – and skeptics have noted that accusations that the government is hiding information on UFOs are nothing new.</p><p>“The story aligns with a lot of similar stories that have played out, going back to the 1980s and 1970s, that together allege that the US government has kept an incredible secret, the literal most extraordinary secret that mankind could have, for not just weeks or months, but years and decades, with no meaningful leak or documentary evidence to ever come forward,” Graff previously told the Guardian.</p><p>“I think when you look at the government’s ability to keep secret other really important secrets, there’s a lot of reason to doubt the capability of the government to do that.”</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How to build toxic software teams (104 pts)]]></title>
+            <title><![CDATA[How to build toxic software teams (105 pts)]]></title>
             <link>https://badsoftwareadvice.substack.com/p/how-to-build-toxic-software-teams</link>
             <guid>36882767</guid>
             <pubDate>Wed, 26 Jul 2023 18:40:59 GMT</pubDate>
@@ -346,7 +521,7 @@ Leo
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><p>People want to get along. </p><p>Few people, if they are shown some respect, will figure out a way to make peace with their coworkers. As the leader of a team wanting to create a toxic culture and have it still be going when you return from prison, you need to create a team that never reaches this peace.</p><p><strong>Foster a culture of inconsistent goals</strong></p><p>The definition of quality work should not be consistent and well-understood. Imagine that you are a working at a restaurant making soup, and a head chef decides if your soup is good enough everyday and you only get paid if it is. You make the soup the same everyday, but some days it isn't good enough. You start to imagine reasons - maybe the chef doesn't like you, maybe someone is messing with your ingredients, maybe you don’t know what you are doing, maybe you have angered the soup God - the stress of this situation given the stakes will create a paranoid and uncollaborative workforce.</p><p><span>This is your goal - create a culture in which only your approval is a measure of good or bad. Make this approval infrequent and inconsistent. As soon as the soupmaker starts to feel empowered, spit out his soup. Occassionly say things like “this soup is OK, but Barbara doesn’t like it”. Extra points if there is no coworker named Barbara. This single action will kill any hopes of a team with ownership - after all, if it isn't good enough often enough they will never feel like it is </span><em>their soup</em><span>.</span></p><p><strong>Discourage creativity</strong></p><p>If something goes wrong, start an investigation. Figure out who to blame and do it publically. Raise your voice, send nasty emails, mean-mug without delay. Anytime there is a failure, don't miss an opportunity to assert your authority. Attach ideas to specific people, not to the team. The team may come up with an idea, but failure falls to one person.</p><p>This will prevent the team from trying new things and keep making soup while hoping for the best. Eventually, they will also get better at investigations than making food.</p><p><strong>Go away, then return with chaos</strong></p><p>If you lead the team, don't show up. Don't tell anybody. In general be very hard to reach. Move or cancel meetings, then show up late to the ones you do attend. Don’t let meetings start without you, then change the subject ten minutes after you arrive. Make it so that people simply do not know what you are about to say, then surprise them.</p><p><strong>Prepare the team for their next leader</strong></p><p>If you do these steps, the next leader will be easy to find - he or she can only be found from outside the team. Nobody left on the team can be head chef, they only know how to fearfully make crappy soup and run internal investigations. Congratulations - you have properly prepared the team for their next leader.</p></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple's infamously strict on App Store rules but gives WeChat a free pass (2020) (223 pts)]]></title>
+            <title><![CDATA[Apple's infamously strict on App Store rules but gives WeChat a free pass (2020) (228 pts)]]></title>
             <link>https://reclaimthenet.org/apple-app-store-wechat-china</link>
             <guid>36882467</guid>
             <pubDate>Wed, 26 Jul 2023 18:23:19 GMT</pubDate>
@@ -380,7 +555,7 @@ Leo
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Continue – Open-source coding autopilot (194 pts)]]></title>
+            <title><![CDATA[Show HN: Continue – Open-source coding autopilot (204 pts)]]></title>
             <link>https://github.com/continuedev/continue</link>
             <guid>36882146</guid>
             <pubDate>Wed, 26 Jul 2023 18:04:29 GMT</pubDate>
@@ -427,7 +602,7 @@ Leo
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Sinead O’Connor has died (603 pts)]]></title>
+            <title><![CDATA[Sinead O’Connor has died (604 pts)]]></title>
             <link>https://www.irishtimes.com/culture/music/2023/07/26/sinead-oconnor-acclaimed-dublin-singer-dies-aged-56/</link>
             <guid>36881814</guid>
             <pubDate>Wed, 26 Jul 2023 17:46:48 GMT</pubDate>
@@ -435,7 +610,7 @@ Leo
 <div id="readability-page-1" class="page"><article><p>Irish singer <a href="https://www.irishtimes.com/tags/sinead-oconnor/" target="_blank">Sinéad O’Connor</a> has died at the age of 56, her family has announced.</p><p>In a statement, the singer’s family said: “It is with great sadness that we announce the passing of our beloved Sinéad. Her family and friends are devastated and have requested privacy at this very difficult time.”</p><p>The acclaimed Dublin performer released 10 studio albums, while her song Nothing Compares 2 U was named the number one world single in 1990 by the Billboard Music Awards.</p><p>Her version of the ballad, written by musician Prince, topped the charts around the globe and earned her three Grammy nominations.</p><p>The accompanying music video, directed by English filmmaker John Maybury, consisted mostly of a close-up of O’Connor’s face as she sung the lyrics and became as famous as her recording of the song. </p><p>In 1991, O’Connor was named artist of the year by Rolling Stone magazine on the back of the song’s success.</p><p>Ms O’Connor was presented with the inaugural award for Classic Irish Album at the RTÉ Choice Music Awards earlier this year.</p><figure><picture><source srcset="https://www.irishtimes.com/resizer/6mH9nfKHnrJ6PFUjrHRJkEuZoK8=/1440x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/HNRCK6IIIRE5TAMS3R73ASXFYY.jpg" media="screen and (min-width: 992px)"><source srcset="https://www.irishtimes.com/resizer/Ue7Y6FbRhEM3ZwBxNrGzI9xFr5w=/1024x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/HNRCK6IIIRE5TAMS3R73ASXFYY.jpg" media="screen and (min-width: 768px)"><source srcset="https://www.irishtimes.com/resizer/0GzeMrx_0PvOMDzFN78IFaQZEhQ=/768x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/HNRCK6IIIRE5TAMS3R73ASXFYY.jpg" media="screen and (min-width: 0px)"><img src="https://www.irishtimes.com/resizer/6mH9nfKHnrJ6PFUjrHRJkEuZoK8=/1440x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/HNRCK6IIIRE5TAMS3R73ASXFYY.jpg" width="1440" height="0" loading="lazy"></picture><figcaption><p><span>Sinéad O'Connor receives the Classic Irish Album award for I Do Not Want What I Haven’t Got at the RTÉ Choice Music Prize at Vicar Street on March 9th. Photograph: Kieran Frost/Redferns </span></p></figcaption></figure><p>The singer received a standing ovation as she dedicated the award, for I Do Not Want What I Haven’t Got, to “each and every member of Ireland’s refugee community”.</p><p>“You’re very welcome in Ireland. I love you very much and I wish you happiness,” she said.</p><p>Taoiseach Leo Varadkar led the tributes to O’Connor, expressing his sorrow at the death of the singer in a post on social media.</p><p>“Her music was loved around the world and her talent was unmatched and beyond compare. Condolences to her family, her friends and all who loved her music,” said Mr Varadkar.</p><p>Tánaiste Micheál Martin said he was “devastated” to learn of her death.</p><p>“One of our greatest musical icons, and someone deeply loved by the people of Ireland, and beyond. Our hearts goes out to her children, her family, friends and all who knew and loved her,” he said.</p><p>Ms O’Connor is survived by her three children. Her son, <a href="https://www.irishtimes.com/news/social-affairs/death-of-sinead-o-connor-s-son-referred-to-nrp-for-investigation-1.4772479" target="_blank">Shane, died last year</a> aged 17.</p><p>She drew controversy and divided opinion during her long career in music and time in public life.</p><p>In 1992, Ms O’Connor tore up a photograph of Pope John Paul II on US television programme Saturday Night Live in an act of protest against sex abuse in the Catholic Church.</p><figure><picture><source srcset="https://www.irishtimes.com/resizer/O9_cf7Z3okqMHsb2eqt0tCpB300=/1440x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/RV3FLL576ZADHJKYHTAL74IJSM.jpg" media="screen and (min-width: 992px)"><source srcset="https://www.irishtimes.com/resizer/bPtrQHTWGPKbOfkJMywt7ATH2BI=/1024x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/RV3FLL576ZADHJKYHTAL74IJSM.jpg" media="screen and (min-width: 768px)"><source srcset="https://www.irishtimes.com/resizer/a94kthZLO7ms_7FOpr-SrjYxJPY=/768x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/RV3FLL576ZADHJKYHTAL74IJSM.jpg" media="screen and (min-width: 0px)"><img src="https://www.irishtimes.com/resizer/O9_cf7Z3okqMHsb2eqt0tCpB300=/1440x0/filters:format(jpg):quality(70)/cloudfront-eu-central-1.images.arcpublishing.com/irishtimes/RV3FLL576ZADHJKYHTAL74IJSM.jpg" width="1440" height="0" loading="lazy"></picture><figcaption><p><span>Sinéad O'Connor tears up a photo of Pope John Paul II during a live appearance in New York on NBC's Saturday Night Live on October 5th,1992. Photograph: NBC-TV/AP </span></p></figcaption></figure><p>“I’m not sorry I did it. It was brilliant,” she later said of her protest. “But it was very traumatising,” she added. “It was open season on treating me like a crazy bitch.”</p><p>The year before that high-profile protest, she boycotted the Grammy Awards, the music industry’s answer to the Oscars, saying she did not want “to be part of a world that measures artistic ability by material success.”</p><p>She refused the playing of US national anthem before her concerts, drawing further public scorn.</p><p>In more recent years, O’Connor became better known for her spiritualism and activism and spoke publicly about her mental health struggles.</p><p>In 2007, Ms O’Connor told Oprah Winfrey that she had been diagnosed with bipolar disorder four years previously and that before her diagnosis she had struggled with thoughts of suicide and overwhelming fear.</p><p>She said at the time that medication had helped her find more balance, but “it’s a work in progress”.</p><p>Ms O’Connor had also voiced support for other young women performers facing intense public scrutiny, including Britney Spears and Miley Cyrus.</p><p>The singer converted to Islam in 2018 and changed her name to Shuhada Sadaqat, though continued to perform under the name Sinéad O’Connor. In <a href="https://soundcloud.com/irishtimes-women/ep-504-nothing-compares-sinead-oconnors-rememberings" target="_blank">2021, Ms O’Connor released a memoir Rememberings</a>, while last year a film on her life was directed by Kathryn Ferguson.</p><p>Irish artist Jim Fitzpatrick was among those who have offered his condolences on social media.</p><p>“The amazing Sinéad O’Connor has passed away and I’m so sad for her and all her loved ones,” he said.</p><p>“I was so damn lucky to have spent time with her and to have worked with such an extraordinary talented woman.”</p><p>Colm O’Gorman, executive director of Amnesty International Ireland, said: “It is hard to think of an artist who has had the social and cultural impact of Sinead. What a loss. Heartfelt condolences to her children, her family and all who loved her.”</p></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Superconductor news: What’s claimed, and how strong the evidence seems to be (846 pts)]]></title>
+            <title><![CDATA[Superconductor news: What’s claimed, and how strong the evidence seems to be (885 pts)]]></title>
             <link>https://www.science.org/content/blog-post/breaking-superconductor-news</link>
             <guid>36881808</guid>
             <pubDate>Wed, 26 Jul 2023 17:46:30 GMT</pubDate>
@@ -443,7 +618,7 @@ Leo
 Couldn't get https://www.science.org/content/blog-post/breaking-superconductor-news: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[UK version of “Online Harms Bill” wants to prefilter content without due process (157 pts)]]></title>
+            <title><![CDATA[UK version of “Online Harms Bill” wants to prefilter content without due process (158 pts)]]></title>
             <link>https://easydns.com/blog/2023/07/26/uk-version-of-online-harms-bill-wants-to-prefilter-content-without-due-process/</link>
             <guid>36881153</guid>
             <pubDate>Wed, 26 Jul 2023 17:10:44 GMT</pubDate>
@@ -487,7 +662,7 @@ Couldn't get https://www.science.org/content/blog-post/breaking-superconductor-n
 </div></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Data brokers selling license plate location and analytics data (192 pts)]]></title>
+            <title><![CDATA[Data brokers selling license plate location and analytics data (197 pts)]]></title>
             <link>https://www.tlo.com/vehicle-sightings</link>
             <guid>36881133</guid>
             <pubDate>Wed, 26 Jul 2023 17:09:53 GMT</pubDate>
@@ -495,7 +670,7 @@ Couldn't get https://www.science.org/content/blog-post/breaking-superconductor-n
 Couldn't get https://www.tlo.com/vehicle-sightings: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Stable Diffusion XL 1.0 (307 pts)]]></title>
+            <title><![CDATA[Stable Diffusion XL 1.0 (310 pts)]]></title>
             <link>https://techcrunch.com/2023/07/26/stability-ai-releases-its-latest-image-generating-model-stable-diffusion-xl-1-0/</link>
             <guid>36880756</guid>
             <pubDate>Wed, 26 Jul 2023 16:48:42 GMT</pubDate>
@@ -523,7 +698,7 @@ Couldn't get https://www.tlo.com/vehicle-sightings: Error: Request failed with s
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Study shows glyphosate impairs learning in bumblebees (186 pts)]]></title>
+            <title><![CDATA[Study shows glyphosate impairs learning in bumblebees (188 pts)]]></title>
             <link>https://phys.org/news/2023-07-glyphosate-impairs-bumblebees.html</link>
             <guid>36880639</guid>
             <pubDate>Wed, 26 Jul 2023 16:41:49 GMT</pubDate>
@@ -583,7 +758,7 @@ Couldn't get https://www.tlo.com/vehicle-sightings: Error: Request failed with s
 									</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rethinking Window Management (220 pts)]]></title>
+            <title><![CDATA[Rethinking Window Management (224 pts)]]></title>
             <link>https://blogs.gnome.org/tbernard/2023/07/26/rethinking-window-management/</link>
             <guid>36880235</guid>
             <pubDate>Wed, 26 Jul 2023 16:19:04 GMT</pubDate>
@@ -658,7 +833,7 @@ Couldn't get https://www.tlo.com/vehicle-sightings: Error: Request failed with s
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[JEP 400: UTF-8 by Default (123 pts)]]></title>
+            <title><![CDATA[JEP 400: UTF-8 by Default (125 pts)]]></title>
             <link>https://openjdk.org/jeps/400</link>
             <guid>36880069</guid>
             <pubDate>Wed, 26 Jul 2023 16:06:55 GMT</pubDate>
