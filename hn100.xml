@@ -4,12 +4,900 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 11 Aug 2023 12:00:07 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 11 Aug 2023 13:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Firefox desktop extensions coming soon for the upcoming Android release (501 pts)]]></title>
+            <title><![CDATA[Fastest Branchless Binary Search (116 pts)]]></title>
+            <link>https://mhdm.dev/posts/sb_lower_bound/</link>
+            <guid>37086796</guid>
+            <pubDate>Fri, 11 Aug 2023 09:38:29 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://mhdm.dev/posts/sb_lower_bound/">https://mhdm.dev/posts/sb_lower_bound/</a>, See on <a href="https://news.ycombinator.com/item?id=37086796">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><p>You’re a busy person so I’ll first jump right to it. Here it is, the fastest general (and simple) binary search C++ implementation:</p><div><pre><code data-lang="C++"><span>template</span> <span>&lt;</span><span>class</span> <span>ForwardIt</span>, <span>class</span> <span>T</span>, <span>class</span> <span>Compare</span><span>&gt;</span>
+<span>constexpr</span> ForwardIt sb_lower_bound(
+      ForwardIt first, ForwardIt last, <span>const</span> T<span>&amp;</span> value, Compare comp) {
+   <span>auto</span> length <span>=</span> last <span>-</span> first;
+   <span>while</span> (length <span>&gt;</span> <span>0</span>) {
+      <span>auto</span> rem <span>=</span> length <span>%</span> <span>2</span>;
+      length <span>/=</span> <span>2</span>;
+      <span>if</span> (comp(first[length], value)) {
+         first <span>+=</span> length <span>+</span> rem;
+      }
+   }
+   <span>return</span> first;
+}
+</code></pre></div><p>Same function interface as <code>std::lower_bound</code>, but <strong>2x</strong> faster, and shorter. “branchless” because the <code>if</code> compiles down to a conditional move instruction rather than a branch/conditional jump. We will explore compiler options, even faster versions, fully branchless, and caveats towards the end of the article. There’s a significant <strong>update</strong> too. Oh and I’m sorry about just thrusting C++ code on you. Rude, I know. You don’t really need to know C++ to understand this article, just iterators (<code>first</code> and <code>last</code>), basically pointers to elements in an array, though note they can point one past the last array entry. Ignore <code>template</code>, <code>class</code>, <code>constexpr</code> and <code>&amp;</code>. If only there was a clean fast bare-metal language to write all this in.. <sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup> <sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup></p><h2 id="binary-search-intro">Binary search intro</h2><p>You have a sorted list and want to find where a <code>value</code> would fit. In C++ you’d use <code>std::lower_bound</code> which returns the first position (iterator) for which the comparison (usually <code>&lt;</code>) fails, or <code>last</code> if the comparison is true for all elements. Let’s write that, so surprise coding interview question! (In C++. Good luck.)</p><p>The <code>binary</code> in binary search comes from splitting up the list into two at some middle item and doing a comparison of the middle against the given <code>value</code>. Based on the comparison result we pick which of the two lists to keep looking in. We start with a list of some <code>length = last - first</code> that starts at the given iterator <code>first</code>. We need to have some loop that keeps going until the list is empty, i.e. <code>while (length &gt; 0)</code>. Pick the/a middle, at <code>length / 2</code> do a comparison and update the current list, which we’ll do by updating <code>first</code> and <code>length</code>. Here goes:</p><div><pre><code data-lang="C++"><span>// std_lower_bound()
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> half <span>=</span> length <span>/</span> <span>2</span>;
+   <span>if</span> (comp(first[half], value)) {
+      first <span>+=</span> half <span>+</span> <span>1</span>;
+      length <span>-=</span> half <span>+</span> <span>1</span>;
+   } <span>else</span> {
+      length <span>=</span> half;
+   }
+}
+<span>return</span> first;
+</code></pre></div><p>That was straight-forward. What we got was a slightly refactored version of <a href="https://github.com/gcc-mirror/gcc/blob/releases/gcc-13/libstdc%2B%2B-v3/include/bits/stl_algobase.h#L1467">what gcc/libstdc++ uses</a> or <a href="https://github.com/llvm/llvm-project/blob/release/16.x/libcxx/include/__algorithm/lower_bound.h#L36">what llvm/libc++ uses</a>. Roughly the same speed, even (sometimes) compiles down to the same assembly in the loop.</p><h2 id="branch-prediction">Branch prediction</h2><p>“What’s slow about this?” Not much but glad you asked, great question. Processors have gotten faster and faster over the years, and part of the reason why is <em>branch prediction</em>. Short explanation: for speed, the CPU attempts to execute instructions in parallel by dividing each instruction execution into multiple stages, say F-D-E-W (fetch, decode, execute, writeback). With a careful design it can make progress on multiple stages of different instructions (Example: instruction 5 in stage F, 6 in D, 7E, 8F) at the same time. The complication comes from branches in the code, i.e. conditional jump instructions, where depending on some result the next instruction is either X or Y. The CPU <em>predicts</em> one option, X, and starts running through the stages, eventually including the stages of say X+1 and X+2. When the result becomes available and it turns out it should have been Y, all the work on X, X+1 and X+2 is thrown away. Branch mispredictions are expensive because the CPU could have already made progress on Y, Y+1 and Y+2 instead.</p><p>Branch prediction is great, but not for binary search. It’s a search, and you only search for something if you don’t know exactly where it is, otherwise you’d just get it. Which means that <code>if (comp(first[half], value))</code> is unpredictable in common use of <code>std::lower_bound</code>.</p><p><img src="https://mhdm.dev/posts/sb_lower_bound/predictions.png" alt="A happy-go-lucky processor saying “my predictions fail only half the time!" "="">
+Credit <a href="https://www.instagram.com/practicemakespink">@practicemakespink</a></p><p>Let’s help the processor.</p><p>-We:</p><div><pre><code data-lang="C++"><span>// bstd_lower_bound()
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> half <span>=</span> length <span>/</span> <span>2</span>;
+   <span>bool</span> compare <span>=</span> comp(first[half], value);
+   <span>// No more ifs
+</span><span></span>   first <span>=</span> compare <span>?</span> first <span>+</span> half <span>+</span> <span>1</span> <span>:</span> first;
+   length <span>=</span> compare <span>?</span> length <span>-</span> half <span>-</span> <span>1</span> <span>:</span> half;
+}
+<span>return</span> first;
+</code></pre></div><p>-Clang compiler: “That’s not how this works!”</p><p>-We: <code>-mllvm -x86-cmov-converter=false</code></p><p>-Clang compiler: “Yes, boss."<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup></p><p>The result is 25% faster as it uses 2 conditional move instructions. Not bad. But turns out that <code>-mllvm -x86-cmov-converter=false</code>, which we’ll shorten to <code>-cmov</code>, speeds up <code>std::lower_bound</code> just as much because clang is smart enough to figure out how to convert the <code>if</code>/<code>else</code> to conditional moves. gcc doesn’t have such an option and generally just doesn’t care about what you want.</p><p>Overall, there’s currently no good way to tell either clang<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup> or gcc<sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup> to use a conditional move in just a certain situation.I’m trying to not make this article about finicky compilers, so let’s move on.</p><h2 id="what-started-this">What started this</h2><p>Why are we even talking about speeding up binary searches anyway? Why am I roping you into this? Cause someone else roped me into this.</p><p><video muted="" autoplay="" loop="" src="https://mhdm.dev/posts/sb_lower_bound/rope.mp4" width="100%" title="Meeseeks blaming one another for being roped in | Rick and Morty" onclick="this.paused?this.play():this.pause()"></video>
+<a href="https://www.adultswim.com/videos/rick-and-morty/meeseeks-and-destroy">Rick and Morty - Meeseeks and Destroy</a></p><p>I saw Malte Skarupke’s translation of “Shar’s algorithm” into a C++ binary search (<code>branchless_lower_bound</code>) and I couldn’t help but think “it’s not optimal”. Malte’s version sometimes compares <code>value</code> against the same element multiple times. So I wondered, what is the optimal ‘branchless’ binary search? That led to <code>sb_lower_bound</code> which is ~20% faster than <a href="https://probablydance.com/2023/04/27/beautiful-branchless-binary-search/">Malte’s version of lower_bound that he tested as 2x faster than GCC</a>.</p><p>“What’s an ‘optimal’ binary search anyway?” Good question. I think a binary search is ‘optimal’ if it completes by doing the minimum number of comparisons. This is very useful when you have a (relatively) slow comparison function. Malte noted his version is slower than <code>std::lower_bound</code> for binary searching a large number of strings.</p><p>Looking at <code>std::lower_bound</code> it returns an iterator, which can point to any of the list elements but also one past the end. For a list of size <code>n</code> there are <code>n+1</code> possible options. Thus for a list of size <code>2<sup>k</sup>-1</code> there are <code>2<sup>k</sup></code> possible options. In this case the optimal number of comparisons is <code>k</code>. Provably so as being able to distinguish between all <code>2<sup>k</sup></code> options requires <code>k</code> bits of information, and each comparison gives us 1 bit of information (true vs false). Translating this case into code, we get:</p><div><pre><code data-lang="C++"><span>// Really fast but only works when length is a power of 2 minus 1
+</span><span>// When not, it can result in out of bounds accesses like for
+</span><span>// array [0, 1, 2, 3, 4, 5] and value 4
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   length <span>/=</span> <span>2</span>;
+   <span>if</span> (comp(first[length], value)) {
+      first <span>+=</span> length <span>+</span> <span>1</span>;
+   }
+}
+<span>return</span> first;
+</code></pre></div><p>With clang <code>-cmov</code> the loop compiles down to 6 instructions, one of which is <code>cmov</code>. The reason this (and Malte’s code) is so fast is that only updating <code>first</code> depends on the comparison result.</p><h2 id="sb_lower_bound"><code>sb_lower_bound</code></h2><p>Now let’s look at <code>sb_lower_bound</code> (named after <em>simple branchless</em>). It actually took me longer to stumble upon than faster versions (yet to be presented) as it’s not ‘optimal’.</p><div><pre><code data-lang="C++"><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> rem <span>=</span> length <span>%</span> <span>2</span>;
+   length <span>/=</span> <span>2</span>;
+   <span>if</span> (comp(first[length], value)) {
+      first <span>+=</span> length <span>+</span> rem;
+   }
+}
+<span>return</span> first;
+</code></pre></div><p>Every time we split the list, the number of elements happens to be even, and comp returns true then we don’t skip over enough elements. For <code>n</code> elements, where <code>2<sup>k</sup> &lt;= n &lt; 2<sup>k+1</sup></code>, <code>sb_lower_bound</code> will always make <code>k+1</code> comparisons while <code>std::lower_bound</code> will either make <code>k</code> or <code>k+1</code> comparisons. On average <code>std::lower_bound</code> will make about <code>log2(n+1)</code> comparisons. Overall <code>sb_lower_bound</code> is faster as it has significantly fewer instructions in the loop. The comparison function has to be really slow for the difference between <code>k+1</code> and <code>log2(n+1)</code> number of comparisons to matter.</p><p>Second caveat is that currently, gcc does not emit branchless code for <code>sb_lower_bound</code> regardless of optimization level. It doesn’t emit branchless code for <code>std::lower_bound</code> either so they end up about as fast. We can try to write some inline assembly to force gcc to use <code>cmov</code> but there’s a tradeoff. The simple way results in more instructions than necessary. The alternative requires writing different assembly code for every possible type of <code>value</code> (int, float, etc.).</p><div><pre><code data-lang="C++"><span>// asm_lower_bound, works for x86 only
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> rem <span>=</span> length <span>%</span> <span>2</span>;
+   length <span>/=</span> <span>2</span>;
+   <span>auto</span> firstplus <span>=</span> first <span>+</span> length <span>+</span> rem;
+   <span>// Does a comparison which sets some x86 FLAGS like CF or ZF
+</span><span></span>   <span>bool</span> compare <span>=</span> comp(first[length], value);
+   <span>// Inline assembly doesn't support passing bools straight into FLAGS
+</span><span></span>   <span>// so we ask the compiler to copy it from FLAGS into a register
+</span><span></span>   __asm__(
+         <span>// Then we test the register, which sets ZF=!compare and CF=0
+</span><span></span>         <span>// Reference: https://www.felixcloutier.com/x86/test
+</span><span></span>         <span>"test %[compare],%[compare]</span><span>\n</span><span>"</span>
+         <span>// cmova copies firstplus into first if ZF=0 and CF=0
+</span><span></span>         <span>// Reference: https://www.felixcloutier.com/x86/cmovv
+</span><span></span>         <span>"cmova %[firstplus],%[first]</span><span>\n</span><span>"</span>
+         <span>:</span> [first] <span>"+r"</span>(first)
+         <span>:</span> [firstplus] <span>"r"</span>(firstplus), [compare]<span>"r"</span>(compare)
+   );
+}
+<span>return</span> first;
+</code></pre></div><p>2x faster than the gcc version of <code>std::lower_bound</code>, but slightly slower than <code>sb_lower_bound</code> with clang <code>-cmov</code>. Presented just for demonstration purposes.</p><h2 id="more-optimal">More optimal</h2><p>I promised an even faster version in the intro. Here it is:</p><div><pre><code data-lang="C++"><span>// bb_lower_bound
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>// while length isn't a power of 2 minus 1
+</span><span></span><span>while</span> (length <span>&amp;</span> (length <span>+</span> <span>1</span>)) {
+   <span>auto</span> step <span>=</span> length <span>/</span> <span>8</span> <span>*</span> <span>6</span> <span>+</span> <span>1</span>; <span>// MAGIC
+</span><span></span>   <span>if</span> (comp(first[step], value)) {
+      first <span>+=</span> step <span>+</span> <span>1</span>;
+      length <span>-=</span> step <span>+</span> <span>1</span>;
+   } <span>else</span> {
+      length <span>=</span> step;
+      <span>break</span>;
+   }
+}
+<span>while</span> (length <span>!=</span> <span>0</span>) {
+   length <span>/=</span> <span>2</span>;
+   <span>if</span> (comp(first[length], value)) {
+      first <span>+=</span> length <span>+</span> <span>1</span>;
+   }
+}
+<span>return</span> first;
+</code></pre></div><p>Let’s quickly go over <code>length &amp; (length + 1)</code>. Example: <code>length</code> is <code>110011</code>, <code>length+1</code> is <code>110100</code>, <code>length &amp; (length+1)</code> is <code>110000</code>. Note how they always share their most significant <code>1</code> except for when <code>length+1</code> carries over all set bits. That case is when <code>length</code> is of the form <code>11..1</code>, i.e. power of 2 minus 1, in which case <code>length &amp; (length + 1)</code> will be 0. Slightly adapted from one of the bit twiddling tricks I remembered and there’s a (warning!) <a href="https://graphics.stanford.edu/~seander/bithacks.html">rabbit hole full of awesome tricks here</a>.</p><p>Let us call lengths ‘nice’ if they are powers of 2 minus 1. Earlier we found that for nice lengths we can have optimal searching. The original idea was that for non-nice length we split the search list not in half but in a way that we’ll quickly end up only searching sub-lists of nice lengths. This idea was not quite fast enough as it meant spending significant time just splitting up the list. The first compromise is that early <code>break</code>, which means the second <code>while</code> loop may (non-optimally) search past its original length; no out of bounds accesses though as this sub-list isn’t at the end of the full list. This compromise leads to a second compromise, that bit of MAGIC in selecting the <code>step</code> size. To be fast we want a large <code>step</code>, definitely <code>&gt;= length/2</code>, so we more often break out to the faster <code>while</code> loop. But not so large a <code>step</code> that almost equals <code>length</code> because we lose on what makes a binary search fast. We’d also prefer that the <code>step</code> is nice or has many <code>1</code>s in its binary representation, which makes the second <code>while</code> loop more optimal. The many <code>1</code>s is why the <code>step</code> is forced to be odd. Last but not least, we’d want <code>length - step - 1</code> to be nice.</p><p>I’ve tried quite a few variations. The most bitter sweet was <code>auto step = length &gt;&gt; 1; step |= step &gt;&gt; 1;</code> which I thought to be a good fast heuristic that balances the listed compromises, is very close to optimal but ultimately ended up slightly slower than MAGIC. Another issue is the ‘break’ makes it branchy.</p><p>One unexplored avenue is exhaustively searching for the fastest (yet still optimal) <code>step</code> for every length and storing that into a precomputed table. Then either deriving a good heuristic from said table or using it outright. With <code>sb_lower_bound</code> I’ve reached my good-enough point but you’re welcome to explore further :).</p><div><pre><code data-lang="C++"><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&amp;</span> (length <span>+</span> <span>1</span>)) {
+   <span>auto</span> step <span>=</span> precomputed[length];
+   <span>if</span> (comp(first[step], value)) {
+      first <span>+=</span> step <span>+</span> <span>1</span>;
+      length <span>-=</span> step <span>+</span> <span>1</span>;
+   } <span>else</span> {
+      length <span>=</span> step;
+   }
+}
+<span>// ...
+</span></code></pre></div><h2 id="more-branchless-more-better">More branchless, more better?</h2><p>Short answer: no. This section can be skipped but here’s the long answer: For <code>n</code> elements where <code>2<sup>k</sup> &lt;= n &lt; 2<sup>k+1</sup></code> <code>sb_lower_bound</code> will always do <code>k+1</code> comparisons. On a 64-bit machine that means at most 64 iterations of the <code>while (length &gt; 0)</code> loop. So it’s possible to write a “fully branchless” version that doesn’t have the <code>length</code> check by using a <code>switch</code> with intentional fall-through.</p><div><pre><code data-lang="C++">size_t length <span>=</span> last <span>-</span> first;
+size_t rem;
+<span>switch</span>(std<span>::</span>bit_width(length)) {
+   <span>case</span> <span>64</span><span>:</span>
+      rem <span>=</span> length <span>%</span> <span>2</span>;
+      length <span>/=</span> <span>2</span>;
+      first <span>+=</span> comp(first[length], value) <span>*</span> (length <span>+</span> rem);
+   <span>case</span> <span>63</span><span>:</span>
+      rem <span>=</span> length <span>%</span> <span>2</span>;
+      length <span>/=</span> <span>2</span>;
+      first <span>+=</span> comp(first[length], value) <span>*</span> (length <span>+</span> rem);
+   <span>// ...
+</span><span></span>   <span>case</span> <span>1</span><span>:</span>
+      rem <span>=</span> length <span>%</span> <span>2</span>;
+      length <span>/=</span> <span>2</span>;
+      first <span>+=</span> comp(first[length], value) <span>*</span> (length <span>+</span> rem);
+}
+<span>return</span> first;
+</code></pre></div><p>If you’re not familiar with <code>switch</code>, think of it as a jump into code. In our case to the exact place from which there are exactly the right number of comparisons left to do.</p><p>“Is it any faster?” No. Modern x86 processors handle loop conditions well as they’re predictable; we’re very likely to remain in the loop. And that’s good especially because it saves us from writing templates or macros or copy-paste-edit the 64 cases.</p><h2 id="spotlight-on-performance">Spotlight on Performance</h2><p><img src="https://mhdm.dev/posts/sb_lower_bound/performance.png" alt="Sketch of processor’s performance" title="Spotlight on Performance">
+Credit <a href="https://www.instagram.com/practicemakespink">@practicemakespink</a></p><p>Average run time (ns):</p><table><thead><tr><th></th><th><code>std::lower_</code></th><th><code>branchless_lower_</code></th><th><code>asm_lower_</code></th><th><code>sb_lower_</code></th><th><code>sbm_lower_</code></th><th><code>bb_lower_</code></th></tr></thead><tbody><tr><td>gcc</td><td>80.68</td><td>43.65</td><td>54.92</td><td>77.22</td><td>34.19</td><td>75.64</td></tr><tr><td>clang</td><td>78.66</td><td>90.97</td><td>51.83</td><td>80.06</td><td>83.95</td><td>74.44</td></tr><tr><td>clang -cmov</td><td>61.30</td><td>43.43</td><td>54.32</td><td><strong>33.24</strong></td><td>35.54</td><td><strong>32.73</strong></td></tr></tbody></table><p>Geometric mean run time (ns):</p><table><thead><tr><th></th><th><code>std::lower_</code></th><th><code>branchless_lower_</code></th><th><code>asm_lower_</code></th><th><code>sb_lower_</code></th><th><code>sbm_lower_</code></th><th><code>bb_lower_</code></th></tr></thead><tbody><tr><td>gcc</td><td>62.44</td><td>25.55</td><td>32.35</td><td>59.67</td><td>20.62</td><td>57.93</td></tr><tr><td>clang</td><td>61.24</td><td>65.72</td><td>30.67</td><td>63.59</td><td>66.91</td><td>58.19</td></tr><tr><td>clang -cmov</td><td>39.17</td><td>25.14</td><td>31.21</td><td><strong>19.81</strong></td><td>20.91</td><td>21.33</td></tr></tbody></table><p>Runtimes in line chart form:</p><p><a href="https://mhdm.dev/posts/sb_lower_bound/runtimes.png"><img src="https://mhdm.dev/posts/sb_lower_bound/runtimes.png" alt="Runtimes"></a></p><p>“What’s <code>sbm_lower_bound</code>?” It’s basically <code>sb_lower_bound</code> but modified to trick gcc into generating a conditional move. The difference is switching from the <code>if</code> statement to <code>first += comp(first[length], value) * (length + rem)</code>. Use with comments and caution as the next version of gcc may undo this optimization.</p><p>Benchmarking commands showing compiler options:</p><div><pre><code data-lang="sh">g++-10 -std<span>=</span>c++20 -Wall -O2 -march<span>=</span>haswell test.cpp -o test <span>&amp;&amp;</span> ./test
+clang++-10 -std<span>=</span>c++20 -Wall -O2 -march<span>=</span>haswell test.cpp -o test <span>&amp;&amp;</span> ./test
+clang++-10 -std<span>=</span>c++20 -Wall -O2 -march<span>=</span>haswell -mllvm -x86-cmov-converter<span>=</span>false test.cpp -o test <span>&amp;&amp;</span> ./test
+</code></pre></div><p><code>-march=native</code> or no <code>-march</code> did not significantly influence the rankings. Benchmarked on an intel i7 kaby lake.</p><h3 id="branch-mispredictions">Branch mispredictions</h3><p>We can look at branch mispredictions/misses using <code>perf</code>:</p><div><pre><code data-lang="sh"><span># clang</span>
+perf stat ./test
+<span># [..]</span>
+         16,599.95 msec task-clock:u     <span>#    1.000 CPUs utilized</span>
+<span># [..]</span>
+    30,309,755,516      instructions:u   <span>#    0.53  insn per cycle</span>
+     6,941,783,502      branches:u       <span>#  418.181 M/sec</span>
+     1,203,569,540      branch-misses:u  <span>#   17.34% of all branches</span>
+<span># clang -cmov</span>
+perf stat ./test
+<span># [..]</span>
+         10,982.97 msec task-clock:u     <span>#    1.000 CPUs utilized</span>
+<span># [..]</span>
+    32,603,123,521      instructions:u   <span>#    0.90  insn per cycle</span>
+     4,070,883,093      branches:u       <span>#  370.654 M/sec</span>
+        35,954,999      branch-misses:u  <span>#    0.88% of all branches</span>
+</code></pre></div><p><code>-cmov</code> removes ~2.9B branches and ~1.2B branch misses, so it removes branches that were mispredicted ~41% of the time. It’s close to the 50% we’d expect for purely unpredictable branches, if we had perfect randomness and benchmarking. In which case <code>-cmov</code> would result in an even higher improvement.</p><h3 id="performance-with-slower-comp">Performance with slower <code>comp()</code></h3><p>For somewhat realistic scenarios of binary searching with a slower <code>comp()</code> function I’ve thought of searching through ids, phone numbers, accounts and keywords. I’ve thus settled on testing searching 8-byte strings.</p><p>Average run time (ns):</p><table><thead><tr><th></th><th><code>std::lower_</code></th><th><code>branchless_lower_</code></th><th><code>sb_lower_</code></th><th><code>sbm_lower_</code></th><th><code>bb_lower_</code></th></tr></thead><tbody><tr><td>gcc</td><td><strong>160.01</strong></td><td>205.24</td><td>165.66</td><td>193.96</td><td>163.91</td></tr><tr><td>clang</td><td><strong>157.71</strong></td><td>178.77</td><td>162.68</td><td>166.00</td><td><strong>157.22</strong></td></tr><tr><td>clang -cmov</td><td><strong>156.06</strong></td><td>193.70</td><td>164.71</td><td>181.57</td><td>157.48</td></tr></tbody></table><p>In this case <code>std::lower_bound</code> is very slightly but consistently faster than <code>sb_lower_bound</code>. To always get the best performance it is possible for libraries to use <code>sb_lower_bound</code> whenever directly working on primitive types and <code>std::lower_bound</code> otherwise.</p><h2 id="assembly">Assembly</h2><p>No bare-metal code performance optimization is complete without looking at the generated assembly. However, feel free to skip this section.</p><div><pre><code data-lang="js"><span>Time</span><span>%</span> <span>|</span>      <span>instructions</span>
+
+<span>// std::lower_bound, clang -cmov, hottest loop assembly
+</span><span></span> <span>1.68</span> <span>│</span><span>20</span><span>:</span>   <span>mov</span>      <span>%</span><span>rsi</span>,<span>%</span><span>rcx</span>             <span>// rcx = length
+</span><span></span> <span>3.20</span> <span>│</span>      <span>shr</span>      <span>%</span><span>rcx</span>                  <span>// rcx = length / 2
+</span><span></span> <span>1.08</span> <span>│</span>      <span>mov</span>      <span>%</span><span>rcx</span>,<span>%</span><span>rdx</span>             <span>// rdx = length / 2
+</span><span></span> <span>4.42</span> <span>│</span>      <span>not</span>      <span>%</span><span>rdx</span>                  <span>// rdx = binary_not(rdx) = -length / 2 - 1
+</span><span></span> <span>2.85</span> <span>│</span>      <span>add</span>      <span>%</span><span>rsi</span>,<span>%</span><span>rdx</span>             <span>// rdx = length - length / 2 - 1
+</span><span></span><span>63.41</span> <span>│</span>      <span>vucomiss</span> (<span>%</span><span>rax</span>,<span>%</span><span>rcx</span>,<span>4</span>),<span>%</span><span>xmm0</span>   <span>// Compare first[rcx] with value, sets FLAGS
+</span><span></span> <span>0.21</span> <span>│</span>      <span>lea</span>      <span>0x4</span>(<span>%</span><span>rax</span>,<span>%</span><span>rcx</span>,<span>4</span>),<span>%</span><span>rsi</span> <span>// rsi = first + length / 2 + 1
+</span><span></span><span>10.14</span> <span>│</span>      <span>cmova</span>    <span>%</span><span>rsi</span>,<span>%</span><span>rax</span>             <span>// first = compare_res ? first : rsi
+</span><span></span> <span>4.87</span> <span>│</span>      <span>cmovbe</span>   <span>%</span><span>rcx</span>,<span>%</span><span>rdx</span>             <span>// rdx = not compare_res ? length / 2 : rdx
+</span><span></span> <span>0.88</span> <span>│</span>      <span>mov</span>      <span>%</span><span>rdx</span>,<span>%</span><span>rsi</span>             <span>// rsi = rdx (new length)
+</span><span></span> <span>0.33</span> <span>│</span>      <span>test</span>     <span>%</span><span>rdx</span>,<span>%</span><span>rdx</span>             <span>// Set FLAGS based on rdx
+</span><span></span> <span>3.90</span> <span>│</span>    <span>↑</span> <span>jg</span>       <span>20</span>                    <span>// Jump to instruction 20 if rdx not zero
+</span><span></span>
+<span>// sb_lower_bound, clang -cmov, hottest loop assembly
+</span><span></span> <span>4.21</span> <span>│</span><span>20</span><span>:</span>   <span>shr</span>      <span>%</span><span>rcx</span>                  <span>// rcx = length / 2
+</span><span></span> <span>4.70</span> <span>│</span>      <span>and</span>      <span>$0x1</span>,<span>%</span><span>esi</span>             <span>// esi = length % 2
+</span><span></span> <span>5.00</span> <span>│</span>      <span>add</span>      <span>%</span><span>rcx</span>,<span>%</span><span>rsi</span>             <span>// rsi = length / 2 + length % 2
+</span><span></span><span>68.86</span> <span>│</span>      <span>vucomiss</span> (<span>%</span><span>rax</span>,<span>%</span><span>rcx</span>,<span>4</span>),<span>%</span><span>xmm0</span>   <span>// Compare first[rcx] with value, sets FLAGS
+</span><span></span> <span>0.01</span> <span>│</span>      <span>lea</span>      (<span>%</span><span>rax</span>,<span>%</span><span>rsi</span>,<span>4</span>),<span>%</span><span>rdx</span>    <span>// rdx = first + length / 2 + length % 2
+</span><span></span><span>11.69</span> <span>│</span>      <span>cmova</span>    <span>%</span><span>rdx</span>,<span>%</span><span>rax</span>             <span>// first = compare_res ? first : rdx
+</span><span></span> <span>3.71</span> <span>│</span>      <span>mov</span>      <span>%</span><span>rcx</span>,<span>%</span><span>rsi</span>             <span>// rsi = length / 2
+</span><span></span>      <span>│</span>      <span>test</span>     <span>%</span><span>rcx</span>,<span>%</span><span>rcx</span>             <span>// Set FLAGS based on rcx
+</span><span></span> <span>0.02</span> <span>│</span>    <span>↑</span> <span>jne</span>      <span>20</span>                    <span>// Jump to instruction 20 if rcx not zero
+</span><span></span>
+<span>// branchless_lower_bound, clang -cmov, hottest loop assembly
+</span><span></span> <span>3.04</span> <span>│</span><span>70</span><span>:</span>   <span>lea</span>      (<span>%</span><span>rdi</span>,<span>%</span><span>rcx</span>,<span>4</span>),<span>%</span><span>rax</span>    <span>// rax = first + length
+</span><span></span><span>71.22</span> <span>│</span>      <span>vucomiss</span> (<span>%</span><span>rdi</span>,<span>%</span><span>rcx</span>,<span>4</span>),<span>%</span><span>xmm0</span>   <span>// Compare first[rcx] with value, sets FLAGS
+</span><span></span><span>12.26</span> <span>│</span>      <span>cmova</span>    <span>%</span><span>rax</span>,<span>%</span><span>rdi</span>             <span>// first = compare_res ? first : rax
+</span><span></span> <span>1.03</span> <span>│</span><span>7</span><span>d</span><span>:</span>   <span>shr</span>      <span>%</span><span>rcx</span>                  <span>// length /= 2, but note it also sets FLAGS
+</span><span></span> <span>1.64</span> <span>│</span>    <span>↑</span> <span>jne</span>      <span>70</span>                    <span>// Jump to instruction 20 if length not zero
+</span></code></pre></div><p>The <code>branchless_lower_bound</code> assembly is really short and clean. While that’s a good indicator of speed, <code>sb_lower_bound</code> wins out in the performance tests due to low overhead.</p><h2 id="conclusion">Conclusion</h2><p>If the slowest part of your program involves searching and/or comparisons that a processor would not be able to predict then try clang with <code>-mllvm -x86-cmov-converter=false</code> (if your processor is x86).</p><p>If you’d benefit from a faster binary search, try <code>sb_lower_bound</code> (or for gcc you could also try <a href="https://github.com/mh-dm/sb_lower_bound/blob/master/sbm_lower_bound.h"><code>sbm_lower_bound</code></a>). I’ve made it open source, MIT license.</p><p>If you want more articles like this, follow me <a href="https://twitter.com/_mhdm">@_mhdm</a> on Twitter (I don’t post often). Alternatively, you can <a href="https://mhdm.dev/index.xml">use RSS</a>.</p><p>Code, including benchmarking, is available at <a href="https://github.com/mh-dm/sb_lower_bound/">github.com/mh-dm/sb_lower_bound/</a>.</p><p>If you have ideas, thoughts, or something to add you can <a href="https://www.reddit.com/r/cpp/comments/14okto7/fastest_branchless_binary_search/">leave a comment here</a>.</p><h2 id="update">Update</h2><p>Following a fruitful comment by <a href="https://orlp.net/">orlp.net author</a>, <code>sb_lower_bound</code> can be refactored slightly to reduce the number of assembly instructions in the hot loop from 9 to 8.</p><div><pre><code data-lang="C++"><span>// sb_lower_bound refactored
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> half <span>=</span> length <span>/</span> <span>2</span>;
+   <span>if</span> (comp(first[half], value)) {
+      <span>// length - half equals half + length % 2
+</span><span></span>      first <span>+=</span> length <span>-</span> half;
+   }
+   length <span>=</span> half;
+}
+<span>return</span> first;
+</code></pre></div><p>With <code>clang -cmov</code> there’s a slight speed up from ~33ns to ~32ns for the average run time.</p><h3 id="prefetching">Prefetching</h3><p>From comments there was a recommended method for a further speed-up, namely prefetching. Prefetching pulls particular parts of memory into cache (usually L1/L2) so that when prefetched data is actually needed the load only incurs L1/L2 cache latency (~4/12 cycles) vs slower cache (L3, ~40 cycles) or memory latency (~200 cycles). <a href="https://www.7-cpu.com/cpu/Skylake.html">Example timings</a>. For this there’s <code>__builtin_prefetch()</code> supported in both gcc and clang.</p><p>Say we’re going to check against the element at <code>length / 2</code>. We could prefetch at <code>length / 4</code> and <code>length * 3 / 4</code>. Or we could also prefetch at <code>length / 8</code> divisions, which is an extra 4 memory locations. For <code>length / 4</code> divisions, 1 out of every 2 prefetches will be wasted, doubling cache pressure. If also <code>length / 8</code> divisions, 5 out of every 6 prefetches will be wasted. There’s overhead in computing the locations and prefetching, overhead that will be significant in the hot loop we worked hard to make short.</p><p>Finally, if we’ve already made a few full searches the initial divisions are likely to be in the cache as many elements should fit in modern 256KB+ L2 caches.</p><p>When trying various prefetching strategies, none helped for under 256KB arrays, which is about what we expect. Long story short, here’s <code>sb_lower_bound</code> but with prefetching added in for 256KB+:</p><div><pre><code data-lang="C++"><span>// sbp_lower_bound
+</span><span></span><span>auto</span> length <span>=</span> last <span>-</span> first;
+<span>// Sized to roughly fit in L2 cache
+</span><span></span><span>constexpr</span> <span>int</span> entries_per_256KB <span>=</span> <span>256</span> <span>*</span> <span>1024</span> <span>/</span> <span>sizeof</span>(T);
+<span>if</span> (length <span>&gt;=</span> entries_per_256KB) {
+   <span>constexpr</span> <span>int</span> num_per_cache_line <span>=</span> std<span>::</span>max(<span>64</span> <span>/</span> <span>int</span>(<span>sizeof</span>(T)), <span>1</span>);
+   <span>while</span> (length <span>&gt;=</span> <span>3</span> <span>*</span> num_per_cache_line) {
+      <span>auto</span> half <span>=</span> length <span>/</span> <span>2</span>;
+      __builtin_prefetch(<span>&amp;</span>first[half <span>/</span> <span>2</span>]);
+      <span>// length - half equals half + length % 2
+</span><span></span>      <span>auto</span> first_half1 <span>=</span> first <span>+</span> (length <span>-</span> half);
+      __builtin_prefetch(<span>&amp;</span>first_half1[half <span>/</span> <span>2</span>]);
+      first <span>=</span> comp(first[half], value) <span>?</span> first_half1 : first;
+      length <span>=</span> half;
+   }
+}
+<span>while</span> (length <span>&gt;</span> <span>0</span>) {
+   <span>auto</span> half <span>=</span> length <span>/</span> <span>2</span>;
+   <span>auto</span> first_half1 <span>=</span> first <span>+</span> (length <span>-</span> half);
+   first <span>=</span> comp(first[half], value) <span>?</span> first_half1 : first;
+   length <span>=</span> half;
+}
+<span>return</span> first;
+</code></pre></div><p>Tested in the same way as before, for sizes ranging up to ~4 million entries (or 16MB), there’s a further speed up from ~32ns to ~26ns average run time. At this point I should acknowledge that my original size stopping point happened to be too small. A case of a quick ‘should be larger than L3 cache size’ and a mistake in not following up. So let’s go much higher, now to ~128 million entries (or 512MB). We’re way past L3 but still in reasonable data set size.</p><p>Runtimes in line chart form:</p><p><a href="https://mhdm.dev/posts/sb_lower_bound/runtimes2.png"><img src="https://mhdm.dev/posts/sb_lower_bound/runtimes2.png" alt="Runtimes 2"></a></p><p>There’s some interesting stuff going on.</p><ul><li>Branchless <code>std::lower_bound</code> that’s generated with <code>clang -cmov</code> is slower than the branchy version at massive sizes. Modern cpus follow predicted branches including loading from memory (basically a prefetch) and speculatively executing on said data (basically a <a href="https://en.wikipedia.org/wiki/Transient_execution_CPU_vulnerability">security nightmare</a>).</li><li><code>sbpm_lower_bound</code> is the prefetching version of <code>sbm_lower_bound</code> which does a multiply with a boolean to trick gcc into generating branchless code.</li><li>We’re at ~2.3x faster average time comparing <code>std::lower_bound</code> (~161ns) to prefetched version (~71ns).</li></ul><h3 id="faster">Faster?</h3><h4 id="drop-in-replacement-for-stdlower_bound">Drop in replacement for <code>std::lower_bound</code></h4><p>There’s a performance graph bump/weirdness between 1-10 million elements so faster is possible in theory. In practice the prefetching code is getting messy and gaining magic constants. An exciting part for me in writing this post was the (small) probability of contributing back to <a href="https://gcc.gnu.org/contribute.html">gcc/libstdc++</a> and/or <a href="https://libcxx.llvm.org/Contributing.html">llvm/libc++</a>. I’ll stop here as that probability gets even smaller with added complexity.</p><h4 id="breaking-stdlower_bound-constraints">Breaking <code>std::lower_bound</code> constraints</h4><p>Comments also noted the interesting <a href="https://algorithmica.org/en/eytzinger">Eytzinger Binary Search</a> variant where the input array is reshaped (into a binary med-“heap”) for lookups to be cache friendly. I could ponder how fast a SIMD optimized K-ary tree could be, but no need to ponder: 7x to 15x faster than <code>std::lower_bound</code> (for 16-ary tree of ints) as presented by <a href="https://www.youtube.com/watch?v=1RIPMQQRBWk">Sergey Slotin at CppCon 2022</a>.</p><h4 id="footnotes">Footnotes</h4><section role="doc-endnotes"><hr><ol><li id="fn:1" role="doc-endnote"><p>BUT RUST.. Rust is fast but do you really want my first post to be <a href="https://doc.rust-lang.org/src/core/slice/mod.rs.html#2520">about unsafe code</a>? <a href="#fnref:1" role="doc-backlink">↩︎</a></p></li><li id="fn:2" role="doc-endnote"><p>BUT ZIG.. There’s no binary search implementation in Zig that I could find, rather it calls to C++. <a href="#fnref:2" role="doc-backlink">↩︎</a></p></li><li id="fn:3" role="doc-endnote"><p>There’s always a <a href="https://m.xkcd.com/149/">relevant XKCD</a>. <a href="#fnref:3" role="doc-backlink">↩︎</a></p></li><li id="fn:4" role="doc-endnote"><p>With clang we could do <a href="https://clang.llvm.org/docs/LanguageExtensions.html#builtin-unpredictable"><code>__builtin_unpredictable</code></a><code>(comp(first[half], value))</code> but it does nothing (tested v10-13). <a href="#fnref:4" role="doc-backlink">↩︎</a></p></li><li id="fn:5" role="doc-endnote"><p>gcc has <a href="https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html#index-_005f_005fbuiltin_005fexpect_005fwith_005fprobability"><code>__builtin_expect_with_probability</code></a><code>(cond, 0, 0.5)</code> but it does nothing (tested v10). <a href="#fnref:5" role="doc-backlink">↩︎</a></p></li></ol></section></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[There is no hard takeoff (109 pts)]]></title>
+            <link>https://geohot.github.io//blog/jekyll/update/2023/08/10/there-is-no-hard-takeoff.html</link>
+            <guid>37086779</guid>
+            <pubDate>Fri, 11 Aug 2023 09:34:59 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://geohot.github.io//blog/jekyll/update/2023/08/10/there-is-no-hard-takeoff.html">https://geohot.github.io//blog/jekyll/update/2023/08/10/there-is-no-hard-takeoff.html</a>, See on <a href="https://news.ycombinator.com/item?id=37086779">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div aria-label="Content">
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>Back in 2014, Elon Musk referred to AI as <a href="https://www.washingtonpost.com/news/innovations/wp/2014/10/24/elon-musk-with-artificial-intelligence-we-are-summoning-the-demon/">summoning the demon</a>. And it wasn’t hard to see that view. Soon, <a href="https://en.wikipedia.org/wiki/AlphaGo">Go agents</a> would beat top humans learning from self play. By the end of 2017, the <a href="https://arxiv.org/abs/1712.01815">same algorithm</a> mastered Chess and Shogi. By 2020, it didn’t even need tons of calls to the simulator, and could <a href="https://www.deepmind.com/blog/muzero-mastering-go-chess-shogi-and-atari-without-rules">play Atari too</a>.</p>
+
+<p>AI looked scary. It looked like it was one FOOM away from self playing and becoming superhuman at the universe. And yet, here we are in 2023 and self driving cars still don’t work.</p>
+
+<p>Does becoming superhuman at the universe make any practical sense? The universe has so many orders of magnitude more states than any Go game. And I don’t even need math to illustrate this point, just imagine tiling the universe with as many very tiny Go boards as you can fit.</p>
+
+<p>That’s a lot of Go boards. So many that the difference in complexity between Go and the Universe is not a matter of number, it’s a matter of kind. Every Go program operates at the stone level. Almost nothing predicting the world operates at the atom level.</p>
+
+<hr>
+
+
+<p>These modern self play systems like <a href="https://arxiv.org/pdf/1911.08265.pdf">MuZero</a> have some form of dynamics model, a function that given the current state of the world and an action, it predicts the next state. We also use these dynamics models <a href="https://twitter.com/comma_ai/status/1681491118536691712">at comma</a>. They are world models, and contain all the knowledge of how the world works inside of them.</p>
+
+<p>GPT-4 is a dynamics model also, conditioned on the prior of the action space. And there’s an even simpler way to think about it. The loss function for dynamics is compression.</p>
+
+<p><a href="http://www.hutter1.net/ai/">Compression is prediction is intelligence, intelligence is prediction is compression.</a> One of the coolest facts I ever learned. So, feed in the whole internet, build a compressive model, make it really really big, and you just won the universe?</p>
+
+<hr>
+
+
+<p>Not so fast. This approach can lead to <a href="https://chat.openai.com/">very neat applications</a>, but does it take over the world?</p>
+
+<p>You want to get rich? Here’s an idea. Download all the historical stock market data. Get lots and lots of GPUs to train a huge model. Boom, predictor for the stock market. I look at prediction, I know which stocks go up! I buy the stocks that go up, I short the stocks that go down. With mega leverage, I am a billionaire by the end of the week! I can reinvest my billions in more GPUs for recursive self improvement. Nobody will stop me, I will take over the whole economy. How is nobody doing this?!?</p>
+
+<p>Oh wait…every hedge fund bro is already doing this. And most of them aren’t billionaires. The problem is your model needs to include all the computers playing the market, and it also needs to include the other hedge fund bros themselves. This strategy only dominates if you have more compute than the whole market itself, which you don’t.</p>
+
+<hr>
+
+
+<p>In Go, your model doesn’t need to include other computers. Yes, you are playing against a computer that you are modeling, but the game itself is way too small to contain a Go playing computer. The other computer you are playing against is outside the universe. The rules of Go don’t include computers. The rules of Go are fixed in complexity.</p>
+
+<p>On the other hand, your dynamics model of the universe must include computers. You’ll have to spend a lot of effort modeling them. Unless you have an absolutely staggering advantage, you aren’t going to figure them out from self play. The computers are active players, and they have a lot of compute. They might even be using it to try to model you!</p>
+
+<p>Assuming <a href="https://time.com/6266923/ai-eliezer-yudkowsky-open-letter-not-enough/">no untoward market intervention</a>, why would any one system ever have a large majority of the compute? Compute will be distributed in a <a href="https://en.wikipedia.org/wiki/Power_law">power law</a>.</p>
+
+<p>The smart regulation isn’t capping the FLOPS in training runs. That’s creating a powder keg. If the FLOPS are artificially restricted, and one person breaks the restriction, you could end up with a single dominant system.</p>
+
+<p>If you don’t want FOOM, you just need to prevent a 51% attack on compute.</p>
+
+<hr>
+
+
+<p>Now, if there’s one weird trick to 1e20x your efficiency, and only one group gets it, all bets are off. But this is never how things happen. Nobody has a 1e20x more efficient steam engine, it isn’t even possible.</p>
+
+<p>Nobody has a 1e20x more efficient Bitcoin miner either, and I also doubt that’s possible, we just <a href="https://en.wikipedia.org/wiki/Thermodynamics">understand</a> steam engines a lot better, so for steam engines we <em>know</em>. More intelligence leads to more new tricks, but the tricks get harder and harder to find.</p>
+
+<p>There’s low hanging fruit, you pick it, then you build tools to get the higher hanging fruit. You spend money on ladders, electric crane thingies, more and more money to get less and less fruit. Oil <a href="https://en.wikipedia.org/wiki/Petroleum_seep">used to be</a> just pouring out of the ground, now we go <a href="https://www.indelac.com/blog/introduction-to-oil-gas-offshore-drilling">to the bottom</a> of the ocean.</p>
+
+<hr>
+
+
+<p>A revolution is coming. The information revolution will do for intelligence what the industrial revolution did for energy. Most work (force*distance) used to be done by muscles, now it’s not. Most thinking used to be done by brains, soon it won’t be.</p>
+
+<p>But it’s not going to happen overnight. It’ll happen on a nice exponential, like it already is. The universe is an unfathomable number of orders of magnitude more complex than the Go game. The universe includes the player. The universe includes the other players. Games don’t.</p>
+
+<p><img src="https://geohot.github.io/blog/assets/images/trolley.jpg" height="250"></p>
+
+<p>Unless we build a terrifying powder keg, there is no FOOM. Let the markets cook.</p>
+
+  </div>
+</article>
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Artificial General Intelligence – A gentle introduction (103 pts)]]></title>
+            <link>https://cis.temple.edu/~pwang/AGI-Intro.html</link>
+            <guid>37086308</guid>
+            <pubDate>Fri, 11 Aug 2023 08:15:43 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://cis.temple.edu/~pwang/AGI-Intro.html">https://cis.temple.edu/~pwang/AGI-Intro.html</a>, See on <a href="https://news.ycombinator.com/item?id=37086308">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div dir="ltr" id="sites-canvas-main"><center><span size="5"><b><br>
+</b></span></center>
+<center>
+<span size="5"><b>Artificial General Intelligence</b></span></center>
+<center>
+<span size="4">— A gentle introduction</span></center>
+<center><span size="4"><br>
+</span></center>
+<center>
+<i><a href="http://www.cis.temple.edu/%7Epwang/" rel="nofollow">Pei Wang</a></i>
+</center>
+<p><span><span size="2">[This page contains up-to-date information about the field of Artificial General Intelligence (AGI), collected and organized according to my judgment, though efforts are made to avoid personal biases.] </span></span></p>
+<div><p><span size="2"><div><p>Contents</p><ol><li><a href="#TOC-From-AI-to-AGI"><strong>1 </strong>From AI to AGI</a><ol><li><a href="#TOC-AI:-in-different-directions-and-through-seasonal-cycles"><strong>1.1 </strong>AI: in different directions, and through seasonal cycles</a></li><li><a href="#TOC-A-new-spring"><strong>1.2 </strong>A new spring</a></li><li><a href="#TOC-It-s-summer-again"><strong>1.3 </strong>It's summer again</a></li></ol></li><li><a href="#TOC-AGI-Basics"><strong>2 </strong>AGI Basics</a><ol><li><a href="#TOC-What-is-AGI"><strong>2.1 </strong>What is AGI</a></li><li><a href="#TOC-Limitations-and-objections"><strong>2.2 </strong>Limitations and objections</a></li><li><a href="#TOC-Strategies-and-techniques"><strong>2.3 </strong>Strategies and techniques</a></li><li><a href="#TOC-The-ethics-of-AGI"><strong>2.4 </strong>The ethics of AGI</a></li></ol></li><li><a href="#TOC-Representative-AGI-Projects"><strong>3 </strong>Representative AGI Projects</a></li><li><a href="#TOC-AGI-Literatures-and-Resources"><strong>4 </strong>AGI Literatures and Resources</a></li></ol></div></span></p></div>
+<h2><a name="TOC-From-AI-to-AGI"></a>From AI to AGI</h2>
+<h3><a name="TOC-AI:-in-different-directions-and-through-seasonal-cycles"></a>AI: in different directions, and through seasonal cycles</h3><p>
+    Artificial Intelligence (AI) started with "thinking machine" or
+    "human-comparable intelligence" as the ultimate goal, as documented by
+    the following literature:
+    
+</p><ul>
+<li><a href="http://cogprints.org/499/1/turing.html" rel="nofollow">Computing
+          machinery and intelligence</a>, 1950</li>
+<li><a href="http://www-formal.stanford.edu/jmc/history/dartmouth/dartmouth.html" rel="nofollow">Proposal of the Dartmouth Meeting</a>, 1956</li>
+<li><a href="https://mitpress.mit.edu/books/computers-and-thought-1" rel="nofollow">Computers and Thought</a>, 1963</li>
+</ul><p>
+    In the past, there were some ambitious projects aiming at this goal,
+    though they all failed. The best-known examples include the
+    following ones:
+</p><ul>
+<li><a href="https://en.wikipedia.org/wiki/General_Problem_Solver" rel="nofollow">General Problem Solver</a> </li>
+<li><a href="http://en.wikipedia.org/wiki/Fifth_generation_computer" rel="nofollow">Fifth
+          Generation Computer Systems</a> </li>
+<li><a href="https://en.wikipedia.org/wiki/Strategic_Computing_Initiative" rel="nofollow">DARPA's Strategic Computing Initiative</a></li>
+</ul><p>
+    Partly due to the recognized difficulty of the problem, in the
+    1970s-1980s mainstream AI gradually moved away from general-purpose
+    intelligent systems, and turned to domain-specific problems and
+    special-purpose solutions, though there are opposite attitudes
+    toward this change:
+</p><ul>
+<li>"<a href="https://www.americanscientist.org/article/the-manifest-destiny-of-artificial-intelligence" rel="nofollow">AI adopts
+          the scientific method (1987-present): ... It is now more
+        common to build on existing theories than to propose brand new
+        ones, to base claims on rigorous theorems or hard experimental
+        evidence rather than on intuition, and to show relevance to
+        real-world applications rather than toy examples.</a>"</li>
+<li>"<a href="https://www.wired.com/2003/08/why-a-i-is-brain-dead/" rel="nofollow">Only a small community has concentrated on general intelligence ... AI has been brain-dead since the 1970s.</a>" </li>
+</ul><p>
+    Consequently, the field currently called "AI" consists of many
+    loosely related subfields without a common foundation or framework,
+    and suffers from an identity crisis:
+</p><ul>
+<li><a href="http://en.wikipedia.org/wiki/AI_effect" rel="nofollow">External
+          recognition</a>: As soon as a problem is solved, it is no
+        longer considered as requiring "intelligence" anymore, so the AI community rarely gets credit. </li>
+<li><a href="http://www.aaai.org/Library/President/Brachman.pdf" rel="nofollow">Internal
+          fragmentation</a>: The subfields of AI become less and less
+        associated to one another, even though their problems are closely
+        related. </li>
+</ul>
+<h3><a name="TOC-A-new-spring"></a>A new spring</h3><p>
+    Roughly in the period of 2004 to 2007, calls for research on
+    general-purpose systems returned, both inside and outside mainstream
+    AI.
+    
+</p><p> Anniversaries are good time to review the big picture of the
+      field. In the following collections and events, many
+      well-established AI researchers raised the topic of
+      general-purpose and human-level intelligence: </p>
+<ul>
+<li><a href="http://www.aaai.org/ojs/index.php/aimagazine/issue/view/161/showToc" rel="nofollow">AI
+          Magazine 26(4), Winter 2005</a>: for the 25th Anniversary of
+        AAAI and AI Magazine </li>
+<li><a href="http://www.aaai.org/ojs/index.php/aimagazine/issue/view/165/showToc" rel="nofollow">AI
+          Magazine 27(4), Winter 2006</a>: for the 50th Anniversary of
+        AI </li>
+<li><a href="https://en.wikipedia.org/wiki/AI@50" rel="nofollow">AI@50</a>:
+        2006 Dartmouth Artificial Intelligence Conference: The Next
+        Fifty Years </li>
+</ul><p>
+    More or less coincidentally, from outside mainstream AI, there were several books with bold titles and novel technical approaches to produce
+    intelligence as a whole in computers:
+</p><ul>
+<li>Eric Baum, <a href="http://www.whatisthought.com/" rel="nofollow">What is
+          Thought?</a>, 2004 </li>
+<li>Jeff Hawkins, <a href="https://numenta.com/resources/papers-videos-and-more/on-intelligence/" rel="nofollow">On Intelligence</a>, 2004 </li>
+<li>Marcus Hutter, <a href="http://www.hutter1.net/ai/uaibook.htm" rel="nofollow">Universal
+          Artificial Intelligence</a>, 2005 </li>
+<li>Pei Wang, <a href="http://www.springer.com/west/home/computer/artificial?SGWID=4-147-22-173659733-0" rel="nofollow">Rigid
+Flexibility:
+          The Logic of Intelligence</a>, 2006 [The manuscript was finished in 2003.]</li>
+<li>Ben Goertzel &amp; Cassio Pennachin (Editors), <a href="http://www.springer.com/sgw/cda/frontpage/0,11855,4-147-22-43950079-0,00.html" rel="nofollow">Artificial General Intelligence</a>, 2007 [The manuscript was finished in 2003.] </li>
+</ul><p>
+    There were also several less technical but more influential books,
+    with the same optimism on the possibility of building
+    general-purpose AI:
+    
+</p><ul>
+<li>Ray Kurzweil, <a href="http://www.singularity.com/aboutthebook.html" rel="nofollow">The
+          Singularity Is Near: When Humans Transcend Biology</a>, 2005 </li>
+<li>Marvin Minsky, <a href="http://en.wikipedia.org/wiki/The_Emotion_Machine" rel="nofollow">The
+          Emotion Machine: Commonsense Thinking, Artificial
+          Intelligence, and the Future of the Human Mind</a>, 2006 </li>
+<li>Ben Goertzel, <a href="http://www.brownwalker.com/book.php?method=ISBN&amp;book=1581129890" rel="nofollow">The
+          Hidden Pattern: A Patternist Philosophy of Mind</a>, 2006 </li>
+<li>J. Storrs Hall, <a href="https://www.google.com/books/edition/Beyond_AI/j6ofAQAAIAAJ?hl=en" rel="nofollow">Beyond AI: Creating the Conscience of the Machine</a>, 2007 </li>
+</ul><p>
+    So after several decades, "general-purpose system", "integrated AI",
+    and "human-level AI" become less taboo (though still far from popular)
+    topics, as shown by several related meetings:
+    
+</p><ul>
+<li><a href="http://www.aaai.org/Library/Symposia/Fall/fs04-01.php" rel="nofollow">Achieving Human-Level Intelligence through Integrated Systems and Research, AAAI Fall Symposium (2004)</a>
+</li>
+<li><a href="http://www-cs.stanford.edu/groups/nips05-AI-Workshop/" rel="nofollow">Towards Human-Level AI?, NIPS Workshop (2005)</a>
+</li>
+<li><a href="http://www.aaai.org/Conferences/AAAI/2006/aaai06iictrack.php" rel="nofollow">AAAI conferences special track on Integrated Intelligent
+        Capabilities (2006)</a>
+</li>
+<li><a href="http://www.iospress.nl/book/advances-in-artificial-general-intelligence-concepts-architectures-and-algorithms/" rel="nofollow">Artificial General Intelligence Workshop (2006)</a></li>
+</ul>
+<h3><a name="TOC-It-s-summer-again"></a>It's summer again</h3><p>
+
+Since 2008, several research communities have emerged, with similar focuses and overlapping participants:
+</p><ul>
+<li>Artificial General Intelligence: <a href="http://www.agi-conf.org/" rel="nofollow">conferences</a>, <a href="https://sciendo.com/journal/JAGI" rel="nofollow">journal</a>, <a href="http://www.agi-society.org/" rel="nofollow">society</a> </li>
+<li>Biologically Inspired Cognitive Architectures: <a href="https://bica.ai/" rel="nofollow">conferences</a>, <a href="http://www.sciencedirect.com/science/journal/2212683X" rel="nofollow">journal</a>,
+        <a href="http://www.bicasociety.org/" rel="nofollow">society</a> </li>
+<li>Advances in Cognitive Systems: <a href="http://www.cogsys.org/journal" rel="nofollow">journal</a>, <a href="http://www.cogsys.org/" rel="nofollow">conferences</a></li>
+<li>IEEE Task Force on Towards Human-like Intelligence: <a href="http://www.mini.pw.edu.pl/%7Emandziuk/cis_tf_thli/" rel="nofollow">website</a>, <a href="http://www.mini.pw.edu.pl/~mandziuk/cis_tf_thli/?page=activities" rel="nofollow">conferences</a></li>
+</ul><p>
+More research books have been published:
+</p><ul>
+<li>Joscha Bach, <a href="https://global.oup.com/academic/product/principles-of-synthetic-intelligence-psi-an-architecture-of-motivated-cognition-9780195370676" rel="nofollow">Principles of Synthetic Intelligence PSI: An Architecture of Motivated Cognition</a>, 2009</li>
+<li>John Laird, <a href="http://mitpress.mit.edu/books/soar-cognitive-architecture" rel="nofollow">The Soar Cognitive Architecture</a>, 2012</li>
+<li>Pei Wang and Ben Goertzel (Editors), <a href="http://www.springer.com/computer/ai/book/978-94-91216-61-9" rel="nofollow">Theoretical
+          Foundations of Artificial General Intelligence</a>, 2012</li>
+<li>Pei Wang, <a href="http://www.worldscientific.com/worldscibooks/10.1142/8665" rel="nofollow">Non-Axiomatic
+Logic: A Model of Intelligent Reasoning</a>, 2013</li>
+<li>Ben Goertzel <i>et al.</i>, Engineering General Intelligence, <a href="http://www.springer.com/computer/ai/book/978-94-6239-026-3" rel="nofollow">Part 1</a> and <a href="http://www.springer.com/computer/ai/book/978-94-6239-029-4" rel="nofollow">Part 2</a>, 2014</li>
+</ul>
+<p>In mainstream AI, <a href="https://en.wikipedia.org/wiki/Deep_learning" rel="nofollow">deep learning</a> has made impressive progress in recent years, which raises many people's hope on "human-level" AI once again. The claim <a href="https://www.telegraph.co.uk/technology/news/10884839/Computer-passes-Turing-Test-for-the-first-time-after-convincing-users-it-is-human.html" rel="nofollow">"The Turing Test has been passed"</a> and the success of <a href="https://en.wikipedia.org/wiki/AlphaGo" rel="nofollow">AlphaGo</a> in the board game Go renewed the discussion on what "artificial intelligence" is really about, and how to reach it. There is still no consensus, and the <a href="https://content.sciendo.com/view/journals/jagi/11/2/article-p1.xml" rel="nofollow">opinions</a> are not even converging. Several large companies have labeled their results as "steps towards AGI", and their approaches are either extensions of deep learning or integrations of the existing AI techniques. This approach is exemplified by <a href="https://openai.com/research/gpt-4">GPT-4</a>, which is claimed by its creator as "a significant step towards AGI".
+</p>
+<p>
+Partly triggered by the recent progresses, more and more people consider AGI, or whatever it is called, as really possible. As a consequence, the risk and safety of it becomes a hot topic:
+</p><ul>
+<li><a href="https://en.wikipedia.org/wiki/Superintelligence:_Paths,_Dangers,_Strategies" rel="nofollow">Superintelligence: Paths, Dangers, Strategies</a> by Nick Bostrom, 2014</li>
+<li><a href="hhttps://futureoflife.org/open-letter/pause-giant-ai-experiments/" rel="nofollow">Pause Giant AI Experiments: An Open Letter</a> from the Future of Life Institute, 2023</li>
+</ul>
+
+<h2><a name="TOC-AGI-Basics"></a>AGI Basics</h2>
+<div><p>The most general questions every AGI researcher needs to answer include:
+  </p><ol><li>What is AGI, accurately specified?</li>
+<li>Is it possible to build the AGI as specified?</li>
+<li>If AGI is possible, what is the most plausible way to achieve it?</li>
+<li>Even if we know how to achieve AGI, should we really do it?</li>
+</ol><p>
+[My own answers to these questions are <a href="http://www.iiim.is/2010/05/questions-about-artificial-intelligence/" rel="nofollow">here</a>.]</p></div>
+<p>In the following the major answers in the field of AGI are summarized.</p>
+<h3><a name="TOC-What-is-AGI"></a>What is AGI</h3><p>
+Roughly speaking, Artificial General Intelligence (AGI) research has the following features:
+</p><ul>
+<li>Stressing on the <i>general-purpose</i> nature of intelligence,</li>
+<li>Taking a <i>holistic or integrative</i> viewpoint on intelligence,</li>
+<li>Believing the time has come to build an AI that is comparable to human intelligence.</li></ul><p>
+Therefore, "AGI" is closer to the original meaning "AI", while very different from the current mainstream "AI research", which focuses on domain-specific and problem-specific methods. "AGI" is similar or related to notions like "<a href="http://en.wikipedia.org/wiki/Strong_AI" rel="nofollow">strong AI</a>", "<a href="http://www-formal.stanford.edu/jmc/human/human.html" rel="nofollow">human-level AI</a>", "<a href="http://en.wikipedia.org/wiki/AI-complete" rel="nofollow">complete AI</a>", "<a href="http://cogprints.org/499/1/turing.html" rel="nofollow">thinking machine</a>", "<a href="http://en.wikipedia.org/wiki/Cognitive_computing" rel="nofollow">cognitive computing</a>", and some others. <a href="https://goertzel.org/who-coined-the-term-agi/">Here</a> is an explanation about the selection of the term "AGI".
+</p><p>
+Even though there is a vague consensus on the objective of reproducing "intelligence" as a whole in computers, the current AGI projects are not aimed at exactly the same goal. Though every AGI approach gets its inspiration from the same source, that is, human intelligence, here "intelligence" is understood in several senses. Consequently, AGI projects attempt to duplicate human intelligence at different levels of abstraction:
+</p><ul>
+<li><b>Structure</b><br>
+            Rationale: Intelligence is produced by the human brain. Therefore, to build an intelligent computer means to simulate the brain structure as faithfully as possible.<br>
+            Background: Neuroscience, biology, etc.<br>
+            Examples:&nbsp; <a href="http://en.wikipedia.org/wiki/Hierarchical_Temporal_Memory" rel="nofollow">HTM</a>,&nbsp;<a href="https://www.vicarious.com/" rel="nofollow">Vicarious</a><br>
+            Challenge: There may be biological details that are neither
+            possible nor necessary to be reproduced in AI systems.
+      </li>
+<li><b>Behavior</b><br>
+            Rationale: Intelligence is displayed in how the human beings
+            behave. Therefore, the goal should be to make a computer to behave exactly like a human.<br>
+            Background: Psychology, linguistics, etc.<br>
+            Examples: <a href="http://en.wikipedia.org/wiki/Turing_test" rel="nofollow">Turing
+              Test</a>, <a href="https://openai.com/blog/chatgpt/" rel="nofollow">ChatGPT</a><br>
+            Challenge: There may be psychological or social factors that are
+            neither possible nor necessary to be reproduced in AI
+            systems.
+      </li>
+<li><b>Capability</b><br>
+            Rationale: Intelligence is evaluated by problem-solving capability. Therefore, an intelligent system should be able to solve certain practical problem that is currently solvable by humans only.<br>
+            Background: Computer application guided by domain knowledge<br>
+            Examples: <a href="https://en.wikipedia.org/wiki/IBM_Watson" rel="nofollow">IBM Watson</a>, <a href="https://en.wikipedia.org/wiki/AlphaGo" rel="nofollow">AlphaGo</a><br>
+            Challenge: There is no defining problems of intelligence, and the
+            special-purpose solutions lack generality and flexibility.
+      </li>
+<li><b>Function</b><br>
+            Rationale: Intelligence is associated to a collection of cognitive
+            functionality, such as perceiving, reasoning, learning, acting, communicating, problem solving, etc. Therefore the goal is to reproduce these functions in computers.<br>
+            Background: Computer science<br>
+            Examples: <a href="http://aima.cs.berkeley.edu/chapters.html" rel="nofollow">Mainstream
+              AI textbooks</a>, <a href="http://soar.eecs.umich.edu/" rel="nofollow">Soar</a><br>
+            Challenge: The AI techniques developed so far are highly
+            fragmented and rigid, and it is hard for them to work together.
+      </li>
+<li><b>Principle</b><br>
+            Rationale: Intelligence is a form of rationality or
+            optimality. Therefore, an intelligent system should always "do the right thing" according to certain general principles.<br>
+            Background: Logic, mathematics, etc.<br>
+            Examples: <a href="http://www.hutter1.net/ai/uaibook.htm" rel="nofollow">AIXI</a>, <a href="https://cis.temple.edu/~pwang/NARS-Intro.html">NARS</a>
+<br>
+            Challenge: There are too many aspects in intelligence and cognition to be explained and reproduced by a
+            simple theory.</li></ul>
+<p>
+From top to bottom, they correspond to descriptions of human intelligence in more and more general level, and to reproduce that description in computer systems. Since different descriptions have different granularity and scope, the above objectives are related, but still very different, and do not subsume each other. The best way to achieve one is usually not a good choice for the others. [A more detailed discussion of this issue can be found <a href="https://content.sciendo.com/view/journals/jagi/10/2/article-p1.xml" rel="nofollow">here</a>.]
+</p><p>
+The "general purpose" nature of AGI has also obtained different interpretations over the years, as meaning
+</p>
+<p><i><ol>
+<li>Can solve all problems,</li>
+<li>Can solve all human-solvable problems,</li>
+<li>Can solve all computable problems,</li>
+<li>Can try to solve all representable problems.</li>
+</ol></i></p><p>
+Because of this diversity in research goal, in AGI currently there is no commonly accepted evaluation criteria (such as milestones and benchmarks).
+
+</p>
+<h3><a name="TOC-Limitations-and-objections"></a>Limitations and objections</h3><p>
+
+Since the idea of AI or "thinking machine" appeared, there have been various objections against its possibility. Some people claimed that they have proved that AGI, or whatever it is called, is theoretically impossible, due to certain fundamental limitations of computers.
+</p><p>
+Many researchers have argued against these objections. Classical arguments can be found in the following works:
+</p>
+<ul>
+<li><a href="http://cogprints.org/499/1/turing.html" rel="nofollow">Computing machinery and
+    intelligence</a>, Alan M. Turing</li>
+<li><a href="http://en.wikipedia.org/wiki/G%C3%B6del%2C_Escher%2C_Bach" rel="nofollow">G<span color="#6a6a6a" face="Arial">ö</span>del, Escher, Bach: An Eternal Golden Braid</a>, Douglas R. Hofstadter</li>
+</ul><p>
+Obviously, all AGI researchers believe that AGI can be achieved (though they have different interpretations to the term). In the <a href="http://www.cis.temple.edu/~pwang/Publication/AGI_Aspects.pdf" rel="nofollow">introductory chapter of the AGI 2006 Workshop Proceedings</a>, I and Ben Goertzel responded to the following common doubts and objections of this research:
+</p><ul><i>
+<li>AGI is impossible.</li>
+<li>There is no such a thing as general intelligence.</li>
+<li>General-purpose systems are not as good as special-purpose ones.</li>
+<li>AGI is already included in the current AI.</li>
+<li>It is too early to work on AGI.</li>
+<li>AGI is nothing but hype.</li>
+<li>AGI research is not fruitful.</li>
+<li>AGI is dangerous.</li>
+</i></ul>
+<p>Some of the doubts about the possibility of AGI come from misconceptions on what AGI attempts to achieve or what computers can do. The previous subsection has clarified the former issue, while an analysis of the latter issue can be found <a href="http://www.cis.temple.edu/~pwang/Publication/AI_Misconceptions.pdf" rel="nofollow">here</a>.</p>
+<h3><a name="TOC-Strategies-and-techniques"></a>Strategies and techniques</h3><p>
+
+On one hand, the ultimate goal of AGI is to reproduce intelligence as a whole, while on the other hand, engineering practice must be step-by-step. To resolve this dilemma, three overall strategies have been proposed:
+    
+</p><ul>
+<li><b>Hybrid</b><br>
+            Approach: To develop individual functions first (using
+            different theories and techniques), then to connect them
+            together.<br>
+            Argument: <a href="http://www.aaai.org/Library/President/Brachman.pdf" rel="nofollow">(AA)AI:
+              More than the Sum of Its Parts</a>, Ronald Brachman<br>
+            Difficulty: Compatibility of the theories and techniques
+      </li>
+<li><b>Integrated</b><br>
+            Approach: To design an architecture first, then to design
+            its modules (using various techniques) accordingly.<br>
+            Argument: <a href="http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.233.1596" rel="nofollow">Cognitive
+              Synergy: A Universal Principle for Feasible General
+              Intelligence?</a>, Ben Goertzel<br>
+            Difficulty: Isolation, specification, and coordination of
+            the functions
+      </li>
+<li><b>Unified</b><br>
+            Approach: Using a single technique to start from a core
+            system, then to extend and augment it incrementally.<br>
+            Argument: <a href="http://www.cis.temple.edu/%7Epwang/Publication/unifiedAI.pdf" rel="nofollow">Toward
+              a Unified Artificial Intelligence</a>, Pei Wang<br>
+            Difficulty: Versatility and extensibility of the core technique
+      </li>
+</ul><p>
+Obviously, the selection of development strategy partially depends on the selection of the research objective.
+</p>
+<div><p>At the current time, the major techniques used in AGI projects include, though are not limited to:
+</p><ul><li>logic</li>
+<li>probability theory</li>
+<li>production system</li>
+<li>graph theory</li>
+<li>knowledge base</li>
+<li>learning algorithm</li>
+<li>neural network</li>
+<li>evolutionary computation</li>
+<li>robotics</li>
+<li>multi-agent system</li></ul><p>
+Though each of these techniques is also explored in mainstream AI, to use it in a general-purpose system leads to very different design decisions in technical details.</p><h3><a name="TOC-The-ethics-of-AGI"></a>The ethics of AGI</h3>
+<p>Even if we have found out how to achieve AGI, it does not necessarily mean we really want to do it. Like all major scientific discoveries and technical breakthroughs, AGI has the potential to revolutionize our life and even the fate of the human species, either in a desired way or an undesired way — or, as things usually go, a mixture of the two.
+</p>
+<p>AGI researchers are aware of their responsibility on this topic, though most of them think that, according to the currently available evidence, progress in AGI research will benefit the human species, rather than to destroy it. Discussions on how to make AGI "safe" have existed in AGI meetings since the very beginning. Sample discussions include</p>
+<ul>
+<li><a href="http://agi-conf.org/2008/" rel="nofollow">AGI-08</a> had a workshop on <a href="http://agi-conf.org/2008/workshop/" rel="nofollow">The Sociocultural, Ethical and Futurological Implications of Artificial General Intelligence</a></li>
+<li><a href="http://agi-conf.org/2012/" rel="nofollow">AGI-12</a> was jointly sponsored by Oxford's <a href="https://www.fhi.ox.ac.uk/" rel="nofollow">Future of Humanity Institute</a>. In this conference, many papers address ethical and moral issues</li>
+</ul>
+<p>Of course, many crucial problems remain open, but to find their solutions, the research of AGI should be speed up, rather than slowed down. Once again, some wide-spreading concerns and fears about AGI are based on misconceptions about the nature of AGI.</p>
+	
+<h2><a name="TOC-Representative-AGI-Projects"></a>Representative AGI Projects</h2><p>
+
+The following projects are selected to represent the current AGI research, as for each of them, it can be said that</p></div>
+<div>
+<ol><li>It is clearly oriented to AGI (that is why IBM's Watson and DeepMind's AlphaGo are not included)</li>
+<li>It is still very active (that is why Pollock's OSCAR and Brooks' Cog are no longer included)</li>
+<li>It has ample publications on technical details (that is why many recent AGI projects are not included yet, except GPT-4 that is used to represent various deep learning projects toward AGI)</li>
+</ol>
+<p>The projects are listed in alphabetical order. Each project name is linked to the project website, where the following quotations are extracted. The focus of the quotations is on the research goal (the 1st question) and technical path (the 3rd question). Two publications on the project are selected, usually one brief introduction and one detailed description.</p>
+<blockquote><i>
+</i></blockquote>
+<p><b><a href="http://act-r.psy.cmu.edu/" rel="nofollow">ACT-R</a></b>
+[<a href="http://act-r.psy.cmu.edu/wordpress/wp-content/uploads/2012/12/526FSQUERY.pdf" rel="nofollow">An Integrated Theory of the Mind</a>; <a href="http://act-r.psy.cmu.edu/book/" rel="nofollow">The Atomic Components of Thought</a>]
+    <i>
+<blockquote>
+    ACT-R is a cognitive architecture: a theory for simulating and
+          understanding human cognition. Researchers working on ACT-R
+          strive to understand how people organize knowledge and produce
+          intelligent behavior. As the research continues, ACT-R evolves
+          ever closer into a system which can perform the full range of
+          human cognitive tasks: capturing in great detail the way we
+          perceive, think about, and act on the world. 
+<p>
+On the exterior, ACT-R looks like a programming language;
+          however, its constructs reflect assumptions about human
+          cognition. These assumptions are based on numerous facts
+          derived from psychology experiments. Like a programming
+          language, ACT-R is a framework: for different tasks (e.g.,
+          Tower of Hanoi, memory for text or for list of words, language
+          comprehension, communication, aircraft controlling),
+          researchers create models (aka programs) that are written in
+          ACT-R and that, beside incorporating the ACT-R's view of
+          cognition, add their own assumptions about the particular
+          task. These assumptions can be tested by comparing the results
+          of the model with the results of people doing the same tasks.
+     </p>
+<p>
+     ACT-R is a hybrid cognitive
+          architecture. Its symbolic structure is a production system;
+          the subsymbolic structure is represented by a set of massively
+          parallel processes that can be summarized by a number of
+          mathematical equations. The subsymbolic equations control many
+          of the symbolic processes. For instance, if several
+          productions match the state of the buffers, a subsymbolic
+          utility equation estimates the relative cost and benefit
+          associated with each production and decides to select for
+          execution the production with the highest utility. Similarly,
+          whether (or how fast) a fact can be retrieved from declarative
+          memory depends on subsymbolic retrieval equations, which take
+          into account the context and the history of usage of that
+          fact. Subsymbolic mechanisms are also responsible for most
+          learning processes in ACT-R.
+        </p>
+</blockquote>
+</i>
+<b><a href="https://openaera.org/" rel="nofollow">AERA</a></b>
+[<a href="https://alumni.media.mit.edu/~kris/ftp/AnytimeBoundedRationalityagi15_nivelEtAl.pdf" rel="nofollow">Anytime Bounded Rationality</a>; <a href="https://alumni.media.mit.edu/~kris/ftp/AERA-RUTR-SCS13002.pdf" rel="nofollow">Autocatalytic Endogenous Reflective Architecture</a>]
+    <i>
+<blockquote>
+    AERA is a cognitive architecture - and a blueprint - for constructing agents with high levels of operational autonomy, starting from only a small amount of designer-specified code – a seed. Using a value-driven dynamic priority scheduling to control the parallel execution of a vast number of lines of reasoning, the system accumulates increasingly useful models of its experience, resulting in recursive self-improvement that can be autonomously sustained after the machine leaves the lab, within the boundaries imposed by its designers. 
+<p>
+AERA demonstrates domain-independent self-supervised cumulative learning of complex tasks. Unlike contemporary AI systems, AERA-based agents excel at handling novelty - situations, information, data, tasks - that their programmers could not anticipate. It is the only implementable / implemented system in existence for achieving bounded recursive self-improvement.
+     </p>
+<p>
+     AERA-based agents learn cumulatively from experience by interacting with the world and generating compositional causal-relational micro-models of its experience. Using non-axiomatic abduction and deduction, it constantly predicts how to achieve its active goals and what the future may hold, generating a flexible opportunistically-interruptable plan for action.
+        </p>
+</blockquote>
+</i>
+<b><a href="http://www.hutter1.net/ai/index.htm" rel="nofollow">AIXI</a></b>  [<a href="http://www.hutter1.net/ai/aixigentle.htm" rel="nofollow">Universal Algorithmic Intelligence: A mathematical top-&gt;down approach</a>; <a href="http://www.hutter1.net/ai/uaibook.htm" rel="nofollow">Universal Artificial Intelligence</a><span>]</span><i>
+<blockquote>An important observation is that most, if not all known facets of intelligence can be formulated as goal driven or, more precisely, as maximizing some utility function.
+<p>Sequential decision theory formally solves the problem of rational agents in uncertain worlds if the true environmental prior probability distribution is known. Solomonoff's theory of universal induction formally solves the problem of sequence prediction for unknown prior distribution. We combine both ideas and get a parameter-free theory of universal Artificial Intelligence. We give strong arguments that the resulting AIXI model is the most intelligent unbiased agent possible.</p>
+<p>The major drawback of the AIXI model is that it is uncomputable, ... which makes an implementation impossible. To overcome this problem, we constructed a modified model AIXItl, which is still effectively more intelligent than any other time t and length l bounded algorithm.</p>
+</blockquote>
+</i>
+<b><a href="http://www.cyc.com/" rel="nofollow">Cyc</a></b> [<a href="http://www.csee.umbc.edu/courses/471/papers/cyc95.pdf" rel="nofollow">Cyc: A Large-Scale Investment in Knowledge Infrastructure</a>; <a href="https://www.researchgate.net/publication/220545983_D_B_Lenat_and_R_V_Guha_Building_Large_Knowledge-Based_Systems_Representation_and_Inference_in_the_Cyc_Project" rel="nofollow">Building Large Knowledge-Based Systems</a>]<i>
+<blockquote>Vast amounts of commonsense knowledge, representing human consensus reality, would need to be encoded to produce a general AI system. In order to mimic human reasoning, Cyc would require background knowledge regarding science, society and culture, climate and weather, money and financial systems, health care, history, politics, and many other domains of human experience. The Cyc Project team expected to encode at least a million facts spanning these and many other topic areas.
+<p>The Cyc knowledge base (KB) is a formalized representation of a vast quantity of fundamental human knowledge: facts, rules of thumb, and heuristics for reasoning about the objects and events of everyday life. The medium of representation is the formal language CycL. The KB consists of terms -- which constitute the vocabulary of CycL -- and assertions which relate those terms. These assertions include both simple ground assertions and rules.</p>
+</blockquote>
+</i>
+<b><a href="https://openai.com/research/gpt-4" rel="nofollow">GPT-4</a></b> [<a href="https://cdn.openai.com/papers/gpt-4.pdf" rel="nofollow">GPT-4 Technical Report</a>; <a href="https://arxiv.org/abs/2303.12712">Sparks of Artificial General Intelligence</a>]<i>
+<blockquote>
+We’ve created GPT-4, the latest milestone in OpenAI’s effort in scaling up deep learning. GPT-4 is a large multimodal model (accepting image and text inputs, emitting text outputs) that, while less capable than humans in many real-world scenarios, exhibits human-level performance on various professional and academic benchmarks. <p>
+The combination of the generality of GPT-4's capabilities, with numerous abilities spanning a broad swath of domains, and its performance on a wide spectrum of tasks at or beyond human-level, makes us comfortable with saying that GPT-4 is a significant step towards AGI.</p>
+</blockquote>
+</i>
+<b><a href="http://en.wikipedia.org/wiki/Hierarchical_Temporal_Memory" rel="nofollow">HTM</a></b> [<a href="http://numenta.com/assets/pdf/whitepapers/hierarchical-temporal-memory-cortical-learning-algorithm-0.2.1-en.pdf" rel="nofollow">Hierarchical Temporal Memory</a>; <a href="http://www.onintelligence.org/" rel="nofollow">On Intelligence</a>]<i>
+<blockquote>At the core of every Grok model is the Cortical Learning Algorithm (CLA), a detailed and realistic model of a layer of cells in the neocortex. Contrary to popular belief, the neocortex is not a computing system, it is a memory system. When you are born, the neocortex has structure but virtually no knowledge. You learn about the world by building models of the world from streams of sensory input. From these models, we make predictions, detect anomalies, and take actions.
+<p>In other words, the brain can best be described as a predictive modeling system that turns predictions into actions. Three key operating principles of the neocortex are described below: sparse distributed representations, sequence memory, and on-line learning.</p>
+</blockquote>
+</i><b><a href="http://ccrg.cs.memphis.edu/projects.html" rel="nofollow">LIDA</a></b>
+[<a href="http://ccrg.cs.memphis.edu/assets/papers/zo-1010-lida-060403.pdf" rel="nofollow">The LIDA Architecture</a>;
+<a href="http://ccrg.cs.memphis.edu/tutorial/tutorial.html" rel="nofollow">LIDA Tutorial</a>]
+  <i>
+  <blockquote>
+Implementing and fleshing out
+          a number of psychological and neuroscience theories of
+          cognition, the LIDA conceptual model aims at being a cognitive
+          "theory of everything." With modules or processes for
+          perception, working memory, episodic memories,
+          "consciousness," procedural memory, action selection,
+          perceptual learning, episodic learning, deliberation,
+          volition, and non-routine problem solving, the LIDA model is
+          ideally suited to provide a working ontology that would allow
+          for the discussion, design, and comparison of AGI systems. The
+          LIDA technology is based on the LIDA cognitive cycle, a sort
+          of "cognitive atom." The more elementary cognitive modules
+          play a role in each cognitive cycle. Higher-level processes
+          are performed over multiple cycles.
+    
+<p>
+     The LIDA architecture
+          represents perceptual entities, objects, categories,
+          relations, etc., using nodes and links .... These serve as
+          perceptual symbols acting as the common currency for
+          information throughout the various modules of the LIDA
+          architecture.</p>
+</blockquote>
+</i><b><a href="http://cognitive-ai.com/" rel="nofollow">MicroPsi</a></b><span>  [</span><a href="http://cognitive-ai.com/publications/assets/MicroPsiArchitectureICCM03.pdf" rel="nofollow">The MicroPsi Agent Architecture</a><span>;  </span><a href="https://global.oup.com/academic/product/principles-of-synthetic-intelligence-psi-an-architecture-of-motivated-cognition-9780195370676?cc=us&amp;lang=en&amp;" rel="nofollow">Principles of Synthetic Intelligence</a><span>]</span><i>
+<blockquote>The MicroPsi agent architecture describes the interaction of emotion, 
+motivation and cognition of situated agents, mainly based on the Psi 
+theory of Dietrich Dorner. 
+The Psi theory addresses emotion, perception, representation and bounded
+ rationality, but being formulated within psychology, has had relatively
+ little impact on the discussion of agents within computer science. 
+MicroPsi is a formulation of the original theory in a more abstract and 
+formal way, at the same time enhancing it with additional concepts for 
+memory, building of ontological categories and attention.
+<p>The agent framework uses semantic networks, called node nets, that are a
+ unified representation for control structures, plans, sensory and 
+action schemas, Bayesian networks and neural nets. Thus it is possible 
+to set up different kinds of agents on the same framework.</p>
+</blockquote>
+</i><b><a href="http://opennars.org/">NARS</a></b><span>  [</span><a href="https://proceedings.mlr.press/v192/wang22a/wang22a.pdf">Intelligence: From Definition to Design</a><span>;  </span><a href="http://www.springer.com/west/home/computer/artificial?SGWID=4-147-22-173659733-0" rel="nofollow">Rigid Flexibility: The Logic of Intelligence</a><span>]</span><i>
+<blockquote>What makes NARS different from conventional reasoning systems is its ability to learn from its experience and to work with insufficient knowledge and resources. NARS attempts to uniformly explain and reproduce many cognitive facilities, including reasoning, learning, planning, etc, so as to provide a unified theory, model, and system for AI as a whole. The ultimate goal of this research is to build a thinking machine.
+<p>The development of NARS takes an incremental approach consisting four major stages. At each stage, the logic is extended to give the system a more expressive language, a richer semantics, and a larger set of inference rules; the memory and control mechanism are then adjusted accordingly to support the new logic.</p>
+<p>In NARS the notion of "reasoning" is extended to represent a system's ability to predict the future according to the past, and to satisfy the unlimited resources demands using the limited resources supply, by flexibly combining justifiable micro steps into macro behaviors in a domain-independent manner.</p>
+</blockquote>
+</i><b><a href="http://opencog.org/" rel="nofollow">OpenCog</a> </b><span>[</span><a href="https://arxiv.org/abs/2103.15100v3" rel="nofollow">The General Theory of General Intelligence: A Pragmatic Patternist Perspective</a><span>; Engineering General Intelligence, </span><a href="http://www.springer.com/computer/ai/book/978-94-6239-026-3" rel="nofollow">Part 1</a><span> and </span><a href="http://www.springer.com/computer/ai/book/978-94-6239-029-4" rel="nofollow">Part 2</a><span>]</span><i>
+<blockquote>OpenCog, as a software framework, aims to provide research scientists and software developers with a common platform to build and share artificial intelligence programs. The long-term goal of OpenCog is acceleration of the development of beneficial AGI.
+<p>OpenCogPrime is a specific AGI design being constructed within the OpenCog framework. It comes with a fairly detailed, comprehensive design covering all aspects of intelligence. The hypothesis is that if this design is fully implemented and tested on a reasonably-sized distributed network, the result will be an AGI system with general intelligence at the human level and ultimately beyond.</p>
+<p>While an OpenCogPrime based AGI system could do a lot of things, we are initially focusing on using OpenCogPrime to control simple virtual agents in virtual worlds. We are also experimenting with using it to control a Nao humanoid robot. See http://novamente.net/example for some illustrative videos.</p>
+</blockquote>
+</i><b><a href="http://cogarch.ict.usc.edu/" rel="nofollow">Sigma</a></b><span> [</span><a href="https://www.dropbox.com/s/bsfsyot89xl28zo/SM%20Symp%20Sigma%202017%20Revised%20D.pdf" rel="nofollow">Lessons from Mapping Sigma onto the Standard Model of the Mind</a><span>; </span><a href="https://sciendo.com/article/10.1515/jagi-2016-0001" rel="nofollow">The Sigma Cognitive Architecture and System</a><span>]</span><i>
+<blockquote>The goal of this effort is to develop a sufficiently efficient, 
+functionally elegant, generically cognitive, grand unified, cognitive 
+architecture in support of virtual humans (and hopefully intelligent 
+agents/robots – and even a new form of unified theory of human cognition
+ – as well).<p>
+
+Our focus is on the development of the <em>Sigma</em> (∑) architecture, which explores the <em>graphical architecture hypothesis</em>
+ that progress at this point depends on blending what has been learned 
+from over three decades worth of independent development of cognitive 
+architectures and <em>graphical models</em>, a broadly applicable state-of-the-art formalism for constructing intelligent mechanisms.  The result is a <em>hybrid</em> (discrete+continuous) <em>mixed</em>
+ (symbolic+probabilistic) approach that has yielded initial results 
+across memory and learning, problem solving and decision making, mental 
+imagery and perception, speech and natural language, and emotion and 
+attention.</p></blockquote>
+</i><b><a href="http://www.cse.buffalo.edu/sneps/" rel="nofollow">SNePS</a></b>
+[<a href="http://www.cse.buffalo.edu/%7Eshapiro/Papers/shabon09a.pdf" rel="nofollow">The
+GLAIR Cognitive Architecture</a>; <a href="http://www.cse.buffalo.edu/sneps/Tutorial/" rel="nofollow">SNePS Tutorial</a>]
+<i>
+<blockquote>
+The long term goal of the SNePS Research Group is to understand the
+          nature of intelligent cognitive processes by developing and
+          experimenting with computational cognitive agents that are
+          able to use and understand natural language, reason, act, and
+          solve problems in a wide variety of domains.
+          
+<p>
+          The SNePS knowledge representation, reasoning, and
+          acting system has several features that facilitate
+          metacognition in SNePS-based agents. The most prominent is the
+          fact that propositions are represented in SNePS as terms
+          rather than as logical sentences. The effect is that
+          propositions can occur as arguments of propositions, acts, and
+          policies without limit, and without leaving first-order logic.</p>
+</blockquote>
+</i></p><p><b><a href="http://soar.eecs.umich.edu/" rel="nofollow">Soar</a></b> [<a href="http://www.cse.msu.edu/~cse841/papers/Soar.pdf" rel="nofollow">A Gentle Introduction to Soar</a>; <a href="http://mitpress.mit.edu/books/soar-cognitive-architecture" rel="nofollow">The Soar Cognitive Architecture</a>]</p>
+<blockquote><i>The ultimate in intelligence would be complete rationality which would imply the ability to use all available knowledge for every task that the system encounters. Unfortunately, the complexity of retrieving relevant knowledge puts this goal out of reach as the body of knowledge increases, the tasks are made more diverse, and the requirements in system response time more stringent. The best that can be obtained currently is an approximation of complete rationality. The design of Soar can be seen as an investigation of one such approximation.
+<p>For many years, a secondary principle has been that the number of distinct architectural mechanisms should be minimized. Through Soar 8, there has been a single framework for all tasks and subtasks (problem spaces), a single representation of permanent knowledge (productions), a single representation of temporary knowledge (objects with attributes and values), a single mechanism for generating goals (automatic subgoaling), and a single learning mechanism (chunking). We have revisited this assumption as we attempt to ensure that all available knowledge can be captured at runtime without disrupting task performance. This is leading to multiple learning mechanisms (chunking, reinforcement learning, episodic learning, and semantic learning), and multiple representations of long-term knowledge (productions for procedural knowledge, semantic memory, and episodic memory).</p>
+<p>Two additional principles that guide the design of Soar are functionality and performance. Functionality involves ensuring that Soar has all of the primitive capabilities necessary to realize the complete suite of cognitive capabilities used by humans, including, but not limited to reactive decision making, situational awareness, deliberate reasoning and comprehension, planning, and all forms of learning. Performance involves ensuring that there are computationally efficient algorithms for performing the primitive operations in Soar, from retrieving knowledge from long-term memories, to making decisions, to acquiring and storing new knowledge.</p>
+</i></blockquote>
+<p><b>A rough classification</b></p><p>
+The above AGI projects are roughly classified in the following
+        table, according to the type of their answers to the previously
+        listed 1st question (on research goal) and 3rd question (on
+        technical path).
+</p>
+
+<center>
+<table>
+<tbody>
+<tr>
+<td><i>goal  \  path</i></td>
+<td><b>hybrid</b></td>
+<td><b>integrated</b></td>
+<td><b>unified</b></td>
+</tr>
+<tr>
+<td><b>principle</b></td>
+<td> </td>
+<td><br>
+</td>
+<td>AERA, AIXI, NARS</td>
+</tr>
+<tr>
+<td><b>function</b></td>
+<td><br>
+</td>
+<td>OpenCog, Sigma, Soar</td>
+<td>SNePS</td>
+</tr>
+<tr>
+<td><b>capability</b></td>
+<td><br>
+</td>
+<td><br>
+</td>
+<td>Cyc</td>
+</tr>
+<tr>
+<td><b>behavior</b></td>
+<td><br>
+</td>
+<td>ACT-R, LIDA, MicroPsi</td>
+<td>GPT-4</td>
+</tr>
+<tr>
+<td><b>structure</b></td>
+<td><br>
+</td>
+<td><br>
+</td>
+<td>HTM</td>
+</tr>
+</tbody>
+</table>
+</center>
+<p>
+Since this classification is made at a high level, projects in the same entry of the table are still quite different in the details of their research goals and technical paths.
+ </p>
+<p>
+In summary, the current AGI projects are based on very different theories and techniques.</p>
+<h2><a name="TOC-AGI-Literatures-and-Resources"></a>AGI Literatures and Resources</h2>
+<p>AGI collections:</p>
+<div>
+<ul><li>The earliest collection of AGI works is <a href="https://link.springer.com/book/10.1007/978-3-540-68677-4" rel="nofollow">Artificial General Intelligence</a>. Though this book was published in 2007, 
+the manuscript was finished in 2003.</li>
+<li><a href="https://www.iospress.com/catalog/books/advances-in-artificial-general-intelligence-concepts-architectures-and-algorithms" rel="nofollow">Advances in Artificial General Intelligence: Concepts, Architectures and Algorithms</a> is a post-conference proceedings of the 2006 AGI Workshop. The introductory chapter "<a href="https://cis.temple.edu/~pwang/Publication/AGI_Aspects.pdf" rel="nofollow">Aspects of Artificial General Intelligence</a>" clarified the notion of AGI and summarized the other chapters.</li>
+<li><a href="http://www.springer.com/computer/ai/book/978-94-91216-61-9" rel="nofollow">Theoretical Foundations of Artificial General Intelligence</a> is a collection co-authored by active AGI researchers. Each chapter address a theoretical topic in AGI, and is written in a non-technical style, so as to provide information for readers who are not AGI researchers.</li>
+<li><a href="https://www.amazon.com/Between-Ape-Artilect-Conversations-Transformative/dp/1496138171" rel="nofollow">Between Ape and Artilect: Conversations with Pioneers of Artificial General Intelligence and Other Transformative Technologies</a> contains some interviews of AGI researchers.</li></ul>
+<p>
+The <a href="http://agi-conf.org/" rel="nofollow">annual AGI international conference series</a> was started in 2008. The conference websites link to all accepted papers, plus additional materials like presentation files and video records.
+</p>
+<p>
+<a href="https://sciendo.com/journal/JAGI" rel="nofollow">Journal of Artificial General Intelligence</a> (JAGI) is a peer-reviewed journal with open access, started in 2009.</p>
+<p>The AGI conference and journal are managed by the <a href="http://www.agi-society.org/" rel="nofollow">Artificial General Intelligence Society</a> (AGIS). Everyone interested in AGI can become a member.
+</p><p>
+Communication venues and social media dedicated to AGI or related research:
+</p><ul>
+<li>AGI groups in Facebook: <a href="https://www.facebook.com/groups/propBitDev/" rel="nofollow">Artificial General Intelligence (AGI)</a>, <a href="https://www.facebook.com/groups/RealAGI/" rel="nofollow">Real AGI</a>,
+<a href="https://www.facebook.com/groups/396475193810786/" rel="nofollow">Artificial General Intelligence</a>, <a href="https://www.facebook.com/groups/722892624534381/" rel="nofollow">Artificial Cognition</a></li>
+<li><a href="https://www.linkedin.com/groups/1084997" rel="nofollow">AGI group</a> in LinkedIn</li>
+<li><a href="http://groups.google.com/group/artificial-general-intelligence">AGI group</a> in Google Group</li>
+<li><a href="https://agi.topicbox.com/" rel="nofollow">AGI mailing list</a> in Listbox</li>
+</ul>
+<p>Educational materials for students:</p>
+<ul>
+<li><a href="https://cis.temple.edu/~pwang/AGI-Curriculum.html">
+Suggested Education for Future AGI Researchers</a>, by Pei Wang</li>
+<li><a href="http://goertzel.org/agi-curriculum/" rel="nofollow">Sketch of an AGI Curriculum</a>, by Ben Goertzel</li>
+<li><a href="http://www.hutter1.net/ai/introref.htm" rel="nofollow">AI Recommendations</a>, by Marcus Hutter</li>
+<li><a href="http://www.agi-society.org/resources/" rel="nofollow">Videos of the past AGI Summer School lectures</a></li>
+</ul>
+<p>Other AGI resources:</p>
+<div>
+<ul><li>AGIS <a href="http://www.agi-society.org/resources/" rel="nofollow">resources page</a></li>
+<li><a href="http://en.wikipedia.org/wiki/Artificial_General_Intelligence" rel="nofollow">Artificial general intelligence page</a> in Wikipedia</li>
+<li><a href="http://www.scholarpedia.org/article/Artificial_General_Intelligence" rel="nofollow">Artificial general intelligence page</a> in Scholarpedia</li></ul>
+</div>
+</div>
+</div></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Firefox desktop extensions coming soon for the upcoming Android release (554 pts)]]></title>
             <link>https://blog.mozilla.org/addons/2023/08/10/prepare-your-firefox-desktop-extension-for-the-upcoming-android-release/</link>
             <guid>37084677</guid>
             <pubDate>Fri, 11 Aug 2023 03:09:30 GMT</pubDate>
@@ -51,7 +939,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Git-appraise – Distributed Code Review for Git (182 pts)]]></title>
+            <title><![CDATA[Git-appraise – Distributed Code Review for Git (196 pts)]]></title>
             <link>https://github.com/google/git-appraise</link>
             <guid>37084575</guid>
             <pubDate>Fri, 11 Aug 2023 02:52:46 GMT</pubDate>
@@ -178,7 +1066,42 @@ annotate the first revision in the review. They must conform to the
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Tetris, but the blocks are ARM instructions that execute in the browser (161 pts)]]></title>
+            <title><![CDATA[I fixed a bug the other day (102 pts)]]></title>
+            <link>https://www.javiergonzalez.io/blog/i-fixed-a-bug/</link>
+            <guid>37084262</guid>
+            <pubDate>Fri, 11 Aug 2023 02:06:47 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.javiergonzalez.io/blog/i-fixed-a-bug/">https://www.javiergonzalez.io/blog/i-fixed-a-bug/</a>, See on <a href="https://news.ycombinator.com/item?id=37084262">Hacker News</a></p>
+<div id="readability-page-1" class="page"><p>I fixed a bug that was in production for 2 years the other day. My boss said thank you, the UX researcher that called it out two years ago and was told it was not possible to do on our end said thank you. The product manager that had tried to tackle the issue a few times but gotten nowhere with their devs said thank you. It turns out that it was one of the biggest customer complaints and for some reason it had been neglected? ignored? idk. The change was about 20 lines of code, as they usually are, but had an outsized impact on customer satisfaction ratings. Why?</p><div><h3>The Issue</h3>
+<p>I work in supermarket systems. Think e-commerce on steroids. We do weekly ads (which are called circulars) and these have discounts, the app also handles enough work to employ hundreds of developers working on loyalty programs, personalized recommendations, organizing pick up, delivery, managing availability for orders that are fulfilled in a physical location (which is most orders) shopping lists, a custom cms..., you get the picture. The issue was that our system for weekly ad was having an issue where the ads needed to 'clip' a coupon (read hit an api) for the discounted price to reach our cart calculations. However, the api that we used for managing the weekly ads was managed by an external vendor, and often when we queried their endpoint, the coupon field was returning empty when it shouldn't. To the customer, this meant that they would click on a tile that says a discounted price in their description, but would hit their cart as full price. Really frustrating and a cause of many loud customer complaints.</p>
+<h3>Why was it hard to fix</h3>
+<p>It wasn't. It was, however an issue that was difficult to replicate in our lower test environments, as the data simply wasn't there. It was also an issue that had to do how the external provider formatted the data that they were passing to us. Because this data was missing a field, it required manual data entry to update it. However, this data changed in real time, so it was OFTEN out of date. Whenever this issue came up to developers, the reaction was always to blame the vendor. This is natural, as it technically was the vendor's fault. However, what became apparent is that people were not going below the surface level to get to the heart of what could be done.</p>
+<p>It became clear that this was an issue in <strong>process</strong> not in <strong>execution</strong>. The inertia in the company was to find why it would be hard to do, or impossible to do, why the fault lay elsewhere. We had spikes, and backlogs with this issue, but no action. I had never looked at this code, but was told to take a look, given that we seemed to have the data coming back in one of our API calls. Here's a diagram of the flow of info that we already had on our site:
+<img src="https://www.javiergonzalez.io/assets/i-fixed-a-bug-graphic.a273ed83.png"></p>
+<p>That's right, for any developer, the answer here is simple: use the coupons that we are ALREADY receiving on the frontend to populate the fields that users expect so they can get their discounts. Products already had the associated coupons, but we were simply ignoring that. Not only where we ignoring that, we said it was not possible to do. This reminds me of <a href="https://badsoftwareadvice.substack.com/p/how-to-debug-software">this article</a> I read on how to report a bug:</p>
+<ul>
+<li>Deny that there is a problem.</li>
+<li>Deny that it is your problem.</li>
+<li>Ask for more information.</li>
+<li>Complain.</li>
+</ul>
+<p>The real difficulty was in reproducing the data, so I completely hacked it, and replaced the api call service with a dumb function that returned hardcoded data copied from a production. As our principal engineer said to me when I told him about the hack to get the data in my local environment: "<strong>All data in lower environments is mock data</strong>".</p>
+<h3>The Solution</h3>
+<p>There is very little that is exciting about the bugfix. It was easy, a few array methods to ensure we were not searching for duplicates, and it even required one less API call than before. It worked nicely and the customer satisfaction scores went up as expected. What I did is come in as an outsider to the issue and this particular business concern, let my naivety guide my investigation and provided a solution within a few days. Why wasn't this done before is the more interesting question, and it seems to be related to a few things that are above my paygrade but are quite interesting to me.</p>
+<h3>Closing Thoughts</h3>
+<p>I like my company, and my direct managers, and several other people that I interact with in a regular basis. However, this was a case where the inertia of the status quo got the better of the organization at the expense of customer experience. I want to understand how this came to be, rather than to shift blame around, and to do there are a few things that I am paying attention to. The incentives and the feedback loops.</p>
+<p>A company that is not a startup has strange incentives opposed to some of the original ones when it is getting started. Here's the cycle described by <a href="https://thenetworkstate.com/left-is-the-new-right-is-the-new-left#the-libertarian-cycle">Balaji Srinivasan</a>:</p>
+<blockquote>
+<p>First, a libertarian(ish) founder leaves the stifling bureaucracy of a big company to start their own. Most immediately fail, but through pure maneuver warfare and relentless execution, that founder might be able to make enough money to hire someone. In the early days the most important quantity is the burn rate. Every single person must be indispensable.</p>
+<p>Eventually, if successful, the company starts building up some structure. Conservativism takes over. With the business growing consistently, the founder adds structure, career tracks, and a stable hierarchy. Now the most important quantity becomes the bus number, the number of people who can get hit by a bus such that the company is still functional. Suddenly every single person must now be&nbsp;<strong>dispensable</strong>.</p>
+</blockquote>
+<p><a href="https://medium.com/tech-tajawal/the-bus-factor-6ea1a3ede6bd">The bus factor</a> creates redundancy, and people being dispensable makes a strange feedback loop. When everyone is dispensable, as a good company should make their employees, there is a tension between owning your work and standing out, vs just doing the minimum. Where that line sits is not clear at all.</p>
+<p>This pressure and quite frankly this contradiction is an extremely difficult one to solve. Harvard and others have written about it <a href="https://hbr.org/2012/09/why-big-companies-cant-innovate">Why Big Companies Can't Innovate</a>. I am interested in this, because I am interested in doing work, at scale, within a company that has a culture of solving problems, not of being a behemoth with enough inertia to not need to correct when there is a need. Luckily, my team within the larger org values this nimble attitude of getting sh(stuff)t done, and was able to in some sense circumvent this inertia and this extreme risk aversion.</p>
+<p>I've also been thinking quite a bit of a company as a cybernetic system. You have a product, and that product has a shape which is shaped by the organizational structure (in Software Development, we call it <a href="https://en.wikipedia.org/wiki/Conway%27s_law">Conway's Law</a>). The product reflects the org, and the org reflects the product. This separation gets reinforced, and we were reinforcing invisible (and nonexistent to the customer) boundaries within ourselves and the vendors for no good reason. I want to investigate this notion of cybernetic systems and how to direct them in the context of a software company, so I'll be writing more about that.</p>
+<p>In the end, this issue revealed a flaw in process more than a flaw in the technical execution of our product. Of course a <a href="https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/">leaky abstraction</a> showed to the customer, but it was a matter of understanding it and patching it rather than allowing that distinction to continue and reinforce itself. As I progress in software, I am very interested in thinking of steering the cybernetic system of a corporation in order to get self reinforcing outcomes in an intentional direction. I will be writing on that more soon.</p>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Show HN: Tetris, but the blocks are ARM instructions that execute in the browser (185 pts)]]></title>
             <link>https://ofrak.com/tetris/</link>
             <guid>37083309</guid>
             <pubDate>Thu, 10 Aug 2023 23:56:03 GMT</pubDate>
@@ -198,7 +1121,7 @@ annotate the first revision in the review. They must conform to the
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[SQLite Functions for Working with JSON (142 pts)]]></title>
+            <title><![CDATA[SQLite Functions for Working with JSON (148 pts)]]></title>
             <link>https://www.sqlite.org/json1.html</link>
             <guid>37082941</guid>
             <pubDate>Thu, 10 Aug 2023 23:14:08 GMT</pubDate>
@@ -1297,7 +2220,7 @@ in its '$.partlist'.
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Source code for Quake 2 rerelease (475 pts)]]></title>
+            <title><![CDATA[Source code for Quake 2 rerelease (498 pts)]]></title>
             <link>https://github.com/id-Software/quake2-rerelease-dll</link>
             <guid>37082771</guid>
             <pubDate>Thu, 10 Aug 2023 22:57:10 GMT</pubDate>
@@ -2773,7 +3696,7 @@ sound = temp_sound &amp; ~(<span>0x4000</span> | <span>0x8000</span>)
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Git scraping: track changes over time by scraping to a Git repository (132 pts)]]></title>
+            <title><![CDATA[Git scraping: track changes over time by scraping to a Git repository (140 pts)]]></title>
             <link>https://simonwillison.net/2020/Oct/9/git-scraping/</link>
             <guid>37082289</guid>
             <pubDate>Thu, 10 Aug 2023 21:57:24 GMT</pubDate>
@@ -2851,7 +3774,7 @@ sound = temp_sound &amp; ~(<span>0x4000</span> | <span>0x8000</span>)
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Llama 2 on ONNX runs locally (164 pts)]]></title>
+            <title><![CDATA[Llama 2 on ONNX runs locally (167 pts)]]></title>
             <link>https://github.com/microsoft/Llama-2-Onnx</link>
             <guid>37082117</guid>
             <pubDate>Thu, 10 Aug 2023 21:37:17 GMT</pubDate>
@@ -2919,7 +3842,7 @@ git submodule update</pre></div>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A Modern C Development Environment (203 pts)]]></title>
+            <title><![CDATA[A Modern C Development Environment (208 pts)]]></title>
             <link>https://interrupt.memfault.com/blog/a-modern-c-dev-env</link>
             <guid>37081833</guid>
             <pubDate>Thu, 10 Aug 2023 21:08:40 GMT</pubDate>
@@ -3777,7 +4700,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[My Overkill Home Network (448 pts)]]></title>
+            <title><![CDATA[My Overkill Home Network (463 pts)]]></title>
             <link>https://blog.networkprofile.org/my-home-network-complete-details-2023/</link>
             <guid>37081789</guid>
             <pubDate>Thu, 10 Aug 2023 21:05:20 GMT</pubDate>
@@ -3787,7 +4710,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
     </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A Grumman F11 Tiger Shot Itself Down (2021) (105 pts)]]></title>
+            <title><![CDATA[A Grumman F11 Tiger Shot Itself Down (2021) (106 pts)]]></title>
             <link>https://www.planeandpilotmag.com/news/pilot-talk/grumman-f11-tiger-shoot-itself-down/</link>
             <guid>37081752</guid>
             <pubDate>Thu, 10 Aug 2023 21:02:55 GMT</pubDate>
@@ -3819,7 +4742,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Was Y Combinator worth it? (172 pts)]]></title>
+            <title><![CDATA[Was Y Combinator worth it? (174 pts)]]></title>
             <link>https://tableflow.com/blog/was-y-combinator-worth-it</link>
             <guid>37081485</guid>
             <pubDate>Thu, 10 Aug 2023 20:41:05 GMT</pubDate>
@@ -3827,7 +4750,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 <div id="readability-page-1" class="page"><div fs-codehighlight-theme="base16/nebula" fs-codehighlight-element="code" id="content"><p>When people learn that we were part of a recent YC batch I usually get one of two reactions: "Cool… what is YC?" or "Was YC worth it?".</p><p>‍</p><p>Y Combinator (often just “YC”) is the top startup accelerator in the Bay Area, and arguably the world. It runs two “batches” each year – one in the Summer and one in the Winter. These batches last 3 months and consist of a kickoff retreat, meetups, talks from alumni, partner office hours, and regular group check-ins. (more about what happens <a href="https://www.ycombinator.com/about">here</a>)</p><p>They also provide funding. The <a href="https://www.ycombinator.com/deal">YC standard deal</a> usually equates to $500k for around 10% of the company. This is why people ask the second question.&nbsp;</p><p>So… was YC worth it? For us, absolutely!</p><p>I understand why people ask. 10% is a meaningful chunk of a company. While $500k sounds generous, many startups with traction could easily raise that money on much better terms. For companies in this position, there’s a difficult calculation to decide whether or not the benefits that come with YC are worth the less-favorable investment terms.</p><p>We, however, were not in this position. Eric and I still had full-time jobs when we were accepted. While we had been meeting regularly for a few months to discuss different ideas, we had absolutely zero traction, no working product, and very little validation. When we completed the application process, we thought of it more as a mental exercise than an actual chance at getting in. Luckily we did get in. This was much more due to our experience (technical background, worked at startups, friends/coworkers for 2+ years) than what we were working on (we pivoted anyway!).</p><p>So what did we get out of the experience?</p><h2>Ability to go full-time</h2><p>Starting a company takes a lot of time and energy. Doing it while having an existing job usually isn’t possible for any significant amount of time. So you’re kind of left choosing between two bad options: not making progress as quickly (working nights and weekends) OR not making any money while you figure out what you’re doing and attempt to fundraise. With YC, we were able to avoid this decision. When we applied and interviewed with YC, we still had our full-time jobs. Once we knew we’d have $500k to kickstart the company, the leap to founding was much less daunting.</p><h2>Overcoming imposter syndrome</h2><p>Even with a stereotypical founder background, I absolutely struggle with imposter syndrome. Am I really smart enough to be starting a company? Do I have the technical skills to hold my own with “10x engineers”? How am I going to figure out how to actually sell this thing? These are doubts I bet most founders experience when starting their journey.&nbsp;</p><p>YC is full of extremely bright founders, many of whom already have impressive achievements. That being said, they’re all trying to figure out the same things. Commiserating with batchmates on a weekly basis normalizes the challenges that you’re facing. Pivots no longer seem like a massive failure and instead feel like part of the process. Listening to raw, unfiltered stories directly from well-known alumni makes you realize that they faced similar challenges throughout their journey.</p><h2>Answering boring questions</h2><p>A critical part to founding and running a company is the business operations. This includes incorporating, tax filing, banking, working with lawyers, hiring contractors, configuring HR systems, and much, much more. With each one of these categories, there are likely dozens of decisions that will need to be made. Some of those are important decisions, others are easily updated in the future and don’t matter that much.</p><p>If you’re going at it alone, you’ll need to figure out which things matter and which don’t. And for the things that matter, you’ll need to figure out what the tradeoffs are between the available options. Most of these decisions are not exciting. They’re not fun to research. It probably ends up in most people Googling for hours and finding conflicting advice. With YC, all of these questions have come up before. After seeing thousands of companies, the YC partners typically know the tradeoffs and have clear recommendations. For the questions that aren’t already documented, you get access to the YC legal team for assistance.</p><h2>Adding legitimacy</h2><p>Attaching the YC brand to your name, both at a company and personal level, provides an immediate level of legitimacy to what you’re working on. Similar to how students from top universities get immediate recognition based on the strength of their program, YC founders also benefit greatly from their association with the accelerator.&nbsp;</p><p>It’s relatively easy to say you’re a “founder”. YC adds legitimacy by confirming that they interviewed you and believe your company is in the top percent of startups that applied. Additionally they have committed to providing $500k, a supportive community, and a wealth of other resources. For anyone looking to measure a company’s likelihood of success (investors, prospective employees, customers, concerned parents), having this additional support makes the company seem significantly more attractive.</p><h2>Founder community</h2><p>The YC community is often referenced as one of the program’s biggest selling points, and this is for good reason. During the batch, we forged strong friendships with many of our batchmates. We continue to meet on a regular basis to share updates, ideas, and provide support to each other. Having other people that can listen and empathize with the challenges you're experiencing goes a long way. While my family and friends have been extremely supportive, they can’t identify with many of the ups and downs of being a founder.</p><p>Not only are you kicking off the startup journey along with hundreds of other founders in your batch, you also have the support and contact information for thousands of alumni. This extremely valuable network provides an opportunity to connect with potential customers, investors, advisors, and future employees. Generally, YC founders are quick to give their time or respond to an email from another founder. This “pay it forward” mentality is part of the magic that makes the YC community so special.</p><p>‍</p><p>So, for us YC was a no-brainer. We were able to take the leap to founding our company, met brilliant batchmates and alumni, and we’ve already benefited greatly from the added legitimacy of being a “YC Company.” Beyond all of this, the founder experience has been more fun and less daunting by having the support of a world class community behind us.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HashiCorp Adopts Business Source License (503 pts)]]></title>
+            <title><![CDATA[HashiCorp Adopts Business Source License (521 pts)]]></title>
             <link>https://www.hashicorp.com/blog/hashicorp-adopts-business-source-license</link>
             <guid>37081306</guid>
             <pubDate>Thu, 10 Aug 2023 20:26:37 GMT</pubDate>
@@ -3852,7 +4775,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 <p>We know there will be additional questions, and we’ve assembled a set of <a href="https://hashi.co/license-faq">frequently asked questions</a> to help you better understand the changes. You can also watch the short video below for more information:</p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Amiga runs Michigan schools' heating and air conditioning systems (2015) (144 pts)]]></title>
+            <title><![CDATA[Amiga runs Michigan schools' heating and air conditioning systems (2015) (146 pts)]]></title>
             <link>https://www.woodtv.com/news/grand-rapids/1980s-computer-controls-grps-heat-and-ac/</link>
             <guid>37081129</guid>
             <pubDate>Thu, 10 Aug 2023 20:12:22 GMT</pubDate>
@@ -3934,7 +4857,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Turns out lowly thymus may be saving your life (133 pts)]]></title>
+            <title><![CDATA[Turns out lowly thymus may be saving your life (136 pts)]]></title>
             <link>https://news.harvard.edu/gazette/story/2023/08/turns-out-lowly-thymus-may-be-saving-your-life/</link>
             <guid>37080404</guid>
             <pubDate>Thu, 10 Aug 2023 19:07:38 GMT</pubDate>
@@ -3998,7 +4921,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Aurora I/O optimized config saved 90% DB cost (124 pts)]]></title>
+            <title><![CDATA[Aurora I/O optimized config saved 90% DB cost (126 pts)]]></title>
             <link>https://graphite.dev/blog/how-an-aws-aurora-feature-cut-db-costs</link>
             <guid>37079909</guid>
             <pubDate>Thu, 10 Aug 2023 18:29:48 GMT</pubDate>
@@ -4006,7 +4929,7 @@ Creating gcov results report<span>(</span>s<span>)</span> <span>in</span> <span>
 <div id="readability-page-1" class="page"><article><p>All of Graphite’s data lives on Amazon Aurora Postgres.</p><p>Our database load is sizable — far larger than a typical startup of our size. This is because we sync bidirectionally with GitHub for <strong>everything</strong> a user does on Graphite, so Aurora plays a crucial role in helping us handle and scale massive amounts of data.</p><p>If Uber were to sign up for Graphite tomorrow, we could handle the countless webhook events triggered through their GitHub repos. But, our AWS bill would skyrocket due to a high volume of database operations.</p><p>Regardless of if one Uber engineer or a hundred sign up for Graphite, we’d still actively diff all of Uber’s GitHub activity against Graphite’s state in Aurora - mostly to power features like custom notifications. Our original implementation made our Aurora costs account for over 80% of our AWS bill, which paid for several thousand daily active users (roughly 4000 queries per second).</p><h3>Try serverless?</h3><p>Aurora prices on two things: storage rate and I/O rate. Our storage rate was affordable because our instance size was relatively cheap. But, our I/O rate was significantly more expensive because of our GitHub syncing.</p><p>We looked at Aurora Serverless to get our costs down. It sounded promising: Only pay for capacity that’s consumed. However, we constantly ingested so many updates via GitHub that it resulted in us needing such a large instance size on Aurora Serverless that it cost us <em>more</em> than if we chose a fixed instance size on Aurora. Furthermore, our traffic rarely experienced dramatic fluctuations, so we didn’t need the ability to upscale/downscale automatically.</p><p>But still, the issue with our high I/O costs on Aurora remained.</p><h3>Christmas came early in May: Aurora I/O Optimized</h3><p>On one foggy morning in late May, I opened the RDS console and found a pop-up that may as well have had a ribbon bow on top:</p><p>AWS <a href="https://aws.amazon.com/about-aws/whats-new/2023/05/amazon-aurora-i-o-optimized/">released</a> “Aurora I/O optimized”, a cost optimization feature that directly addressed our high I/O costs by offering up to 40% cost savings where I/O charges exceed 25% of the total Aurora database spend.</p><p>This feature would only charge us for a slightly higher storage rate but no I/O charges — making pricing more predictable. As CTO, I immediately began work to migrate our Aurora setup.</p><p>We hoped with I/O Optimized that we’d see those “40% cost savings”. After the migration, our cost savings were a whopping <strong>90%.</strong></p><p>This was insane. Also, the migration itself was so simple: you can convert existing clusters with either a few clicks in the console, using the CLI, or AWS’s SDK.</p><p>We reached out to some contacts at AWS to find out why the Aurora team built this. Did I/O Optimized do some clever engineering with sharding and storing data in S3? Were they just feeling generous?</p><p>The answer we got was more the latter. The Aurora team wanted to enable more customers to run heavier I/O workloads without worrying about heavier costs.</p><h3>Conclusion</h3><p>We faced a massive bill on AWS due to high I/O costs, and I/O Optimized rescued us. Serverless did not benefit us as much as we expected. Hopefully our story encourages you to monitor your AWS bill, experiment with cost optimization, and keep an eye out for new features/updates from your database provider.</p></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Water Cooled Rooftop Solar Panels (116 pts)]]></title>
+            <title><![CDATA[Water Cooled Rooftop Solar Panels (118 pts)]]></title>
             <link>https://evergreenoffgrid.com/water-cooled-rooftop-solar-panels/</link>
             <guid>37079616</guid>
             <pubDate>Thu, 10 Aug 2023 18:05:41 GMT</pubDate>
