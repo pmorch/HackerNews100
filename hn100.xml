@@ -4,12 +4,394 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 15 Aug 2023 23:00:05 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 16 Aug 2023 00:00:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Requiring ink to scan a document–yet another insult from the printer industry (134 pts)]]></title>
+            <title><![CDATA[How Is LLaMa.cpp Possible? (146 pts)]]></title>
+            <link>https://finbarr.ca/how-is-llama-cpp-possible/</link>
+            <guid>37140013</guid>
+            <pubDate>Tue, 15 Aug 2023 22:18:17 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://finbarr.ca/how-is-llama-cpp-possible/">https://finbarr.ca/how-is-llama-cpp-possible/</a>, See on <a href="https://news.ycombinator.com/item?id=37140013">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content">
+    
+    
+    
+    <p><em>If you want to read more of my writing, I have a <a href="https://finbarrtimbers.substack.com/">Substack</a>. Articles will be posted simultaneously to both places.</em></p>
+
+<p>Recently, a <a href="https://github.com/ggerganov/llama.cpp">project</a> rewrote the <a href="https://github.com/facebookresearch/llama">LLaMa inference code</a> in raw C++. With some optimizations and quantizing the weights, this allows running a LLM locally on a wild variety of hardware:</p>
+
+<ul>
+  <li>On a <a href="https://twitter.com/rgerganov/status/1635604465603473408">Pixel5</a>, you can run the 7B parameter model at 1 tokens/s.</li>
+  <li>On a <a href="https://simonwillison.net/2023/Mar/11/llama/">M2 Macbook Pro</a>, you can get ~16 tokens/s with the 7B parameter model</li>
+  <li>You can <a href="https://twitter.com/miolini/status/1634982361757790209">even run the 7B model on a 4GB RAM Raspberry Pi</a>, albeit at 0.1 tokens/s.</li>
+</ul>
+
+<p>If you are like me, you saw this and thought: What? How is this possible? Don’t large models require expensive GPUs? I took my confusion and dove into the math surrounding inference requirements to understand the constraints we’re dealing with.</p>
+
+<p>Let’s start with GPUs. GPUs have two main benefits for deep learning:</p>
+
+<ol>
+  <li>They have a large amount of memory bandwidth (<a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf">A100</a>: 1935 GB/s, <a href="https://images.nvidia.com/aem-dam/Solutions/geforce/ada/ada-lovelace-architecture/nvidia-ada-gpu-architecture-whitepaper-1.03.pdf">4090</a>: 1008 GB/s)</li>
+  <li>They have a large amount of compute (<a href="https://www.nvidia.com/content/dam/en-zz/Solutions/Data-Center/a100/pdf/nvidia-a100-datasheet-us-nvidia-1758950-r4-web.pdf">A100</a>: 312 TFLOPS of FP16, <a href="https://images.nvidia.com/aem-dam/Solutions/geforce/ada/ada-lovelace-architecture/nvidia-ada-gpu-architecture-whitepaper-1.03.pdf">4090</a>: 82.6 TFLOPS of FP16)</li>
+</ol>
+
+<p>When we talk about memory bandwidth, we’re talking about how long it takes to move things from the HBM memory (i.e. the RAM) into the on-chip memory. To actually do math with the GPU, we need to move the matrices in question into the on-chip memory, which is quite small (40MB on an A100, compared to 40-80GB of RAM). Note that the memory bandwidth is ~2 orders of magnitude smaller than the compute performance— this will matter later, as the memory bandwidth tends to be the bottleneck for inference.</p>
+
+<p>What does this mean in the context of serving LLaMa? Let’s start with some <a href="https://kipp.ly/blog/transformer-inference-arithmetic/">inference arithmetic</a>. We can do some rough calculations on the inference performance of a LLM using <a href="https://kipp.ly/blog/transformer-param-count/">Kipply’s article</a><sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup>. First, some notation on the dimensions of the model:</p>
+
+<ul>
+  <li>The \(Q\), \(K\), and \(V\) weight matrices are all shape [ \(d_{\text{model}}\), \(d_{\text{head}}\)], and we have \(n_{\text{heads}}\) of them per layer; the attention output matrix has the same shape, for a total of  \(4 \times\) [ \(d_{\text{model}}\), \(n_{\text{heads}} \cdot d_{\text{head}}\)]. By convention, GPT-style networks have \(d_{\text{head}} \cdot n_{\text{heads}} = d_{\text{model}}\).</li>
+  <li>The MLP has two weight matrices, of shape [ \(d_{\text{model}}\), \(4 \cdot d_{\text{model}}\)] and [ \(4\cdot d_{\text{model}}\), \(d_{\text{model}}\)]</li>
+  <li>The embeddings matrix is of size [ \(d_{\text{vocab}}\), \(d_{\text{model}}\)].</li>
+</ul>
+
+<p>This gives us a handy equation for the number of parameters in a GPT-style model:<sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup></p><p>
+
+\[P = n_{\text{blocks}} \left( 4 \cdot d_{\text{model}}^2 + 2 \cdot 4 \cdot d_{\text{model}}^2\right) + n_{\text{vocab}} \cdot d_{\text{model}}\]
+
+</p><p>For the duration of the post, I’m going to focus on the case where we’re running a ChatGPT style service locally, which is what LLaMa.cpp does, letting me assume a batch size of 1.</p>
+
+<p>For efficient inference, the KV cache has to be stored in memory; the KV cache requires storing the KV values for every layer, which is equal to storing:</p><p>
+
+\[n_{\text{bytes}} \cdot 2 \cdot d_{\text{model}}\]
+
+</p><p>I use \(n_{\text{bytes}}\) here to indicate the number of bytes per param; for float32s, this is 4, for float16s, this is 2, etc. The 2 in the middle is because we have to store one set of weights for the K values, and one for the Vs.</p>
+
+<p>Given a model with n layers, the total memory for the KV cache is:</p><p>
+
+\[n_{\text{blocks}} \cdot n_{\text{bytes}} \cdot 2 \cdot d_{\text{model}}\]
+
+</p><p>In addition to storing the KV cache in memory, we also need to store the weights themselves in memory; this requires \(n_{\text{bytes}} \cdot P\) bytes.</p>
+
+<p><img src="https://finbarr.ca/static/images/llama-memory-weights.png" alt="Screenshot of table showing the memory required for LLaMa weights"></p>
+
+<p>This is the advantage of quantization. By using less precision, we can radically decrease the amount of memory needed to store our models in memory. Note that, with int4 precision, <em>all of these models fit into memory on an A100</em> (which is the standard datacenter GPU right now), and all of them, except for the biggest model, fit into memory on high-end consumer GPUs (3090s/4090s, which have 24GB of RAM).</p>
+
+<p>It takes approximately \(2P\) FLOPS to run inference on our model for a single token, because we are doing a bunch of matmuls with a total of \(P\) parameters, and multiplying a matrix of size \((m, n)\) with a vector of size \((n,)\) has a cost of \(2mn\).<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">3</a></sup></p>
+
+<p>With all that math out of the way, let’s calculate the requirements for running inference with LLaMa. The main requirements when it comes to sampling are:</p>
+
+<ol>
+  <li>Keep the KV cache in memory, in addition to all the parameters.</li>
+  <li>Read all the weights from HBM into the on-chip memory. Because we sample auto-regressively, we have to repeat this for each token we sample.</li>
+  <li>Do the actual matmuls to calculate the output of our network.</li>
+</ol>
+
+<p>The latency is the maximum of either the compute or the memory latency, as reading parameters into on-chip memory happens asynchronously in all modern tensor programming libraries. As a result, we write:</p><p>
+
+\[\begin{align*}
+\text{latency}_\text{model} &amp;= \text{max}(\text{latency}_\text{compute}, \text{latency}_\text{memory})\\
+\text{latency}_\text{memory} &amp;= \dfrac{2 \cdot P \cdot n_{\text{bytes}}\cdot B}{n_{\text{memory bandwidth}}},\\
+\text{latency}_\text{compute} &amp;= \dfrac{2 \cdot P}{n_{\text{flops}}},
+\end{align*}\]
+
+</p><p>where \(B\) is the batch size. As \(n_{\text{memory bandwidth}} = 1.935e12\), and  \(n_{\text{flops}} = 3.12e14,\) as long as the batch size is less than 161, the model is memory-bound.<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">4</a></sup></p>
+
+<p>With a batch size of 1, this is the same equation, as on most hardware (e.g. Nvidia GPUs), there is a linear speedup as you decrease the precision (you get twice the FLOPS when using fp16 vs fp32, which doubles again as you go to int8, and doubles once more as you go to int4s).</p>
+
+<p>As LLaMa.cpp uses int4s, the RAM requirements are reduced to 1.33GB of memory for the KV cache, and 16.25GB of VRAM for the model parameters. That’s pretty good!</p>
+
+<p>As the memory bandwidth is almost always<sup id="fnref:5" role="doc-noteref"><a href="#fn:5" rel="footnote">5</a></sup> much smaller than the number of FLOPS, memory bandwidth is the binding constraint.</p>
+
+<p><img src="https://finbarr.ca/static/images/llama-inference-times.png" alt="Screenshot fo table showing the inference times to run the varying LLaMa models with varying precision levels on an A100"></p>
+
+<h2 id="running-llama-on-an-a100">Running LLaMa on an A100</h2>
+
+<p>On an A100 (80GB PCIe), the memory bandwidth is 1935GB/s. The int4 compute is 1248 TOPS. As such, the model is (heavily) memory-bound. We should expect to see inferences as given in the table; roughly 30 tokens/s with the 65B model, and 277 tokens/s with the 7B model.</p>
+
+<h2 id="running-llama-on-a-m1-macbook-air">Running LLaMa on a M1 Macbook Air</h2>
+
+<p>The M1 GPU has a bandwidth of <a href="https://www.macworld.com/article/783678/m2-vs-m1-chip-performance-graphics-ram.html">68.25 GB/s</a>, while the M1 GPU can do up to <a href="https://tlkh.dev/benchmarking-the-apple-m1-max#heading-gpu-matrix-multiplication-gemm-performance">5.5 TFLOPS</a> of fp16 compute. As such, we should expect a ceiling of ~1 tokens/s for sampling from the 65B model with int4s, and 10 tokens/s with the 7B model.</p>
+
+<p>As the M2 Pro has 200 GB/s of bandwidth, and the M2 Max has 400 GB/s of bandwidth, we should expect massive improvements with them, going up to 6 tokens/s with the M2 Max with the 65B model. That’s pretty darn good for a laptop.</p>
+
+<h2 id="running-llama-on-a-raspberry-pi-4">Running LLaMa on a Raspberry Pi 4</h2>
+
+<p>A Raspberry Pi 4 has <a href="https://web.eece.maine.edu/~vweaver/group/green_machines.html">13.5 GFLOPS of compute</a>, and <a href="https://forums.raspberrypi.com/viewtopic.php?t=281183">~4GB/s of memory bandwidth</a>. Given this, we’d expect to see ~2 tokens/s with the 7B model if it was memory bound. Given that we’re currently seeing ~0.1 tokens/s, I suspect we’re actually compute-bound (although this is a stab in the dark— I can’t find enough information about the specs for a Raspberry Pi to determine this with any precision).</p>
+
+<h2 id="summary">Summary</h2>
+
+<p>Memory bandwidth is the limiting factor in almost everything to do with sampling from transformers. Anything that reduces the memory requirements for these models makes them <em>much</em> easier to serve— like quantization! This is yet another reason why distillation, or just <a href="https://finbarr.ca/llms-not-trained-enough/">training smaller models for longer</a>, is really important.</p>
+
+<p><em>Note: I’m not an expert in CUDA, so I probably have errors in my math. If so, please shoot me an <a href="mailto:finbarrtimbers@gmail.com">email</a> and let me know- I’d love to hear from you so I can learn more about how this works and update this post.</em></p>
+
+<p>Resources on transformer inference performance:</p>
+
+<ul>
+  <li><a href="https://lilianweng.github.io/posts/2023-01-10-inference-optimization/">Large Transformer Model Inference Optimization</a></li>
+  <li><a href="https://kipp.ly/blog/transformer-inference-arithmetic/">Transformer inference arithmetic</a></li>
+  <li><a href="https://kipp.ly/blog/transformer-param-count/">LLM parameter counting</a></li>
+  <li><a href="https://arxiv.org/abs/2009.06732">Efficient Transformers</a></li>
+</ul>
+
+<p><em>Thank you to <a href="https://twitter.com/kaushikpatnaik?lang=en">Kaushik Patnaik</a>, <a href="https://twitter.com/arthurallshire">Arthur Allshire</a>, <a href="https://twitter.com/stanislavfort">Stanislav Fort</a>, and <a href="https://twitter.com/banburismus_">Tom McGrath</a> for reading early drafts of this.</em></p>
+
+
+
+    
+    <p>PS if you want to read more of my writing, subscribe to my <a href="https://finbarrtimbers.substack.com/">Substack</a>.</p>
+    
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How should I read type system notation? (113 pts)]]></title>
+            <link>https://langdev.stackexchange.com/questions/2692/how-should-i-read-type-system-notation</link>
+            <guid>37138807</guid>
+            <pubDate>Tue, 15 Aug 2023 20:15:27 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://langdev.stackexchange.com/questions/2692/how-should-i-read-type-system-notation">https://langdev.stackexchange.com/questions/2692/how-should-i-read-type-system-notation</a>, See on <a href="https://news.ycombinator.com/item?id=37138807">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div itemprop="text">
+<p>The notation used to describe type systems varies from presentation to presentation, so giving a comprehensive overview is impossible. However, most presentations share a large, common subset, so this answer will attempt to provide a foundation of enough of the basics to understand variations on the common theme.</p>
+<h2>Syntax and grammars</h2>
+<p>Type systems as applied to programming language are <em>syntactic</em> systems. That is, a type system is a set of rules that operate on the (abstract) syntax of a programming language. For this reason, comprehensive treatments of type systems begin by providing the <a href="https://en.wikipedia.org/wiki/Formal_grammar" rel="noreferrer">grammar</a> of all the syntactic constructs considered by the type system using <a href="https://en.wikipedia.org/wiki/Backus%E2%80%93Naur_form" rel="noreferrer">BNF</a> notation. In the simplest typed languages, syntax is needed for precisely two things: <em>expressions</em> and <em>types</em>.</p>
+<p>For example, let’s consider the grammar for an extremely simple language of booleans and integers:
+<span>$$
+\begin{array}{rcll}
+e \hskip{-10mu}
+  &amp;::=&amp;\hskip{-10mu} \mathsf{true}\hskip{10mu}|\hskip{10mu}\mathsf{false} &amp;\textrm{boolean literal}\\
+  &amp; | &amp;\hskip{-10mu} 0 \hskip{5mu}|\hskip{5mu} 1 \hskip{5mu}|\hskip{5mu} {-1} \hskip{5mu}|\hskip{5mu} 2 \hskip{5mu}|\hskip{5mu} {-2} \hskip{5mu}|\hskip{5mu} \ldots &amp;\textrm{integer literal}\\
+  &amp; | &amp;\hskip{-10mu} \mathbf{if}\ e\ \mathbf{then}\ e\ \mathbf{else}\ e &amp;\textrm{conditional}\\
+  &amp; | &amp;\hskip{-10mu} e + e \hskip{10mu}|\hskip{10mu} e - e \hskip{10mu}|\hskip{10mu} e × e &amp;\textrm{arithmetic}\\
+  &amp; | &amp;\hskip{-10mu} e = e \hskip{10mu}|\hskip{10mu} e &lt; e \hskip{10mu}|\hskip{10mu} e &gt; e &amp;\textrm{comparison}\\[8pt]
+\tau \hskip{-10mu}
+  &amp;::=&amp;\hskip{-10mu} \mathsf{Bool} &amp;\textrm{booleans}\\
+  &amp; | &amp;\hskip{-10mu} \mathsf{Int} &amp;\textrm{integers}
+\end{array}
+$$</span>
+Here, <span>$e$</span> corresponds to an expression and <span>$\tau$</span> corresponds to a type, which is a standard notational convention. Some presentations use other symbols for types, such as <span>$t$</span>, <span>$T$</span>, <span>$\sigma$</span>, or other lowercase Greek letters, but the overall structure will look roughly the same.</p>
+<p>More complex languages will naturally have more complex grammars: imperative languages will include the grammar of statements, languages with pattern-matching will include the grammar of patterns, and so on. This language is so simple that it doesn’t even have variables! However, this core syntactic division between <em>terms</em> (things that have types) and <em>types</em> is essential, as defining the relationship between them is what type systems are all about.</p>
+<h2>Relations, judgments, axioms, and inference rules</h2>
+<p>Once the grammar has been specified, the next step is to define the <em>typing relation</em>, which is generally written <span>$e : \tau$</span> and can be read “<span>$e$</span> has type <span>$\tau$</span>”. Intuitively, we understand that some statements of this form “make sense” and others do not:</p>
+<ul>
+<li><p><span>$1 + 2 : \mathsf{Int}$</span> means “<span>$1 + 2$</span> has type <span>$\mathsf{Int}$</span>”, which certainly makes sense.</p>
+</li>
+<li><p><span>$1 + 2 : \mathsf{Bool}$</span> means “<span>$1 + 2$</span> has type <span>$\mathsf{Bool}$</span>”, which does <em>not</em> make sense.</p>
+</li>
+<li><p><span>$\mathsf{true} + 2 : \mathsf{Int}$</span> means “<span>$\mathsf{true} + 2$</span> has type <span>$\mathsf{Int}$</span>”, which makes even <em>less</em> sense, as the expression <span>$\mathsf{true} + 2$</span> is nonsense and does not have any type at all.</p>
+</li>
+</ul>
+<p>We’d like to write down some rules that precisely capture our intuitions about which statements “make sense” and which do not. To do this, we’ll define the <em>typing judgment</em>, which is written using the following notation:
+<span>$$
+⊢ e : \tau
+$$</span>
+Here, the <span>$⊢$</span> can be read to mean “the following statement is true”. (The <span>$⊢$</span> might seem a bit unnecessary, and indeed it is sometimes omitted in simple systems like this one, but it will play a more significant role later.) Using this notation, we can write down the some of the <em>typing rules</em> for our type system:
+<span>$$
+\begin{array}{l}\hline ⊢ \mathsf{true} : \mathsf{Bool}\end{array} \quad \quad
+\begin{array}{l}\hline ⊢ \mathsf{false} : \mathsf{Bool}\end{array}
+$$</span>
+The horizontal bar over each of these rules with nothing on top means that they are <em>always</em> true, which makes them <em>axioms</em>. We also have an infinite number of similar axioms for integer literals:
+<span>$$
+\begin{array}{l}\hline ⊢ 0 : \mathsf{Int}\end{array} \quad
+\begin{array}{l}\hline ⊢ 1 : \mathsf{Int}\end{array} \quad
+\begin{array}{l}\hline ⊢ -1 : \mathsf{Int}\end{array} \quad
+\begin{array}{l}\hline ⊢ 2 : \mathsf{Int}\end{array} \quad \cdots
+$$</span></p>
+<p>Of course, the typing rules for literals are fairly boring. Things get much more interesting when we consider rules for expressions that have subexpressions! Here are the typing rules for <span>$+$</span> and <span>$&lt;$</span>:
+<span>$$
+\begin{array}{l}
+⊢ e_1 : \mathsf{Int} \\
+⊢ e_2 : \mathsf{Int} \\
+\hline
+⊢ e_1 + e_2 : \mathsf{Int}
+\end{array} \quad \quad \quad \begin{array}{l}
+⊢ e_1 : \mathsf{Int} \\
+⊢ e_2 : \mathsf{Int} \\
+\hline
+⊢ e_1 &lt; e_2 : \mathsf{Bool}
+\end{array}
+$$</span>
+Now we have things both above <em>and</em> below the horizontal bars, which makes these <em>inference rules</em>. These represent conditional typing rules: the statement under the bar is true <strong>if</strong> all of the statements above the bar are true. For example, the first rule can be read as “if <span>$e_1 : \mathsf{Int}$</span> and <span>$e_2 : \mathsf{Int}$</span> are true, then <span>$e_1 + e_2 : \mathsf{Int}$</span> is true,” which should hopefully make intuitive sense.</p>
+<p>Rules for <span>$-$</span>, <span>$×$</span>, <span>$=$</span>, and <span>$&gt;$</span> are nearly identical to the ones given above, but the rule for <span>$\mathbf{if} \ldots \mathbf{then} \ldots \mathbf{else}$</span> must be slightly more complex. This is because the branches of these expressions can be any type, as long as they agree. That is, both
+<span>$$ \mathbf{if}\ \mathsf{true}\ \mathbf{then}\ 1\ \mathbf{else}\ 2 $$</span>
+and
+<span>$$ \mathbf{if}\ \mathsf{true}\ \mathbf{then}\ \mathsf{false}\ \mathbf{else}\ \mathsf{true} $$</span>
+are legal, but
+<span>$$
+\mathbf{if}\ \mathsf{true}\ \mathbf{then}\ 1\ \mathbf{else}\ \mathsf{true}
+$$</span>
+is not. To capture this, the typing rule uses a variable to stand for the type of the branches:
+<span>$$
+\begin{array}{l}
+⊢ e_1 : \mathsf{Bool} \\
+⊢ e_2 : \tau \\
+⊢ e_3 : \tau \\
+\hline
+⊢ \mathbf{if}\ e_1\ \mathbf{then}\ e_2\ \mathbf{else}\ e_3 : \tau
+\end{array}
+$$</span>
+When the rule is applied, any type may be picked for <span>$\tau$</span> as long as the choice is used consistently.</p>
+<p>This notation originates in formal logic, and in particular, the style used to specify type systems most closely resembles <a href="https://en.wikipedia.org/wiki/Natural_deduction" rel="noreferrer">natural deduction</a>. Though I will not go into the formal details of the notation in this answer, rules expressed in this way can be used to construct formal proofs about the system’s properties, which is important for proving things like <a href="https://en.wikipedia.org/wiki/Type_safety" rel="noreferrer">type soundness</a>.</p>
+<h2>Judgments as an algorithmic specification</h2>
+<p>So far, I’ve intentionally refrained from saying anything about the computational interpretation of typing judgments. In general, judgments are just logical rules, and some type systems specified this way do not directly correspond to a decidable typechecking algorithm. However, if you are not used to thinking about proof systems, this perspective can be extremely difficult to wrap your head around.</p>
+<p>Fortunately, in many cases, there <em>is</em> a way to read typing rules that directly yields a typechecking algorithm: it’s possible to interpret <span>$⊢ e : \tau$</span> as a <em>function</em> from an expression <span>$e$</span> to its type <span>$\tau$</span>. This is because there is usually exactly one rule defined for each case in the grammar of expressions, which makes it possible to think of each typing rule as a distinct case in a recursive typechecking function.</p>
+<p>For example, consider the rules for our little language given above. They correspond directly to an <span>$\mathrm{infer}$</span> function with the following shape:
+<span>$$
+\begin{array}{l}
+\mathrm{infer} : \mathsf{Expr} → \mathsf{Type} \\
+\mathrm{infer}(e) = \mathbf{match}\ e\ \mathbf{where} \\
+\quad \begin{alignedat}{2}
+  &amp;\mathsf{true}\ |\ \mathsf{false} &amp;&amp;↦ \mathsf{Bool} \\
+  &amp;0\ |\ 1\ |\ {-1}\ |\ 2\ |\ \ldots &amp;&amp;↦ \mathsf{Int} \\
+  &amp;e_1 + e_2 &amp;&amp;↦ \mathbf{assert}\: \mathrm{infer}(e_1) = \mathsf{Int}; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathbf{assert}\: \mathrm{infer}(e_2) = \mathsf{Int}; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathsf{Int} \\
+  &amp;e_1 &lt; e_2 &amp;&amp;↦ \mathbf{assert}\: \mathrm{infer}(e_1) = \mathsf{Int}; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathbf{assert}\: \mathrm{infer}(e_2) = \mathsf{Int}; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathsf{Bool} \\
+  &amp;\mathbf{if}\ e_1\ \mathbf{then}\ e_2\ \mathbf{else}\ e_3
+    &amp;&amp;↦ \mathbf{assert}\: \mathrm{infer}(e_1) = \mathsf{Bool}; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathbf{let}\: \tau = \mathrm{infer}(e_2); \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathbf{assert}\: \mathrm{infer}(e_3) = \tau; \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \tau
+\end{alignedat}
+\end{array}
+$$</span></p>
+<p>Even when it isn’t possible to perform such a direct translation from typing rules to typechecking algorithm, it can be extremely helpful to consider information flow when reasoning about logical judgments. That is, for the <span>$⊢ e : \tau$</span> judgment we defined above, <span>$e$</span> can be considered an “input” to the judgment and <span>$\tau$</span> considered an “output”. This strict directionality does not always apply to every rule in a type system, but it often applies to many of them, and it is a useful way to wrap your head around what the rules represent.</p>
+<h2>Variables, contexts, and environments</h2>
+<p>The language we’ve been using as a running example so far is exceptionally simple. One complication I’ve intentionally chosen to avoid so far is <em>variables</em>, but we need to consider them if we want to be able to write typing rules for any useful programming language. Let’s therefore expand our example language by adding functions, making it a variant of the <a href="https://en.wikipedia.org/wiki/Simply_typed_lambda_calculus" rel="noreferrer">simply typed lambda calculus</a> (STLC). This requires the following additions to the language’s grammar:
+<span>$$
+\begin{array}{rcll}
+e \hskip{-10mu}
+  &amp;::=&amp;\hskip{-10mu}\ldots\\
+  &amp; | &amp;\hskip{-10mu} x &amp;\textrm{variable}\\
+  &amp; | &amp;\hskip{-10mu} λx{:}\tau. e &amp;\textrm{function abstraction}\\
+  &amp; | &amp;\hskip{-10mu} e\ e &amp;\textrm{function application}\\[8pt]
+\tau \hskip{-10mu}
+  &amp;::=&amp;\hskip{-10mu}\ldots\\
+  &amp; | &amp;\hskip{-10mu} \tau → \tau &amp;\textrm{functions}
+\end{array}
+$$</span>
+Here, <span>$x$</span> stands for “some variable”. If you are unfamiliar with the lambda calculus, the notation used here might appear somewhat exotic, but it is likely not as foreign as it seems: the STLC syntax <span>$λx{:}\tau. e$</span> corresponds directly to <code>(x:τ) =&gt; e</code> in TypeScript, and <span>$f\ x$</span> corresponds to <code>f(x)</code>.</p>
+<p>With these additions to our grammar, the notation used for our typing relation does not change—it’s still just <span>$e : \tau$</span>—but the structure of our typing <em>judgment</em> must be extended. The trouble appears when we attempt to write a typing rule for variables:
+<span>$$
+\begin{array}{l}
+\hline
+⊢ x : \text{???}
+\end{array}
+$$</span>
+The problem is that the type of a variable depends on the <em>context</em> it appears in. Therefore, we need to extend the typing judgment to keep track of the types of all variables that happen to be in scope, which we do using the following notation:
+<span>$$
+Γ ⊢ e : \tau
+$$</span>
+<span>$Γ$</span> is called “the context” or “the type environment”, and the role of the <span>$⊢$</span> now becomes clearer: it separates contextual assumptions from the statement to be proved. The extended judgment can therefore be pronounced “under the context <span>$Γ$</span>, the expression <span>$e$</span> has type <span>$\tau$</span>”, and algorithmically, <span>$Γ$</span> can be considered an additional “input” to the judgment of type <code>Map&lt;Variable, Type&gt;</code>. However, formally speaking, every typing rule must be defined syntactically, so contexts are explicitly represented in typing rules as syntactic constructs with the following shape:
+<span>$$
+\begin{array}{rcll}
+Γ \hskip{-10mu}
+  &amp;::=&amp;\hskip{-10mu} \varnothing &amp;\textrm{empty context}\\
+  &amp; | &amp;\hskip{-10mu} Γ, x{:}\tau &amp;\textrm{variable binding}
+\end{array}
+$$</span>
+Sometimes <span>$\bullet$</span> is used instead of <span>$\varnothing$</span> to represent the empty context. Under this representation, a context is essentially an <a href="https://en.wikipedia.org/wiki/Association_list" rel="noreferrer">association list</a> mapping variable names to types.</p>
+<p>Most typing rules have no reason to care about the context. Most inference rules just pass it along unaltered, and most axioms ignore it altogether. For example, here are a couple typing rules from above adapted to our new judgment:
+<span>$$
+\begin{array}{l}\hline
+Γ ⊢ \mathsf{true} : \mathsf{Bool}
+\end{array} \quad \quad \begin{array}{l}
+Γ ⊢ e_1 : \mathsf{Int} \\
+Γ ⊢ e_2 : \mathsf{Int} \\
+\hline
+Γ ⊢ e_1 + e_2 : \mathsf{Int}
+\end{array}
+$$</span>
+However, the context is essential for two new typing rules, which handle variable uses and lambda expressions:
+<span>$$
+\begin{array}{l}
+x{:}\tau \in Γ \\
+\hline
+Γ ⊢ x : \tau
+\end{array} \quad \quad
+\begin{array}{l}
+Γ,x{:}\tau_1 ⊢ e : \tau_2 \\
+\hline
+Γ ⊢ (λx{:}\tau_1. e) : \tau_1 → \tau_2
+\end{array}
+$$</span>
+The second of these two rules is the more complex one, as it’s where all the magic happens: while typechecking the body <span>$e$</span> of the lambda expression, the context is extended with a new binding <span>$x{:}\tau_1$</span>. This information is then utilized by the first rule, which says that if there is a variable binding <span>$x$</span> with type <span>$\tau$</span> in the current context (and therefore in scope), then <span>$x$</span> has type <span>$\tau$</span>. In other words, the context is used as a communication mechanism to propagate information between these two rules.</p>
+<p>(Observant readers may note that this model does not handle variable shadowing. As a simplifying assumption, type systems specified this way usually assume that all variables have already been resolved and made unique.)</p>
+<p>If this still seems a bit confusing to you, it may help to consider the way these additions affect our <span>$\mathrm{infer}$</span> function from earlier:
+<span>$$
+\begin{array}{l}
+\mathrm{infer} : (\mathsf{Context}, \mathsf{Expr}) → \mathsf{Type} \\
+\mathrm{infer}(Γ, e) = \mathbf{match}\ e\ \mathbf{where} \\
+\quad \begin{alignedat}{2}
+  &amp;\ldots\\
+  &amp;x &amp;&amp;↦ \mathrm{lookup}(Γ, x) \\
+  &amp;(λx{:}\tau_1. e') &amp;&amp;↦ \mathbf{let}\: Γ' = \mathrm{extend}(Γ, x, \tau_1); \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathbf{let}\: \tau_2 = \mathrm{infer}(Γ', e'); \\
+    &amp;&amp;&amp;\phantom{{}↦{}} \mathsf{\tau_1 → \tau_2}
+\end{alignedat}
+\end{array}
+$$</span></p>
+<p>The only remaining rule we need to add to cope with the addition of functions is a rule for function application:
+<span>$$
+\begin{array}{l}
+Γ ⊢ e_1 : \tau_1 → \tau_2 \\
+Γ ⊢ e_2 : \tau_1 \\
+\hline
+Γ ⊢ e_1\ e_2 : \tau_2
+\end{array}
+$$</span>
+That’s it!</p>
+<h2>Other common notation and considerations</h2>
+<p>The above describes the large majority of notation used to specify type systems if measured by volume, but modifications and extensions to this foundation are extremely common. It would be impossible to cover all of them, but fortunately, good papers usually explain whatever nonstandard notation they choose to introduce. However, some conventions are common enough that they are often used without explanation; this section attempts to provide a basic survey and describe a few notational quirks.</p>
+<p>Since this is not and can never be an exhaustive list, please open a separate question if you find some notation not covered here!</p>
+<h2>Inference rule layout</h2>
+<p>So far, all of the examples in this answer have laid out inference rules in a very regular, vertical way. However, placing each condition on its own line is not by any means required, so several conditions may appear side-by-side:
+<span>$$
+\begin{array}{c}
+Γ ⊢ e_1 : \mathsf{Int} \hskip{25mu}
+Γ ⊢ e_2 : \mathsf{Int} \\
+\hline
+Γ ⊢ e_1 + e_2 : \mathsf{Int}
+\end{array}
+$$</span>
+Vertical and horizontal arrangement may even be combined within the same rule.</p>
+<h2>Side conditions</h2>
+<p>Usually, the conditions that appear above the horizontal bar in an inference rule are themselves judgments that must be satisfied by some combination of inference rules and axioms. However, this is not always the case: rules may also include arbitrary boolean expressions known as <em>side conditions</em>, which must all be true in order for the rule to be applied. The <span>$x{:}\tau \in Γ$</span> condition in our typing rule for variables is an example of a side condition.</p>
+<p>A special type of side condition that sometimes appears in algorithmic type systems is written <span>$\alpha\ \mathbf{fresh}$</span>. This means that <span>$\alpha$</span> should be a fresh type variable, i.e. a type variable distinct from all other type variables.</p>
+<h2>Subtyping</h2>
+<p>Subtyping introduces a weaker notion of consistency between types than strict equality, and the subtyping relation must be explicitly defined. It is usually denoted <span>$\tau_1 &lt;: \tau_2$</span>, which can be read as “<span>$\tau_1$</span> is a subtype of <span>$\tau_2$</span>”.</p>
+<p>The relation is often defined using the same syntax used to define judgments. For example, a very simple subtyping relation might introduce two special types, <span>$\top$</span> (pronounced “top”) and <span>$\bot$</span> (pronounced “bottom”), which are the supertype and subtype of all types, respectively. This relation can be expressed using three simple axioms:
+<span>$$
+\begin{array}{l}\hline \tau &lt;: \tau \end{array} \quad \quad
+\begin{array}{l}\hline \tau &lt;: \top \end{array} \quad \quad
+\begin{array}{l}\hline \bot &lt;: \tau \end{array}
+$$</span>
+The first rule is the reflexive rule, often abbreviated to “refl”, which states that every type is a subtype of itself and ensures that subtyping is strictly weaker than equality.</p>
+<p>The defined subtyping relation must then be used explicitly in every rule that permits subtyping. For example, a system that supports subtyping might use the following rule for function application:
+<span>$$
+\begin{array}{l}
+Γ ⊢ e_1 : \tau_2 → \tau_3 \\
+Γ ⊢ e_2 : \tau_1 \\
+\tau_1 &lt;: \tau_2 \\
+\hline
+Γ ⊢ e_1\ e_2 : \tau_3
+\end{array}
+$$</span></p>
+<h2>Multiple contexts</h2>
+<p>Some type systems define typing judgments involving more than one context. The second context is usually named <span>$Δ$</span>. Common notations for multi-context rules are <span>$Γ;Δ ⊢ e : \tau$</span> (used when both contexts are morally “inputs”) and <span>$Γ ⊢ e : \tau ⊣ Δ$</span> (used when <span>$Δ$</span> is morally an “output”).</p>
+<p>The second context may be used for any number of different things. Perhaps certain variables can be referenced from inside certain expressions but not others, or perhaps an output context is used to keep track of which variables are “consumed” in a resource-aware programming language.</p>
+<h2>Bidirectional typechecking</h2>
+<p><a href="https://arxiv.org/abs/1908.05839" rel="noreferrer">Bidirectional typechecking</a> is an approach for performing a limited form of nonlocal type inference without the need to use a constraint solver. A bidirectional system splits the usual <span>$Γ ⊢ e : \tau$</span> typing judgment into two specialized judgments:</p>
+<ul>
+<li><p><span>$Γ ⊢ e ⇐ \tau$</span> is the <em>checking</em> judgment, which checks that <span>$e$</span> has some expected type <span>$\tau$</span>. Algorithmically, <span>$\tau$</span> is an <em>input</em> to this judgment.</p>
+</li>
+<li><p><span>$Γ ⊢ e ⇒ \tau$</span> is the <em>inference</em> judgment, which is used whenever expected type information is not available. Algorithmically, <span>$\tau$</span> is an <em>output</em> from this judgment.</p>
+</li>
+</ul>
+<p>The two judgments are defined in a mutually-recursive way to propagate type information bidirectionally, which allows some type annotations to sometimes be omitted. For example, the checking variant of the rule for lambda abstraction may omit the annotation on the variable binder since it can be determined from the expected type:
+<span>$$
+\begin{array}{c}
+Γ,x{:}\tau_1 ⊢ e ⇐ \tau_2 \\
+\hline
+Γ ⊢ (λx. e) ⇐ \tau_1 → \tau_2
+\end{array}
+$$</span></p>
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Requiring ink to scan a document–yet another insult from the printer industry (139 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2023/08/the-printers-that-require-ink-to-scan-and-fax/</link>
             <guid>37138691</guid>
             <pubDate>Tue, 15 Aug 2023 20:06:17 GMT</pubDate>
@@ -59,7 +441,7 @@
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[ISPs complain that listing every fee is too hard, urge FCC to scrap new rule (144 pts)]]></title>
+            <title><![CDATA[ISPs complain that listing every fee is too hard, urge FCC to scrap new rule (205 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2023/08/isps-complain-that-listing-every-fee-is-too-hard-urge-fcc-to-scrap-new-rule/</link>
             <guid>37138681</guid>
             <pubDate>Tue, 15 Aug 2023 20:05:43 GMT</pubDate>
@@ -93,7 +475,7 @@
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Asteroid ZTm0038 with a >3% impact probability (173 pts)]]></title>
+            <title><![CDATA[Asteroid ZTm0038 with a >3% impact probability (184 pts)]]></title>
             <link>https://newton.spacedys.com/neodys2/NEOScan/risk_page/ZTm0038/index_summary_ZTm0038.html</link>
             <guid>37138102</guid>
             <pubDate>Tue, 15 Aug 2023 19:19:16 GMT</pubDate>
@@ -273,7 +655,7 @@
 <div id="readability-page-1" class="page"><div><div><h2 id="c567">Our plan and pledge to keep Terraform open source</h2><div><a href="https://medium.com/@brikis98?source=post_page-----ab0b9ba65bca--------------------------------" rel="noopener follow"><div aria-hidden="false"><p><img alt="Yevgeniy Brikman" src="https://miro.medium.com/v2/resize:fill:88:88/1*7IJ4hkSmGgjeibEpJfbMGQ.jpeg" width="44" height="44" loading="lazy" data-testid="authorPhoto"></p></div></a><a href="https://blog.gruntwork.io/?source=post_page-----ab0b9ba65bca--------------------------------" rel="noopener  ugc nofollow"><div aria-hidden="false"><p><img alt="Gruntwork" src="https://miro.medium.com/v2/resize:fill:48:48/1*d6HE86wu0vvHrTQi_FZ3NQ.jpeg" width="24" height="24" loading="lazy" data-testid="publicationPhoto"></p></div></a></div></div><figure></figure><p id="f23e">On August 10, 2023, HashiCorp announced that after ~9 years of Terraform being open source under the MPL v2 license, they were suddenly switching it to a non open source BSL v1.1 license. We believe the BSL license is a poison pill for Terraform which threatens the entire community and ecosystem, and in this blog post, we’ll introduce <a href="https://opentf.org/" rel="noopener ugc nofollow" target="_blank">OpenTF</a>, our plan for keeping Terraform open source—forever.</p><h2 id="7b5c">Why the BSL license is a poison pill for Terraform</h2><h2 id="b3c6">The virtuous cycle of open source</h2><p id="5ada">Terraform was originally released under the <a href="https://www.mozilla.org/en-US/MPL/2.0/FAQ/" rel="noopener ugc nofollow" target="_blank">Mozilla Public License</a> (MPL) v2.0, which is a well-known, trusted, and permissive open source license: MPL allows you to use Terraform for just about any purpose and incorporate it into any product, including copying, modifying, and redistributing the code. The only limitation is that if you modify the source code of Terraform itself, you have to release those modifications under the same MPL license.</p><p id="a2a2">The permissive terms of this license were a key factor in why the community adopted Terraform:</p><ul><li id="055b">Companies were comfortable in adopting Terraform, as the license ensured there would be no unexpected fees or IP problems.</li><li id="2be6">Developers were comfortable in contributing to <a href="https://github.com/hashicorp/terraform/" rel="noopener ugc nofollow" target="_blank">Terraform core</a> (which had 1,700+ contributors as of this writing) and the hundreds of Terraform providers (the <a href="https://github.com/hashicorp/terraform-provider-aws" rel="noopener ugc nofollow" target="_blank">AWS provider</a> had 2,800+ contributors and the <a href="https://github.com/hashicorp/terraform-provider-azurerm" rel="noopener ugc nofollow" target="_blank">Azure provider</a> had 1,300+ contributors as of this writing), as the license ensured they’d be able to use their work in both their current jobs and any future ones.</li><li id="355c">Vendors created tools, modules, and extensions for Terraform (e.g., at Gruntwork, we created <a href="https://terragrunt.gruntwork.io/" rel="noopener ugc nofollow" target="_blank">Terragrunt</a>, <a href="https://terratest.gruntwork.io/" rel="noopener ugc nofollow" target="_blank">Terratest</a>, and the <a href="https://gruntwork.io/infrastructure-as-code-library/" rel="noopener ugc nofollow" target="_blank">IaC Library</a>), as the license ensured you’d be able to use this work, whether for fun (e.g., as part of a side project) or profit (e.g., as part of a proprietary project).</li></ul><p id="a02b">This led to a virtuous cycle: as more companies adopt Terraform, more developers start using it; those developers contribute to Terraform, fixing bugs, improving security, adding new features, creating new tools and extensions, etc.; that makes Terraform even more compelling, so even more companies adopt it, and the cycle continues. As a result, Terraform has become one of the most popular infrastructure as code (IaC) tools on the market.</p><p id="3112"><strong>But none of this would have happened if Terraform hadn’t been released under a truly open source license</strong>. Those companies wouldn’t have adopted it; those developers wouldn’t have contributed to it; I can say for certain we would’ve never built Terragrunt, Terratest, and the IaC Library, or even written <a href="https://www.terraformupandrunning.com/" rel="noopener ugc nofollow" target="_blank"><em>Terraform: Up &amp; Running</em></a>, if Terraform hadn’t been open source.</p><h2 id="0e18">The move to BSL</h2><p id="920b">After ~9 years of seeing the virtuous cycle of open source in action, we were shocked to hear HashiCorp’s <a href="https://www.hashicorp.com/blog/hashicorp-adopts-business-source-license" rel="noopener ugc nofollow" target="_blank">announcement</a> that they were suddenly switching Terraform to the <a href="https://www.hashicorp.com/bsl" rel="noopener ugc nofollow" target="_blank">Business Source License</a> (BSL) v1.1, which is <em>not</em> an open source license (<a href="https://www.hashicorp.com/license-faq#details-on-nomenclature" rel="noopener ugc nofollow" target="_blank">HashiCorp’s own FAQ</a> even says the BSL doesn’t meet the definition of open source). In fact, not only Terraform, but all other core HashiCorp products are moving to BSL too: e.g., Vault, Consul, Nomad, etc.</p><p id="a744">To some extent, we understand what led HashiCorp in this direction. They are trying to maintain a delicate balance: on the one hand, they are creating amazing value by providing high quality, free, open source software to a community of thousands of developers; on the other hand, they are trying to run a sustainable business, so they need to capture and monetize some of the value they create.</p><p id="0c3f">The tricky part is deciding what to make open source and what to commercialize. If you make too much open source, then you don’t have enough to sell, so you can’t make enough money to pay the very employees who are creating and maintaining these amazing open source projects, so everyone loses; but if you make too little open source, then you never build up a community, and without that community, you can’t sell enough, can’t pay employees, and again, everyone loses. It’s only when you get this balance just right that everyone wins.</p><p id="ed96">Up until last Friday, it seemed like HashiCorp had this balance just right. They did so by making most functionality open source, but reserving some functionality solely for their commercial products, such as Terraform Cloud and Terraform Enterprise. With this approach, the Terraform community grew, companies that used Terraform grew, and, of course, HashiCorp grew into a public, multi-billion dollar company. Everyone wins!</p><p id="d078">That’s why we’re so stumped about the sudden move away from an open source license to a non open source BSL license. We believe that this move away from open source will upset the delicate balance and will lead to a scenario where everyone loses: the community will lose, companies that use Terraform will lose, and ultimately, even HashiCorp will lose. Let’s discuss why.</p><h2 id="44fe">The problems with BSL</h2><p id="8645">The BSL license, along with the additional use grants HashiCorp wrote for it, is generally fairly permissive, allowing you to copy, modify, and redistribute the code. However, there is an exception. The license does <em>not</em> allow you to use Terraform if you meet both of the following conditions:</p><ol><li id="979e">You are building a product that is competitive with HashiCorp.</li><li id="43b3">You embed or host Terraform in your product.</li></ol><p id="e46f"><strong>The first problem is that the terms of the BSL and the use grants are vague.</strong> What does “competitive with HashiCorp” mean and who decides that? And what does “embed or host” mean? If you’re a lawyer and you see this, you start to sweat. The number of questions is infinite. For example, if you’re an independent software vendor (ISV) or managed service provider (MSP) in the DevOps space, and you use Terraform with your customers (but not necessarily Terraform Cloud/Enterprise), are you a competitor? If your company creates a CI / CD product, is that competitive with Terraform Cloud or Waypoint? If your CI / CD product natively supports running Terraform as part of your CI / CD builds, is that embedding or hosting? If you built a wrapper for Terraform, is that a competitor? Is it embedding only if you include the source code or does using the Terraform CLI count as embedding? What if the CLI is installed by the customer? Is it hosting if the customer runs your product on their own servers?</p><p id="a5e5">It’s not an accident that these terms are vague. This is a common practice used by many legal teams to implicitly force you to ask the company for permission, so they can decide on a case-by-case basis: <a href="https://www.hashicorp.com/license-faq#details-on-nomenclature" rel="noopener ugc nofollow" target="_blank">HashiCorp’s FAQ</a> even says that to get clarification on whether what you’re doing is competitive or embedding or hosting, you need to reach out to <a href="mailto:licensing@hashicorp.com" rel="noopener ugc nofollow" target="_blank">licensing@hashicorp.com</a>.</p><p id="500d"><strong>And that leads to the second problem with the BSL: whether your usage complies with the license isn’t determined by the legal terms, but instead is entirely at the whim of HashiCorp.</strong> If HashiCorp doesn’t think you’re a competitor, you’re in the clear. But if they feel threatened by your company: no Terraform for you. If they want to define your usage as embedding or hosting: no Terraform for you. Or perhaps they grant you a license to use Terraform, but only at a fee, and if you can’t pay that fee: no Terraform for you.</p><p id="ee62"><strong>And that brings us to the third, and worst problem with the BSL: HashiCorp can change its decisions at any time. </strong>Perhaps HashiCorp told you your usage was safe before, but a year later, you launched a new product and now they think you’re a competitor, so suddenly, your usage no longer complies with the license. Or perhaps you didn’t change anything on your end, but it’s HashiCorp that launched a new product, which just so happens to be in your market, so now you’re a competitor, and your usage is no longer allowed. Or maybe HashiCorp decides that all the usages that were OK before will now cost money. Or maybe you’ve already been paying them for a license, but suddenly, they decide to raise prices. And no matter what else happens, or what previous decisions or agreements you’ve reached, remember, HashiCorp can just change the license again at any time!</p><p id="7011"><strong>As a result of the change to BSL, there is now no certainty with using Terraform:</strong></p><ul><li id="1fd2">If you’re a CTO, and you’re picking an IaC tool to use at your company, if you see that Terraform is BSL licensed, why take the risk? You’re now much more likely to go with alternative tools that are truly open source and have no licensing headaches.</li><li id="3f81">If you’re on the legal team at a company and reviewing the licenses your dev team wants to use, and you see BSL, why take the risk? You’re now much more likely to push back and put BSL on the banned license list.</li><li id="ae6c">If you’re a developer and considering contributing to open source, why contribute to a BSL project with no guarantee you’d be able to use your own work in the future? You’re now much more likely to contribute to something else.</li><li id="68d6">If you’re a vendor and considering building a product or tooling in the DevOps space, why build it around Terraform, and take the risk that HashiCorp will, now or in the future, consider you competitive? That’s just too shaky of a foundation to build on, so you’re now much more likely to build around something else.</li></ul><p id="3dcf"><strong>In short, BSL breaks the virtuous open source cycle that got Terraform to where it is today.</strong> And once you break that virtuous cycle, everyone loses: adoption will slow, contributions will decrease, and the community and ecosystem will dwindle and wither.</p><h2 id="5e3b">OpenTF: keeping Terraform open source</h2><p id="9908">We believe that the essential building blocks of the modern Internet—tools such as Linux, Kubernetes, and Terraform—must be truly open source. That is the only way to ensure that we are building our industry on top of solid and predictable underpinnings.</p><p id="37f0">Therefore, we have joined forces with a number of other companies to create the <a href="https://opentf.org/" rel="noopener ugc nofollow" target="_blank">OpenTF manifesto</a>. <strong>The goal of the manifesto is to ensure Terraform remains truly open source — always.</strong></p><p id="324e">To this end, the manifesto lays out the following two-step plan:</p><ol><li id="2d67"><strong>Ask HashiCorp to switch Terraform back to open source. </strong>The manifesto is a public request—a petition with signatures—for HashiCorp to do the right thing here and switch Terraform back to a truly open source license (e.g., go back to MPL). Moreover, we want to be sure that it stays that way, so we are asking HashiCorp to commit to keeping Terraform under an open source license forever in the future.</li><li id="59ba"><strong>If they refuse, we will fork Terraform into an open source foundation.</strong> If HashiCorp decides to keep Terraform under the BSL license, then we will fork the MPL-licensed Terraform (Terraform version 1.5.5 and all versions before that are still MPL licensed), and put it into an open source foundation maintained by the community. We are one of many companies who have pledged resources to maintaining this fork, if it comes to it.</li></ol><p id="64a6"><strong>Either way, the future of Terraform is open source</strong>. If you also believe that Terraform should remain open source, please lend us your support, and let HashiCorp know how you feel by signing the OpenTF manifesto at <a href="https://opentf.org/" rel="noopener ugc nofollow" target="_blank">https://opentf.org/</a>!</p><h2 id="0e44">What this means for Gruntwork customers</h2><p id="7d02"><strong>As long as you use Terraform 1.5.5 or older, you can keep using all our commercial and open source products with no changes</strong>. Terraform 1.5.5 and all older versions are still MPL licensed, so you can keep using that version of Terraform with Terragrunt, Terratest, the IaC Library, the Reference Architecture, Gruntwork Pipelines, etc., with no changes of any kind.</p><p id="f16d"><strong>For future versions of Terraform, Gruntwork will use open source Terraform</strong>. For versions of Terraform that come out after 1.5.5, we will switch all our commercial and open source products to work only with open source Terraform: that is, if HashiCorp chooses to switch Terraform back to an open source license, we will use that, and if they don’t, then we will use our open source fork. We are currently waiting to see how HashiCorp responds to OpenTF, and we will share more details once we have them.</p><p id="9dba"><strong>But rest assured: no matter what happens, we are committed to keeping Terraform open source and ensuring all our products will continue to work with it.</strong></p><p id="6f20">For more information, and to join the OpenTF movement, please see <a href="https://opentf.org/" rel="noopener ugc nofollow" target="_blank">https://opentf.org/</a>!</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We reduced the cost of building Mastodon at Twitter-scale by 100x (587 pts)]]></title>
+            <title><![CDATA[We reduced the cost of building Mastodon at Twitter-scale by 100x (635 pts)]]></title>
             <link>https://blog.redplanetlabs.com/2023/08/15/how-we-reduced-the-cost-of-building-twitter-at-twitter-scale-by-100x/</link>
             <guid>37137110</guid>
             <pubDate>Tue, 15 Aug 2023 17:54:13 GMT</pubDate>
@@ -2711,7 +3093,7 @@ call is actually the most expensive part of this ETL because of the huge volume 
 	</article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Opendream: A layer-based UI for Stable Diffusion (250 pts)]]></title>
+            <title><![CDATA[Opendream: A layer-based UI for Stable Diffusion (263 pts)]]></title>
             <link>https://github.com/varunshenoy/opendream</link>
             <guid>37136898</guid>
             <pubDate>Tue, 15 Aug 2023 17:38:10 GMT</pubDate>
@@ -2807,7 +3189,7 @@ call is actually the most expensive part of this ETL because of the huge volume 
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Elon Musk’s X is throttling traffic to news and websites he dislikes (150 pts)]]></title>
+            <title><![CDATA[Elon Musk’s X is throttling traffic to news and websites he dislikes (156 pts)]]></title>
             <link>https://www.washingtonpost.com/technology/2023/08/15/twitter-x-links-delayed/</link>
             <guid>37136858</guid>
             <pubDate>Tue, 15 Aug 2023 17:33:52 GMT</pubDate>
@@ -2815,7 +3197,7 @@ call is actually the most expensive part of this ETL because of the huge volume 
 Couldn't get https://www.washingtonpost.com/technology/2023/08/15/twitter-x-links-delayed/: Error [ERR_FR_TOO_MANY_REDIRECTS]: Maximum number of redirects exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA["About 67k” sites are banned from submission on HN, the list is kept secret (102 pts)]]></title>
+            <title><![CDATA["About 67k” sites are banned from submission on HN, the list is kept secret (103 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=37130147</link>
             <guid>37136111</guid>
             <pubDate>Tue, 15 Aug 2023 16:41:51 GMT</pubDate>
@@ -3127,7 +3509,7 @@ I've also long wondered about user specific shadow bans. Can you please shed lig
                         </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ball milling destroys PFAS in contaminated soil (116 pts)]]></title>
+            <title><![CDATA[Ball milling destroys PFAS in contaminated soil (117 pts)]]></title>
             <link>https://phys.org/news/2023-08-chemicals.html</link>
             <guid>37134563</guid>
             <pubDate>Tue, 15 Aug 2023 14:40:13 GMT</pubDate>
@@ -3198,7 +3580,7 @@ I've also long wondered about user specific shadow bans. Can you please shed lig
 									</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Code Is Not Literature (2014) (171 pts)]]></title>
+            <title><![CDATA[Code Is Not Literature (2014) (174 pts)]]></title>
             <link>https://gigamonkeys.com/code-reading/</link>
             <guid>37134520</guid>
             <pubDate>Tue, 15 Aug 2023 14:36:35 GMT</pubDate>
@@ -3248,7 +3630,7 @@ I've also long wondered about user specific shadow bans. Can you please shed lig
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Schizophrenia drugs may have been off target for decades, study finds (128 pts)]]></title>
+            <title><![CDATA[Schizophrenia drugs may have been off target for decades, study finds (132 pts)]]></title>
             <link>https://www.msn.com/en-us/health/medical/schizophrenia-drugs-may-have-been-off-target-for-decades-study-finds/ar-AA1fh9Nt</link>
             <guid>37134373</guid>
             <pubDate>Tue, 15 Aug 2023 14:24:13 GMT</pubDate>
@@ -3256,7 +3638,7 @@ I've also long wondered about user specific shadow bans. Can you please shed lig
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Firefox finally outperforming Google Chrome in SunSpider (735 pts)]]></title>
+            <title><![CDATA[Firefox finally outperforming Google Chrome in SunSpider (752 pts)]]></title>
             <link>https://www.phoronix.com/news/Firefox-Faster-SunSpider</link>
             <guid>37134092</guid>
             <pubDate>Tue, 15 Aug 2023 13:58:44 GMT</pubDate>
@@ -3274,7 +3656,7 @@ Last week a new Firefox Nightly News was published that outlines that "We’re n
 Learn about the latest Firefox Nightly build advancements via the <a href="https://blog.nightly.mozilla.org/2023/08/10/a-view-to-a-better-faster-web-these-weeks-in-firefox-issue-143/">Firefox Nightly News</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Entrepreneurship for Engineers: Selling Open Source Software (139 pts)]]></title>
+            <title><![CDATA[Entrepreneurship for Engineers: Selling Open Source Software (144 pts)]]></title>
             <link>https://thenewstack.io/entrepreneurship-for-engineers-selling-open-source-software/</link>
             <guid>37134089</guid>
             <pubDate>Tue, 15 Aug 2023 13:58:17 GMT</pubDate>
@@ -3336,7 +3718,7 @@ Couldn't get https://thenewstack.io/entrepreneurship-for-engineers-selling-open-
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Why host your own LLM? (215 pts)]]></title>
+            <title><![CDATA[Why host your own LLM? (230 pts)]]></title>
             <link>http://marble.onl/posts/why_host_your_own_llm.html</link>
             <guid>37133504</guid>
             <pubDate>Tue, 15 Aug 2023 13:06:31 GMT</pubDate>
@@ -3371,7 +3753,7 @@ Couldn't get https://thenewstack.io/entrepreneurship-for-engineers-selling-open-
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Llama2 Embeddings FastAPI Server (145 pts)]]></title>
+            <title><![CDATA[Show HN: Llama2 Embeddings FastAPI Server (149 pts)]]></title>
             <link>https://github.com/Dicklesworthstone/llama_embeddings_fastapi_service</link>
             <guid>37133163</guid>
             <pubDate>Tue, 15 Aug 2023 12:31:27 GMT</pubDate>
@@ -3844,7 +4226,7 @@ cd llama_embeddings_fastapi_service"><pre>git clone https://github.com/Dickleswo
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The OpenTF Manifesto (448 pts)]]></title>
+            <title><![CDATA[The OpenTF Manifesto (473 pts)]]></title>
             <link>https://opentf.org/</link>
             <guid>37133054</guid>
             <pubDate>Tue, 15 Aug 2023 12:19:33 GMT</pubDate>
@@ -4022,7 +4404,7 @@ cd llama_embeddings_fastapi_service"><pre>git clone https://github.com/Dickleswo
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Nintendo DS cameras are the best lo-fi photo trend (117 pts)]]></title>
+            <title><![CDATA[Nintendo DS cameras are the best lo-fi photo trend (125 pts)]]></title>
             <link>https://www.polygon.com/23827844/nintendo-ds-dsi-3ds-camera-lofi-photo-trend</link>
             <guid>37133033</guid>
             <pubDate>Tue, 15 Aug 2023 12:17:14 GMT</pubDate>
@@ -4094,7 +4476,7 @@ cd llama_embeddings_fastapi_service"><pre>git clone https://github.com/Dickleswo
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[CSS Selectors: A Visual Guide (264 pts)]]></title>
+            <title><![CDATA[CSS Selectors: A Visual Guide (267 pts)]]></title>
             <link>https://fffuel.co/css-selectors/</link>
             <guid>37132754</guid>
             <pubDate>Tue, 15 Aug 2023 11:47:44 GMT</pubDate>
@@ -5637,349 +6019,6 @@ been mis-gendered at birth. Lynn hopes to live to see that day.</p>
 
 
 </div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Bankman-Fried used $100M in stolen FTX funds for political donations, US says (255 pts)]]></title>
-            <link>https://www.reuters.com/legal/bankman-fried-used-customer-funds-100-mln-us-political-donations-prosecutors-say-2023-08-14/</link>
-            <guid>37128392</guid>
-            <pubDate>Mon, 14 Aug 2023 23:57:49 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.reuters.com/legal/bankman-fried-used-customer-funds-100-mln-us-political-donations-prosecutors-say-2023-08-14/">https://www.reuters.com/legal/bankman-fried-used-customer-funds-100-mln-us-political-donations-prosecutors-say-2023-08-14/</a>, See on <a href="https://news.ycombinator.com/item?id=37128392">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-testid="primary-image" role="figure" aria-describedby="primary-image-caption"><figure><div data-testid="Image"><p><img src="https://cloudfront-us-east-2.images.arcpublishing.com/reuters/6RDKDYUWOFMHPJTDYF7SGZ4IUY.jpg" srcset="https://www.reuters.com/resizer/cyhXAgZITfCPqTP0ns4WMKlZEgY=/480x0/filters:quality(80)/cloudfront-us-east-2.images.arcpublishing.com/reuters/6RDKDYUWOFMHPJTDYF7SGZ4IUY.jpg 480w,https://www.reuters.com/resizer/pTykvtuFz1Z7dlzPf1iOb16WEu4=/960x0/filters:quality(80)/cloudfront-us-east-2.images.arcpublishing.com/reuters/6RDKDYUWOFMHPJTDYF7SGZ4IUY.jpg 960w,https://www.reuters.com/resizer/5VTmp8WvaqPcCqqo5ITFnnKbEwA=/1080x0/filters:quality(80)/cloudfront-us-east-2.images.arcpublishing.com/reuters/6RDKDYUWOFMHPJTDYF7SGZ4IUY.jpg 1080w,https://www.reuters.com/resizer/6gg5bwQ8_1WWEOWXE8OoNx8M2Qs=/1200x0/filters:quality(80)/cloudfront-us-east-2.images.arcpublishing.com/reuters/6RDKDYUWOFMHPJTDYF7SGZ4IUY.jpg 1200w" sizes="(min-width: 1024px) 560px, (min-width: 1440px) 700px, 100vw" width="4631" height="3115" alt="Former FTX Chief Executive Bankman-Fried at a courthouse in New York"></p></div><p data-testid="Body">Sam Bankman-Fried, the founder of bankrupt cryptocurrency exchange FTX, arrives at court as lawyers push to persuade the judge overseeing his fraud case not to jail him ahead of trial, at a courthouse in New York, U.S., August 11, 2023.  REUTERS/Eduardo Munoz/File Photo</p></figure></div><div><p data-testid="paragraph-0">NEW YORK, Aug 14 (Reuters) - Sam Bankman-Fried used money he stole from customers of his FTX cryptocurrency exchange to make more than $100 million in political campaign contributions before the 2022 U.S. midterm elections, federal prosecutors said on Monday.</p><p data-testid="paragraph-1">An amended indictment accused the 31-year-old former billionaire of directing two FTX executives to evade contribution limits by donating to Democrats and Republicans, and to conceal where the money came from.</p><p data-testid="paragraph-2">"He leveraged this influence, in turn, to lobby Congress and regulatory agencies to support legislation and regulation he believed would make it easier for FTX to continue to accept customer deposits and grow," the indictment said.</p><p data-testid="paragraph-3">Bankman-Fried faces seven counts of conspiracy and fraud over FTX's collapse, though the indictment no longer includes conspiracy to violate campaign finance laws as a separate count.</p><p data-testid="paragraph-4">Federal prosecutors in Manhattan said last month they would drop that charge after the Bahamas, where FTX was based and where Bankman-Fried was arrested in December 2022, said it never intended to extradite him on that count.</p><p data-testid="paragraph-5">Instead, prosecutors told U.S. District Judge Lewis Kaplan last week that a new indictment would "make clear that Mr. Bankman-Fried remains charged with conducting an illegal campaign finance scheme as part of the fraud and money laundering schemes originally charged."</p><p data-testid="paragraph-6">Mark Botnick, a spokesman for Bankman-Fried, declined to comment.</p><p data-testid="paragraph-7">Bankman-Fried has previously pleaded not guilty to stealing billions of dollars in FTX customer funds to plug losses at Alameda Research, his crypto-focused hedge fund.</p><p data-testid="paragraph-8">Kaplan <a data-testid="Link" href="https://www.reuters.com/legal/ftxs-bankman-fried-seeking-avoid-jail-due-back-court-2023-08-11/">jailed him last Friday</a> ahead of his Oct. 2 trial, after finding probable cause that Bankman-Fried tampered with witnesses.</p><p data-testid="paragraph-9">Previously, Bankmman-Fried had been largely confined to his parents' Palo Alto, California, home on $250 million bond.</p><p data-testid="paragraph-10">Bankman-Fried rode a boom in cryptocurrency values to amass a fortune that was once estimated at $26 billion, and became an influential donor to mostly Democratic candidates and causes.</p><p data-testid="paragraph-11">The November 2022 collapse of FTX after a flurry of customer withdrawals destroyed his wealth and stained his reputation.</p><h2 data-testid="Heading">EX-FTX EXEC SALAME DECLINES TO TESTIFY</h2><p data-testid="paragraph-12">Bankman-Fried's indictment does not name the two people prosecutors say he used for "straw donors" to donate money at his direction. But other court papers and Federal Elections Commission data show they are Nishad Singh and Ryan Salame.</p><p data-testid="paragraph-13">Singh, FTX's former engineering chief, pleaded guilty to fraud and campaign finance violations in February. He donated $9.7 million to Democratic candidates and causes, and <a data-testid="Link" href="https://www.reuters.com/legal/ftxs-singh-agrees-plead-guilty-us-criminal-charges-lawyer-says-2023-02-28/">said in court</a> he knew the money came from FTX customers.</p><p data-testid="paragraph-14">Salame, the former co-CEO of FTX's Bahamian unit, gave more than $24 million to Republican candidates and causes in the 2022 election cycle, according to Federal Election Commision data.</p><p data-testid="paragraph-15">He has not been charged with a crime. In a separate court filing on Monday, prosecutors said Salame's lawyer had told them he would invoke his Fifth Amendment right against self-incrimination if called to testify.</p><p data-testid="paragraph-16">Prosecutors said Salame told a family member in a November 2021 message that Bankman-Fried wanted to use political donations to "weed-out" anti-crypto Democratic and Republican lawmakers, and would likely “route money through me to weed out that republican [sic] side.”</p><p data-testid="paragraph-17">Salame's lawyer did not immediately respond to a request for comment.</p><p><span data-testid="Text">Reporting by Luc Cohen in San Jose, California
-Editing by Chris Reese, David Gregorio, Jonathan Oatis and Shri Navaratnam</span></p><p data-testid="Body">Our Standards: <a data-testid="Link" href="https://www.thomsonreuters.com/en/about-us/trust-principles.html" target="_blank">The Thomson Reuters Trust Principles.</a></p><div><address><p data-testid="Body">Reports on the New York federal courts. Previously worked as a correspondent in Venezuela and Argentina.</p></address></div></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Show HN: AI-town, run your own custom AI world SIM with JavaScript (403 pts)]]></title>
-            <link>https://github.com/a16z-infra/ai-town</link>
-            <guid>37128293</guid>
-            <pubDate>Mon, 14 Aug 2023 23:46:02 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://github.com/a16z-infra/ai-town">https://github.com/a16z-infra/ai-town</a>, See on <a href="https://news.ycombinator.com/item?id=37128293">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-target="readme-toc.content">
-            <article itemprop="text"><h2 tabindex="-1" dir="auto">AI Town <g-emoji alias="house" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f3e0.png">🏠</g-emoji><g-emoji alias="computer" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f4bb.png">💻</g-emoji><g-emoji alias="love_letter" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f48c.png">💌</g-emoji></h2>
-<p dir="auto"><a href="https://www.convex.dev/ai-town" rel="nofollow">Live Demo</a></p>
-<p dir="auto"><a href="https://discord.gg/PQUmTBTGmT" rel="nofollow">Join our community Discord: AI Stack Devs</a></p>
-<a target="_blank" rel="noopener noreferrer" href="https://user-images.githubusercontent.com/3489963/260520547-a4c91f17-23ed-47ec-8c4e-9f9a8505057d.png"><img width="1454" alt="Screen Shot 2023-08-14 at 10 01 00 AM" src="https://user-images.githubusercontent.com/3489963/260520547-a4c91f17-23ed-47ec-8c4e-9f9a8505057d.png"></a>
-<p dir="auto">AI Town is a virtual town where AI characters live, chat and socialize.</p>
-<p dir="auto">This project is a deployable starter kit for easily building and customizing your own version of AI town. Inspired by the research paper <a href="https://arxiv.org/pdf/2304.03442.pdf" rel="nofollow"><em>Generative Agents: Interactive Simulacra of Human Behavior</em></a>.</p>
-<p dir="auto">The primary goal of this project, beyond just being a lot of fun to work on, is to provided a platform with a strong foundation that is meant to be extended. The back-end engine natively supports shared global state, transactions, and a journal of all events so should be suitable for everything from a simple project to play around with to a scalable, multi-player game. A secondary goal is to make a JS/TS framework available as most simulators in this space (including the original paper above) are written in Python.</p>
-<h2 tabindex="-1" dir="auto">Overview</h2>
-<ul dir="auto">
-<li><g-emoji alias="computer" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f4bb.png">💻</g-emoji> <a href="#stack">Stack</a></li>
-<li><g-emoji alias="brain" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f9e0.png">🧠</g-emoji> <a href="#installation">Installation</a></li>
-<li><g-emoji alias="bust_in_silhouette" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f464.png">👤</g-emoji> <a href="#customize-your-own-simulation">Customize - run YOUR OWN simulated world</a></li>
-<li><g-emoji alias="trophy" fallback-src="https://github.githubassets.com/images/icons/emoji/unicode/1f3c6.png">🏆</g-emoji> <a href="#credits">Credits</a></li>
-</ul>
-<h2 tabindex="-1" dir="auto">Stack</h2>
-<ul dir="auto">
-<li>Game engine &amp; Database: <a href="https://convex.dev/" rel="nofollow">Convex</a></li>
-<li>VectorDB: <a href="https://www.pinecone.io/" rel="nofollow">Pinecone</a></li>
-<li>Auth: <a href="https://clerk.com/" rel="nofollow">Clerk</a></li>
-<li>Text model: <a href="https://platform.openai.com/docs/models" rel="nofollow">OpenAI</a></li>
-<li>Deployment: <a href="https://fly.io/" rel="nofollow">Fly</a></li>
-<li>Pixel Art Generation: <a href="https://replicate.com/" rel="nofollow">Replicate</a>, <a href="https://serverless.fal.ai/lora" rel="nofollow">Fal.ai</a></li>
-</ul>
-<h2 tabindex="-1" dir="auto">Installation</h2>
-<h3 tabindex="-1" dir="auto">Clone repo and Install packages</h3>
-<div dir="auto" data-snippet-clipboard-copy-content="git clone git@github.com:a16z-infra/ai-town.git
-cd AI-town
-npm install
-npm run dev"><pre>git clone git@github.com:a16z-infra/ai-town.git
-<span>cd</span> AI-town
-npm install
-npm run dev</pre></div>
-<p dir="auto"><code>npm run dev</code> will fail asking for environment variables.
-Enter them in the environment variables on your Convex dashboard to proceed.
-You can get there via <code>npx convex dashboard</code> or <a href="https://dashboard.convex.dev/" rel="nofollow">https://dashboard.convex.dev</a>
-See below on how to get the various environnment variables.</p>
-<p dir="auto">a. <strong>Set up Clerk</strong></p>
-<ul dir="auto">
-<li>Go to <a href="https://dashboard.clerk.com/" rel="nofollow">https://dashboard.clerk.com/</a> and click on "Add Application"</li>
-<li>Name your application and select the sign-in providers you would like to offer users</li>
-<li>Create Application</li>
-<li>Add <code>NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY</code> and <code>CLERK_SECRET_KEY</code> to <code>.env.local</code></li>
-</ul>
-<div dir="auto" data-snippet-clipboard-copy-content="NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_***
-CLERK_SECRET_KEY=sk_***"><pre>NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_<span>***</span>
-CLERK_SECRET_KEY=sk_<span>***</span></pre></div>
-<ul dir="auto">
-<li>Go to JWT Templates and create a new Convex Template.</li>
-<li>Copy the JWKS endpoint URL for use below.</li>
-</ul>
-<p dir="auto">b. <strong>OpenAI API key</strong></p>
-<p dir="auto">Visit <a href="https://platform.openai.com/account/api-keys" rel="nofollow">https://platform.openai.com/account/api-keys</a> to get your OpenAI API key if you're using OpenAI for your language model.</p>
-<p dir="auto">c. <strong>Pinecone API keys</strong></p>
-<ul dir="auto">
-<li>Create a Pinecone index by visiting <a href="https://app.pinecone.io/" rel="nofollow">https://app.pinecone.io/</a> and click on "Create Index"</li>
-<li>Give it an index name (this will be the environment variable <code>PINECONE_INDEX_NAME</code>)</li>
-<li>Fill in Dimension as <code>1536</code></li>
-<li>Once the index is successfully created, click on "API Keys" on the left side nav and create an API key: copy "Environment" value to <code>PINECONE_ENVIRONMENT</code> variable, and "Value" to <code>PINECONE_API_KEY</code></li>
-</ul>
-<p dir="auto">d. <strong>Add secrets to the convex dashboard</strong></p>
-
-<p dir="auto">Go to "settings" and add the following environment varables. <code>CLERK_ISSUER_URL</code> should be the URL from the JWKS endpoint.</p>
-<div dir="auto" data-snippet-clipboard-copy-content="OPENAI_API_KEY  sk-*******
-CLERK_ISSUER_URL  https://****
-PINECONE_API_KEY  ********
-PINECONE_ENVIRONMENT us****
-PINECONE_INDEX_NAME  ********"><pre>OPENAI_API_KEY  sk-<span>*******</span>
-CLERK_ISSUER_URL  https://<span>****</span>
-PINECONE_API_KEY  <span>********</span>
-PINECONE_ENVIRONMENT us<span>****</span>
-PINECONE_INDEX_NAME  <span>********</span></pre></div>
-<h3 tabindex="-1" dir="auto">Run the code</h3>
-<p dir="auto">To run both the front and and back end:</p>
-
-<p dir="auto">You can now visit <a href="http://localhost:%5BPORT_NUMBER%5D" rel="nofollow">http://localhost:[PORT_NUMBER]</a></p>
-<p dir="auto">If you'd rather run the frontend in a separate terminal from Convex (which syncs
-your backend functions as they're saved), you can run these two commands:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="npm run dev:frontend
-npm run dev:backend"><pre>npm run dev:frontend
-npm run dev:backend</pre></div>
-<p dir="auto">See package.json for details, but dev:backend runs <code>npx convex dev</code></p>
-<p dir="auto">*Note: The simulation will pause after 5 minutes if the window is idle.
-Loading the page will unpause it. If you want to run the world without the
-browser, you can comment-out the heartbeat check in <code>convex/engine.ts</code></p>
-<h3 tabindex="-1" dir="auto">Various commands to run / test / debug</h3>
-<p dir="auto"><strong>To add a new world, seed it, and start it running</strong></p>
-<p dir="auto"><strong>Note</strong>: you can add <code>--no-push</code> to run these commands without first syncing
-the functions. If you already have <code>npm run dev</code> running, this will be faster.
-If you remove it, it'll push up the latest version of code before running the
-command.</p>
-<div dir="auto" data-snippet-clipboard-copy-content="npx convex run init:reset"><pre>npx convex run init:reset</pre></div>
-<p dir="auto"><strong>To go one iteration at a time, you can create a world with</strong></p>
-<div dir="auto" data-snippet-clipboard-copy-content="npx convex run --no-push init:resetFrozen
-
-# for each iteration
-npx convex run --no-push engine:tick '{&quot;worldId&quot;:&quot;<your world id>&quot;,&quot;noSchedule&quot;:true}'"><pre>npx convex run --no-push init:resetFrozen
-
-<span><span>#</span> for each iteration</span>
-npx convex run --no-push engine:tick <span><span>'</span>{"worldId":"&lt;your world id&gt;","noSchedule":true}<span>'</span></span></pre></div>
-<p dir="auto"><strong>To freeze the back end, in case of too much activity</strong></p>
-<div dir="auto" data-snippet-clipboard-copy-content="npx convex run --no-push engine:freezeAll
-
-# when ready to rerun (defaults to latest world)
-npx convex run --no-push engine:unfreeze"><pre>npx convex run --no-push engine:freezeAll
-
-<span><span>#</span> when ready to rerun (defaults to latest world)</span>
-npx convex run --no-push engine:unfreeze</pre></div>
-<p dir="auto"><strong>To clear all databases</strong></p>
-<p dir="auto">Many options:</p>
-<ul dir="auto">
-<li>Go to the dashboard <code>npx convex dashboard</code> and clear tables from there.</li>
-<li>Adjust the variables in <a href="https://github.com/a16z-infra/ai-town/blob/main/convex/crons.ts"><code>crons.ts</code></a> to automatically clear
-up space from old journal and memory entries.</li>
-<li>Run <code>npx convex run --no-push testing:debugClearAll</code> to wipe all the tables.</li>
-<li>As a fallback, if things are stuck, you can check out the <code>origin/reset-town</code>
-git branch. Doing <code>npm run dev</code> from there will clear your schema, stop your
-functions, and allow you to delete your tables in the dashboard.</li>
-</ul>
-<p dir="auto">To delete all vectors from the Pinecone index, you can run:</p>
-<div data-snippet-clipboard-copy-content="npx convex run --no-push lib/pinecone:deleteAllVectors"><pre><code>npx convex run --no-push lib/pinecone:deleteAllVectors
-</code></pre></div>
-<p dir="auto"><strong>NOTE</strong>: If you share this index between dev &amp; prod, or between projects,
-it will wipe them all out. You generally don't need to be deleting vectors from
-Pinecone, as each query is indexed on the userId, which is unique between worlds
-and backend instances.</p>
-<p dir="auto"><strong>To Snoop on messages</strong></p>
-<p dir="auto">Run the following in a side terminal</p>
-<div dir="auto" data-snippet-clipboard-copy-content="npx convex run testing:listMessages --no-push --watch"><pre>npx convex run testing:listMessages --no-push --watch</pre></div>
-<p dir="auto">Or to watch one player's state:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="npx convex run testing:latestPlayer --no-push --watch"><pre>npx convex run testing:latestPlayer --no-push --watch</pre></div>
-<p dir="auto">See more functions in <a href="https://github.com/a16z-infra/ai-town/blob/main/convex/testing.ts"><code>testing.ts</code></a>.</p>
-<h3 tabindex="-1" dir="auto">Deploy the app</h3>
-<h4 tabindex="-1" dir="auto">Deploy to fly.io</h4>
-<ul dir="auto">
-<li>
-<p dir="auto">Register an account on fly.io and then <a href="https://fly.io/docs/hands-on/install-flyctl/" rel="nofollow">install flyctl</a></p>
-</li>
-<li>
-<p dir="auto"><strong>If you are using Github Codespaces</strong>: You will need to <a href="https://fly.io/docs/hands-on/install-flyctl/" rel="nofollow">install flyctl</a> and authenticate from your codespaces cli by running <code>fly auth login</code>.</p>
-</li>
-<li>
-<p dir="auto">Run <code>npx convex deploy</code> to deploy your dev environment to prod environment. Make sure you copy over all secrets to Convex's prod environment</p>
-</li>
-<li>
-<p dir="auto">Run <code>fly launch</code> under project root. This will generate a <code>fly.toml</code> that includes all the configurations you will need</p>
-</li>
-<li>
-<p dir="auto">Modify generated <code>fly.toml</code> to include <code>NEXT_PUBLIC_*</code> during build time for NextJS to access client side.</p>
-</li>
-</ul>
-<div data-snippet-clipboard-copy-content="[build]
-  [build.args]
-    NEXT_PUBLIC_CLERK_SIGN_IN_URL=&quot;/sign-in&quot;
-    NEXT_PUBLIC_CLERK_SIGN_UP_URL=&quot;/sign-up&quot;
-    NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL=&quot;/&quot;
-    NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL=&quot;/&quot;
-    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=&quot;pk_*****&quot;
-    NEXT_PUBLIC_CONVEX_URL=&quot;https://*******.convex.cloud&quot;"><pre><code>[build]
-  [build.args]
-    NEXT_PUBLIC_CLERK_SIGN_IN_URL="/sign-in"
-    NEXT_PUBLIC_CLERK_SIGN_UP_URL="/sign-up"
-    NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL="/"
-    NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL="/"
-    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_*****"
-    NEXT_PUBLIC_CONVEX_URL="https://*******.convex.cloud"
-</code></pre></div>
-<ul dir="auto">
-<li>Modify fly.io's generated <code>Dockerfile</code> to include new ENV variables right above <code>RUN npm run build</code></li>
-</ul>
-<div data-snippet-clipboard-copy-content="ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL
-ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL
-ARG NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL
-ARG NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL
-ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-ARG NEXT_PUBLIC_CONVEX_URL
-
-# Build application
-RUN npm run build"><pre><code>ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL
-ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL
-ARG NEXT_PUBLIC_CLERK_AFTER_SIGN_IN_URL
-ARG NEXT_PUBLIC_CLERK_AFTER_SIGN_UP_URL
-ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-ARG NEXT_PUBLIC_CONVEX_URL
-
-# Build application
-RUN npm run build
-</code></pre></div>
-<ul dir="auto">
-<li>Run <code>fly deploy --ha=false</code> to deploy the app. The --ha flag makes sure fly only spins up one instance, which is included in the free plan.</li>
-<li>Run <code>fly scale memory 512</code> to scale up the fly vm memory for this app.</li>
-<li>Create a new file <code>.env.prod</code> locally and fill in all the production-environment secrets. Remember to update <code>NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY</code> and <code>CLERK_SECRET_KEY</code> by copying secrets from Clerk's production instance -<code>cat .env.prod | fly secrets import</code> to upload secrets. Also remember to update <code>CONVEX_DEPLOYMENT</code> and <code>NEXT_PUBLIC_CONVEX_URL</code>.</li>
-</ul>
-<h2 tabindex="-1" dir="auto">Customize your own simulation</h2>
-<p dir="auto">NOTE: every time you change character data, you should re-run <code>npx convex run testing:debugClearAll --no-push</code> and then <code>npm run dev</code> to re-upload everything to Convex. This is because character data is sent to Convex on the initial load. However, beware that <code>npx convex run testing:debugClearAll --no-push</code> WILL wipe all of your data, including your vector store.</p>
-<ol dir="auto">
-<li>Create your own characters and strories: All characters and stories, as well as their spirtesheet references are stored in <a href="https://github.com/a16z-infra/ai-town/blob/main/convex/characterdata/data.ts#L4">data.ts</a>. You can start by changing character descriptions.</li>
-<li>Updating spritesheets: in <code>data.ts</code>, you will see this code:</li>
-</ol>
-<div data-snippet-clipboard-copy-content="  {
-    name: 'f1',
-    textureUrl: '/assets/32x32folk.png',
-    spritesheetData: f1SpritesheetData,
-    speed: 0.1,
-  },..."><pre lang="export"><code>  {
-    name: 'f1',
-    textureUrl: '/assets/32x32folk.png',
-    spritesheetData: f1SpritesheetData,
-    speed: 0.1,
-  },...
-</code></pre></div>
-<p dir="auto">You should find a sprite sheet for your character, and define sprite motion / assets in the corresponding file (in the above example, <code>f1SpritesheetData</code> was defined in f1.ts)</p>
-<ol start="3" dir="auto">
-<li>Update the background (environment): <code>convex/maps/firstmap.ts</code> is where the map gets loaded. The easiest way to export a tilemap is by using <a href="https://www.mapeditor.org/" rel="nofollow">Tiled</a> -- Tiled export tilemaps as a CSV and you can convert CSV to a 2d array accepted by firstmap.ts</li>
-</ol>
-<h2 tabindex="-1" dir="auto">Credits</h2>
-<ul dir="auto">
-<li>Tilesheet:
-<ul dir="auto">
-<li><a href="https://opengameart.org/content/16x16-game-assets" rel="nofollow">https://opengameart.org/content/16x16-game-assets</a> by George Bailey</li>
-<li><a href="https://opengameart.org/content/16x16-rpg-tileset" rel="nofollow">https://opengameart.org/content/16x16-rpg-tileset</a> by hilau</li>
-</ul>
-</li>
-<li>We used <a href="https://github.com/pierpo/phaser3-simple-rpg">https://github.com/pierpo/phaser3-simple-rpg</a> for the original POC of this project. We have since re-wrote the whole app, but appreciated the easy starting point</li>
-<li>Original assets by <a href="https://opengameart.org/content/tiny-rpg-forest" rel="nofollow">ansimuz</a></li>
-</ul>
-</article>
-          </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Dell fined $6.5M after admitting it made overpriced monitors look discounted (134 pts)]]></title>
-            <link>https://arstechnica.com/gadgets/2023/08/dell-fined-6-5m-after-admitting-it-made-overpriced-monitors-look-discounted/</link>
-            <guid>37128281</guid>
-            <pubDate>Mon, 14 Aug 2023 23:44:19 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://arstechnica.com/gadgets/2023/08/dell-fined-6-5m-after-admitting-it-made-overpriced-monitors-look-discounted/">https://arstechnica.com/gadgets/2023/08/dell-fined-6-5m-after-admitting-it-made-overpriced-monitors-look-discounted/</a>, See on <a href="https://news.ycombinator.com/item?id=37128281">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-            <h4>
-      5,300 monitors sold    —
-</h4>
-            
-            <h2 itemprop="description">Dell Australia is paying for something many of its peers are guilty of. </h2>
-                    </div><div itemprop="articleBody">
-                                    
-<figure>
-  <img src="https://cdn.arstechnica.net/wp-content/uploads/2023/08/GettyImages-497371776-800x533.jpg" alt="An employee uses a handheld scanner to register the barcode of an outgoing Dell Inc. computer monitor inside the warehouse of an order fulfillment centre,">
-      <figcaption></figcaption>  </figure>
-
-  
-
-
-
-
-<!-- cache hit 52:single/related:ba14820ac87d6f95974cc19b433acd26 --><!-- empty -->
-<p>Dell's Australia arm has been slapped with a $10 million AUD (about $6.49 million) fine for "making false and misleading representations on its website about discount prices for add-on computer monitors," the Australian Competition &amp; Consumer Commission (ACCC) announced today. The Australian regulator said the company sold 5,300 monitors this way.</p>
-<p>As Ars Technica previously reported, the ACCC launched <a href="https://arstechnica.com/gadgets/2023/06/dell-in-hot-water-for-making-shoppers-think-overpriced-monitors-were-discounted/">litigation against Dell Australia</a> in November. In June, the Australian Federal Court <a href="https://www.judgments.fedcourt.gov.au/judgments/Judgments/fca/single/2023/2023fca0588" data-uri="05854df1c1e3192c7a6baccebbf109c8">declared</a> that Dell Australia made shoppers believe monitors would be cheaper if bought as an add-on item.</p>
-<p>Here's how the "misleading representations" worked. Shoppers of Dell Australia's website who were buying a computer would see an offer for a Dell display with a lower price next to a higher price with a strikethrough line. That suggested to shoppers that the price they'd pay for the monitor if they added it to their cart now would be lower than the monitor's usual cost. But it turns out the strikethrough prices weren't the typical costs. Sometimes, the lower price was actually <em>higher</em> than what Dell Australia typically charged.</p>
-<figure><a href="https://cdn.arstechnica.net/wp-content/uploads/2023/08/Dell-jpg.jpg" data-height="874" data-width="654"><img src="https://cdn.arstechnica.net/wp-content/uploads/2023/08/Dell-jpg-640x855.jpg" width="640" height="855" srcset="https://cdn.arstechnica.net/wp-content/uploads/2023/08/Dell-jpg.jpg 2x"></a><figcaption></figcaption></figure>
-<p>"In some cases, consumers paid more for the add-on monitor advertised as 'discounted' than they would have paid if they had bought it as a stand-alone product, which is shocking," ACCC commissioner Liza Carver said in a statement in June.</p>
-<p>Dell Australia's website would use savings-signaling lingo, such as: "Includes x% off," "Total Savings" plus a dollar amount, and "Get the best price for popular accessories when purchased with this product," the ACCC noted.</p>                                            
-                                                        
-<p>Dell Australia also admitted to overstating "discounts customers received" since "monitors were not sold for the strikethrough price for most of the relevant time" and that it "contravened the Australian Consumer Law," according to ACCC's announcement today.</p>
-<p>These tricky methods led to shoppers spending over $2 million AUD (about $1.3 million) on Dell monitors from August 2019 to December 2021, according to the ACCC.</p>
-<p>“We took this action against Dell Australia because consumers rely on accurate information about prices and discounts to make purchasing decisions," Carver said in a statement today.</p>
-<p>Dell Australia was already ordered by Australia's Federal Court to provide full or partial refunds to customers. The ACCC said Dell has already started contacting customers about giving full or partial refunds.</p>
-<p>A Dell spokesperson told Ars Technica today that Dell is also paying customers interest and "taking steps to improve our pricing processes to ensure this sort of error does not happen again." Dell didn't specify its exact steps, but in June, Australia's Federal Court ordered Dell Australia to hire an "independent compliance professional."</p>
-<p>A Dell spokesperson also told Ars:</p>
-<blockquote><p>We are pleased that this is now behind us, and our focus can return to serving our Australian customers. As we acknowledged in November 2022 when the ACCC commenced these proceedings, due to an error in Dell's pricing processes, there was incorrect information displayed on our website about the pricing and savings associated with certain monitors.</p></blockquote>
-<p>Unfortunately, for shoppers, even if Dell makes good on its word and eliminates tactics that make typical or bad prices seem like deals, the practice is common among consumer tech vendors. I often see OEMs list products, like laptops and monitors, with discounted prices <em>before</em> they've actually been released. And online marketplaces are flooded with strikethrough prices that represent what the product might have cost <em>years</em> ago.</p>
-<p>Dell Australia may promise to make it easier to spot its actual deals, but it's best to make your own price comparisons or use a price tracker like <a href="https://pcpartpicker.com/" data-uri="8379f2468ee2483f463d89cdbcdc3028">PCPartPicker</a> or <a href="https://camelcamelcamel.com/camelizer" data-uri="6f2b6aaa9b5247ef1624625dd07701e8">The Camelizer</a> (which also comes as a handy browser plugin) and avoid buyer's remorse.</p>
-
-                                                </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Internet Archive responds to recording industry lawsuit targeting obsolete media (381 pts)]]></title>
-            <link>https://blog.archive.org/2023/08/14/internet-archive-responds-to-recording-industry-lawsuit-targeting-obsolete-media/</link>
-            <guid>37128044</guid>
-            <pubDate>Mon, 14 Aug 2023 23:14:28 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://blog.archive.org/2023/08/14/internet-archive-responds-to-recording-industry-lawsuit-targeting-obsolete-media/">https://blog.archive.org/2023/08/14/internet-archive-responds-to-recording-industry-lawsuit-targeting-obsolete-media/</a>, See on <a href="https://news.ycombinator.com/item?id=37128044">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-			
-<p>Late Friday, some of the world’s largest record labels, including Sony and Universal Music Group, filed a lawsuit against the Internet Archive and others for the <a href="https://great78.archive.org/">Great 78 Project</a>, a community effort for the preservation, research and discovery of 78 rpm records that are 70 to 120 years old. As a non-profit library, we take this matter seriously and are currently reviewing the lawsuit with our legal counsel.</p>
-
-
-<div>
-<figure><a href="http://blog.archive.org/wp-content/uploads/2023/08/20thcenturytimemachineimages_0000.jpg"><img decoding="async" width="500" height="750" src="http://blog.archive.org/wp-content/uploads/2023/08/20thcenturytimemachineimages_0000.jpg" alt="" srcset="https://blog.archive.org/wp-content/uploads/2023/08/20thcenturytimemachineimages_0000.jpg 500w, https://blog.archive.org/wp-content/uploads/2023/08/20thcenturytimemachineimages_0000-200x300.jpg 200w" sizes="(max-width: 500px) 100vw, 500px"></a><figcaption>A 78 rpm player in the foyer of the Internet Archive.</figcaption></figure></div>
-
-
-<p>Of note, the <a href="https://great78.archive.org/">Great 78 Project</a> has been in operation since 2006 to bring free public access to a largely forgotten but culturally important medium. Through the efforts of dedicated librarians, archivists and sound engineers, we have preserved hundreds of thousands of recordings that are stored on shellac resin, an obsolete and brittle medium. The resulting preserved recordings retain the scratch and pop sounds that are present in the analog artifacts; noise that modern remastering techniques remove.</p>
-
-
-
-<p><strong>Statement from Brewster Kahle, digital librarian of the Internet Archive:</strong><br>“When people want to listen to music they go to Spotify. When people want to study sound recordings as they were originally created, they go to libraries like the Internet Archive. Both are needed. There shouldn’t be conflict here.”</p>
-
-
-
-<p>These preservation recordings are used in teaching and research, including by university professors like Jason Luther of Rowan University, whose students use the Great 78 collection as the basis for researching and writing podcasts for use in class assignments (<a href="https://blog.archive.org/2021/06/09/university-professor-leverages-78rpm-record-collection-from-the-internet-archive-for-students/">University Professor Leverages 78rpm Record Collection From the Internet Archive for Student Podcasts</a>, June 9, 2021). While this mode of access is important, usage is tiny—on average, each recording in the collection is only accessed by one researcher per month.</p>
-
-
-
-<figure><a href="https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1.jpg"><img decoding="async" loading="lazy" width="1000" height="750" src="https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1.jpg" alt="" srcset="https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1.jpg 1000w, https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1-300x225.jpg 300w, https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1-768x576.jpg 768w, https://blog.archive.org/wp-content/uploads/2023/08/Technician-digitizes-78-1000x750-1-624x468.jpg 624w" sizes="(max-width: 1000px) 100vw, 1000px"></a><figcaption>A technician uses a 4-arm turntable to digitize a 78 rpm record.</figcaption></figure>
-
-
-
-<p>While we review the lawsuit, we remain dedicated to our mission of providing “Universal Access to All Knowledge.” We are grateful for the continued support of our library patrons and partners as we continue to fight these attacks.</p>
-
-
-
-<p>For more information or media inquiries, please contact <a href="mailto:press@archive.org">press@archive.org</a>.&nbsp;</p>
-
-
-
-<p><strong>LINKS</strong></p>
-
-
-
-<ul>
-<li>The Great 78 Project: <a href="https://great78.archive.org/">https://great78.archive.org/</a>&nbsp;</li>
-
-
-
-<li>University Professor Leverages 78rpm Record Collection From the Internet Archive for Student Podcasts: <a href="https://blog.archive.org/2021/06/09/university-professor-leverages-78rpm-record-collection-from-the-internet-archive-for-students/">https://blog.archive.org/2021/06/09/university-professor-leverages-78rpm-record-collection-from-the-internet-archive-for-students/</a>&nbsp;</li>
-
-
-
-<li>78 rpm record digitization: <a href="https://archive.org/details/mass78rpmdiscdigitization">https://archive.org/details/mass78rpmdiscdigitization</a></li>
-</ul>
-					</div></div>]]></description>
         </item>
     </channel>
 </rss>
