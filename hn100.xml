@@ -4,12 +4,209 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 21 Sep 2023 16:00:06 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 21 Sep 2023 17:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Call to shut down Bristol schools’ use of app to ‘monitor’ pupils and families (113 pts)]]></title>
+            <title><![CDATA[Article reply “Godot is not the new Unity” from Juan Linietsky (BDFL of Godot) (115 pts)]]></title>
+            <link>https://gist.github.com/reduz/cb05fe96079e46785f08a79ec3b0ef21</link>
+            <guid>37598985</guid>
+            <pubDate>Thu, 21 Sep 2023 15:21:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://gist.github.com/reduz/cb05fe96079e46785f08a79ec3b0ef21">https://gist.github.com/reduz/cb05fe96079e46785f08a79ec3b0ef21</a>, See on <a href="https://news.ycombinator.com/item?id=37598985">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="file-godot_binding_system_explained-md">
+    <article itemprop="text"><p dir="auto">During the past days, this <a href="https://sampruden.github.io/posts/godot-is-not-the-new-unity/" rel="nofollow">great article</a> by Sam Pruden has been
+making the rounds around the gamedev community. While the article provides an in-depth analysis, its a bit easy to miss the
+point and exert the wrong conclusions from it. As such, and in many cases, users unfamiliar with Godot internals have used
+it points such as following:</p>
+<ul dir="auto">
+<li>Godot C# support is inefficient</li>
+<li>Godot API and binding system is designed around GDScript</li>
+<li>Godot is not production ready</li>
+</ul>
+<p dir="auto">In this brief article, I will shed a bit more light about how the Godot binding system works and some detail on the Godot
+architecture. This should hopefully help understand many of the technical decisions behind it.</p>
+<h3 id="user-content-built-in-types" dir="auto"><a href="#built-in-types">Built-in Types</a></h3>
+<p dir="auto">Compared to other game engines, Godot is designed with a relatively high level data model in mind. At the heart, it uses several
+datatypes across the whole engine. These datatypes are:</p>
+<ul dir="auto">
+<li><strong>Nil</strong>: To indicate an empty value.</li>
+<li><strong>Bool, Int64 and Float64</strong>: For scalar math.</li>
+<li><strong>String</strong>: For String and Unicode handling.</li>
+<li><strong>Vector2, Vector2i, Rect2, Rect2i, Transform2D</strong>: For 2D Vector math.</li>
+<li><strong>Vector3, Vector4, Quaternion, AABB, Plane, Projection, Basis, Transform3D</strong>: For 3D Vector math.</li>
+<li><strong>Color</strong>: For color space math.</li>
+<li><strong>StringName</strong>: For fast processing of Unique IDs (internally a unique pointer).</li>
+<li><strong>NodePath</strong>: For referencing paths between nodes in the Scene Tree.</li>
+<li><strong>RID</strong>: Resource ID for referencing a resource inside a server.</li>
+<li><strong>Object</strong>: An instance of a class.</li>
+<li><strong>Callable</strong>: A generic function pointer.</li>
+<li><strong>Signal</strong>: A signal (see Godot docs).</li>
+<li><strong>Dictionary</strong>: A generic dictionary (can contain any of these datatypes as either key or value).</li>
+<li><strong>Array</strong>: A generic array (can contain any of these datatypes).</li>
+<li><strong>PackedByteArray, PackedInt32Array, PackedInt64Array, PackedFloatArray, PackedDoubleArray</strong>: Scalar packed arrays.</li>
+<li><strong>PackedVector2Array, PackedVector3Array, PackedColorarray</strong>: Vector packed arrays.</li>
+<li><strong>PackedStringArray</strong>: Packed string array.</li>
+</ul>
+<p dir="auto">Does this mean that anything you do in Godot has to use these datatypes? Absolutely not.
+These datatypes have several roles in Godot:</p>
+<ul dir="auto">
+<li><strong>Storage</strong>: Any of these datatypes can be saved to disk and loaded back very efficiently.</li>
+<li><strong>Transfer</strong>: These datatypes can be very efficiently marshalled and compressed for transfer over a network.</li>
+<li><strong>Introspection</strong>: Objects in Godot can only expose their properties as any of those datatypes.</li>
+<li><strong>Editing</strong>: When editing any object in Godot, it is done via any of these datatypes (of course, different editors can exist for the same datatype, depending on the context).</li>
+<li><strong>Languge API</strong>: Godot exposes its API to all languages it binds via those datatypes.</li>
+</ul>
+<p dir="auto">Of course, if you are absolutely unfamliar to Godot, the first questions that come to mind are:</p>
+<ul dir="auto">
+<li>How do you expose more complex datatypes?</li>
+<li>What about other datatypes such as int16?</li>
+</ul>
+<p dir="auto">In general, you can expose more complex datatypes via Object API, so this is not much of an issue. Additionally, modern processors all have at minimum 64 bit buses, so exposing anything other than 64 bit scalar types makes no sense.</p>
+<p dir="auto">If you are unfamliar to Godot, I can totally understand the disbelief. But in truth, it works fine and it makes everything
+far simpler at the time of developing the engine. This data model is one of the main reasons why Godot is such a tiny,
+efficient and yet feature packed engine compared to the large mainstream mamooths. As you get more familiar with the source
+code, you will start to see why.</p>
+<h3 id="user-content-language-binding-system" dir="auto"><a href="#language-binding-system">Language Binding System</a></h3>
+<p dir="auto">Now that we have our data model, Godot imposes a strict requirement that almost any function exposed to the engine API
+must be done via those datatypes. Any function parameters, return types or properties exposed must be via them too.</p>
+<p dir="auto">This makes the job of the binder much simpler. As such, Godot has what we call an universal binder. How does this binder work, then?</p>
+<p dir="auto">Godot registers any C++ function to the binder like this:</p>
+<div dir="auto"><pre>Vector3 <span>MyClass::my_function</span>(<span>const</span> Vector3&amp; p_argname) {
+   <span><span>//</span>..//</span>
+}
+
+<span><span>//</span> Then, on a special function, Godot does:</span>
+
+<span><span>//</span> Describe the method as having a name and the name of the argument, the pass the method pointer</span>
+<span>ClassDB::bind_method</span>(D_METHOD(<span><span>"</span>my_function<span>"</span></span>,<span><span>"</span>my_argname<span>"</span></span>), &amp;MyClass::my_function);</pre></div>
+<p dir="auto">Internally, <em>my_function</em> and <em>my_argument</em> are converted to a StringName (described above), so from now onwards they are
+treated just as a unique pointer by the binding API. In fact, when compiling on release, the argument name is ignored by
+the template and no code is generated, since it serves no purpose.</p>
+<p dir="auto">So, what does <code>ClassDB::bind_method</code> do? If you want to dive into the depths of insanity and try to understand the
+incredibly complex and optimized C++17 variadic templates black magic, feel free <a href="https://github.com/godotengine/godot/blob/master/core/object/method_bind.h">to go ahead</a>.</p>
+<p dir="auto">But In short, it creates a static function like this, which Godot calls "ptrcall" form.:</p>
+<div dir="auto"><pre><span><span>//</span> Not really done like this, but simplifying as much as possible so you get an idea:</span>
+
+<span>static</span> <span>void</span> <span>my_function_ptrcall</span>(<span>void</span> *instance, <span>void</span> **arguments, <span>void</span> *ret_value) {
+    MyClass *c = (MyClass*)instance;
+    Vector3 *ret = (Vector3*)ret_value;
+    *ret = c-&gt;<span>my_method</span>( *(Vector3*)arguments[<span>0</span>] );
+}</pre></div>
+<p dir="auto">This wrapper is basically as efficient as it can be. In fact, for critical functions, inline is forced into the class method, resulting in a C function pointer to the actual function code.</p>
+<p dir="auto">Then Language API works by allowing the request of any engine function in "ptrcall" format. To call this format,
+the language must:</p>
+<ul dir="auto">
+<li>Allocate a bit of stack (basically just adjusting the stack pointer of the CPU)</li>
+<li>set a pointer to the arguments (which already exist in native form in this language 1:1, be it GodotCPP, C#, Rust, etc).</li>
+<li>call.</li>
+</ul>
+<p dir="auto">And that's it. This is an incredibly efficient generic glue API that you can use to expose any language to Godot efficiently.</p>
+<p dir="auto">So, as you can imagine, the C# API in Godot basically uses a C function pointer via unsafe API to call after assigning pointers
+to native C# types. It is very, very efficient.</p>
+<h3 id="user-content-godot-is-not-the-new-unity---the-anatomy-of-a-godot-api-call" dir="auto"><a href="#godot-is-not-the-new-unity---the-anatomy-of-a-godot-api-call">Godot is not the new Unity - The anatomy of a Godot API call</a></h3>
+<p dir="auto">I want to insist that the article written by Sam Pruden is fantastic, but if you are not familiar with how Godot is intended to work under the hood it can be very misleading. I will proceed to explain a bit more in detail what is easy to misunderstand.</p>
+<h4 id="user-content-only-a-pathological-use-case-is-shown-the-rest-of-the-api-is-fine" dir="auto"><a href="#only-a-pathological-use-case-is-shown-the-rest-of-the-api-is-fine">Only a pathological use case is shown, the rest of the API is fine.</a></h4>
+<p dir="auto">The use case shown in the article, the ray_cast function, is a pathological one in the Godot API.
+Cases like this are most likely less 0.01% of the API exposed by Godot. Why the author found this specific one,
+I have no idea nor I will speculate, but I think it was just an unfortunate coincidence.</p>
+<p dir="auto">The problem is that, at the C++ level, this function takes a struct pointer for performance. But at the language
+binding API this is difficult to expose properly. This is very old code (dating to the opensourcing of Godot) and
+a Dictionary was hacked-in to use temporarily until something better is found. Of course, other stuff was more prioritary and very few games need thousands of raycasts, so pretty much nobody complained. Still, there is a <a href="https://github.com/godotengine/godot-proposals/issues/7329" data-hovercard-type="issue" data-hovercard-url="/godotengine/godot-proposals/issues/7329/hovercard">recently open proposal</a> to discuss more efficient binding of these types of functions.</p>
+<p dir="auto">Additionally, to add to how unfortunate this choice of function is, the Godot language binding system <em>does</em> support
+struct pointers like this. GodotCPP and Rust bindings can use pointers to structs without any issue. The problem
+is that C# support in Godot predates the extension system and it was not converted to it yet. Eventually, C# will be
+moved to the universal extension system and this will allow the unifying of the default and .net editors, it is just
+not the case yet, but its top in the list of priorities.</p>
+<h4 id="user-content-the-workaround-is-even-more-pathological" dir="auto"><a href="#the-workaround-is-even-more-pathological">The workaround is even more pathological</a></h4>
+<p dir="auto">Although this time, due to a limitation of C#. If you bind C++ to C#, you need to create a C# version of a C++ instance
+as an adapter. This is not an unique problem to Godot, any other engine or application doing this will require the same.</p>
+<p dir="auto">Why is it troublesome? because C# has a garbage collector and C++ does not. This forces the C++ instance to keep a link
+to the C# instance to avoid it from being collected.</p>
+<p dir="auto">Due to this, the C# binder must do extra work when calling Godot functions that take class instances. You can see
+this code in Sam's article:</p>
+<div dir="auto"><pre><span>public</span> <span><span>static</span></span> GodotObject <span>UnmanagedGetManaged</span><span>(</span><span>IntPtr</span> <span>unmanaged</span><span>)</span>
+<span>{</span>
+    <span>if</span> <span>(</span><span>unmanaged</span> <span>==</span> IntPtr<span>.</span>Zero<span>)</span> <span>return</span> <span>null</span><span>;</span>
+
+    <span>IntPtr</span> <span>intPtr</span> <span>=</span> NativeFuncs<span>.</span><span>godotsharp_internal_unmanaged_get_script_instance_managed</span><span>(</span>unmanaged<span>,</span> <span>out</span> <span>var</span> r_has_cs_script_instance<span>)</span><span>;</span>
+    <span>if</span> <span>(</span><span>intPtr</span> <span>!=</span> IntPtr<span>.</span>Zero<span>)</span> <span>return</span> <span>(</span>GodotObject<span>)</span>GCHandle<span>.</span><span>FromIntPtr</span><span>(</span>intPtr<span>)</span><span>.</span>Target<span>;</span>
+    <span>if</span> <span>(</span>r_has_cs_script_instance<span>.</span><span>ToBool</span><span>(</span><span>)</span><span>)</span> <span>return</span> <span>null</span><span>;</span>
+
+    <span>intPtr</span> <span>=</span> NativeFuncs<span>.</span><span>godotsharp_internal_unmanaged_get_instance_binding_managed</span><span>(</span>unmanaged<span>)</span><span>;</span>
+    <span>object</span> <span>obj</span> <span>=</span> <span>(</span><span>(</span><span>intPtr</span> <span>!=</span> IntPtr<span>.</span>Zero<span>)</span> <span>?</span> GCHandle<span>.</span><span>FromIntPtr</span><span>(</span>intPtr<span>)</span><span>.</span>Target <span>:</span> <span>null</span><span>)</span><span>;</span>
+    <span>if</span> <span>(</span><span>obj</span> <span>!=</span> <span>null</span><span>)</span> <span>return</span> <span>(</span><span>GodotObject</span><span>)</span><span>obj</span><span>;</span>
+
+    <span>intPtr</span> <span>=</span> NativeFuncs<span>.</span><span>godotsharp_internal_unmanaged_instance_binding_create_managed</span><span>(</span>unmanaged<span>,</span> intPtr<span>)</span><span>;</span>
+    <span>if</span> <span>(</span><span>!</span><span>(</span><span>intPtr</span> <span>!=</span> IntPtr<span>.</span>Zero<span>)</span><span>)</span> <span>return</span> <span>null</span><span>;</span>
+
+    <span>return</span> <span>(</span>GodotObject<span>)</span>GCHandle<span>.</span><span>FromIntPtr</span><span>(</span>intPtr<span>)</span><span>.</span>Target<span>;</span>
+<span>}</span></pre></div>
+<p dir="auto">While very efficient, it's still not ideal for hot paths so the Godot API exposed is considerate and does not expose anything critical this way. The workaround used, however, is quite complex and hits this path due to not using the actual function
+intended for it.</p>
+<h4 id="user-content-the-question-of-cherry-picking" dir="auto"><a href="#the-question-of-cherry-picking">The question of cherry picking</a></h4>
+<p dir="auto">I firmly believe the author did not cherry pick this API on purpose. In fact, he himself writes that he checked other places of
+API usages and did not find anything with this level of pathology either.</p>
+<p dir="auto">However, he mentions:</p>
+<pre><code>Let’s also remember that Dictionary is only part of the problem. If we look a little wider for things returning 
+Godot.Collections.Array&lt;T&gt; (remember: heap allocated, contents as Variant) we find lots from physics, 
+mesh &amp; geometry manipulation, navigation, tilemaps, rendering, and more.
+</code></pre>
+<p dir="auto">From my side and contributors side, none of those usages are hot paths or pathological. Remember that, as I mentioned above,
+Godot uses the Godot types mainly for serialization and API communication. While it is true that they do heap allocation,
+this only happens once when the data is created.</p>
+<p dir="auto">I think what may have confused Sam and a few others in this area (which is normal if you are not familiar with the Godot codebase) is that Godot containers don't work like STL containers. Because they are used mainly to pass data around, they are
+allocated once and then kept via reference counting.</p>
+<p dir="auto">This means, the function that reads your mesh data from disk is the only one doing the allocation, then this pointer gets
+passed through many layers via reference counting until arrives Vulkan and is uploaded to the GPU. Zero copies happen along
+the way.</p>
+<p dir="auto">Likewise, when these containers are exposed to C# via the Godot collections, they are also reference counted internally.
+If you create one of those arrays to pass the the Godot API, the allocation only happens <em>once</em>. Then no further copies happen
+and the data arrives intact to the consumer.</p>
+<p dir="auto">Of course, intenally, Godot uses far more optimized containers that are not directly exposed to the binder API.</p>
+<h4 id="user-content-misleading-conclusion" dir="auto"><a href="#misleading-conclusion">Misleading conclusion</a></h4>
+<p dir="auto">The article concludes like this:</p>
+<pre><code>Godot has made a philosophical decision to be slow. The only practical way to interact with the engine is via this binding layer, and its core design prevents it from ever being fast. No amount of optimising the implementation of Dictionary or speeding up the physics engine is going to get around the fact we’re passing large heap allocated values around when we should be dealing with tiny structs. While C# and GDScript APIs remain synchronised, this will always hold the engine back.
+</code></pre>
+<p dir="auto">As you have read in the above points, the binding layer is absolutely not slow. What can be slow is an extremely limited amount of use cases that can be pathological. For those cases, a dedicated solution is found. This is a general <a href="https://docs.godotengine.org/en/stable/contributing/development/best_practices_for_engine_contributors.html#to-each-problem-its-own-solution" rel="nofollow">philosophy</a> behind Godot development that helps keep the codebase small, tidy, maintainable and easy to understand.</p>
+<p dir="auto">In other words, this principle:</p>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer nofollow" href="https://user-images.githubusercontent.com/6265307/269689859-d3bb5bec-1473-4803-a7d4-9ebc33736d48.png"><img src="https://user-images.githubusercontent.com/6265307/269689859-d3bb5bec-1473-4803-a7d4-9ebc33736d48.png" alt="image"></a></p>
+<p dir="auto">The current binder serves its purpose and works well and efficiently for over 99.99% of use cases. For the exceptional ones, as mentioned before, the extension API supports structs already (which you can see here in this excerpt of the extension api dump):</p>
+<pre><code>		{
+			"name": "PhysicsServer2DExtensionRayResult",
+			"format": "Vector2 position;Vector2 normal;RID rid;ObjectID collider_id;Object *collider;int shape"
+		},
+		{
+			"name": "PhysicsServer2DExtensionShapeRestInfo",
+			"format": "Vector2 point;Vector2 normal;RID rid;ObjectID collider_id;int shape;Vector2 linear_velocity"
+		},
+		{
+			"name": "PhysicsServer2DExtensionShapeResult",
+			"format": "RID rid;ObjectID collider_id;Object *collider;int shape"
+		},
+		{
+			"name": "PhysicsServer3DExtensionMotionCollision",
+			"format": "Vector3 position;Vector3 normal;Vector3 collider_velocity;Vector3 collider_angular_velocity;real_t depth;int local_shape;ObjectID collider_id;RID collider;int collider_shape"
+		},
+		{
+			"name": "PhysicsServer3DExtensionMotionResult",
+			"format": "Vector3 travel;Vector3 remainder;real_t collision_depth;real_t collision_safe_fraction;real_t collision_unsafe_fraction;PhysicsServer3DExtensionMotionCollision collisions[32];int collision_count"
+		},
+</code></pre>
+<p dir="auto">So, ultimately, I believe that the conclusion that "Godot is slow by design" is a bit rushed. What is currently missing is the move of the C# language to the GDExtension system in order to be able to take advantage of these. This is currently a work in progress.</p>
+<h3 id="user-content-to-sum-up" dir="auto"><a href="#to-sum-up">To sum up</a></h3>
+<p dir="auto">I hope that this short article is used to dispell a few misconceptions that unintentionally arised from Sam's excellent article:</p>
+<ul dir="auto">
+<li><strong>Godot C# API is inefficient:</strong> This is absolutely not the case, but very few pathological cases remain to be solved and were already being in discussion before last week. In practice, very very few games may run into them and, by next year, hopefully none.</li>
+<li><strong>Godot API is designed around GDScript:</strong> This is also not true. In fact, until Godot 4.1, typed GDScript did calls via "ptrcall" syntax, and the argument encoding was a bottleneck. As a result, we created a <a href="https://github.com/godotengine/godot/pull/79893" data-hovercard-type="pull_request" data-hovercard-url="/godotengine/godot/pull/79893/hovercard">special path</a> for GDScript to call more efficiently.</li>
+</ul>
+<p dir="auto">Thanks for reading and remember that Godot is not commercial software developed behind closed doors. All of us who make it are available online in the same communities as you. If you have any doubt, feel free to ask us directly.</p>
+<p dir="auto"><strong>Bonus:</strong> As a side note, and contrary to popular belief, the Godot data model was not created for GDScript. Originaly, the engine used other languages such as Lua or Squirrel, with several published games while an in-house engine. GDScript was developed afterwards.</p>
+</article>
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Call to shut down Bristol schools’ use of app to ‘monitor’ pupils and families (132 pts)]]></title>
             <link>https://www.theguardian.com/education/2023/sep/21/calls-to-shut-down-bristol-schools-use-of-think-family-education-app-pupils-and-families</link>
             <guid>37597165</guid>
             <pubDate>Thu, 21 Sep 2023 13:16:09 GMT</pubDate>
@@ -17,7 +214,7 @@
 <div id="readability-page-1" class="page"><div id="maincontent"><p>Criminal justice and antiracist campaigners have raised concerns over an app being used by schools in <a href="https://www.theguardian.com/uk/bristol" data-link-name="in body link" data-component="auto-linked-tag">Bristol</a> to “monitor and profile” pupils and their families.</p><p>The app, which is being used by more than 100 schools, gives safeguarding leads quick, easy access to pupils’ and their families’ contacts with police, child protection and welfare services.</p><p>One of the concerns campaigners have is that the Think Family Education (TFE) app includes analysing which children could be at risk of exposure to criminality, which they argue risks leading to more discrimination against pupils from minority ethnic or working-class backgrounds.</p><p>Staff using the app have told <a href="https://www.fairtrials.org/" data-link-name="in body link">the criminal justice campaign charity Fair Trials</a> that they keep it secret from parents and carers, and admitted many would be concerned about it if they knew of it.</p><p>Bristol city council and Avon and Somerset police, who worked together on the system, insist it is in place to protect children, not criminalise them, and deny it is secret, pointing out that <a href="https://www.bristol.gov.uk/residents/social-care-and-health/children-and-families/insight-bristol" data-link-name="in body link">information about its existence is publicly available</a>.</p><p>But Fair Trials said the vast majority of parents would know nothing about the app. Griff Ferris, the charity’s senior legal and policy officer, said: “Schoolchildren should not be monitored, profiled and criminalised by secretive police databases. Surveillance is not safeguarding.</p><p>“Systems like this uphold existing discrimination against children and families from minoritised ethnic and more deprived backgrounds. This system is expanding the net of surveillance. It should be shut down.”</p><p>A spokesperson for <a href="https://www.nomoreexclusions.com/" data-link-name="in body link">the antiracist organisation No More Exclusions Bristol</a> said: “Technologies that gather and use information in the name of ‘public safety’ overwhelmingly reproduce racialised ideas of problematic behaviour.”</p><p>Liz Fekete, the director of the Institute of Race Relations, strongly criticised elements of the app, saying the approach “stigmatises whole families and leaves even primary school children vulnerable to police surveillance and intelligence gathering”.</p><p>When it was consulted, the Bristol City Youth Council, an elected group of young people, expressed reservations that if the system was not used properly it could lead to “prejudice and judgment”.</p><p>Systems to collate information about children are used in other parts of England but Bristol city council describes Think Family as “innovative” and a number of local authorities are watching how the app works.</p><p>On its website, the council says the <a href="https://www.bristol.gov.uk/residents/social-care-and-health/children-and-families/insight-bristol" data-link-name="in body link">Think Family database</a>, which the app draws on, includes information from about 50,000 families across the city collected from agencies including social care, police and the Department for Work and Pensions. It says it highlights “vulnerabilities or needs” and uses “targeted analytics” to help identify children at risk of sexual or criminal exploitation.</p><p>Critics say the reality is that this risks children from minority ethnic or poorer backgrounds being profiled as being involved in gangs or county lines operations.</p><p>Schools using the TFE app receive alerts about children’s and family members’ contact with police, antisocial behaviour and domestic violence incidents. The system also gives schools access to sensitive personal details about families’ financial situations.</p><p>School safeguarding leads told Fair Trials that they kept the system secret from children and their families. One said: “They [parents and carers] wouldn’t know about this ... parents will have no kind of sight of it at all ... They just don’t know of its existence.”</p><p>They described the system as “an early warning process” and admitted: “I think there’s a bit of a risk it getting out there that schools hold this kind of central bank of information.”</p><p>A spokesperson for Bristol city council said the Think Family database was introduced to counter the trend of agencies working in silos at a time of a “generational squeeze” on public finances.</p><p>The spokesperson said: “The introduction of the Think Family Education app means that schools … have access to appropriate information in a secure and restricted way to make decisions about how they support children. There are strict controls in place about who can access this information, how they do this and the reasons why.”</p><p>A spokesperson for Avon and Somerset police said the database gave professionals working with children joined-up information to identify and safeguard those at risk of criminal and sexual exploitation.</p><p>“The TFE app gives professionals immediate access to this information, helping them to act swiftly on any identified risks.” The spokesperson said neither the app or database assessed the likelihood of an individual to commit a crime.</p><p>The force said “robust privacy and sharing agreements” had been approved by <a href="https://ico.org.uk/" data-link-name="in body link">the Information Commissioner’s Office</a> and development of the system done in collaboration with the <a href="https://www.gov.uk/government/organisations/centre-for-data-ethics-and-innovation" data-link-name="in body link">Centre for Data Ethics and Innovation</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Nippon Television has just acquired Studio Ghibli (309 pts)]]></title>
+            <title><![CDATA[Nippon Television has just acquired Studio Ghibli (372 pts)]]></title>
             <link>https://www.catsuka.com/breves/2023-09-21/nippon-television-rachete-le-studio-ghibli</link>
             <guid>37596788</guid>
             <pubDate>Thu, 21 Sep 2023 12:44:11 GMT</pubDate>
@@ -39,7 +236,7 @@ Producer Toshio Suzuki (75y old) was looking for a successor, and proposed Goro 
 Nippon Television was already a long-standing partner of Ghibli ("Friday Road Show").</p><p>(2023/09/21)</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Airlines Are Just Banks Now (142 pts)]]></title>
+            <title><![CDATA[Airlines Are Just Banks Now (175 pts)]]></title>
             <link>https://www.theatlantic.com/ideas/archive/2023/09/airlines-banks-mileage-programs/675374/</link>
             <guid>37596755</guid>
             <pubDate>Thu, 21 Sep 2023 12:40:58 GMT</pubDate>
@@ -47,7 +244,7 @@ Nippon Television was already a long-standing partner of Ghibli ("Friday Road Sh
 <div id="readability-page-1" class="page"><article><header data-event-module="hero"><div><div><p>They make more money from mileage programs than from flying planes—and it shows.</p></div><div><figure><div><picture><img alt="Illustration of planes against a backdrop of a credit card" sizes="(min-width: 976px) 976px, 100vw" srcset="https://cdn.theatlantic.com/thumbor/i1zxOBjUfAa-LcAk39Vpb8-iF8U=/0x0:2000x1125/750x422/media/img/mt/2023/09/airlines_are_banks/original.jpg 750w, https://cdn.theatlantic.com/thumbor/wbxnD5HvcVxcZq5D4_fZVem-SAU=/0x0:2000x1125/828x466/media/img/mt/2023/09/airlines_are_banks/original.jpg 828w, https://cdn.theatlantic.com/thumbor/AY1IMnrdT1NrCRmGfjeURl9WzME=/0x0:2000x1125/960x540/media/img/mt/2023/09/airlines_are_banks/original.jpg 960w, https://cdn.theatlantic.com/thumbor/tYcp3eiVo3YWMCqFQx21qfiBwtE=/0x0:2000x1125/976x549/media/img/mt/2023/09/airlines_are_banks/original.jpg 976w, https://cdn.theatlantic.com/thumbor/_Tgm4RT8P6wSfIJSTVjg7zzGljA=/0x0:2000x1125/1952x1098/media/img/mt/2023/09/airlines_are_banks/original.jpg 1952w" src="https://cdn.theatlantic.com/thumbor/AY1IMnrdT1NrCRmGfjeURl9WzME=/0x0:2000x1125/960x540/media/img/mt/2023/09/airlines_are_banks/original.jpg" width="960" height="540"></picture></div><figcaption>Illustration by The Atlantic. Sources: Getty.</figcaption></figure></div></div><div><p><time datetime="2023-09-21T11:00:00Z">September 21, 2023, 7 AM ET</time></p></div><gpt-ad format="injector" sizes-at-0="mobile-wide" targeting-pos="injector-article-start" sizes-at-976="desktop-wide"></gpt-ad></header><section data-event-module="article body"><p>L<span>ast week</span>, Delta Air Lines announced <a data-event-element="inline link" href="https://thepointsguy.com/news/delta-skymiles-changes/">changes</a> to its SkyMiles program that will make accruing status and taking advantage of perks much harder. Instead of relying on a combination of dollars spent and miles traveled in the air, Delta will grant status based on a single metric—dollars spent—and raise the amount of spending required to get it. In short, SkyMiles is no longer a frequent-flier program; it’s a big-spender program. These changes are so drastic that one of the reporters at the preeminent travel-rewards website The Points Guy <a data-event-element="inline link" href="https://thepointsguy.com/news/why-i-wont-chase-airline-status/">declared</a> that he’s going to “stop chasing airline status.”</p><p>When even the points insiders are sick of playing the mileage game, something has clearly gone wrong. In fact, frequent-flier programs are a symptom of a much deeper rot in the American air-travel industry. And although getting mad at airlines is perfectly reasonable, the blame ultimately lies with Congress.</p><p>From the late 1930s through the ’70s, the federal government regulated airlines as a public utility. The Civil Aeronautics Board decided which airlines could fly what routes and how much they could charge. It aimed to set prices that were fair for travelers and that would provide airlines with a modest profit. Then, in 1978, Congress passed a sweeping law deregulating the airline industry and ultimately abolishing the CAB. Unleashed from regulation, airlines devised new tactics to capture the market. American Airlines was one of the most aggressive. In the lead-up to the deregulation bills, it created discount “super saver” fares to sell off the final few remaining seats on planes. That meant cheap prices for last-minute travelers and more revenue for American, because the planes were going to take off whether or not the seat was filled. But these fares upset business travelers, who tended to buy tickets further in advance for higher prices. So in <a data-event-element="inline link" href="https://www.yahoo.com/news/timeline-events-american-airlines-history-011902886.html?guccounter=1">1981</a>, American developed AAdvantage, its frequent-flier program, to give them additional benefits. Other airlines followed suit.</p><p id="injected-recirculation-link-0" data-view-action="view link - injected link - item 1" data-event-element="injected link" data-event-position="1"><a href="https://www.theatlantic.com/newsletters/archive/2022/06/summer-air-travel-flights-cancelled/661385/">Read: Air travel is a disaster right now. Here’s why.</a></p><p>In the early years, these programs were simple, like the punch card at a café where your 11th coffee is free. But three big changes transformed them into the systems we know today. First, in 1987, American partnered with Citibank to offer a branded credit card that offered points redeemable for flights on the airline. Second, in the ’90s, the airlines proliferated the number of fare classes, charging differential prices for tickets. With more complicated fare structures came the third change: Virgin America realized that the amount people spend on a flight, based on the fare class, is more important to their bottom line than the number of miles flown. So, in 2007, it introduced a loyalty <a data-event-element="inline link" href="https://www.usatoday.com/story/travel/roadwarriorvoices/2016/02/25/frequent-flier-miles-points-loyalty-programs/80860962/">program</a> rewarding money spent rather than mileage accrued.</p><p>These three shifts fundamentally transformed the airline industry. They turned frequent-flier systems into the sprawling points systems they are today. And they turned airlines into something more like financial institutions that happen to fly planes on the side.</p><p>Here’s how the system works now: Airlines create points out of nothing and sell them for real money to banks with co-branded credit cards. The banks award points to cardholders for spending, and both the banks and credit-card companies make money off the swipe fees from the use of the card. Cardholders can redeem points for flights, as well as other goods and services sold through the airlines’ proprietary e-commerce portals.</p><p>For the airlines, this is a great deal. They incur no costs from points until they are redeemed—or ever, if the points are forgotten. This setup has made loyalty programs highly lucrative. <a data-event-element="inline link" href="https://www.fastcompany.com/90934980/how-much-do-we-charge-to-our-delta-air-american-express-cards-its-a-lot">Consumers now</a> charge nearly 1 percent of U.S. GDP to Delta’s American Express credit cards alone. A 2020 analysis by the <i>Financial Times</i> <a data-event-element="inline link" href="https://www.ft.com/content/1bb94ed9-90de-4f15-aee0-3bf390b0f85e">found</a> that Wall Street lenders valued the major airlines’ mileage programs more highly than the airlines themselves. United’s MileagePlus program, for example, was valued at $22 billion, while the company’s market cap at the time was only $10.6 billion.</p><p>Is this a good deal for the American consumer? That’s a trickier question. Paying for a flight or a hotel room with points may feel like a free bonus, but because credit-card-swipe fees increase prices across the economy—Visa or Mastercard takes a cut of every sale—redeeming points is more like getting a little kickback. Certainly the system is bad for Americans who don’t have points-earning cards. They pay higher prices on ordinary goods and services but don’t get the points, effectively <a data-event-element="inline link" href="https://www.brookings.edu/articles/how-credit-card-companies-reward-the-rich-and-punish-the-rest-of-us/">subsidizing</a> the perks of card users, who tend to be wealthier already.</p><p>Like the federal reserve, airlines issue currency—points—out of thin air. They also get to decide how much that currency is worth and what it can be spent on. This helps explain why the points system feels so opaque and, often, unfair. Online analysts try to offer estimates of points’ cash value, but airlines can <a data-event-element="inline link" href="https://viewfromthewing.com/delta-air-lines-is-even-devaluing-your-banked-rollover-elite-qualifying-miles/">reduce</a> these <a data-event-element="inline link" href="https://viewfromthewing.com/delta-ceo-were-not-done-making-changes-to-skymiles-status-or-first-class/">values</a> after the fact and change how points can be redeemed. Airlines even <a data-event-element="inline link" href="https://www.forbes.com/advisor/credit-cards/is-buying-frequent-flyer-miles-ever-a-good-deal/">sell</a> <a data-event-element="inline link" href="https://www.nerdwallet.com/article/travel/times-it-actually-makes-sense-to-buy-miles">points</a> at above their exchange-rate valuation, meaning that people are paying for something worth less than the money they’re buying it with, in part because it’s so hard to know what the real value is.</p><p>In this context, it’s easy to see why Delta is making changes. The shift to a focus on spending, rather than mileage, has long been coming, because of the rise of multiple fare classes and the decoupling of mileage and revenue. Limiting benefits and increasing the requirements for status, meanwhile, looks like a way to spread out costs: 1 percent of GDP spending is a lot of outstanding points that could be redeemed.</p><p>Still, you might wonder how airlines can get away with angering their customers by devaluing loyalty programs. Aren’t they worried that those customers will get a little less loyal? Well, not really. The U.S. has only four major carriers, which <a data-event-element="inline link" href="https://www.npr.org/2023/03/07/1161640389/jetblue-spirit-airlines-doj-lawsuit">account</a> for more than three-quarters of the market, and they tend to move in lockstep. Indeed, American Airlines recently made a <a data-event-element="inline link" href="https://thepointsguy.com/news/american-aadvantage-vs-delta-skymiles/">similar</a> change to its mileage program. Customers don’t have many other places to go.</p><p>I<span>n this</span> and other respects, the strange evolution of airlines into quasi-banks reflects how badly deregulation has gone. Regulation carefully set the terms under which airlines could do business. It was designed to ensure that they remained a stable business and a reliable mode of transportation. Deregulation, in turn, allowed the airlines to pursue profits in whatever way they could—including getting into the financial sector.</p><p>The proponents of deregulation made a few big promises. The cost of flying would go down once airlines were free to compete on price. The industry would get less monopolistic as hundreds of new players entered the market, and it would be stable even without the government guaranteeing profitable rates. Small cities wouldn’t lose service. In the deregulators’ minds, airlines were like any other business. If they were allowed to compete freely, the magic of the market would make everything better. Whatever was good for the airlines’ bottom line would be good for consumers.</p><p>They were wrong. As I explain in my <a data-event-element="inline link" href="https://tertulia.com/book/why-flying-is-miserable-and-how-to-fix-it-ganesh-sitaraman/9798987053584?affiliate_id=atl-347">forthcoming book</a>, most of their predictions didn’t come true, because air travel isn’t a normal business. There are barriers to entry, such as the fixed supply of airport runways and gates. (And, for that matter, mileage programs, designed to keep customers from ditching an established airline for a rival.) There are network effects and economies of scale. There are high capital costs. (Airplanes aren’t cheap.) The idea that anyone could successfully start an airline and outcompete the big incumbents never made much sense.</p><p>After a relatively short period of fierce competition, the deregulated era quickly turned to consolidation and cost-cutting, as dozens of airlines either went bankrupt or were acquired. Service keeps getting worse, because the airlines, facing little competition, have nothing to fear from antagonizing passengers with cramped legroom, cancellations, and ever-multiplying fees for baggage and snacks. Worse still, without mandated service, cities and regions across the country have lost commercial air service, with <a data-event-element="inline link" href="https://washingtonmonthly.com/2012/03/01/terminal-sickness/">serious consequences</a> for their economies. And when a crisis like 9/11 or the coronavirus pandemic comes along, the airlines—which prefer to direct their profits to stock buybacks rather than rainy-day funds—need massive financial relief from the federal government.</p><p id="injected-recirculation-link-1" data-view-action="view link - injected link - item 2" data-event-element="injected link" data-event-position="2"><a href="https://www.theatlantic.com/technology/archive/2023/06/airline-customer-service-chatbot-ai/674412/">Read: Somehow, airline customer service is getting even worse</a></p><p>Deregulation even failed to deliver the one thing it is sometimes credited with: lowering prices. Airfare did get cheaper in the years after the 1978 deregulation law. But the cost of flying had already been falling before<i> </i>deregulation, and it kept falling after at about the same rate.</p><p>The old system of airline regulation wasn’t perfect. Barred from competing directly on price, the airlines got into an amenities arms race that notoriously included <a data-event-element="inline link" href="https://www.youtube.com/watch?v=KnimcgMPuXk">in-flight piano bars</a>. But the cure was worse than the disease. The industry went from being a regulated oligopoly, which had real problems, to an unregulated oligopoly, which we are now seeing is much worse.</p><p>Airlines serve a vital public need, just like railroads, the electric grid, and communication networks. They also exist within a system of special privileges from the government. The public has built and paid for a substantial federal infrastructure to coordinate flights safely. Historically, these are all standard reasons to regulate an industry. A modernized set of rules could arrest the trajectory of airlines becoming financialized e-commerce platforms—and maybe even get them to focus on making air travel less miserable.</p><div data-view-action="view - affiliate module" data-view-label="Why Flying Is Miserable - And How To Fix It"><a href="https://web.tertulia.com/book/9798987053584?affiliate=atl-347" rel="noopener noreferrer" data-label="Why Flying Is Miserable - And How To Fix It" data-action="click link - affiliate module - book cover" target="_blank"><picture><img alt="" loading="lazy" srcset="https://cdn.theatlantic.com/thumbor/Zh_7jqRmMvGK6Gg6nXJl9R3pn9E=/0x0:333x500/80x120/media/img/book_reviews/2023/09/19/51XeRgTLhgL._SL500_/original.jpg, https://cdn.theatlantic.com/thumbor/KdBuSjWrqT4SQxIcOGX5eMfm2WE=/0x0:333x500/160x240/media/img/book_reviews/2023/09/19/51XeRgTLhgL._SL500_/original.jpg 2x" src="https://cdn.theatlantic.com/thumbor/Zh_7jqRmMvGK6Gg6nXJl9R3pn9E=/0x0:333x500/80x120/media/img/book_reviews/2023/09/19/51XeRgTLhgL._SL500_/original.jpg" width="80" height="120"></picture></a></div><div><hr><p>​When you buy a book using a link on this page, we receive a commission. Thank you for supporting<!-- --> <span>The Atlantic.</span></p></div></section><gpt-ad format="injector" sizes-at-0="mobile-wide,native,house" targeting-pos="injector-most-popular" sizes-at-976="desktop-wide,native,house"></gpt-ad></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[BrainTree has been down for more than 7 hours now (127 pts)]]></title>
+            <title><![CDATA[BrainTree has been down for more than 7 hours now (130 pts)]]></title>
             <link>https://www.paypal-status.com/incident/production</link>
             <guid>37596498</guid>
             <pubDate>Thu, 21 Sep 2023 12:15:19 GMT</pubDate>
@@ -55,7 +252,7 @@ Nippon Television was already a long-standing partner of Ghibli ("Friday Road Sh
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Cisco Acquires Splunk (408 pts)]]></title>
+            <title><![CDATA[Cisco Acquires Splunk (482 pts)]]></title>
             <link>https://www.splunk.com/en_us/blog/leadership/splunk-and-cisco-unite-to-accelerate-digital-resilience-as-one-of-the-leading-global-software-companies.html</link>
             <guid>37596497</guid>
             <pubDate>Thu, 21 Sep 2023 12:15:19 GMT</pubDate>
@@ -86,7 +283,587 @@ President &amp; CEO, Splunk</p>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ship of Fools (119 pts)]]></title>
+            <title><![CDATA[An INI Critique of TOML (2021) (102 pts)]]></title>
+            <link>https://github.com/madmurphy/libconfini/wiki/An-INI-critique-of-TOML</link>
+            <guid>37595766</guid>
+            <pubDate>Thu, 21 Sep 2023 10:41:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.com/madmurphy/libconfini/wiki/An-INI-critique-of-TOML">https://github.com/madmurphy/libconfini/wiki/An-INI-critique-of-TOML</a>, See on <a href="https://news.ycombinator.com/item?id=37595766">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+                <p><em>Be conservative in what you do, be liberal in what you accept from others.</em></p>
+<p>— <a href="https://en.wikipedia.org/wiki/Robustness_principle" rel="nofollow">Postel's law</a></p>
+<p>Comparing TOML and INI is not straightforward. The first is a unique standard, the second is a federation of dialects. All INI dialects however are well-defined (every INI file is parsed by some application, and by studying a parser's source code it is <a href="https://github.com/madmurphy/libconfini/wiki/INI-formats">possible to deduce its rules</a>), and, if one looks closely, the number of INI dialects actually used in the wild is not infinite. With an inclusive approach in mind, <strong>libconfini</strong> tries to acknowledge, catalog and extend many of them, so that what once was an informal standard becomes a flexible standard engraved by years of common habits. In referring to “the INI format” this document implicitly refers to that fluid format that <strong>libconfini</strong> is able to parse; and such flexibility is referred to as one of the language's intrinsic features.</p>
+<p>Although it claims to be a human-friendly language, TOML constitutes a step back into something more robotic and primitive when compared to INI files and <strong>libconfini</strong>'s approach. Some of TOML's problems are shared with JSON, which is a problematic format outside the ECMAScript realm. Other are instead problems that TOML has created on its own. The reasons why this document addresses TOML and not, for example, JSON or YAML are two. The first obvious reason is that TOML's syntax is so similar to INI that it is useful to draw a line in front of other formats' problematic design and explain why INI is something else. The other reason is that, while other formats like YAML modestly define themselves as “official subsets” of JSON (which was not born as a configuration format, but rather as a serialization format), TOML claims to be a “minimal configuration file format” – despite being another, definitely not minimal, JSON preprocessor, with dates.</p>
+<p>TOML's syntax is documented at <a href="https://toml.io/en/v1.0.0" rel="nofollow">https://toml.io/en/v1.0.0</a> (at the time of writing its current revision is <a href="https://github.com/toml-lang/toml/tree/8296d6ba97aaaf3151a32a22ed0513301ac650bf">r793.8296d6b</a>). The following paragraphs explain why you might want to avoid TOML for your next configuration file for a C or a C++ application.</p>
+<p>Writing a harsh critique of someone else's efforts is never a pleasant task. But it might be a necessary task when these efforts go in the wrong direction. It is possible that at some point TOML designers will fix the issues listed below. If they will do so, they will finally end up re-inventing INI files.</p>
+<h2 id="user-content-1-data-types"><a href="#1-data-types">1. Data types</a></h2>
+<p>A TOML document syntactically <em>defines</em> data types. This means that writing <code>89</code> and writing <code>"89"</code> are two different things (the first is a number, the second is a string). And this also means that a compliant TOML parser <em>must</em> respond to type changes in a TOML document. Today you write <code>"89"</code>, your application receives a string and everything goes well, but tomorrow you write <code>89</code> and your application <em>must</em> receive a number…</p>
+<p>…and crash.</p>
+<p>Of course no application would let anyone do that. Any judicious application using TOML for its configuration will be either tolerant towards improper data types, or will be obstinate and refuse type changes. In the first scenario you will have a non-compliant TOML parser (basically an INI parser), in the second scenario you will have a parser slightly more stupid than an INI parser and still non-compliant (it will not allow a TOML document to define a data type). The question is then: why giving the configuration file the power to speak about data types when at the end of the day it does not have this power (the application does)? The whole thing sounds like “You decide. No, wait, I decide.”</p>
+<p>In INI files everything is <em>a castable string</em>. It means that an application always receives a string, and such string is always able to produce a boolean, a number, a simple string, or <em>an array of castable strings</em>, without generating errors. But the application decides what to pick up and how to react to it, not the configuration file. If you want to tell the human about it, write it in a comment, but don't give the configuration file the illusion of a power it does not possess.</p>
+<h2 id="user-content-2-quotes-in-values"><a href="#2-quotes-in-values">2. Quotes in values</a></h2>
+<p>There is also a deeper issue with data types. Imagine the following configuration file:</p>
+<div data-snippet-clipboard-copy-content="[server]
+continent = Europe"><pre><code>[server]
+continent = Europe
+</code></pre></div>
+<p>The value above is not required to be a string, it is required to be <em>a continent name</em>. Writing</p>
+<div data-snippet-clipboard-copy-content="[server]
+continent = 1009"><pre><code>[server]
+continent = 1009
+</code></pre></div>
+<p>is not worse than writing</p>
+<div data-snippet-clipboard-copy-content="[server]
+continent = &quot;Vacuum cleaner&quot;"><pre><code>[server]
+continent = "Vacuum cleaner"
+</code></pre></div>
+<p>There is no award to gain in demanding that a value avoid a syntax that for some reason is reserved for numbers when it must not be a lot of other things either. And it does not make much sense to create a “string data type” when a “continent name data type” would be required – once again: <em>the <code>continent</code> key above does not expect a string, it expects a continent name</em> (which is not a string more than the ASCII characters used to express numbers are).</p>
+<p>Instead, without any valid reason, TOML's syntax forces humans to encapsulate anything that is not a number, a boolean or a date in quotes, disregarding the fact that this would incorrectly present <code>Europe</code> as a string (it is an enumeration label to be exact – in configuration files most values tend to be enumeration labels of some sort) and despite humans would not need quotes for understanding when a sequence of characters – like <code>poet</code> – is not a boolean, or a number, or a date – as for the machines, that would not be a hard task either.</p>
+<div data-snippet-clipboard-copy-content="[shakespeare]
+birth = 1564
+death = 1616
+
+# invalid in TOML
+job = poet"><pre><code>[shakespeare]
+birth = 1564
+death = 1616
+
+# invalid in TOML
+job = poet
+</code></pre></div>
+<p>It is probably not a coincidence that one of the first things that <a href="http://hjson.org/" rel="nofollow">the Hjson project</a> did in order to create a dialect of JSON “easy for humans to read and write” was to remove the necessity of using quotes for declaring strings.</p>
+<p>TOML's creator claims that unquoted strings are inherently ambiguous. We can try to imagine the following scenario,</p>
+
+<p>where the quotes seem to suggest that also <code>"252.1"</code> (i.e. a string) would be a valid value for the <code>version</code> key. But do they? What about?</p>
+<div data-snippet-clipboard-copy-content="version = &quot;252_1%2!3?4-5/6=7&quot;"><pre><code>version = "252_1%2!3?4-5/6=7"
+</code></pre></div>
+<p>Would that be a valid version string? What other information does quoting <code>252</code> give except that there could also be “something else” than a simple number?</p>
+<p>Without a comment that explains exactly how to format the <code>version</code> key there is just no way to make it unambiguous, quotes or not.</p>
+<div data-snippet-clipboard-copy-content="#INI
+
+# Please use MAJOR(.MINOR(.REVISION)) here
+version = 252.1.0"><pre><code>#INI
+
+# Please use MAJOR(.MINOR(.REVISION)) here
+version = 252.1.0
+</code></pre></div>
+<p>As in a language that has an extensible semantics, in INI files quotes serve the simple purpose of giving hints, expressing literalness, or removing <em>syntactic</em> (not semantic) ambiguity when there is the risk of it, exactly like a human would do. For instance, an INI file would use quotes like the following example does, for indicating that the <code>#</code> character in <code>#fff000</code> does not mark a comment.</p>
+
+<h2 id="user-content-3-case-sensitivity"><a href="#3-case-sensitivity">3. Case sensitivity</a></h2>
+<p>TOML's syntax is always case-sensitive, despite the fact that there are situations where a configuration file <em>must</em> be case-insensitive (think of configuration files that map a FAT32 filesystem or HTML tags, for example). INI formats can be either case-sensitive or case-insensitive depending on the application's choice.</p>
+<h2 id="user-content-4-unicode-key-names"><a href="#4-unicode-key-names">4. Unicode key names</a></h2>
+<p>TOML's syntax forbids non-ASCII key names unless these are surrounded by quotes.</p>
+<div data-snippet-clipboard-copy-content="value in € = 345    # valid with libconfini but invalid in TOML"><pre><code>value in € = 345    # valid with libconfini but invalid in TOML
+</code></pre></div>
+<p>There is no apparent motivation behind this rule, except that of conforming TOML to JSON, and probably a personal habit in dealing with the latter. But although JSON <em>does</em> have a valid reason to do so because of the programming language it has been designed to work with (ECMAScript property names follow the same rule of identifiers), TOML's reason remains somewhat mysterious.</p>
+<h2 id="user-content-5-square-brackets"><a href="#5-square-brackets">5. Square brackets</a></h2>
+<p>TOML forces arrays to be encapsulated within square brackets (exactly like section paths do), although humans do not need square brackets for recognizing when something is a list.</p>
+<div data-snippet-clipboard-copy-content="# not an array in TOML
+wishes = apples, cars, elephants, chairs"><pre><code># not an array in TOML
+wishes = apples, cars, elephants, chairs
+</code></pre></div>
+<p>Nested arrays are also not a valid reason for justifying square brackets, since in INI files it is already possible to nest arrays either by using different delimiters for each level,</p>
+<div data-snippet-clipboard-copy-content="wishes = \
+    apples : oranges : lemons, \
+    cars, \
+    elephants : tigers, \
+    chairs"><pre><code>wishes = \
+    apples : oranges : lemons, \
+    cars, \
+    elephants : tigers, \
+    chairs
+</code></pre></div>
+<p>or by recursively quoting.</p>
+<div data-snippet-clipboard-copy-content="wishes = \
+    &quot;apples oranges lemons&quot; \
+    cars \
+    &quot;elephants tigers&quot; \
+    chairs"><pre><code>wishes = \
+    "apples oranges lemons" \
+    cars \
+    "elephants tigers" \
+    chairs
+</code></pre></div>
+<p>But there is a more important reason why square brackets are a bad idea in a human-friendly configuration format: one-member arrays. There is no way to convince a human that something composed of only one member is a list (if you think differently, chances are that you are partly non-human). As friendly as they are, INI files behave accordingly, while TOML of course doesn't. Compare this (INI):</p>
+
+<p>with this (TOML):</p>
+
+<p>As in the C language, in INI files <em>a one-member array and a simple value are stored in the same way</em>. Of course you can declare a one-member array in INI files: just write a simple string.</p>
+<p>Thanks to this, INI arrays do not constitute a syntactically distinct type and any string can be parsed as an array. If you have ever dealt with m4 macro arguments you will know the beauty of this.</p>
+<h2 id="user-content-6-array-delimiters"><a href="#6-array-delimiters">6. Array delimiters</a></h2>
+<p>TOML forces arrays to be always comma-separated, although a human can recognize a list even when the separator is a mushroom.</p>
+<div data-snippet-clipboard-copy-content="[Super Mario]
+wishes = jumping 🍄 sneaking into pipes 🍄 princess Peach 🍄 flying
+coins = 39586235"><pre><code>[Super Mario]
+wishes = jumping 🍄 sneaking into pipes 🍄 princess Peach 🍄 flying
+coins = 39586235
+</code></pre></div>
+<p><strong>libconfini</strong> does not allow mushrooms either – but for practical, not philosophical reasons (and the library is not human yet) – but you are free to choose any character within the ASCII range as array delimiter and change it as often as you wish. For instance, in an INI file where normally arrays are comma-separated you might decide that an IP address is also an array, but whose members are separated by dots instead of commas – and just because that is what an IP address actually is, and that might be what your application needs.</p>
+<h2 id="user-content-7-mixed-arrays"><a href="#7-mixed-arrays">7. Mixed arrays</a></h2>
+<p>TOML encourages a nightmare for strongly typed languages like C and C++: mixed arrays. In short, after deciding that a configuration file must express strong types (and nevertheless still allowing <code>"Vacuum cleaner"</code> as a continent name), TOML forces applications to be able to mix them and display some kind of support for something that is natively not supported.</p>
+<p>An array that mixes numbers, strings and other arrays is something a C or C++ application would escape from. Although it is possible to reach the same result also with INI, with both TOML and INI a mixed array can be just emulated, <em>never really implemented</em> from the C perspective (we have left an example under <code>examples/miscellanea/toml-like.c</code>, and we would discourage anyone from doing it). The difference between INI and TOML? INI syntax has <em>the power to express</em> mixed arrays but does not require applications to map them as such, TOML does.</p>
+<h2 id="user-content-8-composite-configuration-files"><a href="#8-composite-configuration-files">8. Composite configuration files</a></h2>
+<p>TOML's syntax forbids to populate sections in different steps (sections are named “tables” in TOML). The following example, understood by a human and an INI parser, would be forbidden in TOML:</p>
+<div data-snippet-clipboard-copy-content="[visitors]
+list = karl, lisa, Andrew Smith, rick92
+
+[host]
+foo = bar
+
+[visitors]          # invalid in TOML
+checked = true      # invalid in TOML"><pre><code>[visitors]
+list = karl, lisa, Andrew Smith, rick92
+
+[host]
+foo = bar
+
+[visitors]          # invalid in TOML
+checked = true      # invalid in TOML
+</code></pre></div>
+<p>Although this might look like an insignificant detail, allowing to populate a configuration file in different steps can come very much in handy when dealing with the composition of several smaller configuration files.</p>
+<h2 id="user-content-9-dates"><a href="#9-dates">9. Dates</a></h2>
+<p>This is probably the most mysterious part of TOML language. In INI files a value can be <em>interpreted</em> as a boolean, a number, a string, an array, or whatever else you like (although in this last case <strong>libconfini</strong> will not help you). The situation is kind of similar in TOML (without the “whatever else you like” part), except that a value can also be <em>a date</em>.</p>
+<p>There is something intriguing in all this. Even forgetting that an application might not need dates at all, why constraining something so particular and that can be formatted in so many different ways into a rigid primitive? Why not doing that for <em>a path</em>? Or <em>a username</em>? Or <em>an email address</em>? Or <em>a regular expression</em>? …Or <em>a continent name</em>? These have all a more constraining semantics than dates.</p>
+<p>In INI files a date is either a time stamp or a human-friendly string.</p>
+<div data-snippet-clipboard-copy-content="date = &quot;Thu, 30 Aug 2012 12:31:00 GMT&quot;"><pre><code>date = "Thu, 30 Aug 2012 12:31:00 GMT"
+</code></pre></div>
+<h2 id="user-content-10--empty-key-names"><a href="#10--empty-key-names">10.  Empty key names</a></h2>
+<p>Although a human would have no idea of what it could possibly mean (and probably a machine would not do any better), TOML's syntax explicitly allows (but discourages) to assign values to empty key names.</p>
+<div data-snippet-clipboard-copy-content="&quot;&quot; = &quot;whatever&quot;     # valid in TOML
+'' = 'whatever'     # valid in TOML
+= 'whatever'        # invalid in TOML (seriously?)"><pre><code>"" = "whatever"     # valid in TOML
+'' = 'whatever'     # valid in TOML
+= 'whatever'        # invalid in TOML (seriously?)
+</code></pre></div>
+<h2 id="user-content-11-arrays-of-tables-aka-arrays-of-sections"><a href="#11-arrays-of-tables-aka-arrays-of-sections">11. Arrays of tables (a.k.a. arrays of sections)</a></h2>
+<p>Sometimes what initially appears to be a nice invention can end up being the opposite – yes, this can happen too. We are talking about arrays of tables here (a.k.a. arrays of sections).</p>
+<p>Arrays of tables are declared in TOML using the double square bracket notation:</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+[[server]]
+ip = &quot;214.252.11.145&quot;
+country = &quot;Australia&quot;
+
+[[server]]
+ip = &quot;214.252.11.146&quot;
+country = &quot;India&quot;
+
+[[server]]
+ip = &quot;214.252.11.147&quot;
+country = &quot;Sweden&quot;
+
+..."><pre><code># TOML
+
+[[server]]
+ip = "214.252.11.145"
+country = "Australia"
+
+[[server]]
+ip = "214.252.11.146"
+country = "India"
+
+[[server]]
+ip = "214.252.11.147"
+country = "Sweden"
+
+...
+</code></pre></div>
+<p>Strictly speaking, arrays of tables introduce the concept of “unnamed tables” – <code>server</code> in the example above is not the name of a table, it is the name of <em>a collection of tables, each of which does not have a name</em>. But independently of the syntactical consequences, this feature carries a major problem: it encourages using configuration files as databases.</p>
+<p>The common way to deal with similar scenarios in INI files would be that of keeping a common parent section – so that the application can scroll blindly through the sibling subsections – and making the nesting explicit by giving each subsection a name (in fact, the only unnamed section in INI files can be the document's root):</p>
+<div data-snippet-clipboard-copy-content="# INI
+
+[server.main]
+ip = 214.252.11.145
+country = Australia
+
+[server.secondary]
+ip = 214.252.11.146
+country = India
+
+[server.broken]
+ip = 214.252.11.147
+country = Sweden
+
+# You can add an infinite number of `server.*` subsections here and use
+# arbitrary names, the application will retrieve all of them."><pre><code># INI
+
+[server.main]
+ip = 214.252.11.145
+country = Australia
+
+[server.secondary]
+ip = 214.252.11.146
+country = India
+
+[server.broken]
+ip = 214.252.11.147
+country = Sweden
+
+# You can add an infinite number of `server.*` subsections here and use
+# arbitrary names, the application will retrieve all of them.
+</code></pre></div>
+<p>The INI way is inherently more human-readable (humans like descriptive names), and produces the nice outcome that when the entries have become too many, and naming each of them has become too cumbersome, it is the good sign that you should finally switch to a database format and keep your configuration file clean.</p>
+<p>Even <a href="https://github.com/toml-lang/toml/blob/8296d6ba97aaaf3151a32a22ed0513301ac650bf/README.md#Example">TOML's featured example</a> proposes “the INI way”</p>
+<div data-snippet-clipboard-copy-content="[servers.alpha]
+ip = &quot;10.0.0.1&quot;
+role = &quot;frontend&quot;
+
+[servers.beta]
+ip = &quot;10.0.0.2&quot;
+role = &quot;backend&quot;"><pre><code>[servers.alpha]
+ip = "10.0.0.1"
+role = "frontend"
+
+[servers.beta]
+ip = "10.0.0.2"
+role = "backend"
+</code></pre></div>
+<p>instead of “the TOML way”</p>
+<div data-snippet-clipboard-copy-content="[[servers]]
+ip = &quot;10.0.0.1&quot;
+role = &quot;frontend&quot;
+
+[[servers]]
+ip = &quot;10.0.0.2&quot;
+role = &quot;backend&quot;"><pre><code>[[servers]]
+ip = "10.0.0.1"
+role = "frontend"
+
+[[servers]]
+ip = "10.0.0.2"
+role = "backend"
+</code></pre></div>
+<p>for presenting the language.</p>
+<p>But if this does not convince you, and at the end of the day you really want to play dirty with your configuration files, INI sill offers you its quirks to reach TOML's effect, without the inconvenience of introducing anonymous sections:</p>
+<div data-snippet-clipboard-copy-content="# INI
+
+[server.&quot;214.252.11.145&quot;]
+country = Australia
+
+[server.&quot;214.252.11.146&quot;]
+country = India
+
+[server.&quot;214.252.11.147&quot;]
+country = Sweden
+
+..."><pre><code># INI
+
+[server."214.252.11.145"]
+country = Australia
+
+[server."214.252.11.146"]
+country = India
+
+[server."214.252.11.147"]
+country = Sweden
+
+...
+</code></pre></div>
+<p>It goes without saying that you should not follow TOML in this. INI is not a database format; it targets primarily humans, not machines. If you want to store multiple sections of the same kind, please give them human-friendly names, and have fun.</p>
+<h2 id="user-content-12-lack-of-support-for-implicit-keys"><a href="#12-lack-of-support-for-implicit-keys">12. Lack of support for implicit keys</a></h2>
+<p>Serialization formats often have shortcuts for expressing a <code>true</code> boolean implicitly. A bare HTML attribute, for instance, is automatically given the <code>"true"</code> value – i.e. the <code>contenteditable</code> attribute in the following example is automatically parsed as <code>contenteditable="true"</code>.</p>
+<div data-snippet-clipboard-copy-content="<div contenteditable class=&quot;my-class&quot;></div>"><pre><code>&lt;div contenteditable class="my-class"&gt;&lt;/div&gt;
+</code></pre></div>
+<p>Similarly, in the following INI fragment from <code>/etc/pacman.conf</code> (<strong>Arch</strong>), <code>Color</code> is an implicit key representing a <code>true</code> boolean – i.e. <code>Color = YES</code>.</p>
+<div data-snippet-clipboard-copy-content="HoldPkg = pacman glibc
+Architecture = auto
+IgnorePkg =
+Color
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional"><pre><code>HoldPkg = pacman glibc
+Architecture = auto
+IgnorePkg =
+Color
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+</code></pre></div>
+<p>TOML lacks support for implicit keys, and key names not followed by an equals sign always constitute syntax errors.</p>
+<h2 id="user-content-13-inline-tables-must-remain-inline"><a href="#13-inline-tables-must-remain-inline">13. Inline tables must remain… inline</a></h2>
+<p>In addition to the INI way, TOML introduces a duplicate way of declaring sections: “inline tables”. The following TOML example:</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+homepage = { page_header = &quot;Lorem ipsum dolor sit amet, consectetur adipiscing elit.&quot;, page_footer = &quot;Orci varius natoque penatibus et magnis dis parturient montes.&quot; }"><pre><code># TOML
+
+homepage = { page_header = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.", page_footer = "Orci varius natoque penatibus et magnis dis parturient montes." }
+</code></pre></div>
+<p>is an exact synonym of:</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+[homepage]
+page_header = &quot;Lorem ipsum dolor sit amet, consectetur adipiscing elit.&quot;
+page_footer = &quot;Orci varius natoque penatibus et magnis dis parturient montes.&quot;"><pre><code># TOML
+
+[homepage]
+page_header = "Lorem ipsum dolor sit amet, consectetur adipiscing elit."
+page_footer = "Orci varius natoque penatibus et magnis dis parturient montes."
+</code></pre></div>
+<p>Besides the visual inconvenience of presenting entire sections like keys, not much would be wrong with this feature, not even the redundancy, had the feature not come with an ugly rule attached: inline tables must remain inline.</p>
+<p>Such a coercion would become tolerable after being reminded that in that language a new line is supposed to end a node, if only there had not been an exception that makes it intolerable: arrays, on the contrary, can span multiple lines.</p>
+<p>Thus, you can write,</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+homepage = [
+	&quot;Lorem ipsum dolor sit amet, consectetur adipiscing elit.&quot;,
+	&quot;Orci varius natoque penatibus et magnis dis parturient montes.&quot;
+]"><pre><code># TOML
+
+homepage = [
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+	"Orci varius natoque penatibus et magnis dis parturient montes."
+]
+</code></pre></div>
+<p>but you cannot write</p>
+<div data-snippet-clipboard-copy-content="# Invalid TOML example
+
+homepage = {
+	page_header = &quot;Lorem ipsum dolor sit amet, consectetur adipiscing elit.&quot;,
+	page_footer = &quot;Orci varius natoque penatibus et magnis dis parturient montes.&quot;
+}"><pre><code># Invalid TOML example
+
+homepage = {
+	page_header = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+	page_footer = "Orci varius natoque penatibus et magnis dis parturient montes."
+}
+</code></pre></div>
+<p>What makes things worse is the fact that this prohibition exists only for the sake of not having two ways of declaring tables that are both multi-line. It is “a moral prohibition”, not dictated by any practical reasons. In short, it exists only for telling you how to behave.</p>
+<p>TOML's designers insist saying that allowing multi-line tables declared in this way would break one of TOML's pillars, which is precisely that of terminating a node when a (non-escaped) new line is found. But that is one of INI's pillars, not TOML's: TOML had already betrayed this principle after establishing its array syntax. Looking at the asymmetry above from a different perspective, one could indeed say that the original mistake lies with arrays, not with inline tables (but however one puts it, a mistake lies somewhere).</p>
+<p>It is possible to argue further that inline tables bring TOML's syntax closer to JSON. That alone is a good reason to be happy that inline tables are alien in INI files.</p>
+<h2 id="user-content-14-incompatibility"><a href="#14-incompatibility">14. Incompatibility</a></h2>
+<p>By design TOML is explicitly incompatible with about fourty years of configuration files.</p>
+<h2 id="user-content-15-immediacy"><a href="#15-immediacy">15. Immediacy</a></h2>
+<p>A configuration file is meant to be edited by a human – possibly someone who has only <strong>Microsoft Notepad</strong> as text editor and has never heard of TOML or INI before – and editing it should feel like a natural and welcomed thing to do, not like hacking a program source code, especially if this does not give any expressive advantage.</p>
+<p>If a person who has never heard of TOML sees the following configuration file,</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+[&quot;bank&quot;]
+&quot;ip&quot; = &quot;192.168.1.1&quot;
+&quot;square root&quot; = 15000
+
+[&quot;client&quot;]
+&quot;hello world&quot; = [&quot;sunny&quot;]
+&quot;foo&quot; = &quot;9234&quot;"><pre><code># TOML
+
+["bank"]
+"ip" = "192.168.1.1"
+"square root" = 15000
+
+["client"]
+"hello world" = ["sunny"]
+"foo" = "9234"
+</code></pre></div>
+<p>how is the person supposed to know that <code>"ip"</code> can be written also without quotes, but that is not the case of <code>"square root"</code>, as this contains spaces and keys containing spaces must be always quoted? or that the string <code>["sunny"]</code> is not a reference to a section name but is an array instead? or what data types a particular array can contain?</p>
+<p>INI, on the other hand, encourages human-friendly comments for explaining what is not immediately visible.</p>
+<div data-snippet-clipboard-copy-content="# INI
+
+[bank]
+ip = 192.168.1.1
+square root = 15000
+
+[client]
+hello world = sunny  # it is possible to write a comma-separated list here
+foo = 9234"><pre><code># INI
+
+[bank]
+ip = 192.168.1.1
+square root = 15000
+
+[client]
+hello world = sunny  # it is possible to write a comma-separated list here
+foo = 9234
+</code></pre></div>
+<p>You can write comments in TOML as well, of course. But the risk is that they end up being lists of things to avoid that have nothing to do with the application you are configuring, rather than suggestions of what is possible to do.</p>
+<div data-snippet-clipboard-copy-content="# TOML
+
+[&quot;bank&quot;]
+&quot;ip&quot; = &quot;192.168.1.1&quot;    # you can remove the quotes from `&quot;ip&quot;` if you want
+&quot;square root&quot; = 15000   # do not remove the quotes from `&quot;square root&quot;`, TOML forbids it
+
+[&quot;client&quot;]
+&quot;hello world&quot; = [&quot;sunny&quot;]   # `[&quot;sunny&quot;]` is not a section name
+&quot;foo&quot; = &quot;9234&quot;  # do not remove the quotes from `&quot;9234&quot;`, it is not a number (I know...)"><pre><code># TOML
+
+["bank"]
+"ip" = "192.168.1.1"    # you can remove the quotes from `"ip"` if you want
+"square root" = 15000   # do not remove the quotes from `"square root"`, TOML forbids it
+
+["client"]
+"hello world" = ["sunny"]   # `["sunny"]` is not a section name
+"foo" = "9234"  # do not remove the quotes from `"9234"`, it is not a number (I know...)
+</code></pre></div>
+<h2 id="user-content-16-genesis"><a href="#16-genesis">16. Genesis</a></h2>
+<p>Configuration files are born out of necessity, and different applications can have different requirements. There are cases where a configuration file differs substantially from the INI format. It is not rare in these situations that developers have ended up abandoning a widespread and solid configuration format such as INI only after realizing that they had no other choice and not without pain.</p>
+<p>In this respect, the way <strong>libconfini</strong> was born is paradigmatic. It was born for an application – an editor – and that application had a very peculiar task: read different types of INI files written in the real world for the applications typically installed on a <strong>GNU/Linux</strong> distribution. What a better scenario for creating a parser?</p>
+<p>The genesis of TOML instead is quite different. Someone without a parser <a href="https://github.com/toml-lang/toml/issues/411#issuecomment-219203431">decided that unquoted strings in INI files <em>are ugly</em> and forbad them</a>. A lot of rules have then been added afterwards on paper, without really thinking of any real case usage and only keeping JSON as a reference point.</p>
+<p>In the beginning it was still only a specification. Many people, enthusiastic finally to read <em>a specification of something somewhere</em>, started to create their own parser for the newborn language. And that was the moment when problems began to appear.</p>
+<p>When you write a parser you might indeed begin to notice contradictions in an apparently unflawed rule, your code might start to become unnecessarily complex because of absurd edge cases, and you might realize that the language you are trying to parse is not that well-designed after all.</p>
+<p>And even if you do survive the process of writing a parser that is fully compliant with TOML (<a href="https://github.com/avakar/pytoml/issues/15#issuecomment-217739462">some people don't</a>), you still have done only half of the job, that of writing a parser, without really thinking of any real case usage. It is still possible that you have completely wasted your time after all.</p>
+<p>There are of course cases where TOML works just fine, and these are the cases where JSON would also work fine (although one has always to tolerate TOML's idea to introduce a syntax for dates). But where JSON works fine, also other JSON dialects more human-friendly than TOML do.</p>
+<h2 id="user-content-17-against-postels-law-by-design"><a href="#17-against-postels-law-by-design">17. Against Postel's law by design</a></h2>
+<p><a href="https://en.wikipedia.org/wiki/Robustness_principle" rel="nofollow">Postel's law</a> is a good indicator of how robust a language is: the more a language is able to make sense of different types of input, the more robust the language.</p>
+<p>In front of a heterogeneous landscape like that of configuration files, a parser that applies Postel's law will try to make sense of the largest possible set of habits and explore all possible solutions to avoid that errors be generated merely because of diversity.</p>
+<p>TOML is a good example of a language designed against this principle. <em>The language's founding element was that of generating errors</em> when quotes were missing, and subsequent rules seem to have <em>in generating errors their only reason</em> (think of the requirement of using quotes for key names containing spaces or unicode characters, which has no justification whatsoever – if it is for aesthetical reasons, think that if you were a Chinese speaker you would rather be tempted to use quotes for the Latin characters and leave the Chinese ideograms out of quotes instead).</p>
+<p>One would think that a language with such tendencies will always have only one way to express the same thing, at least. And instead no: inline tables were introduced as a duplicate of standard tables, despite being less readable and completely alien in the common practice – something vaguely similar were <a href="http://hyperrealm.github.io/libconfig/" rel="nofollow"><strong>libconfig</strong></a>'s sections, but these spanned multiple lines and constituted the only way to declare sections in that language.</p>
+<p>At the end of the day TOML's main goal seems to be that of generating errors. The opposite approach, instead, would be that of taking advantage of diversity and regard it is as a strength.</p>
+<h2 id="user-content-18-performance"><a href="#18-performance">18. Performance</a></h2>
+<p>It is not so obvious to talk about “TOML's performance”: TOML is a language, not a particular parser. It is possible however to predict that any TOML-compliant parser will be on average <em>much slower</em> than an INI parser.</p>
+<p>This entire section is being created while a TOML parser written in C (<a href="https://github.com/cktan/tomlc99"><strong>tomlc99</strong></a>) tries to parse a 50 MiB file that <strong>libconfini</strong> usually parses in half a second – and <strong>libconfini</strong>'s primary goal is not speed (yes, we gave the TOML parser an INI file to parse).</p>
+<p>This is not a critique to the particular parser chosen – we can assume that <strong>tomlc99</strong> is doing its best in its hard task. The reason why a TOML parser will always be slow is the error checking fury required by the language. Where most INI parsers' approach will be that of “don't throw an error unless you really cannot make any sense of what is written in a configuration file – the application will do the rest and will do it better”, the approach of a TOML-compliant parser will be that of searching for errors even when both the application and the human would have already understood a content.</p>
+<p>After 13 minutes and 20 seconds our TOML parser has finally parsed…</p>
+<div data-snippet-clipboard-copy-content="54691749 bytes parsed in 800.849218 seconds.
+Number of bytes parsed per second: 68292.192551
+
+ERROR: cannot parse - line 1: extra chars after value"><pre><code>54691749 bytes parsed in 800.849218 seconds.
+Number of bytes parsed per second: 68292.192551
+
+ERROR: cannot parse - line 1: extra chars after value
+</code></pre></div>
+<p>Of course. Someone forgot to put quotes around the first value.</p>
+<h2 id="user-content-19-human-friendly-vs-human-readable"><a href="#19-human-friendly-vs-human-readable">19. Human-friendly vs. human-readable</a></h2>
+<p>“Human-friendly” and “human-readable” might sound as synonyms, but often they are not. Some texts can be very easy to read but hard to edit.</p>
+<p>An inscription on the front of the Pantheon in Rome says “Marcus Agrippa, son of Lucius, made this building when consul for the third time”. This is a very human-readable text if you know a bit of Latin. But in order to edit it you would need a ladder, a chisel and the wish to ruin a millenary monument – please do not try to do it.</p>
+<p>An emblematic example of this in file formats is JSON. Due to curly brackets, a systematic indentation and a strict syntax it is probably one of the most human-readable serialization formats. But exactly because of the same reasons it is not the most human-friendly one.</p>
+<p>Similarly, if used with a syntax highlighter, the human-readability of TOML is comparable to that of INI. Its human-friendliness, instead, lies a few steps below.</p>
+<h2 id="user-content-20-aesthetics"><a href="#20-aesthetics">20. Aesthetics</a></h2>
+<p>Appearance has its importance too. TOML's specification comes with <a href="https://github.com/toml-lang/toml/blob/8296d6ba97aaaf3151a32a22ed0513301ac650bf/README.md#Example">the following example</a> for illustrating the language:</p>
+<div data-snippet-clipboard-copy-content="# This is a TOML document.
+
+title = &quot;TOML Example&quot;
+
+[owner]
+name = &quot;Tom Preston-Werner&quot;
+dob = 1979-05-27T07:32:00-08:00 # First class dates
+
+[database]
+server = &quot;192.168.1.1&quot;
+ports = [ 8000, 8001, 8002 ]
+connection_max = 5000
+enabled = true
+
+[servers]
+
+  # Indentation (tabs and/or spaces) is allowed but not required
+  [servers.alpha]
+  ip = &quot;10.0.0.1&quot;
+  dc = &quot;eqdc10&quot;
+
+  [servers.beta]
+  ip = &quot;10.0.0.2&quot;
+  dc = &quot;eqdc10&quot;
+
+[clients]
+data = [ [&quot;gamma&quot;, &quot;delta&quot;], [1, 2] ]
+
+# Line breaks are OK when inside arrays
+hosts = [
+  &quot;alpha&quot;,
+  &quot;omega&quot;
+]"><pre><code># This is a TOML document.
+
+title = "TOML Example"
+
+[owner]
+name = "Tom Preston-Werner"
+dob = 1979-05-27T07:32:00-08:00 # First class dates
+
+[database]
+server = "192.168.1.1"
+ports = [ 8000, 8001, 8002 ]
+connection_max = 5000
+enabled = true
+
+[servers]
+
+  # Indentation (tabs and/or spaces) is allowed but not required
+  [servers.alpha]
+  ip = "10.0.0.1"
+  dc = "eqdc10"
+
+  [servers.beta]
+  ip = "10.0.0.2"
+  dc = "eqdc10"
+
+[clients]
+data = [ ["gamma", "delta"], [1, 2] ]
+
+# Line breaks are OK when inside arrays
+hosts = [
+  "alpha",
+  "omega"
+]
+</code></pre></div>
+<p>There are many ways of expressing exactly the same content using <strong>libconfini</strong>. The following is probably the most obvious one:</p>
+<div data-snippet-clipboard-copy-content="# examples/ini_files/toml-like.conf
+
+# Relax, this is an INI document.
+
+
+title = INI Example
+
+[owner]
+name = madmurphy
+dob = &quot;Sun, 27 May 1979 15:32:00 GMT&quot;
+
+[database]
+server = 192.168.1.1    # you can parse an IP address as an array too! :-)
+ports = 8000, 8001, 8002
+connection_max = 5000
+enabled
+
+  # Indentation (tabs and/or spaces) is allowed but not required
+  [servers.alpha]
+  ip = 10.0.0.1
+  dc = eqdc10
+
+  [servers.beta]
+  ip = 10.0.0.2
+  dc = eqdc10
+
+[clients]
+data = gamma : delta, 1 : 2
+
+hosts = alpha, omega"><pre><code># examples/ini_files/toml-like.conf
+
+# Relax, this is an INI document.
+
+
+title = INI Example
+
+[owner]
+name = madmurphy
+dob = "Sun, 27 May 1979 15:32:00 GMT"
+
+[database]
+server = 192.168.1.1    # you can parse an IP address as an array too! :-)
+ports = 8000, 8001, 8002
+connection_max = 5000
+enabled
+
+  # Indentation (tabs and/or spaces) is allowed but not required
+  [servers.alpha]
+  ip = 10.0.0.1
+  dc = eqdc10
+
+  [servers.beta]
+  ip = 10.0.0.2
+  dc = eqdc10
+
+[clients]
+data = gamma : delta, 1 : 2
+
+hosts = alpha, omega
+</code></pre></div>
+<p>For a parsing example, please have a look at <code>examples/miscellanea/toml-like.c</code>.</p>
+<h2 id="user-content-further-readings"><a href="#further-readings">Further readings</a></h2>
+<ul>
+<li><a href="https://toml.io/en/v1.0.0" rel="nofollow">TOML Specification</a></li>
+<li><a href="https://hitchdev.com/strictyaml/why-not/toml/" rel="nofollow">What is wrong with TOML?</a></li>
+</ul>
+<h2 id="user-content-state-of-this-document"><a href="#state-of-this-document">State of this document</a></h2>
+<p>Last revision: October 2021</p>
+
+              </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Ship of Fools (122 pts)]]></title>
             <link>https://successfulsoftware.net/2023/09/19/ship-of-fools/</link>
             <guid>37595322</guid>
             <pubDate>Thu, 21 Sep 2023 09:36:21 GMT</pubDate>
@@ -177,7 +954,7 @@ President &amp; CEO, Splunk</p>
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[India's biggest tech centers named as cyber crime hotspots (161 pts)]]></title>
+            <title><![CDATA[India's biggest tech centers named as cyber crime hotspots (170 pts)]]></title>
             <link>https://www.theregister.com/2023/09/21/india_cybercrime_trends_report/</link>
             <guid>37594855</guid>
             <pubDate>Thu, 21 Sep 2023 08:39:30 GMT</pubDate>
@@ -223,7 +1000,7 @@ President &amp; CEO, Splunk</p>
                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Erlang/OTP 26.1 Released (184 pts)]]></title>
+            <title><![CDATA[Erlang/OTP 26.1 Released (195 pts)]]></title>
             <link>https://erlangforums.com/t/erlang-otp-26-1-released/2886</link>
             <guid>37594525</guid>
             <pubDate>Thu, 21 Sep 2023 07:56:14 GMT</pubDate>
@@ -293,7 +1070,7 @@ E: The repository ‘<a href="http://binaries.erlang-solutions.com/debian" rel="
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenBSD/ARM64 on Hetzner Cloud (172 pts)]]></title>
+            <title><![CDATA[OpenBSD/ARM64 on Hetzner Cloud (183 pts)]]></title>
             <link>https://www.undeadly.org/cgi?action=article;sid=20230921073556</link>
             <guid>37594365</guid>
             <pubDate>Thu, 21 Sep 2023 07:36:31 GMT</pubDate>
@@ -316,7 +1093,7 @@ is needed.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Strong arrows: a new approach to gradual typing (119 pts)]]></title>
+            <title><![CDATA[Strong arrows: a new approach to gradual typing (132 pts)]]></title>
             <link>https://elixir-lang.org/blog/2023/09/20/strong-arrows-gradual-typing/</link>
             <guid>37593967</guid>
             <pubDate>Thu, 21 Sep 2023 06:39:03 GMT</pubDate>
@@ -614,7 +1391,7 @@ and <a href="https://dashbit.co/">Dashbit</a>.</p>
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Install Windows the Arch Linux Way (287 pts)]]></title>
+            <title><![CDATA[Install Windows the Arch Linux Way (290 pts)]]></title>
             <link>https://christitus.com/install-windows-the-arch-linux-way/</link>
             <guid>37593459</guid>
             <pubDate>Thu, 21 Sep 2023 05:15:25 GMT</pubDate>
@@ -661,7 +1438,7 @@ and <a href="https://dashbit.co/">Dashbit</a>.</p>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Terraria developer bashes Unity, donates $200k to open source alternatives (372 pts)]]></title>
+            <title><![CDATA[Terraria developer bashes Unity, donates $200k to open source alternatives (378 pts)]]></title>
             <link>https://lemm.ee/post/8670706</link>
             <guid>37593133</guid>
             <pubDate>Thu, 21 Sep 2023 04:11:49 GMT</pubDate>
@@ -678,7 +1455,7 @@ FNA Logo</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How Equifax Was Breached in 2017 (212 pts)]]></title>
+            <title><![CDATA[How Equifax Was Breached in 2017 (221 pts)]]></title>
             <link>https://blog.0x7d0.dev/history/how-equifax-was-breached-in-2017/</link>
             <guid>37592934</guid>
             <pubDate>Thu, 21 Sep 2023 03:35:43 GMT</pubDate>
@@ -744,7 +1521,7 @@ FNA Logo</p>
 </pre></td></tr></tbody></table></code></p></div><h3 id="credential-access"><span>Credential Access</span><a href="#credential-access"><i></i></a></h3><p>ACIS, like any other application, relied on a database, but it didn’t store a significant amount of personal information because it was only used by a small number of clients at Equifax. The attackers continued their search and eventually discovered a mounted NFS share on the web server. This file share contained notes and configuration files used by Equifax engineers, in which they found many database credentials.</p><h3 id="lateral-movement--collection"><span>Lateral Movement &amp; Collection</span><a href="#lateral-movement--collection"><i></i></a></h3><p>There was no segmentation between the legacy system and the rest of Equifax’s infrastructure, making it possible for the attackers to access databases from other Equifax systems. With the credentials found on the file share, they were able to connect and execute queries on 48 different databases. They quickly found a table containing personal identifiable information (PII) and began collecting the data.</p><h3 id="exfiltration"><span>Exfiltration</span><a href="#exfiltration"><i></i></a></h3><p>The customer’s data was divided into multiple compressed files of 10&nbsp;MB each and placed on the web servers in a publicly accessible directory. Gradually, the attackers exfiltrated the data by making HTTP requests with <code>wget</code> from multiple locations to retrieve the contents of these files. This approach was used to minimize the chances of triggering an alert.</p><h2 id="how-it-was-detected"><span>How It Was Detected</span><a href="#how-it-was-detected"><i></i></a></h2><p>During the month of July 2017, 76 days after the start of the attack, Equifax realized that their Network Intrusion Detection System (NIDS) had an expired SSL certificate, preventing them from decrypting and monitoring traffic for the ACIS environment. Immediately after uploading the SSL certificate, the security engineers received multiple alerts regarding suspicious requests coming from IP addresses in China.</p><p>Equifax initiated a thorough investigation, revealing that the filesystem scan, intended to identify systems with a vulnerable version of Apache Struts, had been executed in the incorrect directory within the ACIS environment, leaving those systems unknowingly vulnerable since March 2017. Simultaneously, several web shells were discovered on these servers, and finally they discovered that data being exfiltrated by attackers contained personal identifiable information (PII).</p><p>Following these discoveries, ACIS was promptly shut down as an emergency action to halt the cyberattack.</p><p>During the month of August 2017, Equifax engaged the firm Mandiant to conduct a forensic investigation. By retracing all the steps of the attackers, they discovered that the attackers had successfully exfiltrated data from 163 million customers before being stopped by the shutdown of the ACIS system.</p><h2 id="conclusion"><span>Conclusion</span><a href="#conclusion"><i></i></a></h2><p>The Equifax data breach from 2017 stands out as one of the largest data breaches in history, impacting millions of individuals. It is the result of several mistakes made by Equifax:</p><ul><li>Insufficient knowledge of their legacy systems.</li><li>Poor password storage practices.</li><li>Lack of rigor in the patching process.</li><li>Lack of network segmentation.</li><li>Lack of Host-Based Intrusion Detection System (HIDS)</li><li>Lack of alerting when security tools fail.</li></ul><p>By learning from these errors, organizations can better protect sensitive data and prevent similar incidents in the future.</p><h3 id="sources"><span>Sources</span><a href="#sources"><i></i></a></h3><ul><li><a href="https://oversight.house.gov/wp-content/uploads/2018/12/Equifax-Report.pdf">The Equifax Data Breach | Oversight and Government Reform</a></li><li><a href="https://www.hsgac.senate.gov/wp-content/uploads/imo/media/doc/FINAL%20Equifax%20Report.pdf">How Equifax Neglected Cybersecurity and Suffered a Devastating Data Breach | United States Senate</a></li></ul><h3 id="techniques"><span>Techniques</span><a href="#techniques"><i></i></a></h3><p>The <a href="https://attack.mitre.org/">MITRE ATT&amp;CK</a> techniques used by the attackers throughout the data breach:</p><ul><li>Initial Access<ul><li><a href="https://attack.mitre.org/techniques/T1190/">T1190 | Exploit Public-Facing Application</a></li></ul></li><li>Persistence<ul><li><a href="https://attack.mitre.org/techniques/T1505/003/">T1505.003 | Server Software Component: Web Shell</a></li></ul></li><li>Credential Access<ul><li><a href="https://attack.mitre.org/techniques/T1552/001/">T1552.001 | Unsecured Credentials: Credentials In Files</a></li></ul></li><li>Collection<ul><li><a href="https://attack.mitre.org/techniques/T1039/">T1039 | Data from Network Shared Drive</a></li><li><a href="https://attack.mitre.org/techniques/T1560/">T1560 | Archive Collected Data</a></li></ul></li><li>Exfiltration<ul><li><a href="https://attack.mitre.org/techniques/T1030/">T1030 | Data Transfer Size Limits</a></li></ul></li></ul><p><a href="https://blog.0x7d0.dev/assets/img/how-equifax-was-breached-in-2017/pixel.png"><img data-src="/assets/img/how-equifax-was-breached-in-2017/pixel.png" alt="p" data-proofer-ignore="" src="https://blog.0x7d0.dev/assets/img/how-equifax-was-breached-in-2017/pixel.png"></a></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Organic Maps: An open-source maps app that doesn't suck (272 pts)]]></title>
+            <title><![CDATA[Organic Maps: An open-source maps app that doesn't suck (276 pts)]]></title>
             <link>https://hardfault.life/p/organic-maps-review</link>
             <guid>37592712</guid>
             <pubDate>Thu, 21 Sep 2023 02:54:09 GMT</pubDate>
@@ -903,7 +1680,7 @@ honest chance, and it made a lasting impression.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[UK Parliament undermined the privacy, security, freedom of all internet users (585 pts)]]></title>
+            <title><![CDATA[UK Parliament undermined the privacy, security, freedom of all internet users (597 pts)]]></title>
             <link>https://www.eff.org/deeplinks/2023/09/today-uk-parliament-undermined-privacy-security-and-freedom-all-internet-users</link>
             <guid>37592699</guid>
             <pubDate>Thu, 21 Sep 2023 02:51:08 GMT</pubDate>
@@ -932,7 +1709,7 @@ honest chance, and it made a lasting impression.</p>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Terry Tao's generals (271 pts)]]></title>
+            <title><![CDATA[Terry Tao's generals (272 pts)]]></title>
             <link>https://web.math.princeton.edu/generals/tao_terence</link>
             <guid>37591652</guid>
             <pubDate>Thu, 21 Sep 2023 00:00:28 GMT</pubDate>
@@ -980,7 +1757,7 @@ honest chance, and it made a lasting impression.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Linux gives up on 6-year LTS kernels, says they’re too much work (243 pts)]]></title>
+            <title><![CDATA[Linux gives up on 6-year LTS kernels, says they’re too much work (245 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2023/09/linux-gives-up-on-6-year-lts-thats-fine-for-pcs-bad-for-android/</link>
             <guid>37591050</guid>
             <pubDate>Wed, 20 Sep 2023 22:36:20 GMT</pubDate>
@@ -1696,170 +2473,6 @@ Published September 20, 2023</time>
             <pubDate>Wed, 20 Sep 2023 17:01:14 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://manapool.com/">https://manapool.com/</a>, See on <a href="https://news.ycombinator.com/item?id=37586681">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div><svg xmlns="http://www.w3.org/2000/svg" id="Layer_2" viewBox="0 0 355.175 101.14" alt="Mana Pool - Buy and sell Magic: The Gathering cards"><defs><linearGradient id="linear-gradient" x1="17.61" x2="59.592" y1="49.09" y2="49.09" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#bfefff"></stop><stop offset=".356" stop-color="#bfe7ff"></stop><stop offset="1" stop-color="#bfdfff"></stop></linearGradient><linearGradient id="linear-gradient-2" x1="24.715" x2="66.697" y1="52.72" y2="52.72" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#80dfff"></stop><stop offset=".603" stop-color="#80c8ff"></stop><stop offset="1" stop-color="#80c0ff"></stop></linearGradient><linearGradient id="linear-gradient-3" x1="31.82" x2="73.802" y1="56.35" y2="56.35" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#40cfff"></stop><stop offset=".235" stop-color="#40c0ff"></stop><stop offset=".707" stop-color="#40a8ff"></stop><stop offset="1" stop-color="#40a0ff"></stop></linearGradient><linearGradient id="linear-gradient-4" x1="38.925" x2="80.907" y1="59.98" y2="59.98" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#00bfff"></stop><stop offset=".382" stop-color="#00a0ff"></stop><stop offset=".764" stop-color="#08f"></stop><stop offset="1" stop-color="#0080ff"></stop></linearGradient><linearGradient id="linear-gradient-5" x1="5.639" x2="34.756" y1="49.694" y2="94.248" gradientUnits="userSpaceOnUse"><stop offset=".078" stop-color="#3b384d"></stop><stop offset=".595" stop-color="#28273b"></stop><stop offset="1" stop-color="#202033"></stop></linearGradient><linearGradient id="linear-gradient-6" x1="5.639" x2="34.756" y1="49.694" y2="94.248" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#595580"></stop><stop offset=".329" stop-color="#3d3b59"></stop><stop offset="1"></stop></linearGradient><linearGradient id="linear-gradient-7" x1="38.182" x2="84.3" y1="60.744" y2="85.171" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#4e4c66"></stop><stop offset=".106" stop-color="#484660"></stop><stop offset=".658" stop-color="#303048"></stop><stop offset="1" stop-color="#282840"></stop></linearGradient><linearGradient id="linear-gradient-8" x1="54.688" x2="68.233" y1="58.391" y2="91.16" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#171621"></stop><stop offset="1"></stop></linearGradient><linearGradient id="linear-gradient-9" x1="5.202" x2="45.229" y1="20.229" y2="71.795" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#595473"></stop><stop offset=".026" stop-color="#565170"></stop><stop offset=".45" stop-color="#353349"></stop><stop offset=".79" stop-color="#212031"></stop><stop offset="1" stop-color="#1a1a29"></stop></linearGradient><linearGradient id="linear-gradient-10" x1="22.215" x2="135.804" y1="13.498" y2="46.312" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#5e5b7a"></stop><stop offset=".059" stop-color="#555370"></stop><stop offset=".329" stop-color="#353449"></stop><stop offset=".544" stop-color="#212131"></stop><stop offset=".677" stop-color="#1a1a29"></stop></linearGradient><linearGradient id="linear-gradient-11" x1="48.907" x2="112.126" y1="21.209" y2="39.472" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#565370"></stop><stop offset=".293" stop-color="#353449"></stop><stop offset=".53" stop-color="#212131"></stop><stop offset=".677" stop-color="#1a1a29"></stop></linearGradient><linearGradient id="linear-gradient-12" x1="37.387" x2="79.792" y1="31.839" y2="47.277" gradientUnits="userSpaceOnUse"><stop offset=".093" stop-color="#4e4c66"></stop><stop offset=".101" stop-color="#4d4b65"></stop><stop offset=".656" stop-color="#35354f"></stop><stop offset="1" stop-color="#2d2d47"></stop></linearGradient><linearGradient id="linear-gradient-13" x1="35.947" x2="45.374" y1="58.074" y2="57.805" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#232233"></stop><stop offset="1" stop-color="#242436"></stop></linearGradient><linearGradient id="linear-gradient-14" x1="79.378" x2="82.044" y1="25.305" y2="48.525" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#171621"></stop><stop offset="1" stop-color="#13131c"></stop></linearGradient><linearGradient id="linear-gradient-15" x1="55.582" x2="68.615" y1="59.069" y2="67.021" gradientUnits="userSpaceOnUse"><stop offset=".089" stop-color="#444259"></stop><stop offset=".61" stop-color="#303047"></stop><stop offset="1" stop-color="#282840"></stop></linearGradient><linearGradient id="linear-gradient-16" x1="-1.636" x2="14.348" y1="23.698" y2="44.289" gradientUnits="userSpaceOnUse"><stop offset=".018" stop-color="#8a84b3"></stop><stop offset=".285" stop-color="#69658c"></stop><stop offset=".596" stop-color="#474665"></stop><stop offset=".846" stop-color="#33334d"></stop><stop offset="1" stop-color="#2c2c45"></stop></linearGradient><linearGradient id="linear-gradient-17" x1="6.2" x2="46.53" y1="8.973" y2="20.515" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#8a84b3"></stop><stop offset=".29" stop-color="#76729f"></stop><stop offset=".728" stop-color="#5e5d88"></stop><stop offset="1" stop-color="#565680"></stop></linearGradient></defs><path d="M113.726 70.292V34.775c0-.476.265-.795.742-.795h5.354c.423 0 .742.16.901.53l12.191 29.845L145.16 34.51c.159-.371.424-.53.848-.53h5.354c.477 0 .796.318.796.794v35.517c0 .477-.319.795-.796.795h-4.4c-.477 0-.742-.318-.742-.795v-25.55l-10.337 25.71c-.159.423-.476.635-.901.635H130.9c-.424 0-.795-.212-.954-.636l-10.285-25.71v25.551c0 .477-.318.795-.794.795h-4.4c-.477 0-.742-.318-.742-.795ZM157.078 58.1c0-7.687 5.09-13.623 12.51-13.623 4.294 0 7.368 1.908 9.171 4.93l.106-3.5c0-.476.265-.795.742-.795h3.87c.476 0 .742.319.742.795v24.385c0 .477-.266.795-.742.795h-3.87c-.477 0-.742-.318-.742-.795l-.106-3.445c-1.855 3.021-4.93 4.876-9.17 4.876-7.422 0-12.51-5.884-12.51-13.623Zm13.624 8.376c4.612 0 7.845-3.34 7.845-8.324 0-5.035-3.233-8.427-7.845-8.427-4.666 0-8.058 3.392-8.058 8.375 0 5.036 3.392 8.376 8.058 8.376ZM189.414 70.292V45.907c0-.476.265-.795.743-.795h4.028c.477 0 .742.212.742.849l.212 3.18c1.484-2.65 4.082-4.664 8.164-4.664 5.513 0 9.436 3.816 9.436 10.654v15.161c0 .477-.319.795-.796.795h-4.188c-.476 0-.742-.318-.742-.795v-14.1c0-4.083-2.014-6.415-5.672-6.415-3.657 0-6.202 2.332-6.202 6.414v14.101c0 .477-.265.795-.742.795h-4.24c-.478 0-.743-.318-.743-.795ZM216.471 58.1c0-7.687 5.089-13.623 12.51-13.623 4.294 0 7.368 1.908 9.17 4.93l.106-3.5c0-.476.266-.795.742-.795h3.87c.477 0 .743.319.743.795v24.385c0 .477-.266.795-.742.795H239c-.477 0-.743-.318-.743-.795l-.105-3.445c-1.856 3.021-4.93 4.876-9.171 4.876-7.421 0-12.51-5.884-12.51-13.623Zm13.623 8.376c4.612 0 7.846-3.34 7.846-8.324 0-5.035-3.234-8.427-7.846-8.427-4.665 0-8.058 3.392-8.058 8.375 0 5.036 3.393 8.376 8.058 8.376ZM259.038 70.292V34.775c0-.476.265-.795.743-.795h10.707c8.428 0 12.67 4.877 12.67 11.822s-4.242 11.821-12.67 11.821h-5.513v12.669c0 .477-.318.795-.795.795h-4.4c-.477 0-.742-.318-.742-.795Zm11.185-17.97c3.923 0 7.209-1.538 7.209-6.52 0-4.984-3.286-6.52-7.209-6.52h-5.248v13.04h5.248ZM284.87 58.1c0-7.687 5.725-13.623 13.464-13.623 7.687 0 13.411 5.936 13.411 13.623s-5.724 13.623-13.41 13.623c-7.74 0-13.465-5.937-13.465-13.623Zm13.464 8.322c4.453 0 7.899-3.339 7.899-8.322 0-4.983-3.446-8.323-7.899-8.323-4.506 0-7.95 3.34-7.95 8.323 0 4.983 3.444 8.322 7.95 8.322ZM314.211 58.1c0-7.687 5.725-13.623 13.464-13.623 7.687 0 13.411 5.936 13.411 13.623s-5.724 13.623-13.41 13.623c-7.74 0-13.465-5.937-13.465-13.623Zm13.464 8.322c4.453 0 7.899-3.339 7.899-8.322 0-4.983-3.446-8.323-7.899-8.323-4.506 0-7.951 3.34-7.951 8.323 0 4.983 3.445 8.322 7.951 8.322ZM344.942 70.292V33.98c0-.476.264-.794.742-.794h4.24c.478 0 .742.318.742.794v36.312c0 .477-.264.795-.742.795h-4.24c-.478 0-.742-.318-.742-.795Z"></path><path d="M53.247 30.073 3.744 43.62v39.321l49.503-13.494V30.073zM85.311 46.162l-32.064-16.09v25.03l32.064-8.94z"></path><path d="M52.487 70.172V9.259l-41.982 11.49v60.913l41.982-11.49z" style="fill:#fff;stroke:#000;stroke-linejoin:round;stroke-width:2px"></path><path d="m17.61 85.292 41.982-11.49V12.888L17.61 24.379v60.913z" style="fill:url(#linear-gradient)"></path><path d="m24.715 88.922 41.982-11.49V16.518l-41.982 11.49v60.913z" style="fill:url(#linear-gradient-2)"></path><path d="m31.82 92.551 41.982-11.49V20.148L31.82 31.638v60.913z" style="fill:url(#linear-gradient-3)"></path><path d="M80.907 84.69V23.779l-41.982 11.49v60.913l41.982-11.49z" style="fill:url(#linear-gradient-4)"></path><path d="M35.809 99.031 3.744 82.942v-39.32L35.81 59.71v39.321z" style="fill:url(#linear-gradient-5)"></path><path d="M35.809 99.031 3.744 82.942v-39.32L35.81 59.71v1L4.654 45.086l.26 37.145 30.895 15.692v1.108z" style="fill:url(#linear-gradient-6)"></path><path d="M45.064 57.177 35.81 59.71v39.321L85.31 85.483V46.162l-9.68 2.65v22.032l-20.336 5.69v8.033l-10.23 2.676V57.177z" style="fill:url(#linear-gradient-7)"></path><path d="M35.809 97.923v1.108L85.31 85.483V46.162l-.768.214.06 38.323L35.81 97.923z" style="fill:url(#linear-gradient-8)"></path><path d="M35.809 59.71 3.744 43.621v-25.32L35.81 34.388V59.71z" style="fill:url(#linear-gradient-9)"></path><path d="M85.311 20.84 51.985 5.134 3.745 18.3l32.064 16.09L85.31 20.84z" style="fill:url(#linear-gradient-10)"></path><path d="M85.311 20.84 51.985 5.134l.01.503 31.44 15.011-47.626 12.99v.751L85.31 20.84z" style="fill:url(#linear-gradient-11)"></path><path d="m75.63 48.811 9.681-2.65v-25.32L35.81 34.388V59.71l9.255-2.533V41.042l15.284 5.67L75.63 32.676v16.135z" style="fill:url(#linear-gradient-12)"></path><path d="M35.809 58.706v1.004l9.255-2.533v-.996l-9.255 2.525z" style="fill:url(#linear-gradient-13)"></path><path d="m75.63 48.811 9.681-2.65v-25.32l-.84.23.056 24.39-8.896 2.544v.806z" style="fill:url(#linear-gradient-14)"></path><path d="m67.293 63.742-13.466 3.686V60.47l13.466-3.686v6.957z" style="fill:url(#linear-gradient-15)"></path><path d="m4.647 44.074-.903-.453v-25.32l.843.422.06 25.351z" style="fill:url(#linear-gradient-16)"></path><path d="M5.293 18.442 51.995 5.637l-.01-.503L3.745 18.3l32.064 16.09v-.753L5.294 18.442z" style="fill:url(#linear-gradient-17)"></path></svg> <p><span data-svelte-h="svelte-1nn0rg7">The Market for Magic Cards</span></p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[XML is better than YAML – Hear me out (270 pts)]]></title>
-            <link>https://changelog.com/posts/xml-better-than-yaml</link>
-            <guid>37586580</guid>
-            <pubDate>Wed, 20 Sep 2023 16:52:18 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://changelog.com/posts/xml-better-than-yaml">https://changelog.com/posts/xml-better-than-yaml</a>, See on <a href="https://news.ycombinator.com/item?id=37586580">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-<p><em>This is a fancified excerpt of <a href="https://carlmjohnson.net/">Carl M. Johnson’s</a> unpopular opinion on the <a href="https://changelog.com/gotime/289">Go Time</a> podcast. <a data-play="/gotime/289/play" data-t="48:06" href="https://cdn.changelog.com/uploads/gotime/289/go-time-289.mp3" role="button" title="Play Go Time #289 starting at 48:06">Click here to listen</a> along while you read or <a href="https://youtu.be/jc2jzDzW0g4">watch the video</a> on YouTube. <a href="#unpop">Jump to the end</a> for the poll results. 📊</em></p>
-<hr>
-<p>My spicy take is that XML is better than YAML, because there are situations where XML is appropriate, but there’s no situation where YAML is appropriate.</p>
-<p><strong>Johnny Boursiquot:</strong> <em>Dang. Shots fired! 🤣</em></p>
-<h2>Let’s talk about XML first</h2>
-<p>So, XML got a really bad reputation. The reason it got a really bad reputation is because people were using it for things that it should never have been used for. XML stands for <a href="https://www.w3.org/TR/xml/">Extensible Markup Language</a>. And if you’re using it as an <em>extensible markup language</em>, it’s actually really great.</p>
-<p>Let’s say you’re working on something and you’re like:</p>
-<blockquote>
-<p>“I’m making a new kind of book, and I need to annotate all of the verses in the Bible, and have the chapter headings and stuff.”</p>
-</blockquote>
-<p>It’s great for that.</p>
-<p>It’s really good for when you have a document, and some things are italicized, and some things are in a foreign language, and subtitles, and all that stuff. It’s really good for that. It’s not good if it’s like:</p>
-<blockquote>
-<p>“I need to configure this server and the server needs to know if this value is true or false.”</p>
-</blockquote>
-<p>No, that’s bad. Don’t do that. That’s not a good use for XML.</p>
-<p>But XML does have some uses for which it’s appropriate. And I think the fact that now everybody is writing React… and they’re writing it with JSX… and JSX is basically just inline XML… I think that shows that there are cases where actually XML is pretty good.</p>
-<h2>YAML on the other hand</h2>
-<p>YAML on the other hand I think is never good. There’s always something better than YAML!</p>
-<p>We’ve finally made it to Go 1.21 and I’m very happy about this. And you know why? Because YAML repeatedly <em>bit me in the behind</em> on Go 1.20. Ask me why.</p>
-<p><strong>Johnny Boursiquot:</strong> <em>Why?</em></p>
-<p>Well, when you say in your test file:</p>
-<blockquote>
-<p>“test this against Go 1.20”</p>
-</blockquote>
-<p>It interprets that as Go 1.2. 😭🤣</p>
-<p>So it was like two or three different times I had a repo where I’m like:</p>
-<blockquote>
-<p>“These tests aren’t passing. Why are my tests not passing?! I’ve just upgraded to Go 1.20.”</p>
-</blockquote>
-<p>And it was like:</p>
-<blockquote>
-<p>“Oh, no. I’ve decided that this is Go 1.2”</p>
-</blockquote>
-<p>And so YAML is always going to do that to you…</p>
-<h3>Better choices</h3>
-<p>Now, I understand why people do YAML, but there are better choices. You can use <a href="https://toml.io/en/">TOML</a>. You can use <a href="https://cuelang.org/">CUE</a>. You can use lots of things.</p>
-<p>I like how <a href="https://caddyserver.com/">Caddy</a> does it. With Caddy, the canonical language that Caddy understands is JSON, but they have adapters.</p>
-<p>So if you want to write YAML, you can. But it’ll just take that YAML and turn it into JSON behind the scenes.  Then they also have a specific Caddy language. So you can give it the Caddy language and then it turns that into JSON behind the scenes. And you can give it an NGINX config and it’ll turn that into JSON behind the scenes. If you have the cycles and time to spare, that’s probably the best solution for most people…</p>
-<p>But when the only way to do it is YAML, it’s like:</p>
-<blockquote>
-<p>“No…!”</p>
-</blockquote>
-<p>It’s just too error-prone, there’s too many things… You just have to always quote everything.</p>
-<h3>Also…</h3>
-<p>Also the YAML specification has all these features that nobody ever uses, because they’re really confusing, and hard, and you can include documents inside of other documents, with references and stuff… And it’s like</p>
-<blockquote>
-<p>“Oh, man, I don’t want to have to understand any of this stuff.”</p>
-</blockquote>
-<p>And then if you’re not careful, it’d be like:</p>
-<blockquote>
-<p>“Oh yeah, the first three things I fed it to understood that, but then the third one was just like using some parser that they found on the back of a truck, and it doesn’t understand it”</p>
-</blockquote>
-<p>and it’s like:</p>
-<blockquote>
-<p>“Oh, man…”</p>
-</blockquote>
-<p>YAML… never appropriate. XML is sometimes appropriate.</p>
-<hr>
-<h3 id="unpop">The polls are open 🗳️</h3>
-<p><em>There you have it. Carl’s reasoning for why XML is better than YAML. Do you agree or disagree? Let your opinion be heard by voting on <a href="https://changelog.social/@gotime/111098085461260473">Mastodon</a> and <a href="https://twitter.com/GoTimeFM/status/1704511116296978592">X</a>!</em></p>
-<p><em>Or just duke it out in the comments below … we’re listening! 👇</em></p>
-
-    </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Toyota Research claims breakthrough in teaching robots new behaviors (361 pts)]]></title>
-            <link>https://www.tri.global/news/toyota-research-institute-unveils-breakthrough-teaching-robots-new-behaviors</link>
-            <guid>37586264</guid>
-            <pubDate>Wed, 20 Sep 2023 16:30:14 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.tri.global/news/toyota-research-institute-unveils-breakthrough-teaching-robots-new-behaviors">https://www.tri.global/news/toyota-research-institute-unveils-breakthrough-teaching-robots-new-behaviors</a>, See on <a href="https://news.ycombinator.com/item?id=37586264">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="main-wrapper">
-              <main id="content" role="main">
-                <section>
-                  <a id="main-content" tabindex="-1"></a>
-                    <div id="block-tri-global-content">
-      
-
-<article data-history-node-id="466" role="article" about="/news/toyota-research-institute-unveils-breakthrough-teaching-robots-new-behaviors">
-  
-  <div>
-      <div>
-          
-          <p><span>Toyota Research Institute Unveils Breakthrough in Teaching Robots New Behaviors</span>
-
-          
-          
-        </p></div>
-      <div><p><em>New Generative AI Technique Brings Researchers One Step Closer to Building a “Large Behavior Model”</em></p>
-
-<p><strong>LOS ALTOS, Calif. and CAMBRIDGE, Mass. (Sept. 19, 2023)<span>&nbsp;</span></strong>– Today, Toyota Research Institute (TRI) announced a breakthrough generative AI approach based on Diffusion Policy to quickly and confidently teach robots new, dexterous skills. This advancement significantly improves robot utility and is a step towards building “Large Behavior Models (LBMs)” for robots, analogous to the Large Language Models (LLMs) that have recently revolutionized conversational AI.</p>
-
-<p>“Our research in robotics is aimed at amplifying people rather than replacing them,” said<span>&nbsp;</span><a href="https://www.tri.global/about-us/dr-gill-pratt" rel="noopener" target="_blank">Gill Pratt</a>, CEO of TRI and Chief Scientist for Toyota Motor Corporation. “This new teaching technique is both very efficient and produces very high performing behaviors, enabling robots to much more effectively amplify people in many ways.”</p>
-
-<p>Previous state-of-the-art techniques to teach robots new behaviors were slow, inconsistent, inefficient, and often limited to narrowly defined tasks performed in highly constrained environments. Roboticists needed to spend many hours writing sophisticated code and/or using numerous trial and error cycles to program behaviors.</p>
-
-<p>TRI has already taught robots more than 60 difficult, dexterous skills using the new approach, including pouring liquids, using tools, and manipulating deformable objects. These achievements were realized without writing a single line of new code; the only change was supplying the robot with new data. Building on this success, TRI has set an ambitious target of teaching hundreds of new skills by the end of the year and 1,000 by the end of 2024.</p>
-
-<p>Today’s news also highlights that robots can be taught to function in new scenarios and perform a wide range of behaviors. These skills are not limited to just “‘pick and place” or simply picking up objects and putting them down in new locations. TRI’s robots can now interact with the world in varied and rich ways — which will one day allow robots to support people in everyday situations and unpredictable, ever-changing environments.</p>
-
-
-
-<p><iframe width="854" height="480" frameborder="0" allowfullscreen="allowfullscreen" src="https://www.youtube.com/embed/w-CGSQAO5-Q?autoplay=0&amp;start=0&amp;rel=0"></iframe>
-</p>
-
-
-
-
-<p>“The tasks that I’m watching these robots perform are simply amazing – even one year ago, I would not have predicted that we were close to this level of diverse dexterity,” remarked<span>&nbsp;</span><a href="https://www.tri.global/about-us/dr-russ-tedrake" rel="noopener" target="_blank">Russ Tedrake</a>, Vice President of Robotics Research at TRI. Dr. Tedrake, who is also the Toyota Professor of Electrical Engineering and Computer Science, Aeronautics and Astronautics, and Mechanical Engineering at MIT, explained, “What is so exciting about this new approach is the rate and reliability with which we can add new skills. Because these skills work directly from camera images and tactile sensing, using only learned representations, they are able to perform well even on tasks that involve deformable objects, cloth, and liquids — all of which have traditionally been extremely difficult for robots.”</p>
-
-<p><strong>Technical details:</strong></p>
-
-<p>TRI’s robot behavior model learns from haptic demonstrations from a teacher, combined with a language description of the goal. It then uses an AI-based Diffusion Policy to learn the demonstrated skill. This process allows a new behavior to be deployed autonomously from dozens of demonstrations. Not only does this approach produce consistent, repeatable, and performant results, but it does so with tremendous speed.</p>
-
-<p>Key achievements of TRI’s research for this novel development include:</p>
-
-<ul><li><strong>Diffusion Policy:</strong><span>&nbsp;</span>TRI and our collaborators in<span>&nbsp;</span><a href="https://shurans.github.io/" rel="noopener" target="_blank">Professor Song</a>’s group at Columbia University developed a new, powerful generative-AI approach to behavior learning. This approach, called<span>&nbsp;</span><a href="https://arxiv.org/abs/2303.04137" rel="noopener" target="_blank">Diffusion Policy</a>, enables easy and rapid behavior teaching from demonstration.</li>
-	<li><strong>Customized Robot Platform:<span>&nbsp;</span></strong>TRI’s robot platform is custom-built for dexterous dual-arm manipulation tasks with a special focus on enabling haptic feedback and tactile sensing.</li>
-	<li><strong>Pipeline</strong>: TRI robots have learned 60 dexterous skills already, with a target of hundreds by the end of the year and 1,000 by the end of 2024.</li>
-	<li><strong>Drake:</strong><span>&nbsp;</span>Part of our (not so) secret sauce is<span>&nbsp;</span><a href="https://drake.mit.edu/" rel="noopener" target="_blank">Drake</a>, a model-based design for robotics that provides us with a cutting-edge toolbox and simulation platform. Drake’s high degree of realism allows us to develop in both simulation and in reality at a dramatically increased scale and velocity than would otherwise be possible. Our internal robot stack is built using Drake’s optimization and systems frameworks, and we have made Drake open source to catalyze work across the entire robotics community.</li>
-	<li><strong>Safety:<span>&nbsp;</span></strong>Safety is core to our robotics efforts at TRI. We have designed our system with strong safeguards, powered by Drake and our custom robot control stack, to ensure our robots respect safety guarantees like not colliding with itself or its environment.</li>
-</ul><p><a href="https://arxiv.org/abs/2303.04137" rel="noopener" target="_blank"><em>Diffusion Policy</em></a><em><span>&nbsp;</span>has been published at the 2023 Robotics Science and Systems conference. Additional technical information can be found on<span>&nbsp;</span></em><a href="https://toyotaresearch.medium.com/2c30b1a8c573" rel="noopener" target="_blank"><em>TRI’s Medium blog</em></a><em>.&nbsp;</em></p>
-
-<p><em>Please join our LinkedIn Live Q&amp;A session on October 4th from 1 pm – 1:30 pm ET / 10 am – 10:30 am PT, for an opportunity to learn more and hear directly from the TRI robotics research team. Sign up for the event on<span>&nbsp;</span></em><a href="https://www.linkedin.com/events/trilinkedinlive7108154211422408704/theater/" rel="noopener" target="_blank"><em>TRI’s LinkedIn page</em></a><em>.</em></p>
-
-
-
-<p><strong>About Toyota Research Institute</strong></p>
-
-<p>Toyota Research Institute (TRI) conducts research to amplify human ability, focusing on making our lives safer and more sustainable. Led by Dr. Gill Pratt, TRI’s team of researchers develops technologies to advance energy and materials, human-centered artificial intelligence, human interactive driving, machine learning, and robotics. Established in 2015, TRI has offices in Los Altos, California, and Cambridge, Massachusetts. For more information about TRI, please visit<span>&nbsp;</span><a href="http://tri.global/" rel="noopener" target="_blank">http://tri.global</a>.</p>
-
-
-
-<p><strong>TRI Media Contact</strong></p>
-
-<p>Wendy Rosen<br>
-Senior Director of Communications<br><a href="mailto:wendy.rosen@tri.global" rel="noopener" target="_blank">wendy.rosen@tri.global</a></p>
-
-</div>
-    </div>
-</article>
-
-    </div>
-
-
-                </section>
-              </main>
-                                  </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Show HN: Booklet – Async forums as an alternative to chat (173 pts)]]></title>
-            <link>https://www.booklet.group/</link>
-            <guid>37585869</guid>
-            <pubDate>Wed, 20 Sep 2023 16:02:28 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.booklet.group/">https://www.booklet.group/</a>, See on <a href="https://news.ycombinator.com/item?id=37585869">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><a href="https://hq.booklet.group/posts/new-on-booklet-use-a-custom-domain-with-your-commu" target="_blank"></a><h2 data-w-id="ed1920cb-257b-ff0e-0154-43249ee85486">Because important discussions get lost in chat.</h2><p data-w-id="ed1920cb-257b-ff0e-0154-43249ee8548a">Booklet is a modern discussion forum and member directory for professional groups. It sends calm, automated summaries to everybody so that they stay informed and engaged.<br></p><p><a data-w-id="ed1920cb-257b-ff0e-0154-43249ee8548c" href="https://new.booklet.group/">Get started →</a></p></div></div>]]></description>
         </item>
     </channel>
 </rss>
