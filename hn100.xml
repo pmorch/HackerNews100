@@ -4,12 +4,626 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 27 Sep 2023 09:00:07 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 27 Sep 2023 10:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[China is flooding Taiwan with disinformation (171 pts)]]></title>
+            <title><![CDATA[I got robbed of my first kernel contribution (133 pts)]]></title>
+            <link>https://ariel-miculas.github.io/How-I-got-robbed-of-my-first-kernel-contribution/</link>
+            <guid>37671991</guid>
+            <pubDate>Wed, 27 Sep 2023 08:58:04 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://ariel-miculas.github.io/How-I-got-robbed-of-my-first-kernel-contribution/">https://ariel-miculas.github.io/How-I-got-robbed-of-my-first-kernel-contribution/</a>, See on <a href="https://news.ycombinator.com/item?id=37671991">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+    <h3 id="context">Context</h3>
+<p>Around a year and a half ago, I’ve asked my former company for some time to
+work on an issue that was impacting the debugging capabilities in our project:
+gdbserver couldn’t debug multithreaded applications running on a PowerPC32
+architecture.  The connection to the gdbserver was broken and it couldn’t
+control the debug session anymore. Multiple people have already investigated
+this problem and I had a good starting point, but we still weren’t sure in
+which software component the issue lied: it could have been the toolchain, the
+gdbserver, the Linux kernel or the custom patches we applied on top of the
+kernel tree. We were quite far away from finding the root cause.</p>
+
+<h3 id="investigating-the-issue">Investigating the issue</h3>
+<p>After diving into the existing analysis for this issue and channeling my
+google-fu, I’ve had my first breakthrough: an <a href="https://lore.kernel.org/linuxppc-dev/dc38afe9-6b78-f3f5-666b-986939e40fc6@keymile.com/">email
+thread</a>
+which not only described the same symptoms as our issue, but also pointed to
+the <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?h=v6.6-rc3&amp;id=0c8c0f03e3a292e031596484275c14cf39c0ab7a">exact
+commit</a>
+which introduced it. The patch that introduced the bug moved the definition of
+<code>thread_struct thread</code> from the middle of the <code>task_struct</code> to the end, a
+seeminlgy innocuous change.</p>
+
+<p>After debugging the issue, this is what Holger Brunck
+<a href="https://lore.kernel.org/linuxppc-dev/e5cbd015-eeb5-31b5-0829-14cc8500dc6d@keymile.com/">observed</a></p>
+<blockquote>
+  <p>What I see is that gdbserver sends for each thread a SIGSTOP to the kernel and
+waits for a response. The kernel does receive all the signals but only respond
+to some of them in the error case. Which then matches with my “ps” output as I
+see that some threads are not in the state pthread_stop and then the gdbserver
+gets suspended.</p>
+</blockquote>
+
+<p>The low-level issue was that after interacting with gdbserver, some threads
+were in the wrong process state and gdbserver couldn’t control them anymore.</p>
+
+<p>I’ve spent 3-4 days reading commit descriptions related to the PowerPC
+architecture and the changes around <code>task_struct</code>, trying to figure out whether
+this issue was solved in subsequent kernel versions (spoiler: it was not).
+I’ve moved <code>thread_struct thread</code> around to determine when the issue reproduced
+and used <a href="https://linux.die.net/man/1/pahole">pahole</a> to inspect
+<code>task_struct</code>’s layout. I’ve used
+<a href="https://www.kernel.org/doc/html/v5.0/trace/ftrace.html">ftrace</a> to figure out
+when the threads of the debugged process were scheduled and that’s how I
+realized this could be a memory corruption issue: the threads that were stuck
+were only scheduled once, unlike the other ones. I’ve originally dismissed that
+this could be a memory corruption issue because in the <a href="https://lore.kernel.org/linuxppc-dev/b78d9e5d-fc2e-3676-a47e-ed5ca7a836e6@keymile.com/">original
+thread</a>
+it was mentioned that:</p>
+<blockquote>
+  <p>the content of the buffer is always zero and does not change. So at least no
+one is writing non-zero to the buffer.</p>
+</blockquote>
+
+<p>That’s what I get for not verifying that the structure isn’t overwritten with
+zero bytes (always validate your assumptions).</p>
+
+<p>I remembered that the x86 architecture has <a href="https://en.wikipedia.org/wiki/X86_debug_register">debug
+registers</a> that could be used
+to trigger data write breakpoints. In fact, this is how I solved a bug back in
+my earlier days as a software engineer. Sure enough, PowerPC also implements a
+similar capability with the help of the <a href="https://stackoverflow.com/a/327540">DABR register</a>.</p>
+
+<p>I’ve investigated how I could use hardware breakpoints on Linux and I ended up
+implementing a linux kernel module based on this <a href="https://stackoverflow.com/a/19755213">excellent stackoverflow
+answer</a>. This allowed me to place a
+hardware breakpoint on the <a href="https://elixir.bootlin.com/linux/v6.5.5/source/include/linux/sched.h#L746">__state
+field</a>
+to figure out who on earth writes to it.</p>
+
+<h3 id="finding-the-bug">Finding the bug</h3>
+<p>And that’s how I found the issue: my custom kernel module showed the stack
+traces from the places where the <code>__state</code> field of <code>task_struct</code> was being
+written to.  I’ve noticed an outlier which revealed a buffer overflow in
+<code>ptrace_put_fpr</code> (used by the POKEUSER API). This led to important fields from
+<code>task_struct</code> getting overwritten, such as <code>__state</code>, which stores the state of
+the process and it’s also used by the kernel to keep track of which processes
+are stopped by the debugger.</p>
+
+<p>The cause of this overflow? Taking an index meant to be used with an array of
+32-bit elements and indexing an array of 64-bit elements. There were 64 indexes
+that addressed the FPR, so the total addressable memory was 64 * 8 = 512
+bytes. But there were only 32 entries in the fp_state.fpr array, which means
+that the available memory was only 32 * 8 = 256 bytes. That allowed the user
+(aka gdbserver) to write up to 256 bytes past the end of the array.
+<img src="https://ariel-miculas.github.io/images/fpr-overflow.png" alt="fpr-overflow"></p>
+
+<h3 id="sending-the-patch-upstream">Sending the patch upstream</h3>
+<p>I’ve sent a patch to the Linux kernel security team (security@kernel.org)
+because I wanted to err on the safe side: a memory corruption issue that could
+overwrite the memory of the processes’s states could have security
+implications. Unfortunately, this mailing list is private so I cannot link to
+the original patch I sent.  Michael Ellerman, the PowerPC maintainer, followed
+up and told me he will contact me in private to figure this issue out. I have
+actually sent him two patches fixing the issue: the original one that I sent to
+the security mailing list and <a href="https://lists.ozlabs.org/pipermail/linuxppc-dev/2022-June/244438.html">another
+version</a>
+(quite different from the first one) which addressed some suggestions received
+in reply to my original submission. And the latter patch was actually based on
+existing kernel code, which emulated PowerPC32 operations on PowerPC64 (yeah,
+they got the FPR indexing right). Neither of those were accepted by Michael
+Ellerman, and instead he implemented his <a href="https://lore.kernel.org/all/20220609133245.573565-1-mpe@ellerman.id.au/">own version of the
+fix</a>.
+I told him that I would really appreciate if he could accept a patch from me,
+so that I could receive credit for fixing this issue and become a kernel
+contributor. I was also open to working with him, addressing his feedback and
+sending subsequent versions of patches. He said (paraphrasing):</p>
+<blockquote>
+  <p>Sorry, I like my version better. If you want to be a Linux kernel
+contributor, here’s an issue you could fix.</p>
+</blockquote>
+
+<p>I found this really perplexing and insulting. Instead of getting recognized for
+fixing the issue, he wanted to give me more work to do. My company and I should
+have received proper credit for solving this issue, especially considering how
+much effort we put into it.</p>
+
+<p>I felt it was really unfair to only get a “Reported-by” tag. Here’s the
+<a href="https://docs.kernel.org/process/submitting-patches.html#using-reported-by-tested-by-reviewed-by-suggested-by-and-fixes">purpose of the tag</a>:</p>
+
+<blockquote>
+  <p>The Reported-by tag gives credit to people who find bugs and report them and it hopefully inspires them to help us again in the future.</p>
+</blockquote>
+
+<p>Well, I certainly didn’t feel inspired to get involved with the kernel
+community again. On the contrary, I felt belittled and angry that my work
+wasn’t properly recognized.</p>
+
+<h3 id="conclusion">Conclusion</h3>
+<p>I spent a lot of time and effort doing root cause analysis, fixing the bug,
+testing and validating the fix, getting feedback from other engineers at my
+company, adapting the fix to the latest kernel version, and sending two
+different patches to Michael Ellerman, the PowerPC maintainer. Instead of
+accepting my patch or guiding me towards a better solution, he went ahead and
+implemented his own fix, giving me credit only for reporting the issue (which
+was <a href="https://lore.kernel.org/linuxppc-dev/dc38afe9-6b78-f3f5-666b-986939e40fc6@keymile.com/">already
+reported</a>
+six years prior to this).</p>
+
+<p>My first contribution to the kernel was a really frustrating and discouraging
+experience, dealing with people who do not think it’s important to get proper
+recognition for your work.</p>
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Arena allocator tips and tricks (113 pts)]]></title>
+            <link>https://nullprogram.com/blog/2023/09/27/</link>
+            <guid>37670740</guid>
+            <pubDate>Wed, 27 Sep 2023 05:59:55 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://nullprogram.com/blog/2023/09/27/">https://nullprogram.com/blog/2023/09/27/</a>, See on <a href="https://news.ycombinator.com/item?id=37670740">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div lang="en">
+<article>
+  
+  <time datetime="2023-09-27">
+    September 27, 2023
+  </time>
+  <p>
+    nullprogram.com/blog/2023/09/27/
+  </p>
+
+  <p>Over the past year I’ve refined my approach to <a href="https://www.rfleury.com/p/untangling-lifetimes-the-arena-allocator">arena allocation</a>.
+With practice, it’s effective, simple, and fast; typically as easy to use
+as garbage collection but without the costs. Depending on need, an
+allocator can weigh just 7–25 lines of code — perfect when <a href="https://nullprogram.com/blog/2023/02/15/">lacking a
+runtime</a>. With the core details of my own technique settled, now is a
+good time to document and share lessons learned. This is certainly not the
+only way to approach arena allocation, but these are practices I’ve worked
+out to simplify programs and reduce mistakes.</p>
+
+<p>An arena is a memory buffer and an offset into that buffer, initially
+zero. To allocate an object, grab a pointer at the offset, advance the
+offset by the size of the object, and return the pointer. There’s a little
+more to it, such as ensuring alignment and availability. We’ll get to
+that. Objects are not freed individually. Instead, groups of allocations
+are freed at once by restoring the offset to an earlier value. Without
+individual lifetimes, you don’t need to write destructors, nor do your
+programs need to walk data structures at run time to take them apart. You
+also no longer need to worry about memory leaks.</p>
+
+<p>A minority of programs inherently require general purpose allocation, at
+least in part, that linear allocation cannot fulfill. This includes, for
+example, most programming language runtimes. If you like arenas, avoid
+accidentally create such a situation through an over-flexible API that
+allows callers to assume you have general purpose allocation underneath.</p>
+
+<p>To get warmed up, here’s my style of arena allocation in action that shows
+off multiple features:</p>
+
+<div><pre><code><span>typedef</span> <span>struct</span> <span>{</span>
+    <span>uint8_t</span>  <span>*</span><span>data</span>
+    <span>ptrdiff_t</span> <span>len</span><span>;</span>
+<span>}</span> <span>str</span><span>;</span>
+
+<span>typedef</span> <span>struct</span> <span>{</span>
+    <span>strlist</span> <span>*</span><span>next</span><span>;</span>
+    <span>str</span>      <span>item</span><span>;</span>
+<span>}</span> <span>strlist</span><span>;</span>
+
+<span>typedef</span> <span>struct</span> <span>{</span>
+    <span>str</span> <span>head</span><span>;</span>
+    <span>str</span> <span>tail</span><span>;</span>
+<span>}</span> <span>strpair</span><span>;</span>
+
+<span>// Defined elsewhere</span>
+<span>void</span>    <span>towidechar</span><span>(</span><span>wchar_t</span> <span>*</span><span>,</span> <span>ptrdiff_t</span><span>,</span> <span>str</span><span>);</span>
+<span>str</span>     <span>loadfile</span><span>(</span><span>wchar_t</span> <span>*</span><span>,</span> <span>arena</span> <span>*</span><span>);</span>
+<span>strpair</span> <span>cut</span><span>(</span><span>str</span><span>,</span> <span>uint8_t</span><span>);</span>
+
+<span>strlist</span> <span>*</span><span>getlines</span><span>(</span><span>str</span> <span>path</span><span>,</span> <span>arena</span> <span>*</span><span>perm</span><span>,</span> <span>arena</span> <span>scratch</span><span>)</span>
+<span>{</span>
+    <span>int</span> <span>max_path</span> <span>=</span> <span>1</span><span>&lt;&lt;</span><span>15</span><span>;</span>
+    <span>wchar_t</span> <span>*</span><span>wpath</span> <span>=</span> <span>new</span><span>(</span><span>&amp;</span><span>scratch</span><span>,</span> <span>wchar_t</span><span>,</span> <span>max_path</span><span>);</span>
+    <span>towidechar</span><span>(</span><span>wpath</span><span>,</span> <span>max_path</span><span>,</span> <span>path</span><span>);</span>
+
+    <span>strpair</span> <span>pair</span> <span>=</span> <span>{</span><span>0</span><span>};</span>
+    <span>pair</span><span>.</span><span>tail</span> <span>=</span> <span>loadfile</span><span>(</span><span>wpath</span><span>,</span> <span>perm</span><span>);</span>
+
+    <span>strlist</span> <span>*</span><span>head</span> <span>=</span> <span>0</span><span>;</span>
+    <span>strlist</span> <span>**</span><span>tail</span> <span>=</span> <span>&amp;</span><span>head</span><span>;</span>
+    <span>while</span> <span>(</span><span>pair</span><span>.</span><span>tail</span><span>.</span><span>len</span><span>)</span> <span>{</span>
+        <span>pair</span> <span>=</span> <span>cut</span><span>(</span><span>pair</span><span>.</span><span>tail</span><span>,</span> <span>'\n'</span><span>);</span>
+        <span>*</span><span>tail</span> <span>=</span> <span>new</span><span>(</span><span>perm</span><span>,</span> <span>strlist</span><span>,</span> <span>1</span><span>);</span>
+        <span>(</span><span>*</span><span>tail</span><span>)</span><span>-&gt;</span><span>item</span> <span>=</span> <span>pair</span><span>.</span><span>head</span><span>;</span>
+        <span>tail</span> <span>=</span> <span>&amp;</span><span>(</span><span>*</span><span>tail</span><span>)</span><span>-&gt;</span><span>next</span><span>;</span>
+    <span>}</span>
+    <span>return</span> <span>head</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Take note of these details, each to be later discussed in detail:</p>
+
+<ul>
+  <li>
+    <p><code>getlines</code> takes two arenas, “permanent” and “scratch”. The former is
+for objects that will be returned to the caller. The latter is for
+temporary objects whose lifetime ends when the function returns. They
+have stack lifetimes just like local variables.</p>
+  </li>
+  <li>
+    <p>Objects are not explicitly freed. Instead, <strong>all allocations from a
+scratch arena are implicitly freed upon return</strong>. This would include
+error return paths automatically.</p>
+  </li>
+  <li>
+    <p>The <strong>scratch arena is passed by copy</strong> — i.e. a copy of the “header”
+not the <em>memory region</em> itself. Allocating only changes the local copy,
+and so cannot survive the return. The semantics are obvious to callers,
+so they’re less likely to get mixed up.</p>
+  </li>
+  <li>
+    <p>While <code>wpath</code> could be an automatic local variable, it’s relatively
+large for the stack, so it’s allocated out of the scratch arena. A
+scratch arena safely permits large, dynamic allocations that would never
+be safe on the stack. In other words, <strong>a sane <a href="https://man7.org/linux/man-pages/man3/alloca.3.html"><code>alloca</code></a>!</strong>
+Same for variable-length arrays (VLAs). A scratch arena means you’ll
+never be tempted to use either of these terrible ideas.</p>
+  </li>
+  <li>
+    <p>The second parameter to <code>new</code> is a type, so it’s obviously a macro. As
+you will see momentarily, this is not some complex macro magic, just a
+convenience one-liner. There is no implicit cast, and you will get a
+compiler diagnostic if the type is incorrect.</p>
+  </li>
+  <li>
+    <p>Despite all the allocation, there is not a single <code>sizeof</code> operator nor
+size computation. That’s because <strong>size computations are a major source
+of defects.</strong> That job is handled by specialized code.</p>
+  </li>
+  <li>
+    <p><strong>Allocation failures are not communicated by a null return</strong>. Lifting
+this burden greatly simplifies programs. Instead such errors are handled
+non-locally by the arena.</p>
+  </li>
+  <li>
+    <p>All allocations are <strong>zero-initialized by default</strong>. This makes for
+simpler, less error-prone programs. When that’s too expensive, this can
+become an opt-out without changing the default.</p>
+  </li>
+</ul>
+
+<p>See also <a href="https://nullprogram.com/blog/2023/01/18/">u-config</a>.</p>
+
+<h3 id="an-arena-implementation">An arena implementation</h3>
+
+<p>An arena suitable for most cases can be this simple:</p>
+
+<div><pre><code><span>typedef</span> <span>struct</span> <span>{</span>
+    <span>char</span> <span>*</span><span>beg</span><span>;</span>
+    <span>char</span> <span>*</span><span>end</span><span>;</span>
+<span>}</span> <span>arena</span><span>;</span>
+
+<span>void</span> <span>*</span><span>alloc</span><span>(</span><span>arena</span> <span>*</span><span>a</span><span>,</span> <span>ptrdiff_t</span> <span>size</span><span>,</span> <span>ptrdiff_t</span> <span>align</span><span>,</span> <span>ptrdiff_t</span> <span>count</span><span>)</span>
+<span>{</span>
+    <span>ptrdiff_t</span> <span>avail</span> <span>=</span> <span>a</span><span>-&gt;</span><span>end</span> <span>-</span> <span>a</span><span>-&gt;</span><span>beg</span><span>;</span>
+    <span>ptrdiff_t</span> <span>padding</span> <span>=</span> <span>-</span><span>(</span><span>uintptr_t</span><span>)</span><span>a</span><span>-&gt;</span><span>beg</span> <span>&amp;</span> <span>(</span><span>align</span> <span>-</span> <span>1</span><span>);</span>
+    <span>if</span> <span>(</span><span>count</span> <span>&gt;</span> <span>(</span><span>avail</span> <span>-</span> <span>padding</span><span>)</span><span>/</span><span>size</span><span>)</span> <span>{</span>
+        <span>abort</span><span>();</span>  <span>// one possible out-of-memory policy</span>
+    <span>}</span>
+    <span>ptrdiff_t</span> <span>total</span> <span>=</span> <span>size</span> <span>*</span> <span>count</span><span>;</span>
+    <span>char</span> <span>*</span><span>p</span> <span>=</span> <span>a</span><span>-&gt;</span><span>beg</span> <span>+</span> <span>padding</span><span>;</span>
+    <span>a</span><span>-&gt;</span><span>beg</span> <span>+=</span> <span>padding</span> <span>+</span> <span>total</span><span>;</span>
+    <span>return</span> <span>memset</span><span>(</span><span>p</span><span>,</span> <span>0</span><span>,</span> <span>total</span><span>);</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Yup, just a pair of pointers! When allocating, all sizes are signed <a href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1428r0.pdf">just
+as they ought to be</a>. Unsigned sizes are another historically
+common source of defects, and offer no practical advantages in return.
+Case in point exercise for the reader: Change each <code>ptrdiff_t</code> to <code>size_t</code>
+in <code>alloc</code>, find the defect that results, then fix it.</p>
+
+<p>The <code>align</code> parameter allows the arena to handle any unusual alignments,
+something that’s surprisingly difficult to do with libc. It’s difficult to
+appreciate its usefulness until it’s convenient.</p>
+
+<p>The <code>uintptr_t</code> business may look unusual if you’ve never come across it
+before. To align <code>beg</code>, we need to compute the number of bytes to advance
+the address (<code>padding</code>) until the alignment evenly divides the address.
+The modulo with <code>align</code> computes the number of bytes it’s since the last
+alignment:</p>
+
+
+
+<p>We can’t operate numerically on an address like this, so in the code we
+first convert to <code>uintptr_t</code>. Alignment is always a power of two, which
+notably excludes zero, so no worrying about division by zero. That also
+means we can compute modulo by subtracting one and masking with AND:</p>
+
+<div><pre><code>extra = addr &amp; (align - 1)
+</code></pre></div>
+
+<p>However, we want the number of bytes to advance to the next alignment,
+which is the inverse:</p>
+
+<div><pre><code>padding = -addr &amp; (align - 1)
+</code></pre></div>
+
+<p>Add the <code>uintptr_t</code> cast and you have the code in <code>alloc</code>.</p>
+
+<p>The <code>if</code> tests if there’s enough memory and simultaneously for overflow on
+<code>size*count</code>. If either fails, it invokes the out-of-memory policy, which
+in this case is <code>abort</code>. I strongly recommend that, at least when testing,
+always having <em>something</em> in place to, at minimum, abort when allocation
+fails, even when you think it cannot happen. It’s easy to use more memory
+than you anticipate, and you want a reliable signal when it happens.</p>
+
+<p>An alternative policy is to <a href="https://nullprogram.com/blog/2023/02/12/">longjmp to a “handler”</a>, which with
+GCC and Clang doesn’t even require runtime support. In that case add a
+<code>jmp_buf</code> to the arena:</p>
+
+<div><pre><code><span>typedef</span> <span>struct</span> <span>{</span>
+    <span>char</span>  <span>*</span><span>beg</span><span>;</span>
+    <span>char</span>  <span>*</span><span>end</span><span>;</span>
+    <span>void</span> <span>**</span><span>jmp_buf</span><span>;</span>
+<span>}</span> <span>arena</span><span>;</span>
+
+<span>void</span> <span>*</span><span>alloc</span><span>(...)</span>
+<span>{</span>
+    <span>// ...</span>
+    <span>if</span> <span>(</span><span>count</span> <span>&gt;</span> <span>(</span><span>avail</span> <span>-</span> <span>padding</span><span>)</span><span>/</span><span>size</span><span>)</span> <span>{</span>
+        <span>__builtin_longjmp</span><span>(</span><span>a</span><span>-&gt;</span><span>jmp_buf</span><span>,</span> <span>1</span><span>);</span>
+    <span>}</span>
+    <span>// ...</span>
+<span>}</span>
+
+<span>bool</span> <span>example</span><span>(...,</span> <span>arena</span> <span>scratch</span><span>)</span>
+<span>{</span>
+    <span>void</span> <span>*</span><span>jmp_buf</span><span>[</span><span>5</span><span>];</span>
+    <span>if</span> <span>(</span><span>__builtin_setjmp</span><span>(</span><span>jmp_buf</span><span>))</span> <span>{</span>
+        <span>return</span> <span>0</span><span>;</span>
+    <span>}</span>
+    <span>scratch</span><span>.</span><span>jmp_buf</span> <span>=</span> <span>jmp_buf</span><span>;</span>
+    <span>// ...</span>
+    <span>return</span> <span>1</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p><code>example</code> returns failure to the caller if it runs out of memory, without
+needing to check individual allocations and, thanks to the implicit free
+of scratch arenas, without needing to clean up. If callees receiving the
+scratch arena don’t set their own <code>jmp_buf</code>, they’ll return here, too. In
+a real program you’d probably wrap the <code>setjmp</code> setup in a macro.</p>
+
+<p>Suppose zeroing is too expensive or unnecessary in some cases. Add a flag
+to opt out:</p>
+
+<div><pre><code><span>void</span> <span>*</span><span>alloc</span><span>(...,</span> <span>int</span> <span>flags</span><span>)</span>
+<span>{</span>
+    <span>// ...</span>
+    <span>return</span> <span>flag</span><span>&amp;</span><span>NOZERO</span> <span>?</span> <span>p</span> <span>:</span> <span>memset</span><span>(</span><span>p</span><span>,</span> <span>0</span><span>,</span> <span>total</span><span>);</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Similarly, perhaps there’s a critical moment where you’re holding a
+non-memory resource (lock, file handle), or you don’t want allocation
+failure to be fatal. In either case, it important that the out-of-memory
+policy isn’t invoked. You could request a “soft” failure with another
+flag, and then do the usual null pointer check:</p>
+
+<div><pre><code><span>void</span> <span>*</span><span>alloc</span><span>(...,</span> <span>int</span> <span>flags</span><span>)</span>
+<span>{</span>
+    <span>// ...</span>
+    <span>if</span> <span>(</span><span>count</span> <span>&gt;</span> <span>(</span><span>avail</span> <span>-</span> <span>padding</span><span>)</span><span>/</span><span>size</span><span>)</span> <span>{</span>
+        <span>if</span> <span>(</span><span>flags</span> <span>&amp;</span> <span>SOFTFAIL</span><span>)</span> <span>{</span>
+            <span>return</span> <span>0</span><span>;</span>
+        <span>}</span>
+        <span>abort</span><span>();</span>
+    <span>}</span>
+    <span>// ...</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Most non-trivial programs will probably at least one of these flags.</p>
+
+<p>In case it wasn’t obvious, allocating an arena is simple:</p>
+
+<div><pre><code><span>arena</span> <span>newarena</span><span>(</span><span>ptrdiff_t</span> <span>cap</span><span>)</span>
+<span>{</span>
+    <span>arena</span> <span>a</span> <span>=</span> <span>{</span><span>0</span><span>};</span>
+    <span>a</span><span>.</span><span>beg</span> <span>=</span> <span>malloc</span><span>(</span><span>cap</span><span>);</span>
+    <span>a</span><span>.</span><span>end</span> <span>=</span> <span>a</span><span>.</span><span>beg</span> <span>?</span> <span>a</span><span>.</span><span>beg</span><span>+</span><span>cap</span> <span>:</span> <span>0</span><span>;</span>
+    <span>return</span> <span>a</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Or make a direct allocation from the operating system, e.g. <code>mmap</code>,
+<code>VirtualAlloc</code>. Typically arena lifetime is the whole program, so you
+don’t need to worry about freeing it. (Since you’re using arenas, you can
+also turn off any memory leak checkers while you’re at it.)</p>
+
+<p>If you need more arenas then you can always allocate smaller ones out of
+the first! In multi-threaded applications, each thread may have at least
+its own scratch arena.</p>
+
+<h3 id="the-new-macro">The <code>new</code> macro</h3>
+
+<p>I’ve shown <code>alloc</code>, but few parts of the program should be calling it
+directly. Instead they have a macro to automatically handle the details. I
+call mine <code>new</code>, though of course if you’re writing C++ you’ll need to
+pick another name (<code>make</code>? <code>PushStruct</code>?):</p>
+
+<div><pre><code><span>#define new(a, t, n)  (t *)alloc(a, sizeof(t), _Alignof(t), n)
+</span></code></pre></div>
+
+<p>The cast is an extra compile-time check, especially useful for avoiding
+mistakes in levels of indirection. It also keeps normal code from directly
+using the <code>sizeof</code> operator, which is easy to misuse. If you added a
+<code>flags</code> parameter, pass in zero for this common case. Keep in mind that
+the goal of this macro is to make common allocation simple and robust.</p>
+
+<p>Often you’ll allocate single objects, and so the count is 1. If you think
+that’s ugly, you could make variadic version of <code>new</code> that fills in common
+defaults. In fact, that’s partly why I put <code>count</code> last!</p>
+
+<div><pre><code><span>#define new(...)            newx(__VA_ARGS__,new4,new3,new2)(__VA_ARGS__)
+#define newx(a,b,c,d,e,...) e
+#define new2(a, t)          (t *)alloc(a, sizeof(t), alignof(t), 1, 0)
+#define new3(a, t, n)       (t *)alloc(a, sizeof(t), alignof(t), n, 0)
+#define new4(a, t, n, f)    (t *)alloc(a, sizeof(t), alignof(t), n, f)
+</span></code></pre></div>
+
+<p>Not quite so simple, but it optionally makes for more streamlined code:</p>
+
+<div><pre><code><span>thing</span> <span>*</span><span>t</span>   <span>=</span> <span>new</span><span>(</span><span>perm</span><span>,</span> <span>thing</span><span>);</span>
+<span>thing</span> <span>*</span><span>ts</span>  <span>=</span> <span>new</span><span>(</span><span>perm</span><span>,</span> <span>thing</span><span>,</span> <span>1000</span><span>);</span>
+<span>char</span>  <span>*</span><span>buf</span> <span>=</span> <span>new</span><span>(</span><span>perm</span><span>,</span> <span>char</span><span>,</span> <span>len</span><span>,</span> <span>NOZERO</span><span>);</span>
+</code></pre></div>
+
+<p>Side note: If <code>sizeof</code> should be avoided, what about array lengths? That’s
+part of the problem! Hardly ever do you want the <em>size</em> of an array, but
+rather the <em>number of elements</em>. That includes <code>char</code> arrays where this
+happens to be the same number. So instead, define a <code>countof</code> macro that
+uses <code>sizeof</code> to compute the value you actually want. I like to have this
+whole collection:</p>
+
+<div><pre><code><span>#define sizeof(x)    (ptrdiff_t)sizeof(x)
+#define countof(a)   (sizeof(a) / sizeof(*(a)))
+#define lengthof(s)  (countof(s) - 1)
+</span></code></pre></div>
+
+<p>Yes, you can convert <code>sizeof</code> into a macro like this! It won’t expand
+recursively and bottoms out as an operator. <code>countof</code> also, of course,
+produces a less error-prone signed count so users don’t fumble around with
+<code>size_t</code>. <code>lengthof</code> statically produces null-terminated string length.</p>
+
+<div><pre><code><span>char</span> <span>msg</span><span>[]</span> <span>=</span> <span>"hello world"</span><span>;</span>
+<span>write</span><span>(</span><span>fd</span><span>,</span> <span>msg</span><span>,</span> <span>lengthof</span><span>(</span><span>msg</span><span>));</span>
+
+<span>#define MSG "hello world"
+</span><span>write</span><span>(</span><span>fd</span><span>,</span> <span>MSG</span><span>,</span> <span>lengthof</span><span>(</span><span>MSG</span><span>));</span>
+</code></pre></div>
+
+<h3 id="enhance-alloc-with-attributes">Enhance <code>alloc</code> with attributes</h3>
+
+<p>At least for GCC and Clang, we can further improve <code>alloc</code> with three
+function attributes:</p>
+
+<div><pre><code><span>__attribute</span><span>((</span><span>malloc</span><span>,</span> <span>alloc_size</span><span>(</span><span>2</span><span>,</span> <span>4</span><span>),</span> <span>alloc_align</span><span>(</span><span>3</span><span>)))</span>
+<span>void</span> <span>*</span><span>alloc</span><span>(...);</span>
+</code></pre></div>
+
+<p><code>malloc</code> indicates that the pointer returned by <code>alloc</code> does not alias any
+existing object. Enables some significant optimizations that are otherwise
+blocked, most often by breaking potential loop-carried dependencies.</p>
+
+<p><code>alloc_size</code> tracks the allocation size for compile-time diagnostics and
+run-time assertions (<a href="https://gcc.gnu.org/onlinedocs/gcc/Object-Size-Checking.html"><code>__builtin_object_size</code></a>). This generally
+requires a non-zero optimization level. In other words, you will get a
+compiler warnings about some out bounds accesses of arena objects, and
+with Undefined Behavior Sanitizer you’ll get run-time bounds checking.
+It’s a great <a href="https://nullprogram.com/blog/2019/01/25/">complement to fuzzing</a>.</p>
+
+<p>In theory <code>alloc_align</code> may also allow better code generation, but I’ve
+yet to observe a case. Consider it optional and low-priority. I mention it
+only for completeness.</p>
+
+<h3 id="arena-size-and-growth">Arena size and growth</h3>
+
+<p>How large an arena should you allocate? The simple answer: As much as is
+necessary for the program to successfully complete. Usually the cost of
+untouched arena memory is low or even zero. Most programs should probably
+have an upper limit, at which point they assume something has gone wrong.
+Arenas allow this case to be handled gracefully, simplifying recovery and
+paving the way for continued operation.</p>
+
+<p>While a sufficient answer for most cases, it’s unsatisfying. There’s a
+common assumption that programs should increase their memory usage as much
+as needed and let the operating system respond if it’s too much. However,
+if you’ve ever tried this yourself, you probably noticed that mainstream
+operating systems don’t handle it well. The typical results are system
+instability — thrashing, drivers crashing — possibly necessitating a
+reboot.</p>
+
+<p>If you insist on this route, on 64-bit hosts you can reserve a gigantic
+virtual address space and gradually commit memory as needed. On Linux that
+means leaning on overcommit by allocating the largest arena possible at
+startup, which will automatically commit through use. <a href="https://nullprogram.com/blog/2019/12/29/">Use <code>MADV_FREE</code> to
+decommit.</a></p>
+
+<p>On Windows, <code>VirtualAlloc</code> handles reserve and commit separately. In
+addition to the allocation offset, you need a commit offset. Then expand
+the committed region ahead of the allocation offset as it grows. If you
+ever manually reset the allocation offset, you could decommit as well, or
+at least <code>MEM_RESET</code>. At some point commit may fail, which should then
+trigger the out-of-memory policy, but the system is probably in poor shape
+by that point — i.e. use an abort policy to release it all quickly.</p>
+
+<h3 id="pointer-laundering-filthy-hack">Pointer laundering (filthy hack)</h3>
+
+<p>While allocations out of an arena don’t require individual error checks,
+allocating the arena itself at startup requires error handling. It would
+be nice if the arena could be allocated out of <code>.bss</code> and punt that job to
+the loader. While you <em>could</em> make a big, global <code>char[]</code> array to back
+your arena, it’s technically not permitted (strict aliasing). A “clean”
+<code>.bss</code> region could be obtained with a bit of assembly — <a href="https://sourceware.org/binutils/docs/as/Comm.html"><code>.comm</code></a>
+plus assembly to get the address into C without involving an array. I
+wanted a more portable solution, so I came up with this:</p>
+
+<div><pre><code><span>arena</span> <span>getarena</span><span>(</span><span>void</span><span>)</span>
+<span>{</span>
+    <span>static</span> <span>char</span> <span>mem</span><span>[</span><span>1</span><span>&lt;&lt;</span><span>28</span><span>];</span>
+    <span>arena</span> <span>r</span> <span>=</span> <span>{</span><span>0</span><span>};</span>
+    <span>r</span><span>.</span><span>beg</span> <span>=</span> <span>mem</span><span>;</span>
+    <span>asm</span> <span>(</span><span>""</span> <span>:</span> <span>"+r"</span><span>(</span><span>r</span><span>.</span><span>beg</span><span>));</span>  <span>// launder the pointer</span>
+    <span>r</span><span>.</span><span>end</span> <span>=</span> <span>r</span><span>.</span><span>beg</span> <span>+</span> <span>countof</span><span>(</span><span>mem</span><span>);</span>
+    <span>return</span> <span>r</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The <code>asm</code> accepts a pointer and returns a pointer (<code>"+r"</code>). The compiler
+cannot “see” that it’s actually empty, and so returns the same pointer.
+The arena will be backed by <code>mem</code>, but by laundering the address through
+<code>asm</code>, I’ve disconnected the pointer from its origin. As far the compiler
+is concerned, this is some foreign, assembly-provided pointer, not a
+pointer into <code>mem</code>. It can’t optimize away <code>mem</code> because it’s been given
+to a mysterious assembly black box.</p>
+
+<p>While inappropriate for a real project, I think it’s a neat trick.</p>
+
+<h3 id="arena-friendly-container-data-structures">Arena-friendly container data structures</h3>
+
+<p>In my initial example I used a linked list to stores lines. This data
+structure is great with arenas. It only takes a few of lines of code to
+implement a linked list on top of an arena, and no “destroy” code is
+needed. Simple.</p>
+
+<p>What about <a href="https://nrk.neocities.org/articles/hash-trees-and-tries">arena-backed associative arrays</a>? Or arena-backed
+dynamic arrays? I have simple, fast, easy solutions for each, but that’s
+the subject for my next article!</p>
+
+
+
+  
+  <ol></ol>
+
+  
+
+  <nav>
+  
+    
+  
+  
+  </nav>
+</article>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[China is flooding Taiwan with disinformation (172 pts)]]></title>
             <link>https://www.economist.com/asia/2023/09/26/china-is-flooding-taiwan-with-disinformation</link>
             <guid>37667874</guid>
             <pubDate>Wed, 27 Sep 2023 00:18:01 GMT</pubDate>
@@ -17,7 +631,7 @@
 <div id="readability-page-1" class="page"><section><p><span><a href="https://www.economist.com/asia/" data-analytics="sidebar:section"><span>Asia</span></a></span><span> | <!-- -->Strait up lies</span></p><h2>With elections looming, China wants Taiwanese voters to think America is their greatest threat</h2></section><div data-body-id="cp2"><p data-component="paragraph"><span data-caps="initial">I</span><small>n July one</small> of Taiwan’s top newspapers, <i>United Daily News</i>, published a story based on supposedly leaked minutes from a secret government meeting. America had asked <a href="https://www.economist.com/china/2023/06/19/when-it-comes-to-a-war-with-taiwan-many-chinese-urge-caution">Taiwan</a> to manufacture biological weapons at a lab run by the island’s defence ministry, the report claimed. Taiwanese and American officials quickly denied it. The allegedly leaked minutes, it transpired, were not written in the usual style of Taiwanese government records. They were filled with official-sounding phrases used in mainland China, but not Taiwan. This was likely Chinese disinformation, Taiwanese officials said. Yet the story spread to Taiwanese talk shows and influencers. Within weeks it had evolved into a wilder claim: Taiwan was going to collect 150,000 samples of Taiwanese blood and hand them over to the Americans, so that they could develop a virus to kill Chinese people.</p><p data-component="paragraph">This sort of disinformation is so widespread in Taiwan that analysts have given it a moniker: <i>yi mei lun</i>, or the “<small>US</small> scepticism” narrative. Its spread is becoming a major worry for Taiwan’s government and civil society in the run-up to a hugely important presidential election next January. Taiwanese voters will in effect be asked to decide whether Taiwan should remain aligned with America in strengthening deterrence against a possible Chinese invasion, or should move towards building ties with China. The opposition Kuomintang has called the vote a choice between “war and peace”, implying that the ruling Democratic Progressive Party’s hostility towards China will provoke it to attack. Chinese state actors have backed that framing, spreading narratives that portray <a href="https://www.economist.com/briefing/2023/03/09/america-and-china-are-preparing-for-a-war-over-taiwan">America</a>, not China, as the island’s biggest threat.  Much of the disinformation is intended to reinforce that false message.</p><p data-component="paragraph">Lo Ping-chen, a cabinet minister who since 2018 has been leading a government task force against disinformation, says it has “severely infiltrated” Taiwan’s society. “We used to think there was more during election season. But it’s now become normalised. It happens every day.” Most Taiwanese voters have little idea of this. A recent survey by Doublethink Lab, a Taiwanese group that studies disinformation, found that less than 20% of respondents believed the false information spread in Taiwan during elections came from abroad. Puma Shen, who heads Doublethink Lab, worries about the one-fifth of voters who are not aligned with any party and could be a decisive bloc. “Even if only 15% of voters are truly affected by Chinese disinformation, it takes only 7% of voters to change the election results,” he says.</p><p data-component="paragraph">A recent study of <small>US</small>-scepticism narratives by the Information Environment Research Centre (<small>IORG</small>), a Taiwanese research group, found that Chinese actors were helping to spread most of them. But more than half appeared to have Taiwanese origins. That suggests China is “piggybacking” on fissures in Taiwanese society, says Chihhao Yu, the report’s author. He suggests many Taiwanese have an “orphan mentality”: they fear abandonment by outsiders because of Taiwan’s experience of losing American diplomatic recognition in the 1970s.</p><p data-component="paragraph">Chinese actors are exploiting those fears, just as Russian disinformation exploited America’s racial and cultural cracks for the benefit of Donald Trump in 2016. Chinese disinformation in Taiwan also echoes Russian propaganda about the war in Ukraine, which claims America is behind the conflict (and is creating bioweapons in Ukrainian labs).</p><p data-component="paragraph">China has developed systematic means to make falsehoods trend in Taiwan, says Chien Yu-yen, a former journalist and author of a book about Chinese influence on Taiwan’s media. She points to a spurious claim that America “wants to blow up” <small>TSMC, </small>a Taiwanese chipmaker. It originated with a misleading video posted on Douyin, the Chinese version of TikTok, which featured an American lawmaker appearing to discuss the possibility. The following morning, a Taiwanese newspaper published a story about the video. Opposition lawmakers and talk-show hosts whipped up outrage. “The journey from China’s Douyin to Taiwan’s mass media, videos, newspapers and television took less than half a day,” says Ms Chien. Chinese state media amplified the narrative, as if merely commenting from the outside on a Taiwanese debate.</p><p data-component="paragraph">Taiwanese officials believe that many of the Taiwanese launching<small> US-</small>scepticism untruths are “local collaborators” taking orders and payments from China. But that is hard to prove, because the suspected Chinese funding is probably funnelled through Taiwanese businesspeople or public-relations firms. Wang Kun-yi, a local commentator who frequently writes <small>US</small>-scepticism narratives for Chinese media and pro-China Taiwanese media, defends his work as a commercial enterprise. All journalists in Taiwan serve the bias of their newspapers’ bosses, says Mr Wang, who has worked for both pro-independence and pro-unification newspapers. “Everyone just treats it as a job,” he says. “It’s a tool to feed yourself.”</p><p data-component="paragraph">Taiwan has laws against foreign infiltration and election influence, but they are limited to cases of proven state-sponsored activity. It has additional laws against spreading wilful falsehood in broadcast media, but they do not cover print or digital outlets. In 2020 the government revoked the licence of <small>CTI </small>News, a pro-China channel, citing repeated failures to verify information. <small>CTI</small> simply moved online.</p><p data-component="paragraph">The case sparked accusations of censorship, which Taiwan wants to avoid. So the government has resorted to more liberal methods of fighting disinformation. It has tried to improve media literacy, provide faster official clarifications and promote fact-checking organisations. But such means cannot match the speed of Chinese propaganda. In August Meta removed a network of more than 7,000 accounts, pages and groups that were spreading Chinese disinformation. But new accounts are easy to set up, a problem that will only accelerate with artificial intelligence, says Mr Lo.</p><p data-component="paragraph">Chinese disinformation has already distorted Taiwan’s public conversation. Will it move votes? Meta has noted that the Chinese disinformation network it removed was “high volume, low reach”, despite having a veneer of engagement designed to make the accounts look more popular than they were. Studies of Russian disinformation in America have found that it has little impact on voter preferences. Despite all the messaging in Chinese and Taiwanese media against the Democratic Progressive Party, its candidate, William Lai, is leading in the polls. And for all the scepticism about America, Taiwanese are even warier of China. A 2022 survey by Academia Sinica, a Taiwanese research institution, found 34% of respondents agreeing that America is a “credible” country. Only 9% said the same of China.</p><p data-component="paragraph">China has itself to blame. It recently surrounded Taiwan with warplanes and warships, even as its ruling Communist Party unveiled an integration plan promising benefits to Taiwanese people living in Fujian, a southern province near the island. Most Taiwanese know where their real threat comes from. But China’s insidious efforts to mislead them are increasing.<span>■</span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Radar Maps Platform (123 pts)]]></title>
+            <title><![CDATA[Radar Maps Platform (125 pts)]]></title>
             <link>https://radar.com/blog/introducing-radar-maps-platform</link>
             <guid>37667450</guid>
             <pubDate>Tue, 26 Sep 2023 23:38:48 GMT</pubDate>
@@ -25,7 +639,7 @@
 <div id="readability-page-1" class="page"><div id="__next" data-reactroot=""><div><div><ul><li><a href="https://radar.com/product/geofencing">Product</a></li><li><a href="https://radar.com/solutions/retail">Solutions</a></li><li><a href="https://radar.com/documentation">Docs</a></li><li><a href="https://radar.com/pricing">Pricing</a></li><li><a href="https://radar.com/about">Company</a></li></ul><div><p><a href="https://radar.com/product/geofencing"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M8.132 2a3.648 3.648 0 0 1 3.473 3.641v.156c0 2.152-2.911 5.255-3.216 5.572a.649.649 0 0 1-.425.191.649.649 0 0 1-.424-.19c-.3-.318-3.217-3.42-3.217-5.573V5.64A3.643 3.643 0 0 1 7.797 2h.335ZM6.589 5.64a1.369 1.369 0 1 0 2.738 0 1.369 1.369 0 0 0-2.738 0Zm4.496 4.323a5.5 5.5 0 0 0 .227-.335l.006-.006c.903.455 1.447 1.106 1.447 1.848C12.765 12.91 10.715 14 8 14c-2.714 0-4.765-1.088-4.765-2.53 0-.729.526-1.368 1.399-1.823.066.102.131.204.21.311.166.24.334.46.501.676-.586.263-.92.58-.92.837 0 .532 1.423 1.333 3.569 1.333s3.57-.801 3.57-1.333c0-.263-.353-.592-.963-.855l.058-.076c.139-.181.285-.372.426-.576Z" fill="currentColor"></path></svg>Geofences<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M6.99 3.23a.75.75 0 0 0 0 1.06L10.698 8 6.99 11.709a.75.75 0 1 0 1.06 1.06l4.198-4.197a.81.81 0 0 0 0-1.145L8.05 3.23a.75.75 0 0 0-1.06 0Z" fill="currentColor"></path></svg><span href="/product/geofencing">Industry-leading accuracy with unlimited geofences, polygon geofences, and more</span></a></p><p><a href="https://radar.com/product/trip-tracking"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13.2 2H2.8c-.44 0-.8.365-.8.812v11.376c0 .447.36.812.8.812h.167c.44 0 .8-.365.8-.812v-2.436H13.2c.44 0 .8-.365.8-.812V2.812A.808.808 0 0 0 13.2 2Zm-.967 4.872H9.411v2.866H6.59V6.872H3.767V4.006h2.822v2.866H9.41V4.006h2.822v2.866Z" fill="currentColor"></path></svg>Trips<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M6.99 3.23a.75.75 0 0 0 0 1.06L10.698 8 6.99 11.709a.75.75 0 1 0 1.06 1.06l4.198-4.197a.81.81 0 0 0 0-1.145L8.05 3.23a.75.75 0 0 0-1.06 0Z" fill="currentColor"></path></svg><span href="/product/trip-tracking">Trip tracking, live ETAs, arrival detection, and routing for pickups and deliveries</span></a></p><p><a href="https://radar.com/product/places"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12.425 2.375A.788.788 0 0 0 11.75 2h-7.5c-.3 0-.525.15-.675.375C2 5.375 2 5.525 2 5.75c0 .825.675 1.5 1.5 1.5v6c0 .45.3.75.75.75h7.5c.45 0 .75-.3.75-.75v-6c.825 0 1.5-.675 1.5-1.5 0-.225 0-.375-1.575-3.375ZM9.5 12.5v-3h-3v3H5V7.025c.225.15.45.225.75.225.45 0 .825-.225 1.125-.525.3.3.675.525 1.125.525.45 0 .825-.225 1.125-.525.3.3.675.525 1.125.525.3 0 .525-.075.75-.225V12.5H9.5Z" fill="currentColor"></path></svg>Places<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M6.99 3.23a.75.75 0 0 0 0 1.06L10.698 8 6.99 11.709a.75.75 0 1 0 1.06 1.06l4.198-4.197a.81.81 0 0 0 0-1.145L8.05 3.23a.75.75 0 0 0-1.06 0Z" fill="currentColor"></path></svg><span href="/product/places">Points-of-interest (POI) dataset with chains and categories to detect visits to millions of places</span></a></p><p><a href="https://radar.com/product/api"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12.57 6.57A4.578 4.578 0 0 0 8.21 2h-.42a4.573 4.573 0 0 0-4.36 4.57v.195c0 2.702 3.662 6.597 4.037 6.995.15.157.383.24.533.24.15 0 .383-.083.533-.24.383-.398 4.037-4.293 4.037-6.995V6.57ZM7.993 8.29a1.718 1.718 0 1 1 0-3.437c.953 0 1.718.765 1.718 1.718S8.946 8.29 7.993 8.29Z" fill="currentColor"></path></svg>Maps Platform<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M6.99 3.23a.75.75 0 0 0 0 1.06L10.698 8 6.99 11.709a.75.75 0 1 0 1.06 1.06l4.198-4.197a.81.81 0 0 0 0-1.145L8.05 3.23a.75.75 0 0 0-1.06 0Z" fill="currentColor"></path></svg><span href="/product/api">The cost-effective, all-in-one Google Maps alternative, with geocoding, search, routing, and maps</span></a></p></div></div><div><ul><li><a href="https://radar.com/login">Log in</a></li><li><a href="https://radar.com/contact">Get a demo</a></li></ul></div></div><div><header><nav><ul><li><a href="https://radar.com/blog">Blog Home</a></li><li><a href="https://radar.com/blog/categories/company">Company</a></li><li><a href="https://radar.com/blog/categories/product">Product</a></li><li><a href="https://radar.com/blog/categories/engineering">Engineering</a></li><li><a href="https://radar.com/blog/categories/industry">Industry</a></li><li><a href="https://radar.com/blog/categories/guides">Guides</a></li></ul></nav></header></div><div><h2>It’s time to build</h2><p>See what Radar’s location and geofencing <br>solutions can do for your business.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Philips Hue ecosystem is collapsing into stupidity (810 pts)]]></title>
+            <title><![CDATA[The Philips Hue ecosystem is collapsing into stupidity (823 pts)]]></title>
             <link>https://rachelbythebay.com/w/2023/09/26/hue/</link>
             <guid>37667266</guid>
             <pubDate>Tue, 26 Sep 2023 23:22:15 GMT</pubDate>
@@ -33,7 +647,7 @@
 Couldn't get https://rachelbythebay.com/w/2023/09/26/hue/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Warren Spector – 40 years and I'm still here (104 pts)]]></title>
+            <title><![CDATA[Warren Spector – 40 years and I'm still here (109 pts)]]></title>
             <link>https://www.gamedeveloper.com/blogs/my-40-years-in-the-game-industry</link>
             <guid>37665946</guid>
             <pubDate>Tue, 26 Sep 2023 21:18:48 GMT</pubDate>
@@ -321,7 +935,7 @@ Couldn't get https://rachelbythebay.com/w/2023/09/26/hue/: Error: Request failed
         <figcaption>Remember that picture earlier of the three reprobate designers at Ion Storm? Here we are in 2023 at the ceremony where John Romero got his well-deserved Lifetime Achievement Award at GDC. That’s Tom Hall on the left, then John, then me.</figcaption></figure><p>When I started, we had nothing, conceptually, development-wise, technologically or tools. There were no game engines to make life easier. There weren't even any existing genres to borrow from and guide feature development. There were no sound cards. (One major sound card company told us they owed their survival to the first Wing Commander game...) Hell, when I started, we had one color - green - and got way too excited when CGA came along! We were making it up as we went along. which was pretty exciting, let me tell you. That feeling of creating something – an entire medium, not just a single game, was pretty thrilling.</p><p>There was no E3 show. And the game space at CES was silent as a tomb. Until one year, Chris Roberts rented what passed for a big-screen TV and a movie theater sound system to demo Wing Commander. Let’s just say the folks in charge of the show came by to make us turn the volume down! We ignored them. You can blame Chris and Origin for the hearing-damaging volume levels at game conventions!</p><p>Selling 100,000 copies of a game was called "going gold" and when that happened you went and bought yourself a Ferrari.</p><p>There was no digital distribution or online and multiplayer gaming. We sold in baggies or boxes filled with disks. The first time we shipped a game you could install on a 10-megabyte hard drive, we said "No one has a hard drive that big - we'll have to ship the game with a drive in the box. And the first time we saw a CD - a CD mind you - we stared at it like apes seeing the monolith in 2001 and said "no one will ever fill one of these up." (We were wrong about that, by the way.)</p><p>We actually depended on these things called "magazines" for reviews and PR.</p><p>We posted fan letters... on paper... some of them handwritten... on office walls.</p><p>The 3D revolution hadn't even begun. There were no games that featured 3D modeling - some of us spoke at SIGGRAPH about the 3D revolution in games even as we were in the midst of that revolution. And speaking of 3D, remember what I said earlier about the first time I saw Paul Neurath's tech demo of a real-time, fully-textured first-person, 3D engine and thought to myself, "The world just changed."</p><p>Audience expectations have gone way up. When I started, games were something new and sold to a limited audience who just wanted a novel kind of entertainment. They were D&amp;D players and technophiles who’d never seen anything like this new thing called “computer games” or “video games.” They – we really were geeks who reveled in our ability to master a medium normal people didn’t get. Today, the mass audience has jumped on the bandwagon and developers must exploit the capabilities of machines powerful enough to dwarf anything we could have imagined. Graphics and gameplay have to be first-rate. User interfaces that use every key on a keyboard and didn’t even have the option of a mouse have to be user friendly today at a level we didn’t have to achieve. We were pioneers back in the day and people expected hardship. We’re settled city dwellers today and our audience expects comfort, usability and quality in all aspects of their experience.</p><p>There were only two ways to reach an audience – through a publisher with connections with software stores or in ziplock bags sold by small studios or individual developers through the mail. Advertisements in something called “magazines” were a major distribution outlet for us, Today there are so many business models – so many ways to reach an audience and make some money – it’s hard to keep up.</p><p>And I haven't even gotten to the internet, always-on connectivity, a computer in everyone's pocket, free-to-play, microtransactions, designing games to be played forever instead of being satisfactorily completable. And there's this early access stuff that sounds to me like shipping a game before it's ready. Not only did those things not exist - we couldn't even have imagined them.</p><p>Today, anyone who says they’re not a gamer is either an outcast (like gamers used to be) or a liar.</p><p>I could go on, but you get the idea.</p><h3>Same old same old</h3><p>So what hasn't changed?</p><p>Things still change every day, just as they did when I started - new genres, new graphical approaches, new distribution methods, new multiplayer modes, new business models, and so on. That may sound like a contradiction, like a list of things I should have mentioned earlier, in discussing things that have changed. The reason it's here is because there's as much innovation possible today as there ever was. I learn from younger developers every day, and they learn from each other, just like I learned from my peers earlier. That hasn’t changed. Nor has the necessity of being a life-long learner. Yes, it’s a cliche, but it's one I proudly adopt for myself. And you should adopt yourself. My guess is you already have. I know game developers well enough to be comfortable saying that. There's always something new to learn.</p><p>People and teams are as committed, as dedicated and as in love with what they do as they were 40 years ago. I literally cried at work recently because the team I'm working with listened to a high-level vision and found a way to express it that was so much more than I expected. Better. Deeper. I cried out of pride in them and gratitude for the gift they gave me then and give me every day.</p><p>Games are and always will be - or at least have the potential to be - storytelling tools. But not in the way earlier media were. We can empower players to tell their own stories through their play choices. We can turn every player into an author. That was true in the early days and it's even truer today.</p><p>Things to learn, committed developers and games as a unique medium? All true 40 years ago. Still true today.</p><h3>Survival</h3><p>Now that you know my story, how did I survive it? Here's a partial list. Maybe you can relate to some of these, see them in your own life, and hold them close to make <em>your </em>survival more likely.</p><p>I've been lucky enough to be able to fill every role associated with game development that didn't involve engineering, art and sound. I've been on the business side and the creative side. I've worked for publishers and developers. I've been a designer, a game director, a creative director and a chief creative officer. I've worked with internal teams and external teams. If variety is the spice of life, I've had the Thai food of careers. Spicy! I'm sure "never been bored" is part of my equation.</p><p>I’ve been surrounded by people way smarter than I am and I've learned something from them every day. I get a lot of credit for a lot of games, but I’d be nowhere without folks like Steve Jackson, Richard Garriott, Paul Neurath, Doug Church, Harvey Smith, Art Min, John Romero, Seamus Blackley, Paul Weaver, Chase Jones and, of course, my understanding and long-suffering wife who's helped me when the chaos of development got me down. There are too many more to name. These were my friends and partners. All have been my teachers and some of them more than that - mentors. I owe each of them a debt of gratitude I can never repay. Find folks like this and cherish them.</p><p>I've been driven to and been given the opportunity in a variety of forums to be a relentless evangelist for a particular kind of game - the Immersive Simulation. It’s a genre I love and to this day think is critical to our maturation as a medium. Note that there's still plenty of work to be done in that space if any of you want to join me – literally, as team members, or figuratively, as fellow creators and evangelists.</p><p>I get bored easily. That might not sound like a survival trait but think about it. Boredom can spur you on to try new things, to challenge yourself, maybe even to boldly go where no one has gone before. I often joke that I’ve been making the same game over and over again, just a bit better each time. To an extent that’s true. I have no interest in making a game that doesn’t allow each player to create their own unique experience. I’m a dyed-in-the-wool Immersive Sim guy. But look more closely and you’ll see that the content and associated techniques never repeat. I’ve worked on fantasy and SF games, original IP as well as sequels to other people’s work and licenses. I’ve mashed up existing genres to create something new and unique. Look at Deus Ex - part RPG, part Shooter, part Stealth game. Or Disney Epic Mickey - part Adventure game, part Shooter (think about it…), part Platformer. And my new game, well, let’s just say it’s one part something different than anything I’ve worked on before, combined with something else and something else again. (You have no idea what’s coming…). Trust me when I tell you that part of my survival is that I’ve never had to repeat myself.</p><p>People have appreciated the work my teams and I have done and have expressed it loudly and affectionately. I may or may not deserve accolades, but I've been lucky enough to receive them and I'm grateful for all the kind words and well-wishes I've received. Maybe it's just my ego, but what I consider to be my successes have nothing to do with reviews, sales or revenue. Success for me is connection with players (and not in the data-collecting way some of you may be thinking). I've had people send me handmade plush toys based on characters in my games. I've had people send me artwork they were inspired to create. I've had people tell me a game I worked on helped get them through chemotherapy. Autism. Cerebral palsy. I ran into a young woman at Disneyland dressed as Ortensia, in a homemade costume, before the character was a star in the Disney firmament. “I started my company because of your game,” I’ve been told. And “I changed the way I thought about design because of a game you worked on.” Now those are success criteria that have kept me going, even when things got tough.</p><p>I've had the opportunity to help, in a small way, create and define a new art form, an opportunity that comes along only two or three times a century. I’ve always thought games were - or could be - important, artistically and culturally. And I'm just pretentious enough to want to make art and be a minor contributor to a medium that has and will continue to change the world. (As a note, that opportunity still exists - we're not a solved problem like other media. We've barely scratched the surface of what games can and should be.)</p><p>I’ve been exceptionally lucky. Every time I’ve needed, wanted, or benefited from a change, a phone call came my way offering me a new opportunity. I’ve always had new challenges and new things to learn. Hard to get bored when that’s the nature of things. That said, I believe that you make your own luck, to an extent. I read somewhere that in order to get hit by a train you have to stand on the tracks. A silly way to put it, but with a grain of truth to it. What it means to me is that you have to work hard to make sure you’re in a position where luck can come your way. I think I’ve done that. I’ve prepared for change and put myself in positions where people want to call me. So they do.</p><p>I’ve loved my work, even when I've hated it. (You developers know what I mean!). I hope every one of you reading this feels that love every day when you go to the office (those of you who still <em>go </em>to an office...).</p><p>Finally, I’m not qualified to do anything else but make games. Most of you can get jobs somewhere else. I guess I could teach, but basically, I got nothing but this. I've <em>had </em>to survive!</p><h3>Conclusions</h3><p>So what conclusions can I draw from 40 years of making games?</p><p>I couldn’t have survived without my mentors, notably Steve Jackson and Richard Garriott. Steve gave me what I think of as my undergraduate degree in game development. Richard gave me my graduate degree. They were integral to everything I've done and I guess become... As I said before, I’ve had too many teachers and collaborators to name. Whether I worked <em>for</em> them or they worked for me, whether we were peers or partners, I’ve tried to learn something from all of them. It isn't too strong a statement that I’ve been taught more by others than I taught them. Well, at least as much as I hope I've taught them. Mentors, teachers, teammates, friends and family are, in a real and tangible sense, responsible for "my" success. If you don't have people like this in your life, find them.</p><p>What I discovered at Origin, Looking Glass, Ion Storm, Junction Point and most recently OtherSide, is that I'm not the world’s greatest designer. I’m certainly not as good as some of the other designers I've worked with. What I'm best at is coming up with a concept and communicating a core vision clearly and compellingly before finding star performers who make that vision real, in as great a way as I could have expected or, usually, even better.</p><p>I’m also pretty good at identifying people with a strong, clear vision of their own and helping them express that vision better than they could without a few pushes and nudges here and there. One of the most important lessons I’ve learned is that if your game doesn't have a clear vision, and you can't express and "sell" it and if you don't hire people better than you are, you're likely to fail. At best you're on the road to mediocrity. Life is too short to work on games that you know are going to be simply okay.</p><p>Finally, to younger developers (which is basically all of you given my... ahem... experience), to you I say, don't lose sight of a significant part of your job - maybe the most important part of your job. It's up to each and every one of you to make things so amazing and innovative that people forget about guys like me. Seriously. I want you to stun me, to do things I can't even imagine. Don't settle for rehashes of earlier games that differ only by virtue of prettier pictures. Show me things I've never seen or done before. Games are not what I call a "solved problem." Other media, more mature than us, may offer different content and even different development tools and distribution models, but in formal terms, movies and novels, to name just two, haven't changed much in 100 years or more. Editing techniques and narrative structures are well-understood. Games are a mystery, still.</p><p>I'll wrap this up by saying that the coolest thing I've seen in the last 40 years is that we changed the world - not me, not the individual companies I've worked for. But the game business and the medium as a whole and all the intelligent, creative people working in it. We went from games for geeks to games for everyone. Our sales dwarf those in any other medium of expression ever. Ever. Think about that. We’re a powerful cultural force. We've developed an entirely new art form. We’re the only medium in the history of humankind that can turn every consumer into a creator and, astonishingly, we do that through the power of play. Think about <em>that</em>!</p><p>We changed the world, yes, but we’re not done yet. As I said, we’re not a solved problem. Anyone reading this could be the next agent of change, whether you work for a huge company or a small one. There’s no telling where innovation will come from. So get to it! Give me a game unlike any I’ve ever played. Show me what you got! Change the world.<br></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rethinking the Luddites in the Age of A.I (183 pts)]]></title>
+            <title><![CDATA[Rethinking the Luddites in the Age of A.I (186 pts)]]></title>
             <link>https://www.newyorker.com/books/page-turner/rethinking-the-luddites-in-the-age-of-ai</link>
             <guid>37664682</guid>
             <pubDate>Tue, 26 Sep 2023 19:31:40 GMT</pubDate>
@@ -329,7 +943,7 @@ Couldn't get https://rachelbythebay.com/w/2023/09/26/hue/: Error: Request failed
 <div id="readability-page-1" class="page"><div data-journey-hook="client-content" data-testid="ArticlePageChunks"><p>On December 15, 1811, the London <em>Statesman</em> issued a warning about the state of the stocking industry in Nottingham. Twenty thousand textile workers had lost their jobs because of the incursion of automated machinery. Knitting machines known as lace frames allowed one employee to do the work of many without the skill set usually required. In protest, the beleaguered workers had begun breaking into factories to smash the machines. “Nine Hundred Lace Frames have been broken,” the newspaper reported. In response, the government had garrisoned six regiments of soldiers in the town, in a domestic invasion that became a kind of slow-burning civil war of factory owners, supported by the state, against workers. The article was apocalyptic: “God only knows what will be the end of it; nothing but ruin.”</p><p>The workers destroying the lace frames were the group who called themselves Luddites, after Ned Ludd, a (likely fictional) knitting-frame apprentice near Leicester who was said to have rebelled against his boss by destroying a frame with a hammer. Today, the word “Luddite” is used as an insult to anyone resistant to technological innovation; it suggests ignoramuses, sticks in the mud, obstacles to progress. But a new book by the journalist and author Brian Merchant, titled “<a data-offer-url="https://www.amazon.com/Blood-Machine-Origins-Rebellion-Against/dp/0316487740" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.amazon.com/Blood-Machine-Origins-Rebellion-Against/dp/0316487740&quot;}" href="https://www.amazon.com/Blood-Machine-Origins-Rebellion-Against/dp/0316487740" rel="nofollow noopener" target="_blank">Blood in the Machine</a>,” argues that Luddism stood not against technology per se but for the rights of workers above the inequitable profitability of machines. The book is a historical reconsideration of the movement and a gripping narrative of political resistance told in short vignettes.</p><p>The hero of the story is George Mellor, a young laborer from Huddersfield who worked as a so-called cropper, smoothing the raised surface of rough cloth with shears. He observed the increasing automation of the industry, concluded that it was unjust, and decided to join the insurgent Luddite movement. A physically towering figure, he organized his fellow-workers and led attacks on factories. One factory owner who was targeted was William Horsfall, a local cloth entrepreneur. Horsfall threatened to ride his horse through “Luddite blood” in order to keep his profitable factories going, hiring mercenaries and installing cannons to defend his machines. In the background of the story, figures such as the ineffectual Prince George, a sybaritic regent for his infirm father, George III, and Lord Byron, the poet, who voiced his sympathy for the Luddites in Parliament, debate which side to support: owners or workers. Byron exhorted the workers in his poem “Song for the Luddites” to “die fighting, or live free.”</p><p>Merchant ably demonstrates the dire stakes of the Luddites’ plight. The trades that had sustained livelihoods for generations were disappearing, and their families were starving. A Lancashire weaver’s weekly pay dropped from twenty-five shillings in 1800 to fourteen in 1811. The market was being flooded with cheaper, inferior goods such as “cut-ups,” stockings made from two pieces of cloth joined together, rather than knit as one continuous whole. The government repeatedly failed to intervene on behalf of the workers. What option remained was attacking the boss’s capital by disabling the factories. The secretive captains of the Luddite forces took on the pseudonym General Ludd or King Ludd, which they used to write public letters and to sign threats of attacks. The spectre of violence led some factory owners to abandon their plans for automation. They reverted to manual labor or closed up shop completely. For a time, it seemed that the Luddites were making headway in empowering themselves over the machines.</p><p>The book offers plenty of satisfying imagery for the twenty-first-century reader experiencing techlash. Merchant argues that the message of Luddism is just as relevant today, as our lives become increasingly enmeshed with digital platforms, from TikTok to Uber and Instacart, that translate our labor and attention into profit, “overlaying a sort of psychic factory onto its workers’ lives.” (Who hasn’t at times wished to take a hammer to their MacBook?) The Luddites sought revenge against the innovation that was holding them hostage. In Merchant’s telling, they were activists, punks, and masked celebrities standing up for the skilled working class, the successors to Robin Hood, another product of Nottingham. “Luddite” by that measure sounds like a compliment.</p><p>“Blood in the Machine” is being published just as we are facing a new wave of technological automation centering on <a href="https://www.newyorker.com/science/annals-of-artificial-intelligence/can-we-stop-the-singularity">artificial intelligence</a>—which some, including the consulting firm McKinsey, have labelled the “Fourth Industrial Revolution.” Merchant uses anachronistic terms like “startup” and “tech titan” to describe early factories and entrepreneurs, seeking to draw parallels with the present. (The book’s analytical sections are weaker than its narrative ones.) The “labor-saving technology” of today threatens new categories of jobs: customer service is being performed by chatbots; Amazon is selling e-books written by ChatGPT. Designers and illustrators are losing jobs to image generators; translators are being asked to “clean up” transcripts generated by A.I. The profusion of <a href="https://www.newyorker.com/culture/infinite-scroll/my-ai-writing-robot">dubious A.I.-generated content</a> resembles the badly made stockings of the nineteenth century. At the time of the Luddites, many hoped the subpar products would prove unacceptable to consumers or to the government. Instead, social norms adjusted. Both the mass-manufactured products and the regimented jobs that produced them quickly became entrenched.</p><p>The Luddites watched as sprawling factory buildings rose over their rural towns, concentrating labor that had traditionally been performed independently in the home or small workshops. The working conditions in those factories, often staffed by children, were execrable; the horror stories that emerged, of mangled limbs and bodies, eventually helped encourage reform. The victims of automation today are less immediately obvious. ChatGPT users can’t see the low-paid content moderators in countries such as Kenya who undergird <a href="https://www.newyorker.com/news/the-new-yorker-interview/its-not-possible-for-me-to-feel-or-be-creepy-an-interview-with-chatgpt">the program</a>’s output, performing an onerous psychological task that <a data-offer-url="https://crowd.cs.vt.edu/wp-content/uploads/2021/02/CHI21_final__The_Psychological_Well_Being_of_Content_Moderators-2.pdf" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://crowd.cs.vt.edu/wp-content/uploads/2021/02/CHI21_final__The_Psychological_Well_Being_of_Content_Moderators-2.pdf&quot;}" href="https://crowd.cs.vt.edu/wp-content/uploads/2021/02/CHI21_final__The_Psychological_Well_Being_of_Content_Moderators-2.pdf" rel="nofollow noopener" target="_blank">studies have shown</a> can induce P.T.S.D. There is no single machine that can be smashed to disable artificial intelligence. If the physical server farms that host A.I. programs were attacked, the software could simply be hosted elsewhere. What’s more, the foundation of A.I. is the raw material that humanity has already labored to produce: reams of text and images that programs process into patterns and then remix into fresh “content.” Unlike the machines of the first Industrial Revolution, A.I. does not necessarily need more input; it can sustain itself. “Jobs are definitely going to go away, full stop,” Sam Altman, the C.E.O. of OpenAI, recently told <a href="https://www.theatlantic.com/magazine/archive/2023/09/sam-altman-openai-chatgpt-gpt-4/674764/"><em>The Atlantic</em></a>.</p><p>The tragedy of the Luddites is not the fact that they failed to stop industrialization so much as the way in which they failed. In the end, Parliament “sided decisively with the entrepreneurs,” as Merchant writes, and frame-breaking was made a capital offense. Dozens of workers were executed for Luddite activities, including, in January of 1813, fourteen in one brutal day. George Mellor, the Luddite captain, was eventually convicted of assassinating Horsfall, the factory owner, and was hanged, at the age of twenty-three. Human rebellion proved inadequate against the pull of technological advancement.</p><p>“Blood in the Machine” suggests that although the forces of mechanization can feel beyond our control, the way society responds to such changes is not. Regulation of the textile industry could have protected the Luddite workers before they resorted to destruction. One proposal suggested a tax on every yard of cloth made by machine. After a pro-worker bill failed to pass in the House of Lords, Gravener Henson, a frame knitter turned advocate and historian, led an association of workers that demanded higher wages and labor protections, though such “combination” was outlawed at the time in the U.K. Eventually, Luddism faded into a more general political movement. By the late nineteenth century, the majority of Nottingham’s lace production had been mechanized. In the era of A.I., we have another opportunity to decide whether automation will create advantages for all, or whether its benefits will flow only to the business owners and investors looking to reduce their payrolls. One 1812 letter from the Luddites described their mission as fighting against “all Machinery hurtful to Commonality.” That remains a strong standard by which to judge technological gains.&nbsp;♦</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Prophet: Automatic Forecasting Procedure (249 pts)]]></title>
+            <title><![CDATA[Prophet: Automatic Forecasting Procedure (254 pts)]]></title>
             <link>https://github.com/facebook/prophet</link>
             <guid>37663820</guid>
             <pubDate>Tue, 26 Sep 2023 18:35:04 GMT</pubDate>
@@ -530,7 +1144,7 @@ python -m pip install -e <span>.</span></pre></div>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[EU tells Apple to open everything up to its rivals (366 pts)]]></title>
+            <title><![CDATA[EU tells Apple to open everything up to its rivals (393 pts)]]></title>
             <link>https://appleinsider.com/articles/23/09/26/eu-tells-apple-to-open-everything-up-to-its-rivals</link>
             <guid>37663725</guid>
             <pubDate>Tue, 26 Sep 2023 18:28:20 GMT</pubDate>
@@ -556,7 +1170,7 @@ python -m pip install -e <span>.</span></pre></div>
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[GPU.zip: side channel attack that exposes visual data processed on the GPU (159 pts)]]></title>
+            <title><![CDATA[GPU.zip: side channel attack that exposes visual data processed on the GPU (167 pts)]]></title>
             <link>https://www.hertzbleed.com/gpu.zip/</link>
             <guid>37663601</guid>
             <pubDate>Tue, 26 Sep 2023 18:19:40 GMT</pubDate>
@@ -634,7 +1248,7 @@ Check out the <a href="https://www.hertzbleed.com/gpu.zip/GPU-zip.pdf">paper</a>
       </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Causality for Machine Learning (2020) (111 pts)]]></title>
+            <title><![CDATA[Causality for Machine Learning (2020) (113 pts)]]></title>
             <link>https://ff13.fastforwardlabs.com/</link>
             <guid>37663523</guid>
             <pubDate>Tue, 26 Sep 2023 18:14:23 GMT</pubDate>
@@ -1193,7 +1807,7 @@ def sample():
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Unity like game editor running in pure WASM (544 pts)]]></title>
+            <title><![CDATA[Show HN: Unity like game editor running in pure WASM (553 pts)]]></title>
             <link>https://raverie-us.github.io/raverie-engine/</link>
             <guid>37663270</guid>
             <pubDate>Tue, 26 Sep 2023 17:58:47 GMT</pubDate>
@@ -1201,7 +1815,7 @@ def sample():
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[ROCm is AMD's priority, executive says (264 pts)]]></title>
+            <title><![CDATA[ROCm is AMD's priority, executive says (267 pts)]]></title>
             <link>https://www.eetimes.com/rocm-is-amds-no-1-priority-exec-says/</link>
             <guid>37663194</guid>
             <pubDate>Tue, 26 Sep 2023 17:54:42 GMT</pubDate>
@@ -1277,7 +1891,7 @@ def sample():
 									</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Sidechannel pixel-stealing attack works in Chromium on all modern GPUs (183 pts)]]></title>
+            <title><![CDATA[Sidechannel pixel-stealing attack works in Chromium on all modern GPUs (184 pts)]]></title>
             <link>https://arstechnica.com/security/2023/09/gpus-from-all-major-suppliers-are-vulnerable-to-new-pixel-stealing-attack/</link>
             <guid>37663159</guid>
             <pubDate>Tue, 26 Sep 2023 17:52:45 GMT</pubDate>
@@ -1327,7 +1941,7 @@ def sample():
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Tips for Solopreneur? (185 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Tips for Solopreneur? (187 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=37662937</link>
             <guid>37662937</guid>
             <pubDate>Tue, 26 Sep 2023 17:39:51 GMT</pubDate>
@@ -1361,7 +1975,7 @@ def sample():
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Exploring Linux command-line space time (195 pts)]]></title>
+            <title><![CDATA[Exploring Linux command-line space time (206 pts)]]></title>
             <link>https://fabiensanglard.net/st/index.html</link>
             <guid>37662655</guid>
             <pubDate>Tue, 26 Sep 2023 17:21:12 GMT</pubDate>
@@ -2114,7 +2728,7 @@ Understanding Netlink Process Connector Output</a></td></tr></tbody></table></p>
  <center>*</center></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Vizro – toolkit for creating modular data visualization applications (109 pts)]]></title>
+            <title><![CDATA[Vizro – toolkit for creating modular data visualization applications (114 pts)]]></title>
             <link>https://github.com/mckinsey/vizro</link>
             <guid>37662561</guid>
             <pubDate>Tue, 26 Sep 2023 17:15:33 GMT</pubDate>
@@ -2210,7 +2824,7 @@ please see the <a href="https://vizro.readthedocs.io/en/latest/pages/development
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[macOS Sonoma is available today (353 pts)]]></title>
+            <title><![CDATA[macOS Sonoma is available today (368 pts)]]></title>
             <link>https://www.apple.com/newsroom/2023/09/macos-sonoma-is-available-today/</link>
             <guid>37662510</guid>
             <pubDate>Tue, 26 Sep 2023 17:12:17 GMT</pubDate>
@@ -2818,7 +3432,7 @@ please see the <a href="https://vizro.readthedocs.io/en/latest/pages/development
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Why don’t Americans eat mutton? (166 pts)]]></title>
+            <title><![CDATA[Why don’t Americans eat mutton? (172 pts)]]></title>
             <link>https://modernfarmer.com/2023/09/digging-in-mutton/</link>
             <guid>37662281</guid>
             <pubDate>Tue, 26 Sep 2023 16:59:20 GMT</pubDate>
@@ -5956,18 +6570,6 @@ trent005 -&gt; 500tnert
             <pubDate>Tue, 26 Sep 2023 10:46:51 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.theguardian.com/world/2023/jul/10/spain-closes-pegasus-investigation-over-lack-of-cooperation-from-israel">https://www.theguardian.com/world/2023/jul/10/spain-closes-pegasus-investigation-over-lack-of-cooperation-from-israel</a>, See on <a href="https://news.ycombinator.com/item?id=37657334">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div id="maincontent"><p>A Spanish judge investigating the alleged hacking of ministers’ phones with Pegasus spyware has shelved his investigation over a “complete” lack of cooperation from <a href="https://www.theguardian.com/world/israel" data-link-name="in body link">Israel</a>, a court statement said on Monday.</p><p>In June 2022, José Luis Calama said he had sent a formal request for international judicial assistance, known as a letter rogatory, to the Israeli government asking for information about the software made by the Israeli firm NSO Group.</p><p>He also said he wanted to go there in person to take a witness statement from NSO’s chief executive.</p><p>But on Monday, the Audiencia Nacional, <a href="https://www.theguardian.com/world/spain" data-link-name="in body link">Spain</a>’s top criminal court, said Calama had decided to provisionally close the case “due to the complete lack of legal cooperation from Israel, which has not responded to the rogatory commission … and has prevented the investigation from going ahead”.</p><p>The investigation began in May 2022 after the Spanish government said the spyware, which can infiltrate mobile phones to extract data or activate a camera or microphone to spy on their owners, <a href="https://www.theguardian.com/world/2022/may/03/over-200-spanish-mobile-numbers-possible-targets-pegasus-spyware" data-link-name="in body link">had been used against phones belonging to top politicians</a>.</p><figure id="56a31631-1cfb-471f-93fd-f7145973c18e" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" deferuntil="idle" props="{&quot;richLinkIndex&quot;:5,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/world/2022/may/03/over-200-spanish-mobile-numbers-possible-targets-pegasus-spyware&quot;,&quot;text&quot;:&quot;Over 200 Spanish mobile numbers ‘possible targets of Pegasus spyware’&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;elementId&quot;:&quot;56a31631-1cfb-471f-93fd-f7145973c18e&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;display&quot;:0,&quot;theme&quot;:0,&quot;design&quot;:0}}" config="{&quot;renderingTarget&quot;:&quot;Web&quot;}"></gu-island></figure><p>Among those targeted were the phones of the prime minister, Pedro Sánchez; the defence minister, Margarita Robles; the interior minister, Fernando Grande-Marlaska, and the agriculture minister, Luis Planas.</p><p>But the Israeli government had not answered the request for assistance, which had been sent four times, meaning “it probably never would”, the court said in a statement, indicating the only remaining option was diplomacy.</p><p>“All that remains is a possible diplomatic channel capable of promoting compliance with the obligations derived from international treaties,” it said.</p><p>The court said Sánchez’s phone had been targeted on five occasions between October 2020 and December 2021. But despite a prolonged analysis of the four phones, it had not been possible to determine who was behind the attacks, the statement said.</p><p>Spain’s government has blamed it on “an external attack” while the Spanish press has pointed the finger at Morocco, given the diplomatic crisis between the two countries at the time.</p><p>The Guardian and El País <a href="https://www.theguardian.com/world/2020/jul/13/phone-of-top-catalan-politician-targeted-by-government-grade-spyware" data-link-name="in body link">first reported in June 2020</a> that the speaker of the Catalan regional parliament, Roger Torrent, and at least two other pro-independence supporters had been alerted that they had been targeted in what at the time was called a “possible case of domestic political espionage”. Dozens more cases were later identified in April 2022,<strong> </strong>when researchers at the Citizen Lab at the University of Toronto’s Munk school published a report saying <a href="https://www.theguardian.com/world/2022/apr/18/catalan-leaders-targeted-using-nso-spyware-say-cybersecurity-experts" data-link-name="in body link">the phones of at least 65 Catalan separatists had been targeted using Pegasus</a> after the failed 2017 independence bid.</p><p>NSO has said its spyware is sold to government clients only for the purposes of investigating serious crime and terrorism. It has said it investigates legitimate allegations of abuse.</p><p>The spy chief Paz Esteban told a parliamentary committee in 2022 that 18 Catalan separatists, including the Catalan regional leader, Pere Aragonès, had been spied on with Pegasus software – but always with court approval. She <a href="https://www.theguardian.com/world/2022/may/10/spains-spy-chief-paz-esteban-sacked-after-pegasus-spyware-revelations" data-link-name="in body link">was later sacked</a>.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[NSA, FBI, and CISA Release Cybersecurity Information Sheet on Deepfake Threats (138 pts)]]></title>
-            <link>https://www.cisa.gov/news-events/alerts/2023/09/12/nsa-fbi-and-cisa-release-cybersecurity-information-sheet-deepfake-threats</link>
-            <guid>37656646</guid>
-            <pubDate>Tue, 26 Sep 2023 09:26:40 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.cisa.gov/news-events/alerts/2023/09/12/nsa-fbi-and-cisa-release-cybersecurity-information-sheet-deepfake-threats">https://www.cisa.gov/news-events/alerts/2023/09/12/nsa-fbi-and-cisa-release-cybersecurity-information-sheet-deepfake-threats</a>, See on <a href="https://news.ycombinator.com/item?id=37656646">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-          <p>Today, the National Security Agency (NSA), the Federal Bureau of Investigation (FBI), and the Cybersecurity and Infrastructure Security Agency (CISA) released a Cybersecurity Information Sheet (CSI), <a href="https://media.defense.gov/2023/Sep/12/2003298925/-1/-1/0/CSI-DEEPFAKE-THREATS.PDF" title="Contextualizing Deepfake Threats to Organizations">Contextualizing Deepfake Threats to Organizations</a>, which provides an overview of synthetic media threats, techniques, and trends. Threats from synthetic media, such as deepfakes, have exponentially increased—presenting a growing challenge for users of modern technology and communications, including the National Security Systems (NSS), the Department of Defense (DoD), the Defense Industrial Base (DIB), and national critical infrastructure owners and operators. Between 2021 and 2022, U.S. Government agencies collaborated to establish a set of employable best practices to take in preparation and response to the growing threat. Public concern around synthetic media includes disinformation operations, designed to influence the public and spread false information about political, social, military, or economic issues to cause confusion, unrest, and uncertainty.</p>
-<p>The authoring agencies urge organizations review <a href="https://media.defense.gov/2023/Sep/12/2003298925/-1/-1/0/CSI-DEEPFAKE-THREATS.PDF" title="Contextualizing Deepfake Threats to Organizations">the CSI</a>&nbsp;for recommended steps and best practices to prepare, identify, defend against, and respond to deepfake threats.</p>
-
-      </div></div>]]></description>
         </item>
     </channel>
 </rss>
