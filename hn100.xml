@@ -4,12 +4,826 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 21 Oct 2023 09:00:06 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 21 Oct 2023 10:00:08 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The Shortest Papers Ever Published (157 pts)]]></title>
+            <title><![CDATA[Recent adventures in performance optimization with Rust (107 pts)]]></title>
+            <link>https://willcrichton.net/notes/k-corrset/</link>
+            <guid>37964161</guid>
+            <pubDate>Sat, 21 Oct 2023 04:44:42 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://willcrichton.net/notes/k-corrset/">https://willcrichton.net/notes/k-corrset/</a>, See on <a href="https://news.ycombinator.com/item?id=37964161">Hacker News</a></p>
+<div id="readability-page-1" class="page">
+
+<p>This note documents one of my recent adventures in performance
+optimization with Rust. By following along, hopefully you’ll learn
+something about how to write fast Rust.</p>
+<p>Here’s the context: imagine you have data from an online exam where a
+set of users answered a set of questions. The raw data looks like
+this:</p>
+<div id="cb1"><pre><code><span id="cb1-1">[</span>
+<span id="cb1-2">  {</span>
+<span id="cb1-3">    <span>"user"</span><span>:</span> <span>"5ea2c2e3-4dc8-4a5a-93ec-18d3d9197374"</span><span>,</span></span>
+<span id="cb1-4">    <span>"question"</span><span>:</span> <span>"7d42b17d-77ff-4e0a-9a4d-354ddd7bbc57"</span><span>,</span></span>
+<span id="cb1-5">    <span>"score"</span><span>:</span> <span>1</span></span>
+<span id="cb1-6">  }<span>,</span></span>
+<span id="cb1-7">  {</span>
+<span id="cb1-8">    <span>"user"</span><span>:</span> <span>"b7746016-fdbf-4f8a-9f84-05fde7b9c07a"</span><span>,</span></span>
+<span id="cb1-9">    <span>"question"</span><span>:</span> <span>"7d42b17d-77ff-4e0a-9a4d-354ddd7bbc57"</span><span>,</span></span>
+<span id="cb1-10">    <span>"score"</span><span>:</span> <span>0</span></span>
+<span id="cb1-11">  }<span>,</span>  </span>
+<span id="cb1-12">  <span>/* ... more data ... */</span></span>
+<span id="cb1-13">]</span></code></pre></div>
+<p>Note that each user only answered a subset of all possible questions,
+and all scores are either 0 or 1.</p>
+<p>Here’s the problem: given a size
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span></span>,
+which set of
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>k</mi></mrow><annotation encoding="application/x-tex">k</annotation></semantics></math></span></span>
+questions has the highest correlation with overall performance? We’ll
+call this the <strong>k-CorrSet problem</strong>. A simple brute-force
+algorithm for solving the k-CorrSet problem looks like this
+pseudocode:</p>
+<pre><code>func k_corrset($data, $k):
+  $all_qs = all questions in $data
+  for all $k-sized subsets $qs within $all_qs:
+    $us = all users that answered every question in $qs
+    $qs_totals = the total score on $qs of each user in $us
+    $grand_totals = the grand score on $all_qs of each user in $us
+    $r = correlation($qs_totals, $grand_totals)
+  return $qs with maximum $r    </code></pre>
+<p>We are going to implement several variations on this algorithm to see
+how fast we can make it.</p>
+<h2 id="python-baseline">Python Baseline</h2>
+<p>When I do data analysis, I usually start with Python and then
+transition to Rust when I need better speed or memory consumption. So as
+a baseline, let’s look at a straightforward <a href="https://pandas.pydata.org/">Pandas</a> program for solving
+k-CorrSet:</p>
+<div id="cb3"><pre><code><span id="cb3-1"><span>from</span> itertools <span>import</span> combinations</span>
+<span id="cb3-2"><span>import</span> pandas <span>as</span> pd</span>
+<span id="cb3-3"><span>from</span> pandas <span>import</span> IndexSlice <span>as</span> islice</span>
+<span id="cb3-4"></span>
+<span id="cb3-5"><span>def</span> k_corrset(data, K):</span>
+<span id="cb3-6">    all_qs <span>=</span> data.question.unique()</span>
+<span id="cb3-7">    q_to_score <span>=</span> data.set_index([<span>'question'</span>, <span>'user'</span>])</span>
+<span id="cb3-8">    all_grand_totals <span>=</span> data.groupby(<span>'user'</span>).score.<span>sum</span>().rename(<span>'grand_total'</span>)</span>
+<span id="cb3-9"></span>
+<span id="cb3-10">    corrs <span>=</span> []</span>
+<span id="cb3-11">    <span>for</span> qs <span>in</span> combinations(all_qs, K):</span>
+<span id="cb3-12">        qs_data <span>=</span> q_to_score.loc[islice[qs,:],:].swaplevel()</span>
+<span id="cb3-13">        answered_all <span>=</span> qs_data.groupby(level<span>=</span>[<span>0</span>]).size() <span>==</span> K</span>
+<span id="cb3-14">        answered_all <span>=</span> answered_all[answered_all].index</span>
+<span id="cb3-15">        qs_totals <span>=</span> qs_data.loc[islice[answered_all,:]] <span>\</span></span>
+<span id="cb3-16">            .groupby(level<span>=</span>[<span>0</span>]).<span>sum</span>().rename(columns<span>=</span>{<span>'score'</span>: <span>'qs'</span>})</span>
+<span id="cb3-17">        r <span>=</span> qs_totals.join(all_grand_totals).corr().qs.grand_total</span>
+<span id="cb3-18">        corrs.append({<span>'qs'</span>: qs, <span>'r'</span>: r})</span>
+<span id="cb3-19">    corrs <span>=</span> pd.DataFrame(corrs)</span>
+<span id="cb3-20"></span>
+<span id="cb3-21">    <span>return</span> corrs.sort_values(<span>'r'</span>, ascending<span>=</span><span>False</span>).iloc[<span>0</span>].qs</span>
+<span id="cb3-22"></span>
+<span id="cb3-23">data <span>=</span> pd.read_json(<span>'scores.json'</span>)</span>
+<span id="cb3-24"><span>print</span>(k_corrset(data, K<span>=</span><span>5</span>))</span></code></pre></div>
+<p>This uses a bit of <a href="https://pandas.pydata.org/docs/user_guide/advanced.html">MultiIndex</a>
+magic, but don’t sweat the details. Let’s start benchmarking. First, we
+need data. To make the benchmark realistic, I generated synthetic data
+that roughly matches the properties of my actual data. The properties of
+the synthetic data are:</p>
+<ul>
+<li>60,000 users</li>
+<li>200 questions</li>
+<li>20% sparsity (i.e., 12,000 users answered each question)</li>
+<li>Each score is equally likely 1 or 0</li>
+</ul>
+<p>Our goal will be to compute k-CorrSet on this dataset for k = 5 in a
+reasonable amount of time on my 2021 M1 Macbook Pro. Note that there are
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mo fence="true">(</mo><mfrac linethickness="0px"><mn>200</mn><mn>5</mn></mfrac><mo fence="true">)</mo></mrow><annotation encoding="application/x-tex">\binom{200}{5}</annotation></semantics></math></span></span>
+= 2.5 billion combinations of questions, so we need the inner loop of
+the brute-force algorithm to be quite fast.</p>
+<p>Using Python’s <a href="https://docs.python.org/3/library/time.html#time.time"><code>time.time()</code></a>
+function, I computed the speed of the inner loop for 1,000 iterations
+running with CPython 3.9.17. The average execution time was <strong>36
+milliseconds</strong>. Not too bad, but at this rate, the full
+computation would complete in <strong>2.9 years</strong>. Let’s make
+that faster!</p>
+<blockquote>
+<p>Note: there are lots of ways we could make the Python code faster,
+but the point of this post isn’t to compare highly-optimized Python to
+highly-optimized Rust. The point is to compare
+“standard-Jupyter-notebook” Python to highly-optimized Rust.</p>
+</blockquote>
+<h2 id="rust-reimplementation">Rust Reimplementation</h2>
+<p>We can start optimizing by reimplementing the Python code into a
+roughly equivalent Rust program, expecting some free speedups from
+Rust’s compiler optimizations. For readability, all the code below is a
+simplification of the actual benchmark. For instance, I will omit
+<code>#[derive]</code>s on types, and I will coalesce disparate blocks
+of code into straight-line functions. You can see the full benchmark
+here: <a href="https://github.com/willcrichton/corrset-benchmark">https://github.com/willcrichton/corrset-benchmark</a></p>
+<p>First, we translate the data types:</p>
+<div id="cb4"><pre><code><span id="cb4-1"><span>pub</span> <span>struct</span> User(<span>pub</span> <span>String</span>)<span>;</span></span>
+<span id="cb4-2"></span>
+<span id="cb4-3"><span>pub</span> <span>struct</span> Question(<span>pub</span> <span>String</span>)<span>;</span></span>
+<span id="cb4-4"></span>
+<span id="cb4-5"><span>pub</span> <span>struct</span> Row <span>{</span></span>
+<span id="cb4-6">  <span>pub</span> user<span>:</span> User<span>,</span></span>
+<span id="cb4-7">  <span>pub</span> question<span>:</span> Question<span>,</span></span>
+<span id="cb4-8">  <span>pub</span> score<span>:</span> <span>u32</span><span>,</span></span>
+<span id="cb4-9"><span>}</span></span></code></pre></div>
+<p>We make <code>User</code> and <code>Question</code> into newtypes
+both for clarity and so we can implement traits on them. Then, the basic
+k-CorrSet algorithm is implemented as follows:</p>
+<div id="cb5"><pre><code><span id="cb5-1"><span>fn</span> k_corrset(data<span>:</span> <span>&amp;</span>[Row]<span>,</span> k<span>:</span> <span>usize</span>) <span>-&gt;</span> <span>Vec</span><span>&lt;&amp;</span>Question<span>&gt;</span> <span>{</span></span>
+<span id="cb5-2">  <span>// utils::group_by(impl Iterator&lt;Item = (K1, K2, V)&gt;) </span></span>
+<span id="cb5-3">  <span>//   -&gt; HashMap&lt;K1, HashMap&lt;K2, V&gt;&gt;;</span></span>
+<span id="cb5-4">  <span>let</span> q_to_score<span>:</span> HashMap<span>&lt;&amp;</span>Question<span>,</span> HashMap<span>&lt;&amp;</span>User<span>,</span> <span>u32</span><span>&gt;&gt;</span> <span>=</span> </span>
+<span id="cb5-5">    <span>utils::</span>group_by(data<span>.</span>iter()<span>.</span>map(<span>|</span>r<span>|</span> (<span>&amp;</span>r<span>.</span>question<span>,</span> <span>&amp;</span>r<span>.</span>user<span>,</span> r<span>.</span>score)))<span>;</span></span>
+<span id="cb5-6">  <span>let</span> u_to_score<span>:</span> HashMap<span>&lt;&amp;</span>User<span>,</span> HashMap<span>&lt;&amp;</span>Question<span>,</span> <span>u32</span><span>&gt;&gt;</span> <span>=</span> </span>
+<span id="cb5-7">    <span>utils::</span>group_by(data<span>.</span>iter()<span>.</span>map(<span>|</span>r<span>|</span> (<span>&amp;</span>r<span>.</span>user<span>,</span> <span>&amp;</span>r<span>.</span>question<span>,</span> r<span>.</span>score)))<span>;</span></span>
+<span id="cb5-8">  <span>let</span> all_grand_totals<span>:</span> HashMap<span>&lt;&amp;</span>User<span>,</span> <span>u32</span><span>&gt;</span> <span>=</span> </span>
+<span id="cb5-9">    u_to_score<span>.</span>iter()<span>.</span>map(<span>|</span>(user<span>,</span> scores)<span>|</span> <span>{</span></span>
+<span id="cb5-10">      <span>let</span> total <span>=</span> scores<span>.</span>values()<span>.</span><span>sum::</span><span>&lt;</span><span>u32</span><span>&gt;</span>()<span>;</span></span>
+<span id="cb5-11">      (<span>*</span>user<span>,</span> total)</span>
+<span id="cb5-12">    <span>}</span>)</span>
+<span id="cb5-13">    <span>.</span>collect()<span>;</span></span>
+<span id="cb5-14"></span>
+<span id="cb5-15">  <span>let</span> all_qs <span>=</span> q_to_score<span>.</span>keys()<span>.</span>copied()<span>;</span></span>
+<span id="cb5-16">  all_qs<span>.</span>combinations(k)</span>
+<span id="cb5-17">    <span>.</span>filter_map(<span>|</span>qs<span>:</span> <span>Vec</span><span>&lt;&amp;</span>Question<span>&gt;|</span> <span>{</span></span>
+<span id="cb5-18">      <span>let</span> (qs_totals<span>,</span> grand_totals)<span>:</span> (<span>Vec</span><span>&lt;</span>_<span>&gt;,</span> <span>Vec</span><span>&lt;</span>_<span>&gt;</span>) <span>=</span> all_grand_totals<span>.</span>iter()</span>
+<span id="cb5-19">        <span>.</span>filter_map(<span>|</span>(u<span>,</span> grand_total)<span>|</span> <span>{</span></span>
+<span id="cb5-20">          <span>let</span> q_total <span>=</span> qs<span>.</span>iter()</span>
+<span id="cb5-21">            <span>.</span>map(<span>|</span>q<span>|</span> q_to_score[<span>*</span>q]<span>.</span>get(u)<span>.</span>copied())</span>
+<span id="cb5-22">            <span>.</span><span>sum::</span><span>&lt;</span><span>Option</span><span>&lt;</span><span>u32</span><span>&gt;&gt;</span>()<span>?;</span></span>
+<span id="cb5-23">          <span>Some</span>((q_total <span>as</span> <span>f64</span><span>,</span> <span>*</span>grand_total <span>as</span> <span>f64</span>))</span>
+<span id="cb5-24">        <span>}</span>)</span>
+<span id="cb5-25">        <span>.</span>unzip()<span>;</span></span>
+<span id="cb5-26">      <span>// utils::correlation(&amp;[f64], &amp;[f64]) -&gt; f64;</span></span>
+<span id="cb5-27">      <span>let</span> r <span>=</span> <span>utils::</span>correlation(<span>&amp;</span>qs_totals<span>,</span> <span>&amp;</span>grand_totals)<span>;</span></span>
+<span id="cb5-28">      (<span>!</span>r<span>.</span>is_nan())<span>.</span>then_some((qs<span>,</span> r))</span>
+<span id="cb5-29">    <span>}</span>)</span>
+<span id="cb5-30">    <span>.</span>max_by_key(<span>|</span>(_<span>,</span> r)<span>|</span> FloatOrd(<span>*</span>r))</span>
+<span id="cb5-31">    <span>.</span>unwrap()<span>.</span><span>0</span></span>
+<span id="cb5-32"><span>}</span></span></code></pre></div>
+<p>The key elements to understand:</p>
+<ul>
+<li>Like with Python, we convert the flat data into hierarchical data
+with a hashmap and the <code>utils::group_by</code> helper. (Note that
+everywhere we refer to <code>HashMap</code> is actually an alias for <a href="https://docs.rs/fxhash/0.2.1/fxhash/type.FxHashMap.html"><code>fxhash::FxHashMap</code></a>,
+which is just <a href="https://doc.rust-lang.org/stable/std/collections/struct.HashMap.html"><code>std::collections::HashMap</code></a>
+with a more efficient hashing algorithm.)</li>
+<li>Then we iterate over all combinations of questions using the <a href="https://docs.rs/itertools/0.11.0/itertools/trait.Itertools.html#method.combinations"><code>Itertools::combinations</code></a>
+method.</li>
+<li>In the inner loop, we iterate over all users via
+<code>all_grand_totals.iter()</code>.</li>
+<li>The expression <code>q_to_score[*q].get(u).copied()</code> has type
+<code>Option&lt;u32&gt;</code>, which is <code>Some(n)</code> if the
+user has a score for <code>q</code>, and <code>None</code>
+otherwise.</li>
+<li>The iterator method <code>.sum::&lt;Option&lt;u32&gt;&gt;()</code>
+returns <code>Some(total)</code> if the user answered every question in
+<code>qs</code>, and <code>None</code> otherwise.</li>
+<li>We call a helper method <code>utils::correlation</code> that
+implements a standard calculation for <a href="https://en.wikipedia.org/wiki/Pearson_correlation_coefficient">Pearson’s
+<span><span><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mi>r</mi></mrow><annotation encoding="application/x-tex">r</annotation></semantics></math></span></span></a>.</li>
+<li>We use <code>max_by_key</code> to get the questions with the highest
+correlation. We use <a href="https://docs.rs/float-ord/0.3.2/float_ord/struct.FloatOrd.html"><code>FloatOrd</code></a>
+so we can compare floats.</li>
+</ul>
+<p>So how’s the performance? I used <a href="https://bheisler.github.io/criterion.rs/book/index.html">Criterion</a>
+to benchmark the performance of the inner loop (the
+<code>filter_map</code>) with Criterion’s default settings, using the
+same dataset as before. The new inner loop runs in <strong>4.2
+milliseconds</strong>, which is about 8 times faster than the Python
+baseline! But our full computation is still 124 days, which is too long.
+Now let’s start really optimizing.</p>
+<h2 id="indexed-data">Indexed Data</h2>
+<p>Rather than guess how to optimize the code, let’s run a profiler to
+see where the bottleneck is. On my Mac, I usually use <a href="https://en.wikipedia.org/wiki/Instruments_(software)">Instruments.app</a>,
+but recently I tried <a href="https://github.com/mstange/samply/">samply</a> and wow! It’s much
+nicer to use. Samply seems to work better with Rust both in terms of
+symbol demangling and in terms of reconstructing the call stack. Here’s
+a screenshot of the relevant part of the samply trace for the Rust
+implementation so far:</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-naive.png"></p>
+<p>We’re spending 75% of our time in <code>HashMap::get</code>! This is
+the offending line of code:</p>
+<div id="cb6"><pre><code><span id="cb6-1">q_to_score[<span>*</span>q]<span>.</span>get(u)<span>.</span>copied()</span></code></pre></div>
+<p>The problem is that we’re hashing and comparing 36-byte UUID strings,
+which is expensive. We need a smaller type that can stand-in for the
+question/user strings.</p>
+<p>The solution is that we will collect all the questions and users into
+a <code>Vec</code>, and represent each question/user by their index in
+that <code>Vec</code>. We could just use <code>usize</code> indices with
+the <code>Vec</code> type, but a better practice is to use newtypes to
+represent each kind of index. In fact, this problem comes up so often in
+my work that I’ve already made a crate for it, <a href="https://docs.rs/indexical/0.6.0/indexical/index.html">Indexical</a>
+(which builds on the <a href="https://docs.rs/index_vec/0.1.3/index_vec/index.html">index_vec</a>
+crate). We define those index types like this:</p>
+<div id="cb7"><pre><code><span id="cb7-1"><span>pub</span> <span>struct</span> QuestionRef<span>&lt;</span><span>'a</span><span>&gt;</span>(<span>pub</span> <span>&amp;</span><span>'a</span> Question)<span>;</span></span>
+<span id="cb7-2"><span>pub</span> <span>struct</span> UserRef<span>&lt;</span><span>'a</span><span>&gt;</span>(<span>pub</span> <span>&amp;</span><span>'a</span> User)<span>;</span></span>
+<span id="cb7-3"></span>
+<span id="cb7-4"><span>define_index_type!</span> <span>{</span></span>
+<span id="cb7-5">  <span>pub</span> <span>struct</span> QuestionIdx <span>for</span> QuestionRef<span>&lt;</span><span>'a</span><span>&gt;</span> <span>=</span> <span>u16</span><span>;</span></span>
+<span id="cb7-6"><span>}</span></span>
+<span id="cb7-7"></span>
+<span id="cb7-8"><span>define_index_type!</span> <span>{</span></span>
+<span id="cb7-9">  <span>pub</span> <span>struct</span> UserIdx <span>for</span> UserRef<span>&lt;</span><span>'a</span><span>&gt;</span> <span>=</span> <span>u32</span><span>;</span></span>
+<span id="cb7-10"><span>}</span></span></code></pre></div>
+<p>The <code>QuestionRef</code> and <code>UserRef</code> types are
+newtypes that enable us to implement traits on
+<code>&amp;Question</code> and <code>&amp;User</code>. The
+<code>define_index_type</code> macro creates new index types
+<code>QuestionIdx</code> and <code>UserIdx</code> which are associated
+with <code>QuestionRef</code> and <code>UserRef</code>. Those indices
+are represented as <code>u16</code> and a <code>u32</code>,
+respectively.</p>
+<p>Finally we update <code>k_corrset</code> to generate an <a href="https://docs.rs/indexical/0.6.0/indexical/struct.IndexedDomain.html"><code>IndexedDomain</code></a>
+for questions and users, and then use the <code>QuestionIdx</code> and
+<code>UserIdx</code> types throughout the rest of the code:</p>
+<div id="cb8"><pre><code><span id="cb8-1"><span>fn</span> k_corrset(data<span>:</span> <span>&amp;</span>[Row]<span>,</span> k<span>:</span> <span>usize</span>) <span>-&gt;</span> <span>Vec</span><span>&lt;&amp;</span>Question<span>&gt;</span> <span>{</span></span>
+<span id="cb8-2">  <span>// first, we create an `IndexedDomain` for questions and users</span></span>
+<span id="cb8-3">  <span>let</span> (questions_set<span>,</span> users_set)<span>:</span> (HashSet<span>&lt;</span>_<span>&gt;,</span> HashSet<span>&lt;</span>_<span>&gt;</span>) <span>=</span> data<span>.</span>iter()</span>
+<span id="cb8-4">    <span>.</span>map(<span>|</span>row<span>|</span> (QuestionRef(<span>&amp;</span>row<span>.</span>question)<span>,</span> UserRef(<span>&amp;</span>row<span>.</span>user)))</span>
+<span id="cb8-5">    <span>.</span>unzip()<span>;</span></span>
+<span id="cb8-6">  <span>let</span> questions <span>=</span> <span>IndexedDomain::</span>from_iter(questions_set)<span>;</span></span>
+<span id="cb8-7">  <span>let</span> users <span>=</span> <span>IndexedDomain::</span>from_iter(users_set)<span>;</span></span>
+<span id="cb8-8"></span>
+<span id="cb8-9">  <span>// then we create the same data structures as before, </span></span>
+<span id="cb8-10">  <span>// except using `IndexedDomain::index` to lookup indices.</span></span>
+<span id="cb8-11">  <span>// note the change in the HashMap key types</span></span>
+<span id="cb8-12">  <span>let</span> q_to_score<span>:</span> HashMap<span>&lt;</span>QuestionIdx<span>,</span> HashMap<span>&lt;</span>UserIdx<span>,</span> <span>u32</span><span>&gt;&gt;</span> <span>=</span> </span>
+<span id="cb8-13">    <span>utils::</span>group_by(data<span>.</span>iter()<span>.</span>map(<span>|</span>r<span>|</span> (</span>
+<span id="cb8-14">      questions<span>.</span>index(<span>&amp;</span>(QuestionRef(<span>&amp;</span>r<span>.</span>question)))<span>,</span></span>
+<span id="cb8-15">      users<span>.</span>index(<span>&amp;</span>(UserRef(<span>&amp;</span>r<span>.</span>user)))<span>,</span></span>
+<span id="cb8-16">      r<span>.</span>score<span>,</span></span>
+<span id="cb8-17">    )))<span>;</span></span>
+<span id="cb8-18">  <span>let</span> u_to_score<span>:</span> HashMap<span>&lt;</span>UserIdx<span>,</span> HashMap<span>&lt;</span>QuestionIdx<span>,</span> <span>u32</span><span>&gt;&gt;</span> <span>=</span> </span>
+<span id="cb8-19">    <span>utils::</span>group_by(data<span>.</span>iter()<span>.</span>map(<span>|</span>r<span>|</span> (</span>
+<span id="cb8-20">      users<span>.</span>index(<span>&amp;</span>(UserRef(<span>&amp;</span>r<span>.</span>user)))<span>,</span></span>
+<span id="cb8-21">      questions<span>.</span>index(<span>&amp;</span>(QuestionRef(<span>&amp;</span>r<span>.</span>question)))<span>,</span></span>
+<span id="cb8-22">      r<span>.</span>score<span>,</span></span>
+<span id="cb8-23">    )))<span>;</span>  </span>
+<span id="cb8-24">  <span>let</span> all_grand_totals <span>=</span> <span>// same code</span></span>
+<span id="cb8-25"></span>
+<span id="cb8-26">  <span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb8-27">  all_qs<span>.</span>combinations(k)</span>
+<span id="cb8-28">    <span>.</span>filter_map(<span>|</span>qs<span>:</span> <span>Vec</span><span>&lt;</span>QuestionIdx<span>&gt;|</span> <span>{</span></span>
+<span id="cb8-29">      <span>// same code</span></span>
+<span id="cb8-30">    <span>}</span>)</span>
+<span id="cb8-31">    <span>.</span>max_by_key(<span>|</span>(_<span>,</span> r)<span>|</span> FloatOrd(<span>*</span>r))</span>
+<span id="cb8-32">    <span>.</span>unwrap()<span>.</span><span>0</span></span>
+<span id="cb8-33">    <span>// we have to post-process the indices back to values</span></span>
+<span id="cb8-34">    <span>.</span>into_iter()<span>.</span>map(<span>|</span>idx<span>|</span> questions<span>.</span>value(idx)<span>.</span><span>0</span>)<span>.</span>collect()</span>
+<span id="cb8-35"><span>}</span></span></code></pre></div>
+<p>Again, check out the <a href="https://github.com/willcrichton/corrset-benchmark/blob/main/src/inner/indexed.rs">GitHub</a>
+for the complete implementation, and check out the <a href="https://docs.rs/indexical/0.6.0/indexical/index.html">indexical
+docs</a> for details on its API.</p>
+<p>Once again we run our benchmark on the inner loop of the computation.
+The new inner loop runs in <strong>1.0 milliseconds</strong>, which is 4
+times faster than our last iteration, and 35 times faster than our
+Python baseline. We’re down to 30 days for the total computation — let’s
+keep going!</p>
+<h2 id="indexed-collections">Indexed Collections</h2>
+<p>Let’s profile again:</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-indexed.png"></p>
+<p>Blast, still spending most our time in <code>HashMap::get</code>.
+Well, what if we got rid of hash maps altogether? A
+<code>HashMap&lt;&amp;User, u32&gt;</code> is conceptually the same
+thing as a <code>Vec&lt;Option&lt;u32&gt;&gt;</code> where each
+<code>&amp;User</code> has a unique index. For example, in a domain of
+users <code>["a", "b", "c"]</code>, then the hash map
+<code>{"b" =&gt; 1}</code> is equivalent to the vector
+<code>[None, Some(1), None]</code>. This vector costs more memory
+(paying for the <code>None</code> spaces), but it improves the
+performance of key/value lookups (avoids hashing).</p>
+<p>We’re trying to fully optimize for performance, and given the scale
+of our dataset, we can afford to make the compute/memory trade-off. We
+will use Indexical which provides a <a href="https://docs.rs/indexical/0.6.0/indexical/map/struct.DenseIndexMap.html"><code>DenseIndexMap&lt;K, V&gt;</code></a>
+type that is internally implemented as a <code>Vec&lt;V&gt;</code> type
+indexed by <code>K::Index</code>.</p>
+<p>The main change to the <code>k_corrset</code> function is that we
+convert all our auxiliary data structures to dense index maps:</p>
+<div id="cb9"><pre><code><span id="cb9-1"><span>pub</span> <span>type</span> QuestionMap<span>&lt;</span><span>'a</span><span>,</span> T<span>&gt;</span> <span>=</span> DenseIndexMap<span>&lt;</span><span>'a</span><span>,</span> QuestionRef<span>&lt;</span><span>'a</span><span>&gt;,</span> T<span>&gt;;</span></span>
+<span id="cb9-2"><span>pub</span> <span>type</span> UserMap<span>&lt;</span><span>'a</span><span>,</span> T<span>&gt;</span> <span>=</span> DenseIndexMap<span>&lt;</span><span>'a</span><span>,</span> UserRef<span>&lt;</span><span>'a</span><span>&gt;,</span> T<span>&gt;;</span></span>
+<span id="cb9-3"></span>
+<span id="cb9-4"><span>fn</span> k_corrset(data<span>:</span> <span>&amp;</span>[Row]<span>,</span> k<span>:</span> <span>usize</span>) <span>-&gt;</span> <span>Vec</span><span>&lt;&amp;</span>Question<span>&gt;</span> <span>{</span></span>
+<span id="cb9-5">  <span>// build the `users` and `questions` domains same as before</span></span>
+<span id="cb9-6"></span>
+<span id="cb9-7">  <span>// Initialize q_to_score to an empty dense map</span></span>
+<span id="cb9-8">  <span>let</span> <span>mut</span> q_to_score<span>:</span> QuestionMap<span>&lt;</span><span>'_</span><span>,</span> UserMap<span>&lt;</span><span>'_</span><span>,</span> <span>Option</span><span>&lt;</span><span>u32</span><span>&gt;&gt;&gt;</span> <span>=</span> </span>
+<span id="cb9-9">    <span>QuestionMap::</span>new(<span>&amp;</span>questions<span>,</span> <span>|</span>_<span>|</span> <span>UserMap::</span>new(<span>&amp;</span>users<span>,</span> <span>|</span>_<span>|</span> <span>None</span>))<span>;</span>  </span>
+<span id="cb9-10"></span>
+<span id="cb9-11">  <span>// Fill in q_to_score with the dataset</span></span>
+<span id="cb9-12">  <span>for</span> r <span>in</span> data <span>{</span></span>
+<span id="cb9-13">    q_to_score</span>
+<span id="cb9-14">      <span>.</span>get_mut(<span>&amp;</span>QuestionRef(<span>&amp;</span>r<span>.</span>question))</span>
+<span id="cb9-15">      <span>.</span>unwrap()</span>
+<span id="cb9-16">      <span>.</span>insert(UserRef(<span>&amp;</span>r<span>.</span>user)<span>,</span> <span>Some</span>(r<span>.</span>score))<span>;</span></span>
+<span id="cb9-17">  <span>}</span></span>
+<span id="cb9-18"></span>
+<span id="cb9-19">  <span>let</span> grand_totals <span>=</span> <span>UserMap::</span>new(<span>&amp;</span>users<span>,</span> <span>|</span>u<span>|</span> <span>{</span></span>
+<span id="cb9-20">    q_to_score<span>.</span>values()<span>.</span>filter_map(<span>|</span>v<span>|</span> v[u])<span>.</span><span>sum::</span><span>&lt;</span><span>u32</span><span>&gt;</span>()</span>
+<span id="cb9-21">  <span>}</span>)<span>;</span></span>
+<span id="cb9-22"></span>
+<span id="cb9-23">  <span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb9-24">  all_qs<span>.</span>combinations(k)</span>
+<span id="cb9-25">    <span>// almost the same code, see below</span></span>
+<span id="cb9-26"><span>}</span></span></code></pre></div>
+<p>The only change to the inner loop is that our code which used to say
+this:</p>
+<div id="cb10"><pre><code><span id="cb10-1">q_to_score[<span>*</span>q]<span>.</span>get(u)<span>.</span>copied()</span></code></pre></div>
+<p>Is now this:</p>
+
+<p>Running the benchmark again, the new inner loop runs in <strong>181
+microseconds</strong>, which is 6 times faster than our last iteration,
+and 199 times faster than our Python baseline. We’re down to 5.3 days
+for the total computation.</p>
+<h2 id="bounds-checks">Bounds Checks</h2>
+<p>Another small performance hit comes every time we use the brackets
+<code>[]</code> to index into an <code>DenseIndexMap</code>. The vector
+beneath will run a bounds-check for safety, but our code is guaranteed
+to never exceed vector bounds as written. I couldn’t actually find the
+bounds check in the samply profile, but it does make a noticeable
+difference in the benchmark, so it’s worth implementing.</p>
+<p>Before our inner loop looked like this:</p>
+<div id="cb12"><pre><code><span id="cb12-1"><span>let</span> q_total <span>=</span> qs<span>.</span>iter()</span>
+<span id="cb12-2">  <span>.</span>map(<span>|</span>q<span>|</span> q_to_score[<span>*</span>q][u])</span>
+<span id="cb12-3">  <span>.</span><span>sum::</span><span>&lt;</span><span>Option</span><span>&lt;</span><span>u32</span><span>&gt;&gt;</span>()<span>?;</span></span>
+<span id="cb12-4"><span>let</span> grand_total <span>=</span> all_grand_totals[u]<span>;</span></span></code></pre></div>
+<p>Removing bounds checks with <code>get_unchecked</code>, our new inner
+loop looks like this:</p>
+<div id="cb13"><pre><code><span id="cb13-1"><span>let</span> q_total <span>=</span> qs<span>.</span>iter()</span>
+<span id="cb13-2">  <span>.</span>map(<span>|</span>q<span>|</span> <span>unsafe</span> <span>{</span></span>
+<span id="cb13-3">    <span>let</span> u_scores <span>=</span> q_to_score<span>.</span>get_unchecked(q)<span>;</span></span>
+<span id="cb13-4">    <span>*</span>u_scores<span>.</span>get_unchecked(u)</span>
+<span id="cb13-5">  <span>}</span>)</span>
+<span id="cb13-6">  <span>.</span><span>sum::</span><span>&lt;</span><span>Option</span><span>&lt;</span><span>u32</span><span>&gt;&gt;</span>()<span>?;</span></span>
+<span id="cb13-7"><span>let</span> grand_total <span>=</span> <span>unsafe</span> <span>{</span> <span>*</span>all_grand_totals<span>.</span>get_unchecked(u) <span>};</span></span></code></pre></div>
+<p>It is unsafe without bounds-checks, so we have to mark these blocks
+as <code>unsafe</code>.</p>
+<p>Running the benchmark again, the new inner loop runs in <strong>156
+microseconds</strong>, which is 1.16x faster than our last iteration,
+and 229 times faster than our Python baseline. We’re down to 4.6 days
+for the total computation.</p>
+<h2 id="bit-sets">Bit-sets</h2>
+<p>We’re currently at a 225x speedup, which means we still have three
+orders of magnitude left to go. To get there, we need to rethink the
+computational structure of the inner loop. Right now, our loop
+effectively looks like:</p>
+<pre><code>for each subset of questions $qs:
+  for each user $u:
+    for each question $q in $qs:
+      if $u answered $q: add $u's score on $q to a running total
+      else: skip to the next user
+    $r = correlation($u's totals on $qs, $u's grand total)</code></pre>
+<p>An important aspect of our data is that it forms a <em>sparse</em>
+matrix. For a given question, only 20% of users have answered that
+question. For a set of 5 questions, a much smaller fraction have
+answered all 5 questions. So if we can efficiently determine first which
+users have answered all 5 questions, then our subsequent loop will run
+for fewer iterations (and be free of branches). Something like this:</p>
+<pre><code>for each subset of questions $qs:
+  $qs_u = all users who have answered every question in $qs
+  for each user $u in $qs_u:
+    for each question $q in $qs:
+      add $u's score on $q to a running total
+    $r = correlation($u's scores on $qs, $u's grand total)</code></pre>
+<p>So how do we represent the set of users who have answered a given
+question? We could use a <a href="https://doc.rust-lang.org/std/collections/struct.HashSet.html"><code>HashSet</code></a>,
+but we saw earlier that hashing is computationally expensive. Because
+our data is indexed, we can use a more efficient data structure: the <a href="https://en.wikipedia.org/wiki/Bit_array">bit-set</a>, which uses
+the individual bits of memory to represent whether an object is present
+or absent in a set. Indexical provides another abstraction for
+integratings bit-sets with our newtype indices: the <a href="https://docs.rs/indexical/0.6.0/indexical/struct.IndexSet.html"><code>IndexSet</code></a>.</p>
+<p>Previously, our <code>q_to_score</code> data structure mapped from
+questions to a user-indexed vector of optional scores (that is,
+<code>UserMap&lt;'_, Option&lt;u32&gt;&gt;</code>). Now we will change
+<code>Option&lt;u32&gt;</code> to <code>u32</code> and add a bit-set
+describing the set of users who answered a given question. The first
+half of the updated code looks like this:</p>
+<div id="cb16"><pre><code><span id="cb16-1"><span>type</span> UserSet<span>&lt;</span><span>'a</span><span>&gt;</span> <span>=</span> IndexSet<span>&lt;</span><span>'a</span><span>,</span> UserRef<span>&lt;</span><span>'a</span><span>&gt;&gt;;</span></span>
+<span id="cb16-2"></span>
+<span id="cb16-3"><span>let</span> <span>mut</span> q_to_score<span>:</span> QuestionMap<span>&lt;</span><span>'_</span><span>,</span> (UserSet<span>&lt;</span><span>'_</span><span>&gt;,</span> UserMap<span>&lt;</span><span>'_</span><span>,</span> <span>u32</span><span>&gt;</span>)<span>&gt;</span> <span>=</span> </span>
+<span id="cb16-4">  <span>QuestionMap::</span>new(<span>&amp;</span>questions<span>,</span> <span>|</span>_<span>|</span> (</span>
+<span id="cb16-5">    <span>UserMap::</span><span>&lt;</span><span>'_</span><span>,</span> <span>u32</span><span>&gt;</span><span>::</span>new(<span>&amp;</span>users<span>,</span> <span>|</span>_<span>|</span> <span>0</span>)<span>,</span></span>
+<span id="cb16-6">    <span>UserSet::</span>new(<span>&amp;</span>users)<span>,</span></span>
+<span id="cb16-7">  ))<span>;</span></span>
+<span id="cb16-8"><span>for</span> r <span>in</span> data <span>{</span></span>
+<span id="cb16-9">  <span>let</span> (scores<span>,</span> set) <span>=</span> <span>&amp;</span><span>mut</span> q_to_score<span>.</span>get_mut(<span>&amp;</span>QuestionRef(<span>&amp;</span>r<span>.</span>question))<span>.</span>unwrap()<span>;</span></span>
+<span id="cb16-10">  scores<span>.</span>insert(UserRef(<span>&amp;</span>r<span>.</span>user)<span>,</span> r<span>.</span>score)<span>;</span></span>
+<span id="cb16-11">  set<span>.</span>insert(UserRef(<span>&amp;</span>r<span>.</span>user))<span>;</span></span>
+<span id="cb16-12"><span>}</span></span></code></pre></div>
+<p>Note that <code>q_to_score</code> now effectively has invalid values,
+since we provide a default value of 0 for users who did not answer a
+question. We have to be careful not to use these invalid values in the
+computation.</p>
+<p>Then we update our inner loop to match the new pseudocode:</p>
+<div id="cb17"><pre><code><span id="cb17-1"><span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb17-2">all_qs<span>.</span>combinations(k)</span>
+<span id="cb17-3">  <span>.</span>filter_map(<span>|</span>qs<span>:</span> <span>Vec</span><span>&lt;</span>QuestionIdx<span>&gt;|</span> <span>{</span></span>
+<span id="cb17-4">    <span>// Compute the intersection of the user-sets for each question</span></span>
+<span id="cb17-5">    <span>let</span> <span>mut</span> users <span>=</span> q_to_score[qs[<span>0</span>]]<span>.</span><span>1</span><span>.</span>clone()<span>;</span></span>
+<span id="cb17-6">    <span>for</span> q <span>in</span> <span>&amp;</span>qs[<span>1</span><span>..</span>] <span>{</span></span>
+<span id="cb17-7">      users<span>.</span>intersect(<span>&amp;</span>q_to_score[<span>*</span>q]<span>.</span><span>1</span>)<span>;</span></span>
+<span id="cb17-8">    <span>}</span></span>
+<span id="cb17-9"></span>
+<span id="cb17-10">    <span>let</span> (qs_totals<span>,</span> grand_totals)<span>:</span> (<span>Vec</span><span>&lt;</span>_<span>&gt;,</span> <span>Vec</span><span>&lt;</span>_<span>&gt;</span>) <span>=</span> users<span>.</span>indices()</span>
+<span id="cb17-11">      <span>// only .map, not .filter_map as before</span></span>
+<span id="cb17-12">      <span>.</span>map(<span>|</span>u<span>|</span> <span>{</span></span>
+<span id="cb17-13">        <span>let</span> q_total <span>=</span> qs<span>.</span>iter()          </span>
+<span id="cb17-14">          <span>.</span>map(<span>|</span>q<span>|</span> <span>unsafe</span> <span>{</span></span>
+<span id="cb17-15">            <span>let</span> (u_scores<span>,</span> _) <span>=</span> q_to_score<span>.</span>get_unchecked(q)<span>;</span></span>
+<span id="cb17-16">            <span>*</span>u_scores<span>.</span>get_unchecked(u)</span>
+<span id="cb17-17">          <span>}</span>)</span>
+<span id="cb17-18">          <span>// only u32, not Option&lt;u32&gt; as before</span></span>
+<span id="cb17-19">          <span>.</span><span>sum::</span><span>&lt;</span><span>u32</span><span>&gt;</span>()<span>;</span></span>
+<span id="cb17-20">        <span>let</span> grand_total <span>=</span> <span>unsafe</span> <span>{</span> <span>*</span>all_grand_totals<span>.</span>get_unchecked(u) <span>};</span></span>
+<span id="cb17-21">        (q_total <span>as</span> <span>f64</span><span>,</span> grand_total <span>as</span> <span>f64</span>)</span>
+<span id="cb17-22">      <span>}</span>)</span>
+<span id="cb17-23">      <span>.</span>unzip()<span>;</span></span>
+<span id="cb17-24">    <span>let</span> r <span>=</span> <span>utils::</span>correlation(<span>&amp;</span>qs_totals<span>,</span> <span>&amp;</span>grand_totals)<span>;</span></span>
+<span id="cb17-25">    (<span>!</span>r<span>.</span>is_nan())<span>.</span>then_some((qs<span>,</span> r))</span>
+<span id="cb17-26">  <span>}</span>)</span>
+<span id="cb17-27">  <span>// rest of the code is the same</span></span></code></pre></div>
+<p>Running the benchmark again, the new inner loop runs in <strong>47
+microseconds</strong>, which is 3.4 times faster than our last
+iteration, and 769 times faster than our Python baseline. We’re down to
+1.4 days for the total computation.</p>
+<h2 id="simd">SIMD</h2>
+<p>Our new computational structure is definitely helping, but it’s still
+not fast enough. Let’s check back in with samply:</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-bitset.png"></p>
+<p>Now we’re spending all our time in the bit-set intersection! That
+means we need to dig in to how the bit-set is implemented. The default
+bit-set library used by Indexical is <a href="https://docs.rs/bitvec/1.0.1/bitvec/index.html">bitvec</a>. As of
+2023, the implementation of intersection within bitvec’s bit-set is
+roughly this code:</p>
+<div id="cb18"><pre><code><span id="cb18-1"><span>fn</span> intersect(dst<span>:</span> <span>&amp;</span><span>mut</span> BitSet<span>,</span> src<span>:</span> <span>&amp;</span>BitSet) <span>{</span></span>
+<span id="cb18-2">  <span>for</span> (n1<span>,</span> n2)<span>:</span> (<span>&amp;</span><span>mut</span> <span>u64</span><span>,</span> <span>&amp;</span><span>u64</span>) <span>in</span> dst<span>.</span>iter_mut()<span>.</span>zip(<span>&amp;</span>src) <span>{</span></span>
+<span id="cb18-3">    <span>*</span>n1 <span>&amp;=</span> <span>*</span>n2<span>;</span></span>
+<span id="cb18-4">  <span>}</span></span>
+<span id="cb18-5"><span>}</span></span></code></pre></div>
+<p>So bitvec is AND-ing a <code>u64</code> at a time. But it turns out
+most processors have instructions specifically for doing
+bit-manipulation on multiple <code>u64</code>s at a time, called <a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a>
+(single instruction, multiple data). Thankfully, Rust provides an
+experimental SIMD API <a href="https://doc.rust-lang.org/std/simd/index.html"><code>std::simd</code></a>
+that we can use. Roughly speaking, the SIMD version of bit-set
+intersection looks like this:</p>
+<div id="cb19"><pre><code><span id="cb19-1"><span>fn</span> intersect(dst<span>:</span> <span>&amp;</span><span>mut</span> SimdBitSet<span>,</span> src<span>:</span> <span>&amp;</span>SimdBitSet) <span>{</span></span>
+<span id="cb19-2">  <span>for</span> (n1<span>,</span> n2)<span>:</span> (<span>&amp;</span><span>mut</span> u64x4<span>,</span> <span>&amp;</span>u64x4) <span>in</span> dst<span>.</span>iter_mut()<span>.</span>zip(<span>&amp;</span>src) <span>{</span></span>
+<span id="cb19-3">    <span>*</span>n1 <span>&amp;=</span> <span>*</span>n2<span>;</span></span>
+<span id="cb19-4">  <span>}</span></span>
+<span id="cb19-5"><span>}</span></span></code></pre></div>
+<p>The only difference is that we’ve replaced our primitive
+<code>u64</code> type with a SIMD type <a href="https://doc.rust-lang.org/std/simd/type.u64x4.html"><code>u64x4</code></a>,
+and under the hood, Rust emits a single SIMD instruction to perform the
+<code>&amp;=</code> operation that ANDs four <code>u64</code>s at a
+time.</p>
+<p>Where can we find a SIMD-accelerated bitset? <a href="https://docs.rs/bitvec/1.0.1/bitvec/index.html">bitvec</a> doesn’t
+support SIMD. There are a few on <a href="https://crates.io/">crates.io</a>, and I tried out one called <a href="https://github.com/psiace/bitsvec">bitsvec</a>. It works well for
+fast intersection, but I found that its iterator which finds the indices
+of the 1-bits is actually quite slow. So I copied large portions of the
+bitsvec implementation and wrote a more efficient iterator, which you
+can check out in the <a href="https://github.com/willcrichton/indexical/blob/913fbf5830f4d5acedd23e04841e453ed2659165/src/bitset/simd.rs">Indexical
+source</a> if you’re curious.</p>
+<p>Thanks to Indexical’s abstractions, swapping in the SIMD bitset only
+requires changing a type alias and no other modifications to the
+<code>k_corrset</code> function. I experimented with different lane
+sizes and found <code>u64x16</code> is the most efficient on my machine
+for this dataset.</p>
+<p>Once more we run the benchmark, and the new inner loop runs in
+<strong>1.35 microseconds</strong>, which is 34 times faster than our
+last iteration, and 26,459 times faster than our Python baseline. We’re
+down to 57 minutes for the total computation.</p>
+<h2 id="allocation">Allocation</h2>
+<p>At this point, we’re pretty close to peak performance. (You may not
+like it, but…) Let’s go back to the profile, this time looking at the
+inverted view (which shows the most-called functions at the leaves of
+the call tree):</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-simd.png"></p>
+<p>The biggest bottleneck is our bit-set iterator! I wasn’t joking! But
+we see several concerning functions: <code>memmove</code>,
+<code>realloc</code>, <code>allocate</code> — that’s right, we’re
+allocating memory in the inner loop of this function. Specifically,
+there’s the user bit-set that we initially clone, and there’s the two
+vectors for <code>qs_totals</code> and <code>grand_totals</code> that we
+allocate with <code>unzip</code>.</p>
+<p>To avoid allocation, we create these data structures up front with
+the maximum possible size needed, and then repeatedly write into
+them:</p>
+<div id="cb20"><pre><code><span id="cb20-1"><span>// Allocate our data up front</span></span>
+<span id="cb20-2"><span>let</span> <span>mut</span> qs_totals <span>=</span> <span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]</span>
+<span id="cb20-3"><span>let</span> <span>mut</span> grand_totals <span>=</span> <span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]<span>;</span></span>
+<span id="cb20-4"><span>let</span> <span>mut</span> user_set <span>=</span> <span>IndexSet::</span>new(<span>&amp;</span>users)<span>;</span></span>
+<span id="cb20-5"></span>
+<span id="cb20-6"><span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb20-7">all_qs<span>.</span>combinations(k)</span>
+<span id="cb20-8">  <span>.</span>filter_map(<span>|</span>qs<span>|</span> <span>{</span></span>
+<span id="cb20-9">    <span>// Use `clone_from` rather than `clone` to copy without allocation</span></span>
+<span id="cb20-10">    user_set<span>.</span>clone_from(<span>&amp;</span>q_to_score[qs[<span>0</span>]]<span>.</span><span>1</span>)<span>;</span></span>
+<span id="cb20-11">    <span>for</span> q <span>in</span> <span>&amp;</span>qs[<span>1</span><span>..</span>] <span>{</span></span>
+<span id="cb20-12">      user_set<span>.</span>intersect(<span>&amp;</span>q_to_score[<span>*</span>q]<span>.</span><span>1</span>)<span>;</span></span>
+<span id="cb20-13">    <span>}</span></span>
+<span id="cb20-14"></span>
+<span id="cb20-15">    <span>let</span> <span>mut</span> n <span>=</span> <span>0</span><span>;</span></span>
+<span id="cb20-16">    <span>for</span> (i<span>,</span> u) <span>in</span> user_set<span>.</span>indices()<span>.</span>enumerate() <span>{</span></span>
+<span id="cb20-17">      <span>let</span> q_total <span>=</span> qs<span>.</span>iter()</span>
+<span id="cb20-18">        <span>.</span>map(<span>|</span>q<span>|</span> <span>unsafe</span> <span>{</span></span>
+<span id="cb20-19">          <span>let</span> (u_scores<span>,</span> _) <span>=</span> q_to_score<span>.</span>get_unchecked(q)<span>;</span></span>
+<span id="cb20-20">          <span>*</span>u_scores<span>..</span>get_unchecked(u)</span>
+<span id="cb20-21">        <span>}</span>)</span>
+<span id="cb20-22">        <span>.</span><span>sum::</span><span>&lt;</span><span>u32</span><span>&gt;</span>()<span>;</span></span>
+<span id="cb20-23">      <span>let</span> grand_total <span>=</span> <span>unsafe</span> <span>{</span> <span>*</span>all_grand_totals<span>.</span>get_unchecked(u) <span>};</span></span>
+<span id="cb20-24"></span>
+<span id="cb20-25">      <span>// Update totals/grand_totals in-place rather than pushing into a vector</span></span>
+<span id="cb20-26">      <span>unsafe</span> <span>{</span></span>
+<span id="cb20-27">        <span>*</span>qs_totals<span>.</span>get_unchecked_mut(i) <span>=</span> q_total <span>as</span> <span>f64</span><span>;</span></span>
+<span id="cb20-28">        <span>*</span>grand_totals<span>.</span>get_unchecked_mut(i) <span>=</span> grand_total <span>as</span> <span>f64</span><span>;</span></span>
+<span id="cb20-29">      <span>}</span></span>
+<span id="cb20-30"></span>
+<span id="cb20-31">      n <span>+=</span> <span>1</span><span>;</span></span>
+<span id="cb20-32">    <span>}</span></span>
+<span id="cb20-33"></span>
+<span id="cb20-34">    <span>// Only pass in the first `n` elements!</span></span>
+<span id="cb20-35">    <span>let</span> r <span>=</span> <span>utils::</span>correlation(<span>&amp;</span>qs_totals[<span>..</span>n]<span>,</span> <span>&amp;</span>grand_totals[<span>..</span>n])<span>;</span></span>
+<span id="cb20-36">    (<span>!</span>r<span>.</span>is_nan())<span>.</span>then_some((qs<span>,</span> r))</span>
+<span id="cb20-37">  <span>}</span>)</span></code></pre></div>
+<p>We run the benchmark again, and the new inner loop runs in
+<strong>1.09 microseconds</strong>, which is 1.24 times faster than our
+last iteration, and 32,940 times faster than our Python baseline. We’re
+down to 46 minutes for the total computation.</p>
+<p>(As an aside, it’s impressive that the heap allocator was fast enough
+to have such a small impact on our runtime!)</p>
+<p>In summary, Table <a href="#tbl:inner-speedup">1</a> shows the
+runtime, relative speedup, absolute speedup, and total estimated
+completion time for each level of the benchmark.</p>
+<div id="tbl:inner-speedup">
+<table>
+<caption>Table 1: Performance numbers for the inner loop.</caption>
+<colgroup>
+<col>
+<col>
+<col>
+<col>
+<col>
+</colgroup>
+<thead>
+<tr>
+<th>Level</th>
+<th>Runtime</th>
+<th>Speedup over previous level</th>
+<th>Speedup over Python</th>
+<th>Est. completion time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>python</td>
+<td>35.85 ms</td>
+<td></td>
+<td>1.00×</td>
+<td>2.88 years</td>
+</tr>
+<tr>
+<td>0_basic</td>
+<td>4.24 ms</td>
+<td>8.46×</td>
+<td>8.46×</td>
+<td>124.40 days</td>
+</tr>
+<tr>
+<td>1_indexed</td>
+<td>1.03 ms</td>
+<td>4.11×</td>
+<td>34.78×</td>
+<td>30.25 days</td>
+</tr>
+<tr>
+<td>2_imap</td>
+<td>180.52 μs</td>
+<td>5.71×</td>
+<td>198.60×</td>
+<td>5.30 days</td>
+</tr>
+<tr>
+<td>3_bchecks</td>
+<td>156.23 μs</td>
+<td>1.16×</td>
+<td>229.47×</td>
+<td>4.59 days</td>
+</tr>
+<tr>
+<td>4_bitset</td>
+<td>46.60 μs</td>
+<td>3.35×</td>
+<td>769.26×</td>
+<td>1.37 days</td>
+</tr>
+<tr>
+<td>5_simd</td>
+<td>1.35 μs</td>
+<td>34.40×</td>
+<td>26,459.54×</td>
+<td>57.26 min</td>
+</tr>
+<tr>
+<td>6_alloc</td>
+<td>1.09 μs</td>
+<td>1.24×</td>
+<td>32,940.02×</td>
+<td>45.99 min</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The absolute speedup is summarized in Figure 1. Note that the y-axis
+is on a log-scale!</p>
+<figure>
+
+<figcaption>
+Performance trend of the inner loop.
+</figcaption>
+</figure>
+<h2 id="parallelism">Parallelism</h2>
+<p>At this point, we seem to have totally exhausted our avenues for
+optimization. I actually can’t think of any other ways to make the inner
+loop substantively faster — let me know if you have any ideas. But we’ve
+left out one final, obvious trick: parallelism! This problem is
+embarassingly parallel, so we can trivially parallelize the inner loop
+over multiple cores. <a href="https://docs.rs/rayon/1.8.0/rayon/index.html">Rayon</a> makes this
+a breeze:</p>
+<div id="cb21"><pre><code><span id="cb21-1"><span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb21-2">all_qs<span>.</span>combinations(k)</span>
+<span id="cb21-3">  <span>.</span>par_bridge()</span>
+<span id="cb21-4">  <span>.</span>map_init(</span>
+<span id="cb21-5">    <span>||</span> (<span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]<span>,</span> <span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]<span>,</span> <span>IndexSet::</span>new(<span>&amp;</span>users))<span>,</span></span>
+<span id="cb21-6">    <span>|</span>(qs_totals<span>,</span> grand_totals<span>,</span> user_set)<span>,</span> qs<span>|</span> <span>{</span></span>
+<span id="cb21-7">      <span>// same code as before</span></span>
+<span id="cb21-8">    <span>}</span>)</span>
+<span id="cb21-9">    <span>// same code as before</span></span></code></pre></div>
+<p>The <code>par_bridge</code> method takes a serial iterator and
+converts it into a parallel iterator. The <code>map_init</code> function
+is a parallel map with thread-specific state, so we preserve our
+allocation-free status.</p>
+<p>We need a different benchmark to evaluate the outer loop. I used
+Criterion to run the outer loop over 5,000,000 question combinations in
+a single run with a given strategy. This is enough executions to reveal
+differences in each outer loop without waiting weeks for the benchmark
+to complete.</p>
+<p>Running this benchmark with the serial strategy over the fastest
+inner loop takes <strong>6.8 seconds</strong>. My Macbook Pro has 10
+cores, so with Rayon we should expect to see close to a 10x speedup.
+After benchmarking the parallel strategy, we get… <strong>4.2
+seconds</strong> to complete 5,000,000 combinations. That’s only a 1.6x
+speedup! Shameful!</p>
+<h2 id="batching">Batching</h2>
+<p>Let’s go back to the profile to investigate our lack of scaling:</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-parallel.png"></p>
+<p>Our threads are spending most of their time locking and unlocking a
+mutex! There’s some kind of synchronization bottleneck. Indeed, if we
+read the <a href="https://docs.rs/rayon/1.8.0/rayon/iter/trait.ParallelBridge.html"><code>par_bridge</code>
+documentation</a> carefully, we’ll find a key sentence:</p>
+<blockquote>
+<p>Iterator items are pulled by <code>next()</code> one at a time,
+synchronized from each thread that is ready for work, so this may become
+a bottleneck if the serial iterator can’t keep up with the parallel
+demand.</p>
+</blockquote>
+<p>It seems that the hand-off between the
+<code>Itertools::combinations</code> iterator and the Rayon parallel
+bridge is too slow. Given that we have a huge number of combinations, a
+simple way to avoid this bottleneck is to increase the granularity of
+task assignment. That is, we can batch together many question
+combinations and pass them off to a thread all at once.</p>
+<p>For this task, I defined a quick-and-dirty batching iterator that
+uses an <a href="https://docs.rs/arrayvec/0.7.4/arrayvec/struct.ArrayVec.html"><code>ArrayVec</code></a>
+to avoid allocation.</p>
+<div id="cb22"><pre><code><span id="cb22-1"><span>pub</span> <span>struct</span> Batched<span>&lt;</span><span>const</span> N<span>:</span> <span>usize</span><span>,</span> I<span>:</span> <span>Iterator</span><span>&gt;</span> <span>{</span></span>
+<span id="cb22-2">  iter<span>:</span> I<span>,</span></span>
+<span id="cb22-3"><span>}</span></span>
+<span id="cb22-4"></span>
+<span id="cb22-5"><span>impl</span><span>&lt;</span><span>const</span> N<span>:</span> <span>usize</span><span>,</span> I<span>:</span> <span>Iterator</span><span>&gt;</span> <span>Iterator</span> <span>for</span> Batched<span>&lt;</span>N<span>,</span> I<span>&gt;</span> <span>{</span></span>
+<span id="cb22-6">  <span>type</span> Item <span>=</span> ArrayVec<span>&lt;</span><span>I::</span>Item<span>,</span> N<span>&gt;;</span></span>
+<span id="cb22-7"></span>
+<span id="cb22-8">  <span>#[</span>inline<span>]</span></span>
+<span id="cb22-9">  <span>fn</span> next(<span>&amp;</span><span>mut</span> <span>self</span>) <span>-&gt;</span> <span>Option</span><span>&lt;</span><span>Self</span><span>::</span>Item<span>&gt;</span> <span>{</span></span>
+<span id="cb22-10">    <span>let</span> batch <span>=</span> <span>ArrayVec::</span>from_iter((<span>&amp;</span><span>mut</span> <span>self</span><span>.</span>iter)<span>.</span>take(N))<span>;</span></span>
+<span id="cb22-11">    (<span>!</span>batch<span>.</span>is_empty())<span>.</span>then_some(batch)</span>
+<span id="cb22-12">  <span>}</span></span>
+<span id="cb22-13"><span>}</span></span></code></pre></div>
+<p>Then we modify our outer loop by batching the combinations iterator,
+and modify the inner loop to flatten each batch:</p>
+<div id="cb23"><pre><code><span id="cb23-1"><span>let</span> all_qs <span>=</span> questions<span>.</span>indices()<span>;</span></span>
+<span id="cb23-2">all_qs<span>.</span>combinations(k)</span>
+<span id="cb23-3">  <span>.</span><span>batched::</span><span>&lt;</span><span>1024</span><span>&gt;</span>()</span>
+<span id="cb23-4">  <span>.</span>par_bridge()</span>
+<span id="cb23-5">  <span>.</span>map_init(</span>
+<span id="cb23-6">    <span>||</span> (<span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]<span>,</span> <span>vec!</span>[<span>0</span><span>.;</span> users<span>.</span>len()]<span>,</span> <span>IndexSet::</span>new(<span>&amp;</span>users))<span>,</span></span>
+<span id="cb23-7">    <span>|</span>(qs_totals<span>,</span> grand_totals<span>,</span> user_set)<span>,</span> qs_batch<span>|</span> <span>{</span></span>
+<span id="cb23-8">      qs_batch</span>
+<span id="cb23-9">        <span>.</span>into_iter()</span>
+<span id="cb23-10">        <span>.</span>filter_map(<span>|</span>qs<span>|</span> <span>{</span></span>
+<span id="cb23-11">          <span>// same code as before</span></span>
+<span id="cb23-12">        <span>}</span>)</span>
+<span id="cb23-13">        <span>.</span>collect_vec()</span>
+<span id="cb23-14">    <span>}</span>)</span>
+<span id="cb23-15">    <span>.</span>flatten()</span>
+<span id="cb23-16">    <span>// same code as before</span></span></code></pre></div>
+<p>Running the outer-loop benchmark again, the chunking iterator now
+completes 5,000,000 combinations in <strong>982 milliseconds</strong>.
+This is a 6.9x speedup over the serial approach, which is much better
+for our 10-core machine. Ideally we would get closer to 10x, but I think
+this post is long enough. In summary, our outer loop runtime numbers are
+in Table <a href="#tbl:outer-loop">2</a>.</p>
+<div id="tbl:outer-loop">
+<table>
+<caption>Table 2: Performance numbers for the outer loop.</caption>
+<colgroup>
+<col>
+<col>
+<col>
+<col>
+<col>
+</colgroup>
+<thead>
+<tr>
+<th>Level</th>
+<th>Runtime</th>
+<th>Speedup over previous level</th>
+<th>Speedup over Python</th>
+<th>Est. completion time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0_serial</td>
+<td>6.80 s</td>
+<td></td>
+<td>26,342.63×</td>
+<td>57.51 min</td>
+</tr>
+<tr>
+<td>1_parallel</td>
+<td>4.22 s</td>
+<td>1.61×</td>
+<td>42,439.31×</td>
+<td>35.70 min</td>
+</tr>
+<tr>
+<td>2_batched</td>
+<td>982.46 ms</td>
+<td>4.30×</td>
+<td>182,450.94×</td>
+<td>8.30 min</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 id="conclusion">Conclusion</h2>
+<p>So how far did we come? The original Python program was going to take
+2.9 years to complete at k=5. Our final Rust program only takes
+<strong>8 minutes</strong> on the same dataset. That is roughly a
+<strong>180,000x speedup</strong>. A summary of the key
+optimizations:</p>
+<ul>
+<li>Use Rust’s compiler optimizations.</li>
+<li>Hash numbers instead of strings.</li>
+<li>Use (indexed) vectors instead of hashmaps.</li>
+<li>Use bit-sets for efficient membership tests.</li>
+<li>Use SIMD for efficient bit-sets.</li>
+<li>Use multi-threading to split the work over many cores.</li>
+<li>Use batching to avoid a bottleneck at work distribution.</li>
+</ul>
+<p>Can we do better? Let’s take one last look at the profile:</p>
+<p><img src="https://willcrichton.net/notes/k-corrset/img/profile-batched.png"></p>
+<p>We’re spending 38% of our time in the bit-set iterator, and 36% of
+our time in the bit-set intersection. Another 12% in copying the initial
+bit-set for a given set of questions. And a long tail of other
+operations like computing the correlation.</p>
+<p>I tried my best to make the SIMD bit-set implementation fast, so I
+don’t know of a way to improve these numbers. We might find another +10%
+speedup from careful tweaking of the various constants (lane size, batch
+size, etc.), but I don’t think there’s another order of magnitude left
+on the table. If you know of a way, I invite you to try it out:<br> <a href="https://github.com/willcrichton/corrset-benchmark">https://github.com/willcrichton/corrset-benchmark</a></p>
+<p>Also if you know of an analytic solution to this problem, i.e., a
+smarter way to get an optimal answer without brute force, do let me know
+as well! Otherwise, I hope you learned a bit about performance
+engineering in Rust.</p>
+
+</div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How to self study pure math – a step-by-step guide [video] (104 pts)]]></title>
+            <link>https://www.youtube.com/watch?v=byNaO_zn2fI</link>
+            <guid>37963453</guid>
+            <pubDate>Sat, 21 Oct 2023 02:05:54 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.youtube.com/watch?v=byNaO_zn2fI">https://www.youtube.com/watch?v=byNaO_zn2fI</a>, See on <a href="https://news.ycombinator.com/item?id=37963453">Hacker News</a></p>
+&lt;Unparsable&gt;]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The Shortest Papers Ever Published (171 pts)]]></title>
             <link>https://paperpile.com/blog/shortest-papers/</link>
             <guid>37962682</guid>
             <pubDate>Fri, 20 Oct 2023 23:35:32 GMT</pubDate>
@@ -17,7 +831,7 @@
 <div id="readability-page-1" class="page"><div><article><div><div><figure><p><img alt="A paper consisting of only figures" width="700" height="323" data-lazy="false" src="https://cdn.paperpile.com/blog/img/figure-only-paper-700x323.png" srcset="https://cdn.paperpile.com/blog/img/figure-only-paper-1400x646.png?v=190 1400w,https://cdn.paperpile.com/blog/img/figure-only-paper-350x162.png?v=190 350w,https://cdn.paperpile.com/blog/img/figure-only-paper-440x203.png?v=190 440w,https://cdn.paperpile.com/blog/img/figure-only-paper-700x323.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw"></p></figure></div><p>This blog post is about short papers. It seems out of place writing a long introduction.</p><p>If you ever wondered about the shortest papers ever published, or you just want to take the unique opportunity to read several papers in full within one minute, this post is for you.</p><h2 id="math-can-be-short">Math can be short</h2><p>Math can be hard and tedious resulting in very long papers. The <a href="https://en.wikipedia.org/wiki/Wiles%27s_proof_of_Fermat%27s_Last_Theorem">1995 proof of Fermat’s last Theorem</a> was 108 pages long.</p><p>But math can also be short.</p><p>Lander and Parkin’s paper about a conjecture by Euler (related to Fermat’s last Theorem), is probably the dream of everyone ever written a paper:&nbsp;It answers an interesting and important question, it’s correct beyond any doubt, &nbsp;it’s easy to understand and only two sentences long.</p><figure><p><img alt="A short mathematical proof by a counterexample" width="700" height="394" src="https://cdn.paperpile.com/blog/img/lander-1966-700x394.png" srcset="https://cdn.paperpile.com/blog/img/lander-1966-1400x788.png?v=190 1400w,https://cdn.paperpile.com/blog/img/lander-1966-350x197.png?v=190 350w,https://cdn.paperpile.com/blog/img/lander-1966-700x394.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAGCAIAAAB1kpiRAAAACXBIWXMAAAsSAAALEgHS3X78AAAAfUlEQVQI1yWM2QrFIBBD/f8vLFwQN1wfWhcE63ZDzcOYSZxD9t6lFCnldV2Msd8nY0ytFRWZc+LB4pzTWmN673vv+xMZY+Sc7/sOIaBADdj8tNYiMUYhhFIKZEop5xwGK3631sj7viklXD/Pg/RcI8EEmCC11sIdGnTISOD/AcSpJwgtyCMAAAAASUVORK5CYII=" data-lazy-srcset="https://cdn.paperpile.com/blog/img/lander-1966-1400x788.png?v=190 1400w,https://cdn.paperpile.com/blog/img/lander-1966-350x197.png?v=190 350w,https://cdn.paperpile.com/blog/img/lander-1966-700x394.png?v=190 700w"></p><figcaption>Lander, L. J., &amp; Parkin, T. R. (1966) Bulletin of the American Mathematical Society, 72(6), 1079.</figcaption></figure><p>Is there a way to beat that? John Conway and Alexander Soifer submitted a paper in 2005 with the goal to &nbsp;write the shortest math paper ever.</p><p>It is only two words long and&nbsp;contains two distinct proofs of their problem in two figures.</p><p>The editors were a bit surprised: <em>“The Monthly publishes exposition of mathematics at many levels, and it contains articles both long and short. Your article, however, is a bit too short to be a good Monthly article. . . A line or two of explanation would really help.”</em></p><p>The authors did not give up and could convince the editors: <em>“I respectfully disagree […] What else is there to explain?”</em> <a href="http://www.wfnmc.org/mc20101.pdf">Read the full story</a>.</p><figure><p><img alt="A short figure only proof" width="700" height="963" src="https://cdn.paperpile.com/blog/img/conway-2005-700x963.png" srcset="https://cdn.paperpile.com/blog/img/conway-2005-1400x1925.png?v=190 1400w,https://cdn.paperpile.com/blog/img/conway-2005-350x481.png?v=190 350w,https://cdn.paperpile.com/blog/img/conway-2005-700x963.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAOCAIAAACZwRr8AAAACXBIWXMAAAsSAAALEgHS3X78AAAAp0lEQVQY021Q7Q6DIBDj/Z9xPyRBTQgEow4UJqzhFgRmE+TjetdallKKMV7XhQO+n4wQQspgWMaYaZrGcXxlDMPAOQfpVwbXew+SEEIphcN5nncZl3eFbdustc45iLIiSSZSC0YbFZZl2fe95rFCxMB5nqWUxXbTva4rfGmtj+PoywSY6OQbbfwCJseMvhtPFFk94O6GJMKhAQ/aeEUmIFH+D9b+Y/kCTVmbSbWFaHUAAAAASUVORK5CYII=" data-lazy-srcset="https://cdn.paperpile.com/blog/img/conway-2005-1400x1925.png?v=190 1400w,https://cdn.paperpile.com/blog/img/conway-2005-350x481.png?v=190 350w,https://cdn.paperpile.com/blog/img/conway-2005-700x963.png?v=190 700w"></p><figcaption>Conway, J., Soifer, A. (2005). The American Mathematical Monthly: The Official Journal of the Mathematical Association of America.</figcaption></figure><h2 id="empty-pages">Empty pages</h2><p>Can you &nbsp;write a meaningful paper shorter than 2 words? Probably not. Still, I want to mention the following case report&nbsp;of severe writer’s block, which contribute important zero words to the literature:</p><figure><p><img alt="The shortest paper ever?" width="700" height="1002" src="https://cdn.paperpile.com/blog/img/upper-1974-700x1002.png" srcset="https://cdn.paperpile.com/blog/img/upper-1974-1400x2003.png?v=190 1400w,https://cdn.paperpile.com/blog/img/upper-1974-350x501.png?v=190 350w,https://cdn.paperpile.com/blog/img/upper-1974-700x1002.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAOCAIAAACZwRr8AAAACXBIWXMAAAsSAAALEgHS3X78AAAAo0lEQVQY072QzQrDIBCEff9ns948WBIxISiUGDW/hMSkgykpLYTeOgcZ9mNxdsietCxL0zR5ngshtNbTNG3bhjk5cN/3wzA456y1MF3XYeGNr/QPjDjzPF9isCPqN44xrusKd5oPXNf1LYlSyhgLIaCD8yMC90gCgG/bFguI8sLjOKLLe1JZllVVZVmGCee8KArivQeQUiqlAGCOF+UbY37c/QSD1JP8tE3kngAAAABJRU5ErkJggg==" data-lazy-srcset="https://cdn.paperpile.com/blog/img/upper-1974-1400x2003.png?v=190 1400w,https://cdn.paperpile.com/blog/img/upper-1974-350x501.png?v=190 350w,https://cdn.paperpile.com/blog/img/upper-1974-700x1002.png?v=190 700w"></p><figcaption>Upper, D. (1974) Journal of Applied Behavior Analysis, 7(3), 497–497.</figcaption></figure><p>Also the following zero-word paper (excluding the abstract) makes an important point. Originally submitted to Nature Chemistry it did not make the cut for publication. But the editors liked it so much that they covered it in their <a href="http://blogs.nature.com/thescepticalchymist/2014/06/a-chemical-free-paper.html">blog</a>&nbsp;and their production team produced a print PDF for it. It finally appeared in 2016 &nbsp;in the journal <a href="http://onlinelibrary.wiley.com/doi/10.1002/ciuz.201600750/abstract">“</a><a href="http://onlinelibrary.wiley.com/doi/10.1002/ciuz.201600750/abstract"><em target="_blank" rel="noopener noreferrer">Chemie in unserer Zeit</em></a><a href="http://onlinelibrary.wiley.com/doi/10.1002/ciuz.201600750/abstract">” (50(2), 144–145)</a>&nbsp;published by Wiley. It’s a German journal but don’t worry. The empty pages should be easy to read even in German…</p><figure><p><img alt="Short paper without any content" width="700" height="984" src="https://cdn.paperpile.com/blog/img/goldberg-2014-700x984.png" srcset="https://cdn.paperpile.com/blog/img/goldberg-2014-1400x1968.png?v=190 1400w,https://cdn.paperpile.com/blog/img/goldberg-2014-350x492.png?v=190 350w,https://cdn.paperpile.com/blog/img/goldberg-2014-700x984.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAOCAIAAACZwRr8AAAACXBIWXMAAAsSAAALEgHS3X78AAABCklEQVQY04WOPU/DMBRF/R9ZQSxsDIwVCwt/gaUMSEyMTIzMSEgFSuwkNMH5LI4TF5GQ2HVipzgSSBAJOLrTO7pXD7CsrEtxfTk72Do53D2d7Ewn29OjvbPj/fOrixtQ5Mz3ntGje3+L0NyDD4v5zLHu3BiTuhIgz6nve0GAkzSWrdz8BCRJAiG0bRtCZFmW67pPAwuEECEEpGlqrugLx3HCMIyiCGPMGAObPxl0/wuf+p/2d6qq4pzLVnVKa92PNcloEKekeKOrkgs51pRSkmVmQAje93qsX5bLAGOxlma76zpgPlRKaaV7PSTP8yROGFs1nCujm5oXxWv1XtcNr5tmbZDSjLdta5of/DuDvUlKHuAAAAAASUVORK5CYII=" data-lazy-srcset="https://cdn.paperpile.com/blog/img/goldberg-2014-1400x1968.png?v=190 1400w,https://cdn.paperpile.com/blog/img/goldberg-2014-350x492.png?v=190 350w,https://cdn.paperpile.com/blog/img/goldberg-2014-700x984.png?v=190 700w"></p><figcaption>Sort of published in&nbsp;Nature chemistry, Volume 6 2014.</figcaption></figure><h2 id="short-abstracts">Short abstracts</h2><p>Abstracts should be short by definition. But some are shorter than others. These are the shortest we could&nbsp;find:</p><figure><p><img alt="Paper with two-word abstract" width="700" height="536" src="https://cdn.paperpile.com/blog/img/berry-2011-700x536.png" srcset="https://cdn.paperpile.com/blog/img/berry-2011-1400x1072.png?v=190 1400w,https://cdn.paperpile.com/blog/img/berry-2011-350x268.png?v=190 350w,https://cdn.paperpile.com/blog/img/berry-2011-700x536.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAICAIAAABPmPnhAAAACXBIWXMAAAsSAAALEgHS3X78AAAArklEQVQI10WO2Q6DIBBF/f//0zRKQdQqsrgBBRGlyIM9mbmZzHm52bZtSqnjOJxz53kaY9ZVCyEBwAi1Wfwa8xWJeZ611s6FfQ/W3pNRSiGEbdvCRF3Xw9A3DVZKhhAyljQAoCheVQXKssrzHELkvb913HgJzqcpBhOCE0KWZQ2JW8d28I1rRDEW46iXRcY2fx3rdN1nt9656/DhusLDra21fd8zRjmjhAxSykf/AISp4Xbc3GcoAAAAAElFTkSuQmCC" data-lazy-srcset="https://cdn.paperpile.com/blog/img/berry-2011-1400x1072.png?v=190 1400w,https://cdn.paperpile.com/blog/img/berry-2011-350x268.png?v=190 350w,https://cdn.paperpile.com/blog/img/berry-2011-700x536.png?v=190 700w"></p><figcaption>Berry, M. V., Brunner, N., Popescu, S., &amp; Shukla, P. (2011) Journal of Physics A: Mathematical and Theoretical, 44, 492001.</figcaption></figure><figure><p><img alt="Paper with three word abstract" width="700" height="238" src="https://cdn.paperpile.com/blog/img/doyle-1978-700x238.png" srcset="https://cdn.paperpile.com/blog/img/doyle-1978-1400x476.png?v=190 1400w,https://cdn.paperpile.com/blog/img/doyle-1978-350x119.png?v=190 350w,https://cdn.paperpile.com/blog/img/doyle-1978-700x238.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAADCAIAAAAlXwkiAAAACXBIWXMAAAsSAAALEgHS3X78AAAAQElEQVQI12XGMQrAQAgAQf//PFtrsVAwlYrHYY5AIJAplgUzE5FTZiYiRFTVeUFEuPv1WGvtvecDujszq+rM/NxofFZuZGUiwwAAAABJRU5ErkJggg==" data-lazy-srcset="https://cdn.paperpile.com/blog/img/doyle-1978-1400x476.png?v=190 1400w,https://cdn.paperpile.com/blog/img/doyle-1978-350x119.png?v=190 350w,https://cdn.paperpile.com/blog/img/doyle-1978-700x238.png?v=190 700w"></p><figcaption>Doyle J. C. (1978) IEEE Transactions on Automatic Control, Vol. AC-23, No.4.</figcaption></figure><figure><p><img alt="Paper with one-word abstract" width="700" height="375" src="https://cdn.paperpile.com/blog/img/gardner-1974-700x375.png" srcset="https://cdn.paperpile.com/blog/img/gardner-1974-1400x749.png?v=190 1400w,https://cdn.paperpile.com/blog/img/gardner-1974-350x187.png?v=190 350w,https://cdn.paperpile.com/blog/img/gardner-1974-700x375.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAFCAIAAADzBuo/AAAACXBIWXMAAAsSAAALEgHS3X78AAAAY0lEQVQI102OOQ7AIAwE+f8zOQvuhksCMkUUZQvLHq8Pce+dc4YQnHNKKa11jDGltNY654jWGkUppdbqvcdEknOG0BJYxhhMWGullMYYFjAA3HuL+1PvHfonb5sdRO7xx1eiB/Ozj7wEcHv4AAAAAElFTkSuQmCC" data-lazy-srcset="https://cdn.paperpile.com/blog/img/gardner-1974-1400x749.png?v=190 1400w,https://cdn.paperpile.com/blog/img/gardner-1974-350x187.png?v=190 350w,https://cdn.paperpile.com/blog/img/gardner-1974-700x375.png?v=190 700w"></p><figcaption>Gardner, J. K. &amp; Knopoff L. (1974) Bulletin of the Seismological Society of America, 64(5) 1363-1367.</figcaption></figure><h2 id="enough-already">Enough already</h2><figure><p><img alt="Probably the shortest letter to the editor ever" width="700" height="409" src="https://cdn.paperpile.com/blog/img/tattersall-2013-700x409.png" srcset="https://cdn.paperpile.com/blog/img/tattersall-2013-1400x818.png?v=190 1400w,https://cdn.paperpile.com/blog/img/tattersall-2013-350x204.png?v=190 350w,https://cdn.paperpile.com/blog/img/tattersall-2013-700x409.png?v=190 700w" sizes="(min-width:700px) 700px, 100vw" data-old-src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAGCAIAAAB1kpiRAAAACXBIWXMAAAsSAAALEgHS3X78AAAAbklEQVQI13WMQQqAIBREvf+lqu+6qEX1M1sKiZCJiSVCicuoxzCbNwzp2rYsCqggp0qhlAJAU9cL54TP89D3OI6IOCEyxraMMcY5R9xxXOd5/0CUUkKINWP2/a211lLKNLLWeu/fOsYYQkj9ef4AI76m1OZhgssAAAAASUVORK5CYII=" data-lazy-srcset="https://cdn.paperpile.com/blog/img/tattersall-2013-1400x818.png?v=190 1400w,https://cdn.paperpile.com/blog/img/tattersall-2013-350x204.png?v=190 350w,https://cdn.paperpile.com/blog/img/tattersall-2013-700x409.png?v=190 700w"></p><figcaption>Tattersall, Ian. Evolutionary Anthropology: Issues, News, and Reviews 22.6 (2013): 293-293.</figcaption></figure></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Don't use DISTINCT as a "join-fixer" (116 pts)]]></title>
+            <title><![CDATA[Don't use DISTINCT as a "join-fixer" (126 pts)]]></title>
             <link>https://www.red-gate.com/simple-talk/databases/sql-server/t-sql-programming-sql-server/dont-use-distinct-as-a-join-fixer/</link>
             <guid>37962370</guid>
             <pubDate>Fri, 20 Oct 2023 22:52:17 GMT</pubDate>
@@ -165,7 +979,7 @@
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[F-Droid: Android FOSS app store (240 pts)]]></title>
+            <title><![CDATA[F-Droid: Android FOSS app store (243 pts)]]></title>
             <link>https://f-droid.org/</link>
             <guid>37962152</guid>
             <pubDate>Fri, 20 Oct 2023 22:22:10 GMT</pubDate>
@@ -462,7 +1276,7 @@
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Solving the 100GB Game Download (101 pts)]]></title>
+            <title><![CDATA[Solving the 100GB Game Download (104 pts)]]></title>
             <link>http://venusoft.net/</link>
             <guid>37962102</guid>
             <pubDate>Fri, 20 Oct 2023 22:15:58 GMT</pubDate>
@@ -609,7 +1423,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How the creator of Alone in the Dark came back to games (134 pts)]]></title>
+            <title><![CDATA[How the creator of Alone in the Dark came back to games (137 pts)]]></title>
             <link>https://news.play.date/news/skew/</link>
             <guid>37961232</guid>
             <pubDate>Fri, 20 Oct 2023 20:40:00 GMT</pubDate>
@@ -834,7 +1648,7 @@ X: <strong><a href="https://x.com/@thelastworker">@thelastworker</a></strong></p
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Mitigating the Hetzner/Linode XMPP.ru MitM interception incident (226 pts)]]></title>
+            <title><![CDATA[Mitigating the Hetzner/Linode XMPP.ru MitM interception incident (246 pts)]]></title>
             <link>https://www.devever.net/~hl/xmpp-incident</link>
             <guid>37961166</guid>
             <pubDate>Fri, 20 Oct 2023 20:31:29 GMT</pubDate>
@@ -1233,7 +2047,7 @@ But none of the current schemes qualify. <a href="#fn1b">⏎</a></p>
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Progress on No-GIL CPython (271 pts)]]></title>
+            <title><![CDATA[Progress on No-GIL CPython (278 pts)]]></title>
             <link>https://lwn.net/Articles/947138/</link>
             <guid>37960941</guid>
             <pubDate>Fri, 20 Oct 2023 20:10:52 GMT</pubDate>
@@ -1568,7 +2382,7 @@ as well.
 </p><p>But, really, I just don't want to go to sleep feeling like I'm all alone.</p><!-- HTML_TAG_END --> </div>  <p>12:01 am </p> <p>12:02 am </p> <p>12:03 am </p> <p>12:04 am </p> <p>12:05 am </p> <p>12:06 am </p> <p>12:07 am </p> <p>12:08 am </p> <p>12:09 am </p> <p>12:10 am </p> <p>12:11 am </p> <p>12:12 am </p> <p>12:13 am </p> <p>12:14 am </p> <p>12:15 am </p> <p>12:16 am </p> <p>12:17 am </p> <p>12:18 am </p> <p>12:19 am </p> <p>12:20 am </p> <p>12:21 am </p> <p>12:22 am </p> <p>12:23 am </p> <p>12:24 am </p> <p>12:25 am </p> <p>12:26 am </p> <p>12:27 am </p> <p>12:28 am </p> <p>12:29 am </p> <p>12:30 am </p> <p>12:31 am </p> <p>12:32 am </p> <p>12:33 am </p> <p>12:34 am </p> <p>12:35 am </p> <p>12:36 am </p> <p>12:37 am </p> <p>12:38 am </p> <p>12:39 am </p> <p>12:40 am </p> <p>12:41 am </p> <p>12:42 am </p> <p>12:43 am </p> <p>12:44 am </p> <p>12:45 am </p> <p>12:46 am </p> <p>12:47 am </p> <p>12:48 am </p> <p>12:49 am </p> <p>12:50 am </p> <p>12:51 am </p> <p>12:52 am </p> <p>12:53 am </p> <p>12:54 am </p> <p>12:55 am </p> <p>12:56 am </p> <p>12:57 am </p> <p>12:58 am </p> <p>12:59 am </p> <p>1:00 am </p> <p>1:01 am </p> <p>1:02 am </p> <p>1:03 am </p> <p>1:04 am </p> <p>1:05 am </p> <p>1:06 am </p> <p>1:07 am </p> <p>1:08 am </p> <p>1:09 am </p> <p>1:10 am </p> <p>1:11 am </p> <p>1:12 am </p> <p>1:13 am </p> <p>1:14 am </p> <p>1:15 am </p> <p>1:16 am </p> <p>1:17 am </p> <p>1:18 am </p> <p>1:19 am </p> <p>1:20 am </p> <p>1:21 am </p> <p>1:22 am </p> <p>1:23 am </p> <p>1:24 am </p> <p>1:25 am </p> <p>1:26 am </p> <p>1:27 am </p> <p>1:28 am </p> <p>1:29 am </p> <p>1:30 am </p> <p>1:31 am </p> <p>1:32 am </p> <p>1:33 am </p> <p>1:34 am </p> <p>1:35 am </p> <p>1:36 am </p> <p>1:37 am </p> <p>1:38 am </p> <p>1:39 am </p> <p>1:40 am </p> <p>1:41 am </p> <p>1:42 am </p> <p>1:43 am </p> <p>1:44 am </p> <p>1:45 am </p> <p>1:46 am </p> <p>1:47 am </p> <p>1:48 am </p> <p>1:49 am </p> <p>1:50 am </p> <p>1:51 am </p> <p>1:52 am </p> <p>1:53 am </p> <p>1:54 am </p> <p>1:55 am </p> <p>1:56 am </p> <p>1:57 am </p> <p>1:58 am </p> <p>1:59 am </p> <p>2:00 am </p> <p>2:01 am </p> <p>2:02 am </p> <p>2:03 am </p> <p>2:04 am </p> <p>2:05 am </p> <p>2:06 am </p> <p>2:07 am </p> <p>2:08 am </p> <p>2:09 am </p> <p>2:10 am </p> <p>2:11 am </p> <p>2:12 am </p> <p>2:13 am </p> <p>2:14 am </p> <p>2:15 am </p> <p>2:16 am </p> <p>2:17 am </p> <p>2:18 am </p> <p>2:19 am </p> <p>2:20 am </p> <p>2:21 am </p> <p>2:22 am </p> <p>2:23 am </p> <p>2:24 am </p> <p>2:25 am </p> <p>2:26 am </p> <p>2:27 am </p> <p>2:28 am </p> <p>2:29 am </p> <p>2:30 am </p> <p>2:31 am </p> <p>2:32 am </p> <p>2:33 am </p> <p>2:34 am </p> <p>2:35 am </p> <p>2:36 am </p> <p>2:37 am </p> <p>2:38 am </p> <p>2:39 am </p> <p>2:40 am </p> <p>2:41 am </p> <p>2:42 am </p> <p>2:43 am </p> <p>2:44 am </p> <p>2:45 am </p> <p>2:46 am </p> <p>2:47 am </p> <p>2:48 am </p> <p>2:49 am </p> <p>2:50 am </p> <p>2:51 am </p> <p>2:52 am </p> <p>2:53 am </p> <p>2:54 am </p> <p>2:55 am </p> <p>2:56 am </p> <p>2:57 am </p> <p>2:58 am </p> <p>2:59 am </p> <p>3:00 am </p> <p>3:01 am </p> <p>3:02 am </p> <p>3:03 am </p> <p>3:04 am </p> <p>3:05 am </p> <p>3:06 am </p> <p>3:07 am </p> <p>3:08 am </p> <p>3:09 am </p> <p>3:10 am </p> <p>3:11 am </p> <p>3:12 am </p> <p>3:13 am </p> <p>3:14 am </p> <p>3:15 am </p> <p>3:16 am </p> <p>3:17 am </p> <p>3:18 am </p> <p>3:19 am </p> <p>3:20 am </p> <p>3:21 am </p> <p>3:22 am </p> <p>3:23 am </p> <p>3:24 am </p> <p>3:25 am </p> <p>3:26 am </p> <p>3:27 am </p> <p>3:28 am </p> <p>3:29 am </p> <p>3:30 am </p> <p>3:31 am </p> <p>3:32 am </p> <p>3:33 am </p> <p>3:34 am </p> <p>3:35 am </p> <p>3:36 am </p> <p>3:37 am </p> <p>3:38 am </p> <p>3:39 am </p> <p>3:40 am </p> <p>3:41 am </p> <p>3:42 am </p> <p>3:43 am </p> <p>3:44 am </p> <p>3:45 am </p> <p>3:46 am </p> <p>3:47 am </p> <p>3:48 am </p> <p>3:49 am </p> <p>3:50 am </p> <p>3:51 am </p> <p>3:52 am </p> <p>3:53 am </p> <p>3:54 am </p> <p>3:55 am </p> <p>3:56 am </p> <p>3:57 am </p> <p>3:58 am </p> <p>3:59 am </p> <p>4:00 am </p></div><p>Thank you for reading to the end! Consider directly supporting the author.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Geany 2.0 – Flyweight IDE (199 pts)]]></title>
+            <title><![CDATA[Geany 2.0 – Flyweight IDE (204 pts)]]></title>
             <link>https://geany.org/</link>
             <guid>37959979</guid>
             <pubDate>Fri, 20 Oct 2023 18:53:09 GMT</pubDate>
@@ -1679,7 +2493,7 @@ as well.
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Hackers stole access tokens from Okta's support unit (273 pts)]]></title>
+            <title><![CDATA[Hackers stole access tokens from Okta's support unit (279 pts)]]></title>
             <link>https://krebsonsecurity.com/2023/10/hackers-stole-access-tokens-from-oktas-support-unit/</link>
             <guid>37959904</guid>
             <pubDate>Fri, 20 Oct 2023 18:46:28 GMT</pubDate>
@@ -1706,7 +2520,7 @@ as well.
 											</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[They can and will ruin everything you love (298 pts)]]></title>
+            <title><![CDATA[They can and will ruin everything you love (299 pts)]]></title>
             <link>https://www.welcometohellworld.com/they-can-and-will-ruin-everything-you-love/</link>
             <guid>37959540</guid>
             <pubDate>Fri, 20 Oct 2023 18:10:50 GMT</pubDate>
@@ -1742,7 +2556,7 @@ as well.
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[EU Commissioner as double agent of foreign interference (309 pts)]]></title>
+            <title><![CDATA[EU Commissioner as double agent of foreign interference (312 pts)]]></title>
             <link>https://www.patrick-breyer.de/en/breyer-on-chat-control-investigative-research-eu-commissioner-as-double-agent-of-foreign-interference/</link>
             <guid>37958473</guid>
             <pubDate>Fri, 20 Oct 2023 16:46:47 GMT</pubDate>
@@ -1793,7 +2607,7 @@ as well.
 									</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA["<ESC>[31M"? ANSI Terminal security in 2023 and finding 10 CVEs (244 pts)]]></title>
+            <title><![CDATA["<ESC>[31M"? ANSI Terminal security in 2023 and finding 10 CVEs (247 pts)]]></title>
             <link>https://dgl.cx/2023/09/ansi-terminal-security</link>
             <guid>37957397</guid>
             <pubDate>Fri, 20 Oct 2023 15:22:52 GMT</pubDate>
@@ -2757,7 +3571,7 @@ me research this all.</p>
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The ten year anniversary of the Healthcare.gov rescue (367 pts)]]></title>
+            <title><![CDATA[The ten year anniversary of the Healthcare.gov rescue (368 pts)]]></title>
             <link>https://www.pauladamsmith.com/blog/2023/10/the-10-year-anniversary-of-the-healthcare.gov-rescue.html</link>
             <guid>37957152</guid>
             <pubDate>Fri, 20 Oct 2023 15:06:21 GMT</pubDate>
@@ -2960,7 +3774,7 @@ few weeks and months.</p>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Flappy Bird Implemented in TypeScript Types (218 pts)]]></title>
+            <title><![CDATA[Flappy Bird Implemented in TypeScript Types (219 pts)]]></title>
             <link>https://zackoverflow.dev/writing/flappy-bird-in-type-level-typescript/</link>
             <guid>37956856</guid>
             <pubDate>Fri, 20 Oct 2023 14:47:52 GMT</pubDate>
@@ -3136,7 +3950,7 @@ This type-level Typescript runtime started out as a type-checker for Typescript 
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Cops Are Suing a Teen for Invasion of Privacy After False Arrest Vid Goes Viral (365 pts)]]></title>
+            <title><![CDATA[Cops Are Suing a Teen for Invasion of Privacy After False Arrest Vid Goes Viral (367 pts)]]></title>
             <link>https://www.vice.com/en/article/jg5a88/cops-sue-teen-invasion-of-privacy-false-arrest</link>
             <guid>37956714</guid>
             <pubDate>Fri, 20 Oct 2023 14:37:25 GMT</pubDate>
