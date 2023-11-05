@@ -4,12 +4,1362 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 05 Nov 2023 14:00:14 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 05 Nov 2023 15:00:09 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Exclusive access for LLM companies to largest Chinese nonfiction book collection (154 pts)]]></title>
+            <title><![CDATA[Building a high performance JSON parser (101 pts)]]></title>
+            <link>https://dave.cheney.net/paste/gophercon-sg-2023.html</link>
+            <guid>38150833</guid>
+            <pubDate>Sun, 05 Nov 2023 13:10:43 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://dave.cheney.net/paste/gophercon-sg-2023.html">https://dave.cheney.net/paste/gophercon-sg-2023.html</a>, See on <a href="https://news.ycombinator.com/item?id=38150833">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content">
+<div>
+<h2 id="_introduction"><a href="#_introduction"></a><a href="#_introduction">Introduction</a></h2>
+<div>
+<p>This talk is a case study of designing an efficient Go package.
+I’m going to use the example of building a high performance JSON parser.</p>
+<p>The goals of this project were:</p>
+<div>
+<dl>
+<dt>Supports streaming operations</dt>
+<dd>
+<p>It’s unrealistic to expect to have the entire input in memory.
+Buffering in memory is a availability risk, input sizes are usually unknown and potentially unbounded.
+Buffering before processing introduces latency.
+Streaming reads lets you process data as it arrives and overlap that processing with reading.</p>
+</dd>
+<dt>Reasonably compatible with the <code>encoding/json</code> package</dt>
+<dd>
+<p>This package offers the same high level <code>json.Decoder</code> API but higher throughput and reduced allocations.</p>
+</dd>
+<dt>Allocation free, or bounded API</dt>
+<dd>
+<p>In addition to the <code>encoding/json</code> API, provide an alternative, more efficient API.</p>
+</dd>
+</dl>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_time_complexity"><a href="#_time_complexity"></a><a href="#_time_complexity">Time complexity</a></h2>
+<div>
+<p>Let’s talk about the time complexity of this problem.</p>
+<p>JSON doesn’t use length markers; to know how much to read, we have to read it all.
+To parse the 1,000th element in JSON array, we have to read and process the 999 that come before it.
+This means the lower bounds on the time to process the input is the size of the input — you can’t skip ahead.</p>
+<p>But reading isn’t the full story, we need to process it through the JSON state machine to figure out where the tokens start and end.
+Thus the performance is at least <code>read(N)+parse(N)</code>.</p>
+<p>But there are other costs:</p>
+<div>
+<ul>
+<li>
+<p>Ideally if we read N bytes, we want to process each byte only once.
+If we touch the same byte more than once, that adds overhead, and complicates processing if we have to keep those bytes around to come back and look at them again.</p>
+</li>
+<li>
+<p>Just like we don’t want to process a byte more than once, we want to avoid processing a token more than once.</p>
+</li>
+<li>
+<p>Limit function calls in the hot path inside the <code>Scanner</code> or <code>Decoder</code>.
+We want to limit the number of function to <code>O(tokens)</code>, not <code>O(bytes)</code>.</p>
+</li>
+<li>
+<p>Limit copies.
+If we have a design that limits copying then we reduce the number times we (re)visit a byte.</p>
+</li>
+<li>
+<p>Limit allocations.
+If you limit the number of times data is copied, then you naturally limit allocations, which reduces runtime in several ways:</p>
+<div>
+<ol>
+<li>
+<p>Reduce the overhead in taking the allocation.
+The heap is a shared resource, allocating on the heap requires working with shared data structures.
+This means locks, cache contention, etc. c.f. Amdahl’s Law <sup>[<a id="_footnoteref_1" href="#_footnotedef_1" title="View footnote.">1</a>]</sup></p>
+</li>
+<li>
+<p>Reduce the overhead of freeing allocations.
+The less allocations you make, the less heap you consume and the less garbage you produce.
+Reducing these two factors reduces the overhead of background and foreground garbage collection.</p>
+</li>
+</ol>
+</div>
+</li>
+</ul>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_tokenisation"><a href="#_tokenisation"></a><a href="#_tokenisation">Tokenisation</a></h2>
+<div>
+<p>A JSON decoder has two main components:</p>
+<div>
+<ol>
+<li>
+<p>A scanner, or tokeniser, that converts a stream a bytes into a stream of JSON tokens.</p>
+</li>
+<li>
+<p>An unmarshaller that applies a stream of JSON tokens to a Go object.</p>
+</li>
+</ol>
+</div>
+<div>
+<h3 id="_what_then_is_a_token"><a href="#_what_then_is_a_token"></a><a href="#_what_then_is_a_token">What then, is a token?</a></h3>
+<p>JSON is regular, well defined grammar.
+<a href="https://json.org/">json.org</a> has a wonderful set of railroad diagrams that describe the grammar of JSON.</p>
+<div>
+<pre><code data-lang="json"><span>{</span><span>"a"</span><span>:</span><span> </span><span>1</span><span>,</span><span> </span><span>"b"</span><span>:</span><span> </span><span>true</span><span>,</span><span> </span><span>"c"</span><span>:</span><span> </span><span>[</span><span>1</span><span>,</span><span> </span><span>"two"</span><span>,</span><span> </span><span>null</span><span>]}</span></code></pre>
+</div>
+<p>Is a stream of,</p>
+<div>
+<ul>
+<li>
+<p><code>{</code>, the opening brace, signifying a collection of name/value pairs.</p>
+</li>
+<li>
+<p><code>"a"</code>, the string <code>a</code>.</p>
+</li>
+<li>
+<p><code>:</code>, a colon, the delimiter between the key and the value in the key/value pair.</p>
+</li>
+<li>
+<p><code>1</code>, the number one.</p>
+</li>
+<li>
+<p><code>,</code>, a comma, the delimiter between one key/value pair and the next.</p>
+</li>
+<li>
+<p><code>"b"</code>, the string <code>b</code>.</p>
+</li>
+<li>
+<p><code>:</code></p>
+</li>
+<li>
+<p><code>true</code>, the boolean value for true.</p>
+</li>
+<li>
+<p><code>,</code></p>
+</li>
+<li>
+<p><code>"c"</code>, the string <code>c</code>.</p>
+</li>
+<li>
+<p><code>:</code></p>
+</li>
+<li>
+<p><code>[</code>, the opening square brace, signifying an ordered list of values.</p>
+</li>
+<li>
+<p><code>1</code></p>
+</li>
+<li>
+<p><code>,</code></p>
+</li>
+<li>
+<p><code>"two"</code></p>
+</li>
+<li>
+<p><code>,</code></p>
+</li>
+<li>
+<p><code>null</code>, a null or void value (rare).</p>
+</li>
+<li>
+<p><code>]</code>, closing square brace, terminates the list of values</p>
+</li>
+<li>
+<p><code>}</code>, closing curly brace, terminating the key/value collection.</p>
+</li>
+</ul>
+</div>
+<p>If wanted to parse this with <code>encoding/json</code>, we declare a <code>json.Decoder</code>, then call <code>Token</code> until <code>err</code> is non <code>nil</code>.</p>
+<div>
+<pre><code data-lang="go"><span>package</span> <span>main</span>
+
+<span>import</span> <span>(</span>
+	<span>"encoding/json"</span>
+	<span>"fmt"</span>
+	<span>"strings"</span>
+<span>)</span>
+
+<span>func</span> <span>main</span><span>()</span> <span>{</span>
+	<span>input</span> <span>:=</span> <span>`{"a": 1, "b": true, "c": [1, "two", null]}`</span>
+	<span>dec</span> <span>:=</span> <span>json</span><span>.</span><span>NewDecoder</span><span>(</span><span>strings</span><span>.</span><span>NewReader</span><span>(</span><span>input</span><span>))</span>
+	<span>for</span> <span>{</span>
+		<span>tok</span><span>,</span> <span>err</span> <span>:=</span> <span>dec</span><span>.</span><span>Token</span><span>()</span>
+		<span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+			<span>break</span>
+		<span>}</span>
+		<span>fmt</span><span>.</span><span>Printf</span><span>(</span><span>"%v</span><span>\t</span><span>(%T)</span><span>\n</span><span>"</span><span>,</span> <span>tok</span><span>,</span> <span>tok</span><span>)</span>
+	<span>}</span>
+
+<span>}</span></code></pre>
+</div>
+<p>When we run this we get the following output</p>
+<div>
+<pre><code data-lang="bash"><span>{</span>       <span>(</span>json.Delim<span>)</span>
+a       <span>(</span>string<span>)</span>
+1       <span>(</span>float64<span>)</span>
+b       <span>(</span>string<span>)</span>
+<span>true</span>    <span>(</span>bool<span>)</span>
+c       <span>(</span>string<span>)</span>
+<span>[</span>       <span>(</span>json.Delim<span>)</span>
+1       <span>(</span>float64<span>)</span>
+two     <span>(</span>string<span>)</span>
+&lt;nil&gt;   <span>(</span>&lt;nil&gt;<span>)</span>
+<span>]</span>       <span>(</span>json.Delim<span>)</span>
+<span>}</span>       <span>(</span>json.Delim<span>)</span></code></pre>
+</div>
+<p>This is rather convenient, the type of the token returned is an <code>interface{}</code> so it can represent both the value of the token, and also its type.
+Strings are <code>string</code>, numbers are <code>float64</code>, booleans are <code>true</code> and <code>false</code>, even <code>null</code> is represented as a <code>nil</code>.</p>
+<p>But there is a cost to this convenience, and a reason why Brad Fitzpatrick called the Token API a <a href="https://go-review.googlesource.com/c/go/+/11651/2/src/encoding/json/stream.go#279">garbage factory</a>.</p>
+<p>Because of the design of the <code>Decoder.Token</code> API, the concrete value assigned to each token causes that value to escape to the heap.
+The number of allocations is tied to the number of tokens in the input.</p>
+<p>Let’s look at the allocations for the simplest case, a single token.</p>
+<div>
+<pre><code data-lang="go"><span>package</span> <span>main</span>
+
+<span>import</span> <span>(</span>
+	<span>"encoding/json"</span>
+	<span>"strings"</span>
+	<span>"testing"</span>
+<span>)</span>
+
+<span>func</span> <span>BenchmarkJSONDecodeHello</span><span>(</span><span>b</span> <span>*</span><span>testing</span><span>.</span><span>B</span><span>)</span> <span>{</span>
+	<span>input</span> <span>:=</span> <span>`"hello"`</span>
+	<span>r</span> <span>:=</span> <span>strings</span><span>.</span><span>NewReader</span><span>(</span><span>input</span><span>)</span> <span>// reads strings as []byte</span>
+	<span>dec</span> <span>:=</span> <span>json</span><span>.</span><span>NewDecoder</span><span>(</span><span>r</span><span>)</span>
+	<span>b</span><span>.</span><span>ReportAllocs</span><span>()</span>
+	<span>b</span><span>.</span><span>SetBytes</span><span>(</span><span>int64</span><span>(</span><span>len</span><span>(</span><span>input</span><span>)))</span>
+	<span>b</span><span>.</span><span>ResetTimer</span><span>()</span>
+	<span>for</span> <span>i</span> <span>:=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>b</span><span>.</span><span>N</span><span>;</span> <span>i</span><span>++</span> <span>{</span>
+		<span>r</span><span>.</span><span>Seek</span><span>(</span><span>0</span><span>,</span> <span>0</span><span>)</span>
+		<span>tok</span><span>,</span> <span>_</span> <span>:=</span> <span>dec</span><span>.</span><span>Token</span><span>()</span>
+		<span>if</span> <span>tok</span> <span>!=</span> <span>"hello"</span> <span>{</span>
+			<span>b</span><span>.</span><span>Fatal</span><span>()</span>
+		<span>}</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<p>Which results in</p>
+<div>
+<pre><code data-lang="bash">name               <span>time</span>/op
+JSONDecodeHello-4     355ns ± 0%
+
+name               speed
+JSONDecodeHello-4  19.7MB/s ± 0%
+
+name               alloc/op
+JSONDecodeHello-4     37.0B ± 0%
+
+name               allocs/op
+JSONDecodeHello-4      3.00 ± 0%</code></pre>
+</div>
+<div>
+<p>Take away: API design influences allocation.
+Allocations <em>can</em> influence performance.</p>
+</div>
+</div>
+<div>
+<h3 id="_implicit_tokens"><a href="#_implicit_tokens"></a><a href="#_implicit_tokens">Implicit tokens</a></h3>
+<p>Let’s look back at the sequence of tokens; <code>{</code> <code>"a"</code> <code>:</code> <code>1</code> <code>,</code> <code>"b"</code> <code>:</code> <code>true</code> <code>,</code> <code>"c"</code> <code>:</code> <code>[</code> <code>1</code> <code>,</code> <code>"two"</code> <code>,</code> <code>null</code> <code>]</code> and <code>}</code>.</p>
+<p>It turns out that the first character in the token tells you the <em>type</em> of the token.</p>
+<div>
+<ul>
+<li>
+<p><code>{</code>, <code>}</code> - collection start, end</p>
+</li>
+<li>
+<p><code>[</code>, <code>]</code> - array start, end</p>
+</li>
+<li>
+<p><code>t</code> - true</p>
+</li>
+<li>
+<p><code>f</code> - false</p>
+</li>
+<li>
+<p><code>n</code> - null</p>
+</li>
+<li>
+<p><code>"</code> - string</p>
+</li>
+<li>
+<p><code>-</code>, <code>0</code>-<code>9</code> - a number</p>
+</li>
+</ul>
+</div>
+<p>This is the first improvement we can make in <em>our</em> <code>Decoder.NextToken</code> APIs.
+Rather than converting the input <code>[]byte</code> to a value, we just return the bytes representing the token straight from the input—​a simple subslice.
+The first character in the <code>[]byte</code> will tell the type of the token.</p>
+<div>
+<pre><code data-lang="go"><span>package</span> <span>main</span>
+
+<span>import</span> <span>(</span>
+	<span>"fmt"</span>
+	<span>"github.com/pkg/json"</span>
+	<span>"strings"</span>
+<span>)</span>
+
+<span>func</span> <span>main</span><span>()</span> <span>{</span>
+	<span>input</span> <span>:=</span> <span>`{"a": 1, "b": true, "c": [1, "two", null]}`</span>
+	<span>dec</span> <span>:=</span> <span>json</span><span>.</span><span>NewDecoder</span><span>(</span><span>strings</span><span>.</span><span>NewReader</span><span>(</span><span>input</span><span>))</span>
+	<span>for</span> <span>{</span>
+		<span>tok</span><span>,</span> <span>err</span> <span>:=</span> <span>dec</span><span>.</span><span>NextToken</span><span>()</span>
+		<span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+			<span>break</span>
+		<span>}</span>
+		<span>fmt</span><span>.</span><span>Printf</span><span>(</span><span>"%s</span><span>\t</span><span>(%T)</span><span>\n</span><span>"</span><span>,</span> <span>tok</span><span>,</span> <span>tok</span><span>)</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<div>
+<pre><code data-lang="bash"><span>{</span>       <span>([]</span>uint8<span>)</span>
+<span>"a"</span>     <span>([]</span>uint8<span>)</span>
+1       <span>([]</span>uint8<span>)</span>
+<span>"b"</span>     <span>([]</span>uint8<span>)</span>
+<span>true</span>    <span>([]</span>uint8<span>)</span>
+<span>"c"</span>     <span>([]</span>uint8<span>)</span>
+<span>[</span>       <span>([]</span>uint8<span>)</span>
+1       <span>([]</span>uint8<span>)</span>
+<span>"two"</span>   <span>([]</span>uint8<span>)</span>
+null    <span>([]</span>uint8<span>)</span>
+<span>]</span>       <span>([]</span>uint8<span>)</span>
+<span>}</span>       <span>([]</span>uint8<span>)</span></code></pre>
+</div>
+<p>There are a few subtleties with this API.</p>
+<div>
+<ol>
+<li>
+<p>Because the output is a subslice of the input, not a copy, there are restrictions on how long the output is valid for.
+This is similar to the <code>bufio.Scanner</code> API.</p>
+</li>
+<li>
+<p>Sometimes people want to know type of the token; collection, array, string, number, etc, sometimes they want the token <em>value</em>, <em>the string</em>, the <em>number</em>, in a form they can work with.
+<code>Decoder.NextToken</code> isn’t convenient for that, but can be used to build higher level abstractions.</p>
+</li>
+</ol>
+</div>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_reading"><a href="#_reading"></a><a href="#_reading">Reading</a></h2>
+<div>
+<p>Let’s talk about reading data.
+This can be tricky to do efficiently because JSON is not length delimited, you have to read to the end of the token to find token.</p>
+<div>
+<h3 id="_io_reader_problems"><a href="#_io_reader_problems"></a><a href="#_io_reader_problems">io.Reader problems</a></h3>
+<p>The traditional way to do this is with an <code>io.Reader</code>.</p>
+<div>
+<pre><code data-lang="go"><span>buf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>4</span> <span>&lt;&lt;</span> <span>10</span><span>)</span>
+<span>read</span><span>,</span> <span>err</span> <span>:=</span> <span>r</span><span>.</span><span>Read</span><span>(</span><span>buf</span><span>)</span></code></pre>
+</div>
+<p>But this comes with a number of problems:</p>
+<div>
+<ul>
+<li>
+<p>io.Reader.Read <em>copies</em> data from the reader into a buffer. That copying takes time.</p>
+</li>
+<li>
+<p>io.Reader.Read makes buffer management the problem of the caller.</p>
+<div>
+<ol>
+<li>
+<p>You can read one <code>byte</code> at a time, but you need a place to store the thing you’re walking over, also might need to put the <code>byte</code> back.</p>
+</li>
+<li>
+<p>You can read into a large buffer, then look in buffer for start and end of token.
+If the end token isn’t in the buffer you need to do a lot of bookkeeping and copying to move the data around the the buffer or grow the buffer to make room for more data.</p>
+</li>
+</ol>
+</div>
+</li>
+</ul>
+</div>
+<p>This is tricky to get right, and inefficient even if you do.</p>
+<p>The alternative is an idea inspired by Steven Schveighoffer’s iopipe <sup>[<a id="_footnoteref_2" href="#_footnotedef_2" title="View footnote.">2</a>]</sup> and Phil Pearl <sup>[<a id="_footnoteref_3" href="#_footnotedef_3" title="View footnote.">3</a>]</sup> which I adapted into a type called a <code>byteReader</code>.
+<code>byteReader</code> operates similarly to <code>bufio.Reader</code> but has a more efficient API.</p>
+<div>
+<pre><code data-lang="go"><span>// A byteReader implements a sliding window over an io.Reader.</span>
+<span>type</span> <span>byteReader</span> <span>struct</span> <span>{</span>
+	<span>data</span>   <span>[]</span><span>byte</span>
+	<span>offset</span> <span>int</span>
+	<span>r</span>      <span>io</span><span>.</span><span>Reader</span>
+	<span>err</span>    <span>error</span>
+<span>}</span>
+
+<span>// window returns the current window.</span>
+<span>// The window is invalidated by calls to release or extend.</span>
+<span>func</span> <span>(</span><span>b</span> <span>*</span><span>byteReader</span><span>)</span> <span>window</span><span>()</span> <span>[]</span><span>byte</span> <span>{</span>
+	<span>return</span> <span>b</span><span>.</span><span>data</span><span>[</span><span>b</span><span>.</span><span>offset</span><span>:</span><span>]</span>
+<span>}</span>
+
+<span>// release discards n bytes from the front of the window.</span>
+<span>func</span> <span>(</span><span>b</span> <span>*</span><span>byteReader</span><span>)</span> <span>release</span><span>(</span><span>n</span> <span>int</span><span>)</span> <span>{</span>
+	<span>b</span><span>.</span><span>offset</span> <span>+=</span> <span>n</span>
+<span>}</span>
+
+<span>// extend extends the window with data from the underlying reader.</span>
+<span>func</span> <span>(</span><span>b</span> <span>*</span><span>byteReader</span><span>)</span> <span>extend</span><span>()</span> <span>int</span> <span>{</span></code></pre>
+</div>
+</div>
+<div>
+<h3 id="_example_whitespace"><a href="#_example_whitespace"></a><a href="#_example_whitespace">Example: whitespace</a></h3>
+<p>JSON contains a mixture of tokens and whitespace.
+Space, tab, newline and carriage return can occur between tokens and are ignored, thus the search for a token begins with a search for the first <em>non</em> whitespace character.</p>
+<div>
+<pre><code data-lang="json"><span>{</span><span>"a"</span><span>:</span><span> </span><span>1</span><span>,</span><span> </span><span>"b"</span><span>:</span><span> </span><span>true</span><span>,</span><span> </span><span>"c"</span><span>:</span><span> </span><span>[</span><span>1</span><span>,</span><span> </span><span>"two"</span><span>,</span><span> </span><span>null</span><span>]}</span></code></pre>
+</div>
+<p>This is a good time to talk about the search for whitespace with an example of using a <code>byteReader</code>.</p>
+<div>
+<pre><code data-lang="go"><span>var</span> <span>whitespace</span> <span>=</span> <span>[</span><span>256</span><span>]</span><span>bool</span><span>{</span>
+	<span>' '</span><span>:</span>  <span>true</span><span>,</span>
+	<span>'\t'</span><span>:</span> <span>true</span><span>,</span>
+	<span>'\n'</span><span>:</span> <span>true</span><span>,</span>
+	<span>'\r'</span><span>:</span> <span>true</span><span>,</span>
+<span>}</span>
+
+<span>func</span> <span>countWhitespace</span><span>(</span><span>br</span> <span>*</span><span>byteReader</span><span>)</span> <span>int</span> <span>{</span>
+	<span>n</span> <span>:=</span> <span>0</span>
+	<span>w</span> <span>:=</span> <span>br</span><span>.</span><span>window</span><span>()</span>
+	<span>for</span> <span>{</span>
+		<span>for</span> <span>_</span><span>,</span> <span>c</span> <span>:=</span> <span>range</span> <span>w</span> <span>{</span>
+			<span>if</span> <span>whitespace</span><span>[</span><span>c</span><span>]</span> <span>{</span>
+				<span>n</span><span>++</span>
+			<span>}</span>
+		<span>}</span>
+		<span>br</span><span>.</span><span>release</span><span>(</span><span>len</span><span>(</span><span>w</span><span>))</span>
+		<span>if</span> <span>br</span><span>.</span><span>extend</span><span>()</span> <span>==</span> <span>0</span> <span>{</span>
+			<span>return</span> <span>n</span>
+		<span>}</span>
+		<span>w</span> <span>=</span> <span>br</span><span>.</span><span>window</span><span>()</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<p>This does the minimum, visit each character and test if it matches a whitespace character.
+Any (useful) JSON decoder code cannot go faster that this.</p>
+<div>
+<pre><code>name                             time/op
+CountWhitespace/canada-16          1.10ms ± 2%
+CountWhitespace/citm_catalog-16     838µs ± 1%
+CountWhitespace/twitter-16          306µs ± 1%
+CountWhitespace/code-16             937µs ± 1%
+CountWhitespace/example-16         6.40µs ± 1%
+CountWhitespace/sample-16           333µs ± 1%
+
+name                             speed
+CountWhitespace/canada-16        2.04GB/s ± 2%
+CountWhitespace/citm_catalog-16  2.06GB/s ± 1%
+CountWhitespace/twitter-16       2.06GB/s ± 1%
+CountWhitespace/code-16          2.07GB/s ± 1%
+CountWhitespace/example-16       2.04GB/s ± 1%
+CountWhitespace/sample-16        2.06GB/s ± 1%</code></pre>
+</div>
+<p>So this is our baseline.</p>
+<details>
+<summary>Quiz me after the talk on the best way to write a general purpose whitespace counter.</summary>
+
+</details>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_scanning"><a href="#_scanning"></a><a href="#_scanning">Scanning</a></h2>
+<div>
+<p>Now we can tell which characters are tokens and which are simply whitespace, let’s step up a level and talk about scanning.</p>
+<div>
+<pre><code data-lang="go"><span>// Next returns a []byte referencing the the next lexical token in the stream.</span>
+<span>// The []byte is valid until Next is called again.</span>
+<span>// If the stream is at its end, or an error has occured, Next returns a zero</span>
+<span>// length []byte slice.</span>
+<span>//</span>
+<span>// A valid token begins with one of the following:</span>
+<span>//</span>
+<span>//	{ Object start</span>
+<span>//	[ Array start</span>
+<span>//	} Object end</span>
+<span>//	] Array End</span>
+<span>//	, Literal comma</span>
+<span>//	: Literal colon</span>
+<span>//	t JSON true</span>
+<span>//	f JSON false</span>
+<span>//	n JSON null</span>
+<span>//	" A string, possibly containing backslash escaped entites.</span>
+<span>//	-, 0-9 A number</span>
+<span>func</span> <span>(</span><span>s</span> <span>*</span><span>Scanner</span><span>)</span> <span>Next</span><span>()</span> <span>[]</span><span>byte</span> <span>{</span>
+	<span>s</span><span>.</span><span>br</span><span>.</span><span>release</span><span>(</span><span>s</span><span>.</span><span>offset</span><span>)</span> <span>// release the previous token</span>
+	<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>0</span>
+
+	<span>c</span> <span>:=</span> <span>s</span><span>.</span><span>token</span><span>()</span> <span>// align to the next token</span>
+	<span>length</span> <span>:=</span> <span>0</span>
+	<span>switch</span> <span>c</span> <span>{</span>
+	<span>case</span> <span>ObjectStart</span><span>,</span> <span>ObjectEnd</span><span>,</span> <span>Colon</span><span>,</span> <span>Comma</span><span>,</span> <span>ArrayStart</span><span>,</span> <span>ArrayEnd</span><span>:</span>
+		<span>length</span> <span>=</span> <span>1</span>
+		<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>1</span>
+	<span>case</span> <span>True</span><span>:</span>
+		<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"true"</span><span>)</span>
+		<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+	<span>case</span> <span>False</span><span>:</span>
+		<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"false"</span><span>)</span>
+		<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+	<span>case</span> <span>Null</span><span>:</span>
+		<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"null"</span><span>)</span>
+		<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+	<span>case</span> <span>String</span><span>:</span>
+		<span>length</span> <span>=</span> <span>parseString</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>)</span>
+		<span>if</span> <span>length</span> <span>&lt;</span> <span>2</span> <span>{</span>
+			<span>return</span> <span>nil</span>
+		<span>}</span>
+		<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+	<span>case</span> <span>0</span><span>:</span>
+		<span>// eof</span>
+		<span>return</span> <span>nil</span>
+	<span>default</span><span>:</span>
+		<span>length</span> <span>=</span> <span>s</span><span>.</span><span>parseNumber</span><span>()</span>
+		<span>if</span> <span>length</span> <span>&lt;</span> <span>0</span> <span>{</span>
+			<span>return</span> <span>nil</span>
+		<span>}</span>
+	<span>}</span>
+	<span>return</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()[</span><span>:</span><span>length</span><span>]</span>
+<span>}</span></code></pre>
+</div>
+<p>This is the core loop of <code>Scanner.Next</code>.
+<code>Scanner.Next</code> skips over any intermediate whitespace, determines the token from the first character in the window, then continues to read until the token is read or we hit the end of the input.</p>
+<p>Let’s look at how <code>token</code> works, then we’ll talk about some optimisations</p>
+<div>
+<pre><code data-lang="go"><span>// token positions the scanner at the next token in the stream</span>
+<span>// and returns the first byte of the token.</span>
+<span>func</span> <span>(</span><span>s</span> <span>*</span><span>Scanner</span><span>)</span> <span>token</span><span>()</span> <span>byte</span> <span>{</span>
+	<span>w</span> <span>:=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()</span>
+	<span>for</span> <span>{</span>
+		<span>for</span> <span>_</span><span>,</span> <span>c</span> <span>:=</span> <span>range</span> <span>w</span> <span>{</span>
+			<span>if</span> <span>whitespace</span><span>[</span><span>c</span><span>]</span> <span>{</span>
+				<span>s</span><span>.</span><span>offset</span><span>++</span>
+				<span>continue</span>
+			<span>}</span>
+
+			<span>// release whitespace</span>
+			<span>s</span><span>.</span><span>br</span><span>.</span><span>release</span><span>(</span><span>s</span><span>.</span><span>offset</span><span>)</span>
+			<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>0</span>
+			<span>return</span> <span>c</span>
+		<span>}</span>
+		<span>if</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>extend</span><span>()</span> <span>==</span> <span>0</span> <span>{</span>
+			<span>// eof</span>
+			<span>return</span> <span>0</span>
+		<span>}</span>
+		<span>w</span> <span>=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()[</span><span>s</span><span>.</span><span>offset</span><span>:</span><span>]</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<div>
+<ul>
+<li>
+<p>We start by getting the current window from the <code>byteReader</code>.
+This is a <code>[]byte</code> slice of all the data that is yet to be read.</p>
+</li>
+<li>
+<p>We’re looking for the first non whitespace character.
+If the character is a whitespace we increment <code>s.offset</code> to ignore the character and loop around.</p>
+</li>
+<li>
+<p>If we do find a non whitespace character, we release <code>s.offset</code> characters from the front of the window.
+Now the start of the window is properly aligned with the first character of the token.</p>
+</li>
+<li>
+<p>It turns out that we also get the first character of the token for free, it’s in <code>c</code>, so we can return that as a hint to <code>Scanner.Next</code>.</p>
+</li>
+<li>
+<p>If we run out of characters without hitting a token then we called <code>extend()</code> to grow the window.</p>
+</li>
+<li>
+<p>If we couldn’t grow, then we’ve run out of input and haven’t got a token, so give up.</p>
+</li>
+<li>
+<p>Otherwise update <code>w</code> with a new window.</p>
+</li>
+</ul>
+</div>
+<p>Some things to note:</p>
+<div>
+<ul>
+<li>
+<p>Note the lack of error handling, it’s not part of the inner loop, it only happens when we have to read more data from the underlying reader via <code>extend</code>. <sup>[<a id="_footnoteref_4" href="#_footnotedef_4" title="View footnote.">4</a>]</sup></p>
+</li>
+<li>
+<p><code>extend</code> hides the process of reading into, growing, refilling the buffer, etc. The makes the caller--<code>Scanner.token</code>--simpler; if there is data in the window, process it, extend if you need too. If you can’t extend, give up.</p>
+</li>
+<li>
+<p><code>release</code> is similar, it shrinks the start of the window to exclude data that no longer care about.</p>
+</li>
+<li>
+<p><code>extend</code> is not in the hot path, so there is no need to optimise it, its performance is a function of the buffer it is given.
+In practice an initial buffer of 8k is sufficient.</p>
+</li>
+</ul>
+</div>
+<p>Let’s talk about the performance of this code.</p>
+<div>
+<pre><code>name                     time/op
+Scanner/canada-16         4.41ms ± 2%
+Scanner/citm_catalog-16   2.55ms ± 3%
+Scanner/twitter-16        1.03ms ± 1%
+Scanner/code-16           4.21ms ± 1%
+Scanner/example-16        21.4µs ± 1%
+Scanner/sample-16          822µs ± 1%
+
+name                     speed
+Scanner/canada-16        510MB/s ± 2%
+Scanner/citm_catalog-16  677MB/s ± 3%
+Scanner/twitter-16       615MB/s ± 1%
+Scanner/code-16          461MB/s ± 1%
+Scanner/example-16       608MB/s ± 1%
+Scanner/sample-16        837MB/s ± 1%</code></pre>
+</div>
+<p>Comparing the performance of <code>Scanner.Next</code> to our whitespace benchmark we can see that we’re between 1/4 and 2/5ths of our baseline.</p>
+<p>Let’s talk about improvements we can make to the code.
+Note the amount of work being spent to keep <code>s.offset</code> up to date.
+We know that <code>s.offset</code> is set to 0 just before <code>Scanner.Next</code> calls this function, and we set <code>s.offset</code> to zero on the way out of the function, so the changes we make to <code>s.offset</code> within the function are invisible—​it’s zero on entry, and zero on exit.</p>
+<p>We can rewrite the function to keep a local <code>offset</code> value, which has an impressive effect on <code>token</code>.</p>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>s</span> <span>*</span><span>Scanner</span><span>)</span> <span>token</span><span>()</span> <span>byte</span> <span>{</span>
+	<span>w</span> <span>:=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()</span>
+	<span>offset</span> <span>:=</span> <span>0</span>
+	<span>for</span> <span>{</span>
+		<span>for</span> <span>_</span><span>,</span> <span>c</span> <span>:=</span> <span>range</span> <span>w</span> <span>{</span>
+			<span>if</span> <span>whitespace</span><span>[</span><span>c</span><span>]</span> <span>{</span>
+				<span>offset</span><span>++</span>
+				<span>continue</span>
+			<span>}</span>
+
+			<span>// release whitespace</span>
+			<span>s</span><span>.</span><span>br</span><span>.</span><span>release</span><span>(</span><span>offset</span><span>)</span>
+			<span>return</span> <span>c</span>
+		<span>}</span>
+		<span>if</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>extend</span><span>()</span> <span>==</span> <span>0</span> <span>{</span>
+			<span>// eof</span>
+			<span>return</span> <span>0</span>
+		<span>}</span>
+		<span>w</span> <span>=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()[</span><span>offset</span><span>:</span><span>]</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<div>
+<pre><code>name                     old time/op    new time/op    delta
+Scanner/canada-16          4.39ms ± 1%    4.43ms ± 4%     ~     (p=1.000 n=5+5)
+Scanner/citm_catalog-16    2.52ms ± 1%    1.80ms ± 4%  -28.46%  (p=0.008 n=5+5)
+Scanner/twitter-16         1.03ms ± 2%    0.95ms ± 3%   -7.41%  (p=0.008 n=5+5)
+Scanner/code-16            4.24ms ± 2%    4.18ms ± 1%     ~     (p=0.095 n=5+5)
+Scanner/example-16         21.4µs ± 1%    18.9µs ± 2%  -11.68%  (p=0.008 n=5+5)
+Scanner/sample-16           828µs ± 2%     528µs ± 2%  -36.24%  (p=0.008 n=5+5)
+
+name                     old speed      new speed      delta
+Scanner/canada-16         512MB/s ± 1%   509MB/s ± 4%     ~     (p=1.000 n=5+5)
+Scanner/citm_catalog-16   685MB/s ± 1%   958MB/s ± 4%  +39.84%  (p=0.008 n=5+5)
+Scanner/twitter-16        616MB/s ± 2%   665MB/s ± 3%   +8.01%  (p=0.008 n=5+5)
+Scanner/code-16           458MB/s ± 2%   465MB/s ± 1%     ~     (p=0.095 n=5+5)
+Scanner/example-16        608MB/s ± 1%   688MB/s ± 2%  +13.23%  (p=0.008 n=5+5)
+Scanner/sample-16         831MB/s ± 2%  1303MB/s ± 2%  +56.84%  (p=0.008 n=5+5)</code></pre>
+</div>
+<p>By keeping <code>offset</code> local the compiler avoided those temporary writes back to memory.
+The question I have for you is why did this improve some inputs and not others?</p>
+<p>The answer is different inputs have different amounts of whitespace.
+For example <code>canada</code> only has 33 whitespace characters whereas <code>citm</code> has 1,227,563.</p>
+<details>
+<summary>Quiz me after the talk why the compiler can’t optimise these writes away.</summary>
+
+</details>
+<div>
+<h3 id="_inlining"><a href="#_inlining"></a><a href="#_inlining">Inlining</a></h3>
+<p>There is a larger improvement we can make for the runtime of this code, and it relates to inlining.
+Inlining is the process of automatically (or manually) copying the body of a function into, <em>in line with</em>, its caller.
+This avoids the overhead of the function call.</p>
+<p>The Go compiler has reasonable support for inlining, but has a number of limitations.</p>
+<div>
+<pre><code> % go build -gcflags=-m=2 2&gt;&amp;1 | grep cannot | grep -v decoder
+./reader.go:31:6: cannot inline (*byteReader).extend: function too complex: cost 198 exceeds budget 80
+./scanner.go:99:6: cannot inline (*Scanner).token: unhandled op FOR
+./scanner.go:130:6: cannot inline validateToken: unhandled op FOR
+./scanner.go:153:6: cannot inline parseString: unhandled op FOR
+./scanner.go:182:6: cannot inline (*Scanner).parseNumber: unhandled op FOR
+./scanner.go:56:6: cannot inline (*Scanner).Next: function too complex: cost 476 exceeds budget 80</code></pre>
+</div>
+<p>The first is the size of the function, <code>byteReader.extend</code> cannot be inlined because it is too complex.
+<sup>[<a id="_footnoteref_5" href="#_footnotedef_5" title="View footnote.">5</a>]</sup>
+The second is statements within the function, <code>Scanner.token</code> cannot be inlined because it contains a <code>for</code> statement.</p>
+<p>Let’s go back to the constraints:</p>
+<div>
+<ul>
+<li>
+<p><code>Scanner.Next</code> is called for each token in the input.</p>
+</li>
+<li>
+<p>This means that <code>Scanner.token</code> is called for each token in the input.</p>
+</li>
+<li>
+<p><code>Scanner.token</code> cannot be automatically inlined into its caller because it is too complex.</p>
+</li>
+<li>
+<p>Therefore we’re paying <em>two</em> function calls per token.</p>
+</li>
+</ul>
+</div>
+<p>We can remove one of these by manually inlining <code>Scanner.token</code> into its caller.</p>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>s</span> <span>*</span><span>Scanner</span><span>)</span> <span>Next</span><span>()</span> <span>[]</span><span>byte</span> <span>{</span>
+	<span>// release the previous token</span>
+	<span>s</span><span>.</span><span>br</span><span>.</span><span>release</span><span>(</span><span>s</span><span>.</span><span>offset</span><span>)</span>
+	<span>w</span> <span>:=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()</span>
+	<span>offset</span> <span>:=</span> <span>0</span>
+	<span>for</span> <span>{</span>
+		<span>for</span> <span>_</span><span>,</span> <span>c</span> <span>:=</span> <span>range</span> <span>w</span> <span>{</span>
+			<span>if</span> <span>whitespace</span><span>[</span><span>c</span><span>]</span> <span>{</span>
+				<span>offset</span><span>++</span>
+				<span>continue</span>
+			<span>}</span>
+
+			<span>// release whitespace</span>
+			<span>s</span><span>.</span><span>br</span><span>.</span><span>release</span><span>(</span><span>offset</span><span>)</span>
+
+			<span>length</span> <span>:=</span> <span>0</span>
+			<span>switch</span> <span>c</span> <span>{</span>
+			<span>case</span> <span>ObjectStart</span><span>,</span> <span>ObjectEnd</span><span>,</span> <span>Colon</span><span>,</span> <span>Comma</span><span>,</span> <span>ArrayStart</span><span>,</span> <span>ArrayEnd</span><span>:</span>
+				<span>length</span> <span>=</span> <span>1</span>
+				<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>1</span>
+			<span>case</span> <span>True</span><span>:</span>
+				<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"true"</span><span>)</span>
+				<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+			<span>case</span> <span>False</span><span>:</span>
+				<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"false"</span><span>)</span>
+				<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+			<span>case</span> <span>Null</span><span>:</span>
+				<span>length</span> <span>=</span> <span>validateToken</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>,</span> <span>"null"</span><span>)</span>
+				<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+			<span>case</span> <span>String</span><span>:</span>
+				<span>// string</span>
+				<span>length</span> <span>=</span> <span>parseString</span><span>(</span><span>&amp;</span><span>s</span><span>.</span><span>br</span><span>)</span>
+				<span>if</span> <span>length</span> <span>&lt;</span> <span>2</span> <span>{</span>
+					<span>return</span> <span>nil</span>
+				<span>}</span>
+				<span>s</span><span>.</span><span>offset</span> <span>=</span> <span>length</span>
+			<span>default</span><span>:</span>
+				<span>// ensure the number is correct.</span>
+				<span>length</span> <span>=</span> <span>s</span><span>.</span><span>parseNumber</span><span>()</span>
+				<span>if</span> <span>length</span> <span>&lt;</span> <span>0</span> <span>{</span>
+					<span>return</span> <span>nil</span>
+				<span>}</span>
+			<span>}</span>
+			<span>return</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()[</span><span>:</span><span>length</span><span>]</span>
+		<span>}</span>
+		<span>if</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>extend</span><span>()</span> <span>==</span> <span>0</span> <span>{</span>
+			<span>// eof</span>
+			<span>return</span> <span>nil</span>
+		<span>}</span>
+		<span>w</span> <span>=</span> <span>s</span><span>.</span><span>br</span><span>.</span><span>window</span><span>()[</span><span>offset</span><span>:</span><span>]</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<p>The results support our thesis:</p>
+<div>
+<pre><code>name                     old time/op    new time/op    delta
+Scanner/canada-16          4.36ms ± 1%    3.50ms ± 0%  -19.68%  (p=0.008 n=5+5)
+Scanner/citm_catalog-16    1.80ms ± 1%    1.56ms ± 2%  -13.16%  (p=0.008 n=5+5)
+Scanner/twitter-16          965µs ± 2%     833µs ± 2%  -13.75%  (p=0.008 n=5+5)
+Scanner/code-16            4.15ms ± 1%    3.61ms ± 1%  -12.82%  (p=0.008 n=5+5)
+Scanner/example-16         18.9µs ± 2%    16.6µs ± 1%  -12.42%  (p=0.008 n=5+5)
+Scanner/sample-16           515µs ± 1%     472µs ± 2%   -8.34%  (p=0.008 n=5+5)
+
+name                     old speed      new speed      delta
+Scanner/canada-16         516MB/s ± 1%   642MB/s ± 0%  +24.50%  (p=0.008 n=5+5)
+Scanner/citm_catalog-16   960MB/s ± 1%  1105MB/s ± 2%  +15.16%  (p=0.008 n=5+5)
+Scanner/twitter-16        654MB/s ± 2%   759MB/s ± 1%  +15.94%  (p=0.008 n=5+5)
+Scanner/code-16           468MB/s ± 1%   537MB/s ± 1%  +14.69%  (p=0.008 n=5+5)
+Scanner/example-16        689MB/s ± 2%   787MB/s ± 1%  +14.17%  (p=0.008 n=5+5)
+Scanner/sample-16        1.33GB/s ± 1%  1.46GB/s ± 1%   +9.11%  (p=0.008 n=5+5)</code></pre>
+</div>
+<p>By saving the function call we’ve improved throughput by 9-24%.
+The largest improvement comes from <code>canada</code>, which basically contained no whitespace, so the call to <code>Scanner.token</code> almost always returned immediately having done no work!</p>
+<p>To recap the major optimisations were:</p>
+<div>
+<ul>
+<li>
+<p>Avoiding <code>s.offset</code> updates. They cannot be registerised, CPU has to do a write on every iteration.
+<code>s.offset</code> updates reduced from one per byte to one per token.</p>
+</li>
+<li>
+<p><code>Scanner.Next</code> and <code>Scanner.token</code> were effectively one function spread over two.
+Each are too large to be inlined, so we’re paying for an extra function call per token.
+Manually inlining them increased the indentation depth of the function, but delivered substantial speedups.</p>
+</li>
+<li>
+<p><em>Most</em> JSON contains some whitespace, it’s moderately optimised for human readability.
+It turns out, the more whitespace, the faster <code>pkg/json</code> decodes! <code>citm</code> is over 50% of the baseline, <code>sample</code> is nearly 75%.</p>
+</li>
+</ul>
+</div>
+<div>
+<p>Take away: Avoiding function calls <em>can</em> improve performance in the hot path.</p>
+</div>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_decoding"><a href="#_decoding"></a><a href="#_decoding">Decoding</a></h2>
+<div>
+<p>So far we have a <code>Scanner</code> which tokenises input at 50-75% of the whitespace baseline.
+But there are a few more things we need to make the scanner fully functional.</p>
+<p>The first part of that is validation.</p>
+<div>
+<h3 id="_validation"><a href="#_validation"></a><a href="#_validation">Validation</a></h3>
+<p>JSON is a state machine.
+Depending on the current token, only certain subsequent tokens are valid.
+For example, if you’ve read these tokens <code>{</code>, <code>"username"</code>, then the only valid token is <code>:</code>.
+To track this we need to layer some logic on top of <code>Scanner.Next</code> to assert that a sequence of token is valid.
+This is the role of <code>Decoder.NextToken</code>:</p>
+<div>
+<pre><code data-lang="go"><span>const</span> <span>(</span>
+	<span>stateValue</span>        <span>=</span> <span>0</span>
+	<span>stateObjectString</span> <span>=</span> <span>iota</span>
+	<span>stateObjectColon</span>
+	<span>stateObjectValue</span>
+	<span>stateObjectComma</span>
+	<span>stateArrayValue</span>
+	<span>stateArrayComma</span>
+	<span>stateEnd</span>
+<span>)</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+	<span>switch</span> <span>d</span><span>.</span><span>state</span> <span>{</span>
+	<span>case</span> <span>stateValue</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateObjectString</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectString</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateObjectColon</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectColon</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateObjectValue</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateObjectComma</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectComma</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateArrayValue</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateArrayValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateArrayComma</span><span>:</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateArrayComma</span><span>(</span><span>tok</span><span>)</span>
+	<span>case</span> <span>stateEnd</span><span>:</span>
+		<span>fallthrough</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+<p>This is pretty straightforward stuff.
+We take track the current state in <code>d.state</code> and based on its value we dispatch to the various state methods which assert token is valid and update the state.</p>
+<details>
+<summary>Click to see the source for the various <code>state</code> methods.</summary>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateObjectString</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>'}'</span><span>:</span>
+		<span>inObj</span> <span>:=</span> <span>d</span><span>.</span><span>pop</span><span>()</span>
+		<span>switch</span> <span>{</span>
+		<span>case</span> <span>d</span><span>.</span><span>len</span><span>()</span> <span>==</span> <span>0</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateEnd</span>
+		<span>case</span> <span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectComma</span>
+		<span>case</span> <span>!</span><span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayComma</span>
+		<span>}</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>'"'</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectColon</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateObjectString: missing string key"</span><span>)</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateObjectColon</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>Colon</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectValue</span>
+		<span>return</span> <span>d</span><span>.</span><span>NextToken</span><span>()</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateObjectColon: expecting colon"</span><span>)</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateObjectValue</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>'{'</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectString</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>true</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>'['</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayValue</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>false</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>default</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectComma</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateObjectComma</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>'}'</span><span>:</span>
+		<span>inObj</span> <span>:=</span> <span>d</span><span>.</span><span>pop</span><span>()</span>
+		<span>switch</span> <span>{</span>
+		<span>case</span> <span>d</span><span>.</span><span>len</span><span>()</span> <span>==</span> <span>0</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateEnd</span>
+		<span>case</span> <span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectComma</span>
+		<span>case</span> <span>!</span><span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayComma</span>
+		<span>}</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>Comma</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectString</span>
+		<span>return</span> <span>d</span><span>.</span><span>NextToken</span><span>()</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateObjectComma: expecting comma"</span><span>)</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateArrayValue</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>'{'</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectString</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>true</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>'['</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayValue</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>false</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>']'</span><span>:</span>
+		<span>inObj</span> <span>:=</span> <span>d</span><span>.</span><span>pop</span><span>()</span>
+		<span>switch</span> <span>{</span>
+		<span>case</span> <span>d</span><span>.</span><span>len</span><span>()</span> <span>==</span> <span>0</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateEnd</span>
+		<span>case</span> <span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectComma</span>
+		<span>case</span> <span>!</span><span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayComma</span>
+		<span>}</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>','</span><span>:</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateArrayValue: unexpected comma"</span><span>)</span>
+	<span>default</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayComma</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateArrayComma</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>']'</span><span>:</span>
+		<span>inObj</span> <span>:=</span> <span>d</span><span>.</span><span>pop</span><span>()</span>
+		<span>switch</span> <span>{</span>
+		<span>case</span> <span>d</span><span>.</span><span>len</span><span>()</span> <span>==</span> <span>0</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateEnd</span>
+		<span>case</span> <span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectComma</span>
+		<span>case</span> <span>!</span><span>inObj</span><span>:</span>
+			<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayComma</span>
+		<span>}</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>Comma</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayValue</span>
+		<span>return</span> <span>d</span><span>.</span><span>NextToken</span><span>()</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateArrayComma: expected comma, %v"</span><span>,</span> <span>d</span><span>.</span><span>stack</span><span>)</span>
+	<span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateValue</span><span>(</span><span>tok</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>'{'</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateObjectString</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>true</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>'['</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateArrayValue</span>
+		<span>d</span><span>.</span><span>push</span><span>(</span><span>false</span><span>)</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>case</span> <span>','</span><span>:</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateValue: unexpected comma"</span><span>)</span>
+	<span>default</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>stateEnd</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>nil</span>
+	<span>}</span>
+<span>}</span></code></pre>
+</div>
+</details>
+<p>Let’s look at the results.</p>
+<div>
+<pre>name                                           time/op
+DecoderNextToken/pkgjson/canada-16               5.64ms ± 1%
+DecoderNextToken/encodingjson/canada-16          65.1ms ± 1%
+DecoderNextToken/pkgjson/citm_catalog-16         2.42ms ± 2%
+DecoderNextToken/encodingjson/citm_catalog-16    19.8ms ± 1%
+DecoderNextToken/pkgjson/twitter-16              1.18ms ± 1%
+DecoderNextToken/encodingjson/twitter-16         12.1ms ± 0%
+DecoderNextToken/pkgjson/code-16                 6.10ms ± 2%
+DecoderNextToken/encodingjson/code-16            77.5ms ± 1%
+DecoderNextToken/pkgjson/example-16              25.2µs ± 1%
+DecoderNextToken/encodingjson/example-16          266µs ± 1%
+DecoderNextToken/pkgjson/sample-16                559µs ± 0%
+DecoderNextToken/encodingjson/sample-16          3.18ms ± 2%
+
+name                                           speed
+DecoderNextToken/pkgjson/canada-16              399MB/s ± 1%
+DecoderNextToken/encodingjson/canada-16        34.6MB/s ± 1%
+DecoderNextToken/pkgjson/citm_catalog-16        713MB/s ± 2%
+DecoderNextToken/encodingjson/citm_catalog-16  87.1MB/s ± 1%
+DecoderNextToken/pkgjson/twitter-16             537MB/s ± 1%
+DecoderNextToken/encodingjson/twitter-16       52.2MB/s ± 0%
+DecoderNextToken/pkgjson/code-16                318MB/s ± 2%
+DecoderNextToken/encodingjson/code-16          25.0MB/s ± 1%
+DecoderNextToken/pkgjson/example-16             517MB/s ± 1%
+DecoderNextToken/encodingjson/example-16       49.0MB/s ± 1%
+DecoderNextToken/pkgjson/sample-16             1.23GB/s ± 0%
+DecoderNextToken/encodingjson/sample-16         216MB/s ± 2%</pre>
+</div>
+<p>Compared to <code>encoding/json</code> we’re 8-10x faster.
+But there are some things we can do to improve:</p>
+</div>
+<div>
+<h3 id="_linear_search"><a href="#_linear_search"></a><a href="#_linear_search">Linear search</a></h3>
+<p>Central to the operation of <code>Decoder.NextToken</code> is the <code>switch</code> statement.
+In the general case, <code>switch</code> is implemented as a sequence of <code>if</code> statements.
+Effectively what the compiler sees is</p>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateValue</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateObjectString</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectString</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateObjectColon</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectColon</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateObjectValue</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateObjectComma</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateObjectComma</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateArrayValue</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateArrayValue</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>if</span> <span>d</span><span>.</span><span>state</span> <span>==</span> <span>stateArrayComma</span> <span>{</span>
+		<span>return</span> <span>d</span><span>.</span><span>stateArrayComma</span><span>(</span><span>tok</span><span>)</span>
+	<span>}</span>
+	<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+<span>}</span></code></pre>
+</div>
+<p><code>switch</code> is convenient, but not optimal in the hot path because that long sequence of <code>if</code> statements breaks up the instruction stream, and the puts pressure on the CPU’s branch predictor. Mispredicting a branch is expensive, the CPU has to flush the pipeline, rewind, and take the other branch.</p>
+<p>This problem turns up in many places; bytecode interpreters are a classic example.
+One of the optimisations we could make is is to turn this linear search into a table.
+This can be space efficient if the state space is small and dense (often it is not), and the result might be something like this</p>
+<div>
+<pre><code data-lang="go"><span>var</span> <span>stateTable</span> <span>=</span> <span>[</span><span>...</span><span>]</span><span>func</span><span>(</span><span>*</span><span>Decoder</span><span>,</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>){</span>
+	<span>stateValue</span><span>:</span>        <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateValue</span><span>,</span>
+	<span>stateObjectString</span><span>:</span> <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateObjectString</span><span>,</span>
+	<span>stateObjectColon</span><span>:</span>  <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateObjectColon</span><span>,</span>
+	<span>stateObjectValue</span><span>:</span>  <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateObjectValue</span><span>,</span>
+	<span>stateObjectComma</span><span>:</span>  <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateObjectComma</span><span>,</span>
+	<span>stateArrayValue</span><span>:</span>   <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateArrayValue</span><span>,</span>
+	<span>stateArrayComma</span><span>:</span>   <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateArrayComma</span><span>,</span>
+	<span>stateEnd</span><span>:</span>          <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateEnd</span><span>,</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+	<span>return</span> <span>stateTable</span><span>[</span><span>d</span><span>.</span><span>state</span><span>](</span><span>d</span><span>,</span> <span>tok</span><span>)</span>
+<span>}</span></code></pre>
+</div>
+<details>
+<summary>Unfortunately this won’t compile because there is an initalisation loop.</summary>
+<div>
+<pre><code>./decoder.go:115:5: initialization loop:
+        /Users/davecheney/devel/json/decoder.go:115:5: stateTable refers to
+        /Users/davecheney/devel/json/decoder.go:155:19: (*Decoder).stateObjectColon refers to
+        /Users/davecheney/devel/json/decoder.go:126:19: (*Decoder).NextToken refers to
+        /Users/davecheney/devel/json/decoder.go:115:5: stateTable
+FAIL    github.com/pkg/json [build failed\]</code></pre>
+</div>
+</details>
+<p>But there is a better trick that we <em>can</em> use that is more space efficient than this table, and is sometimes called a <em>computed goto</em>.</p>
+</div>
+<div>
+<h3 id="_computed_goto"><a href="#_computed_goto"></a><a href="#_computed_goto">Computed Goto</a></h3>
+<p>If you look at the table above there is a pattern.
+Each <code>state</code> enumeration is matched with exactly one method.
+What we store in <code>d.state</code> is a proxy for the method we want to call, but to call the method, we have to <code>switch</code> on <code>d.state</code> to find the appropriate method.</p>
+<p>What if we could just store the method directly and call it directly?
+And infact, we can do just that with some old Go 1.0 magic, <a href="https://golang.org/ref/spec#Method_expressions"><em>method expression</em></a>.</p>
+<div>
+<pre><code data-lang="go"><span>// A Decoder decodes JSON values from an input stream.</span>
+<span>type</span> <span>Decoder</span> <span>struct</span> <span>{</span>
+	<span>scanner</span> <span>*</span><span>Scanner</span>
+	<span>state</span>   <span>func</span><span>(</span><span>*</span><span>Decoder</span><span>,</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span>
+	<span>stack</span>   <span>// keeps track of whether we're in an object or array</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+	<span>return</span> <span>d</span><span>.</span><span>state</span><span>(</span><span>d</span><span>,</span> <span>tok</span><span>)</span>
+<span>}</span></code></pre>
+</div>
+<p>Let’s see how this performs.</p>
+<div>
+<pre><code>name                                           old time/op    new time/op    delta
+DecoderNextToken/pkgjson/canada-16               5.60ms ± 0%    5.61ms ± 0%     ~     (p=0.841 n=5+5)
+DecoderNextToken/encodingjson/canada-16          64.9ms ± 1%    64.4ms ± 0%     ~     (p=0.222 n=5+5)
+DecoderNextToken/pkgjson/citm_catalog-16         2.41ms ± 1%    2.42ms ± 1%     ~     (p=0.310 n=5+5)
+DecoderNextToken/encodingjson/citm_catalog-16    19.8ms ± 1%    19.7ms ± 1%     ~     (p=0.548 n=5+5)
+DecoderNextToken/pkgjson/twitter-16              1.17ms ± 1%    1.20ms ± 2%   +2.70%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/twitter-16         12.2ms ± 1%    12.1ms ± 1%     ~     (p=1.000 n=5+5)
+DecoderNextToken/pkgjson/code-16                 6.11ms ± 3%    6.37ms ± 4%   +4.26%  (p=0.016 n=5+5)
+DecoderNextToken/encodingjson/code-16            77.7ms ± 2%    78.6ms ± 2%     ~     (p=0.310 n=5+5)
+DecoderNextToken/pkgjson/example-16              25.0µs ± 0%    25.6µs ± 1%   +2.25%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/example-16          263µs ± 1%     265µs ± 2%     ~     (p=0.222 n=5+5)
+DecoderNextToken/pkgjson/sample-16                560µs ± 1%     553µs ± 0%   -1.15%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/sample-16          3.16ms ± 1%    3.17ms ± 1%     ~     (p=0.690 n=5+5)
+
+name                                           old speed      new speed      delta
+DecoderNextToken/pkgjson/canada-16              402MB/s ± 0%   401MB/s ± 0%     ~     (p=0.841 n=5+5)
+DecoderNextToken/encodingjson/canada-16        34.7MB/s ± 1%  35.0MB/s ± 0%     ~     (p=0.222 n=5+5)
+DecoderNextToken/pkgjson/citm_catalog-16        716MB/s ± 1%   713MB/s ± 1%     ~     (p=0.310 n=5+5)
+DecoderNextToken/encodingjson/citm_catalog-16  87.3MB/s ± 1%  87.6MB/s ± 1%     ~     (p=0.548 n=5+5)
+DecoderNextToken/pkgjson/twitter-16             539MB/s ± 1%   524MB/s ± 2%   -2.62%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/twitter-16       51.9MB/s ± 1%  52.0MB/s ± 1%     ~     (p=1.000 n=5+5)
+DecoderNextToken/pkgjson/code-16                318MB/s ± 2%   305MB/s ± 3%   -4.07%  (p=0.016 n=5+5)
+DecoderNextToken/encodingjson/code-16          25.0MB/s ± 2%  24.7MB/s ± 2%     ~     (p=0.310 n=5+5)
+DecoderNextToken/pkgjson/example-16             521MB/s ± 0%   509MB/s ± 1%   -2.19%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/example-16       49.5MB/s ± 1%  49.1MB/s ± 2%     ~     (p=0.222 n=5+5)
+DecoderNextToken/pkgjson/sample-16             1.23GB/s ± 1%  1.24GB/s ± 0%   +1.16%  (p=0.008 n=5+5)
+DecoderNextToken/encodingjson/sample-16         218MB/s ± 1%   217MB/s ± 1%     ~     (p=0.690 n=5+5)</code></pre>
+</div>
+<p>The results aren’t that promising, but now we can unlock our final optimisation.</p>
+</div>
+<div>
+<h3 id="_outlining"><a href="#_outlining"></a><a href="#_outlining">Outlining</a></h3>
+<p>Compare the previous version of <code>Decoder.NextToken</code></p>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>EOF</span>
+	<span>}</span>
+	<span>return</span> <span>d</span><span>.</span><span>state</span><span>(</span><span>d</span><span>,</span> <span>tok</span><span>)</span>
+<span>}</span></code></pre>
+</div>
+<p>with the version after outlining.</p>
+<div>
+<pre><code data-lang="go"><span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>NextToken</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>return</span> <span>d</span><span>.</span><span>state</span><span>(</span><span>d</span><span>)</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>d</span> <span>*</span><span>Decoder</span><span>)</span> <span>stateObjectColon</span><span>()</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+	<span>tok</span> <span>:=</span> <span>d</span><span>.</span><span>scanner</span><span>.</span><span>Next</span><span>()</span>
+	<span>if</span> <span>len</span><span>(</span><span>tok</span><span>)</span> <span>&lt;</span> <span>1</span> <span>{</span>
+		<span>return</span> <span>nil</span><span>,</span> <span>io</span><span>.</span><span>ErrUnexpectedEOF</span>
+	<span>}</span>
+	<span>switch</span> <span>tok</span><span>[</span><span>0</span><span>]</span> <span>{</span>
+	<span>case</span> <span>Colon</span><span>:</span>
+		<span>d</span><span>.</span><span>state</span> <span>=</span> <span>(</span><span>*</span><span>Decoder</span><span>)</span><span>.</span><span>stateObjectValue</span>
+		<span>return</span> <span>d</span><span>.</span><span>NextToken</span><span>()</span>
+	<span>default</span><span>:</span>
+		<span>return</span> <span>tok</span><span>,</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"stateObjectColon: expecting colon"</span><span>)</span>
+	<span>}</span>
+<span>}</span>
+
+<span>// repeated for each Decoder.state... method</span></code></pre>
+</div>
+<p>Moving the <code>tok := d.scanner.Next()</code> call into each state method might seem like a step backwards, but it has several positive effects.</p>
+<div>
+<ul>
+<li>
+<p>The first is not passing <code>tok</code> into each state method.
+This saves 3 words on the call stack.</p>
+</li>
+<li>
+<p>The second is, by moving the <code>if len(tok) &lt; 1</code> into the same function as the  <code>switch</code>, it enables bounds check elimination.</p>
+<p>Previously, when the <code>len(tok)</code> check happened in <code>Decoder.NextToken</code>, <code>Decoder.stateObjectColon</code> doesn’t know anything about the length of <code>tok</code> because it can’t be inlined because we’re calling it via a method expression.
+When the compiler encounters <code>switch tok[0]</code>, it needs to put a bounds check to make sure <code>tok</code> is at least 1 element long.</p>
+<p>When the <code>if</code> check is moved into the same function, the compiler knows that if we get further than the check then <code>tok</code> is at least 1 element long, so the bounds check is not needed.</p>
+<p>We can see this in the debug information.</p>
+</li>
+</ul>
+</div>
+<div>
+<pre>% go build -gcflags=-d=ssa/prove/debug=2 2&gt;&amp;1 | grep 135\:
+./decoder.go:135:13: Proved IsInBounds (v31)</pre>
+</div>
+<div>
+<ul>
+<li>
+<p>The final optimisation occurs because <code>Decoder.NextToken</code>, which was previously too complex to inline</p>
+</li>
+</ul>
+</div>
+<div>
+<pre>./decoder.go:107:6: cannot inline (*Decoder).NextToken: function too complex: cost 145 exceeds budget 80</pre>
+</div>
+<p>is now inlinable</p>
+<div>
+<pre><code>./bench_test.go:217:29: inlining call to (*Decoder).NextToken method(*Decoder) func() ([]byte, error) { return d.state(d) }</code></pre>
+</div>
+<p>Which means, calls to <code>dec.NextToken()</code></p>
+<div>
+<pre><code data-lang="go"><span>for</span> <span>{</span>
+    <span>_</span><span>,</span> <span>err</span> <span>:=</span> <span>dec</span><span>.</span><span>NextToken</span><span>()</span>
+    <span>if</span> <span>err</span> <span>==</span> <span>io</span><span>.</span><span>EOF</span> <span>{</span>
+        <span>break</span>
+    <span>}</span>
+    <span>check</span><span>(</span><span>b</span><span>,</span> <span>err</span><span>)</span>
+    <span>n</span><span>++</span>
+<span>}</span></code></pre>
+</div>
+<p>becomes a direct call to the current state method.</p>
+<div>
+<pre><code data-lang="go"><span>for</span> <span>{</span>
+    <span>_</span><span>,</span> <span>err</span> <span>:=</span> <span>dec</span><span>.</span><span>state</span><span>(</span><span>dec</span><span>)</span> <span>// this is what the compiler sees</span>
+    <span>if</span> <span>err</span> <span>==</span> <span>io</span><span>.</span><span>EOF</span> <span>{</span>
+        <span>break</span>
+    <span>}</span>
+    <span>check</span><span>(</span><span>b</span><span>,</span> <span>err</span><span>)</span>
+    <span>n</span><span>++</span>
+<span>}</span></code></pre>
+</div>
+<p>Eliminating the cost of the function call.</p>
+</div>
+<div>
+<h3 id="_results"><a href="#_results"></a><a href="#_results">Results</a></h3>
+<p>At the lowest level <code>pkg/json.Scanner</code> can tokenize streaming JSON without allocation (provided it is supplied a few kilobytes of buffer).</p>
+<div>
+<pre><code>BenchmarkScanner/canada-16                  1561           3524005 ns/op         638.78 MB/s           0 B/op          0 allocs/op
+BenchmarkScanner/citm_catalog-16            3556           1555322 ns/op        1110.51 MB/s           0 B/op          0 allocs/op
+BenchmarkScanner/twitter-16                 7068            836031 ns/op         755.37 MB/s           0 B/op          0 allocs/op
+BenchmarkScanner/code-16                    1543           3640425 ns/op         533.03 MB/s           0 B/op          0 allocs/op
+BenchmarkScanner/example-16               341224             16362 ns/op         796.00 MB/s           0 B/op          0 allocs/op
+BenchmarkScanner/sample-16                 12771            467360 ns/op        1471.01 MB/s           0 B/op          0 allocs/op</code></pre>
+</div>
+<p>At the next level <code>pkg/json.Decoder.Token</code> is 2-3x faster than <code>encoding/json.Decoder.Token</code>.</p>
+<div>
+<pre><code>BenchmarkDecoderToken/pkgjson/canada-16                      267          22073095 ns/op         101.98 MB/s     4402914 B/op     222279 allocs/op
+BenchmarkDecoderToken/encodingjson/canada-16                  86          67830737 ns/op          33.19 MB/s    17740387 B/op     889106 allocs/op
+BenchmarkDecoderToken/pkgjson/citm_catalog-16               1114           5183226 ns/op         333.23 MB/s      965992 B/op      81995 allocs/op
+BenchmarkDecoderToken/encodingjson/citm_catalog-16           288          20882018 ns/op          82.71 MB/s     5661597 B/op     324692 allocs/op
+BenchmarkDecoderToken/pkgjson/twitter-16                    2356           2467042 ns/op         255.98 MB/s      768354 B/op      38992 allocs/op
+BenchmarkDecoderToken/encodingjson/twitter-16                471          12606205 ns/op          50.10 MB/s     3584017 B/op     187319 allocs/op
+BenchmarkDecoderToken/pkgjson/code-16                        346          16877006 ns/op         114.98 MB/s     4304233 B/op     320235 allocs/op
+BenchmarkDecoderToken/encodingjson/code-16                    73          80255994 ns/op          24.18 MB/s    23355962 B/op    1319125 allocs/op
+BenchmarkDecoderToken/pkgjson/example-16                  113912             53083 ns/op         245.35 MB/s       16016 B/op        914 allocs/op
+BenchmarkDecoderToken/encodingjson/example-16              21734            273991 ns/op          47.53 MB/s       82416 B/op       4325 allocs/op
+BenchmarkDecoderToken/pkgjson/sample-16                     6642            871796 ns/op         788.59 MB/s      213761 B/op       5081 allocs/op
+BenchmarkDecoderToken/encodingjson/sample-16                1803           3287623 ns/op         209.12 MB/s      723782 B/op      26095 allocs/op</code></pre>
+</div>
+<p>Because allocations make up a large proportion of the <code>Decoder.Token</code> API, <code>pkg/json.Decoder</code> provides an alternative API that produces significantly fewer allocations and is 8-10x faster.</p>
+<div>
+<pre><code>BenchmarkDecoderNextToken/pkgjson/canada-16                 1197           4825232 ns/op         466.52 MB/s         136 B/op          3 allocs/op
+BenchmarkDecoderNextToken/encodingjson/canada-16              90          65392440 ns/op          34.42 MB/s    17740399 B/op     889106 allocs/op
+BenchmarkDecoderNextToken/pkgjson/citm_catalog-16           2709           2162849 ns/op         798.58 MB/s         136 B/op          3 allocs/op
+BenchmarkDecoderNextToken/encodingjson/citm_catalog-16       301          20064314 ns/op          86.08 MB/s     5661597 B/op     324692 allocs/op
+BenchmarkDecoderNextToken/pkgjson/twitter-16                5395           1068106 ns/op         591.25 MB/s         152 B/op          4 allocs/op
+BenchmarkDecoderNextToken/encodingjson/twitter-16            494          12072956 ns/op          52.31 MB/s     3584013 B/op     187319 allocs/op
+BenchmarkDecoderNextToken/pkgjson/code-16                   1135           5124666 ns/op         378.65 MB/s         248 B/op          6 allocs/op
+BenchmarkDecoderNextToken/encodingjson/code-16                74          77579973 ns/op          25.01 MB/s    23355955 B/op    1319125 allocs/op
+BenchmarkDecoderNextToken/pkgjson/example-16              269010             22323 ns/op         583.43 MB/s         152 B/op          4 allocs/op
+BenchmarkDecoderNextToken/encodingjson/example-16          22707            264078 ns/op          49.32 MB/s       82416 B/op       4325 allocs/op
+BenchmarkDecoderNextToken/pkgjson/sample-16                10000            510445 ns/op        1346.85 MB/s        1144 B/op          9 allocs/op
+BenchmarkDecoderNextToken/encodingjson/sample-16            1836           3161804 ns/op         217.44 MB/s      723781 B/op      26095 allocs/op</code></pre>
+</div>
+<p>At the highest level, <code>pkg/json</code> can unmarshal data into a Go object with the same API as <code>encoding/json</code>.</p>
+<div>
+<pre><code>BenchmarkDecoderDecodeInterfaceAny/pkgjson/canada-16                 217          27425893 ns/op          82.08 MB/s     8747163 B/op     281408 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/canada-16            153          38347477 ns/op          58.70 MB/s    20647616 B/op     392553 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/pkgjson/citm_catalog-16           747           8008839 ns/op         215.66 MB/s     5197853 B/op      89673 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/citm_catalog-16      360          16607501 ns/op         104.00 MB/s     9406809 B/op      95389 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/pkgjson/twitter-16               1606           3714515 ns/op         170.01 MB/s     2130731 B/op      30182 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/twitter-16           862           6927998 ns/op          91.15 MB/s     4283407 B/op      31278 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/pkgjson/code-16                   333          17939351 ns/op         108.17 MB/s     7331643 B/op     232059 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/code-16              236          25324951 ns/op          76.62 MB/s    12332753 B/op     271292 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/pkgjson/example-16              76874             78079 ns/op         166.81 MB/s       50980 B/op        739 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/example-16         40886            146685 ns/op          88.79 MB/s       82855 B/op        782 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/pkgjson/sample-16                5240           1116081 ns/op         615.99 MB/s      399970 B/op       5542 allocs/op
+BenchmarkDecoderDecodeInterfaceAny/encodingjson/sample-16           1123           5369313 ns/op         128.04 MB/s     2661872 B/op       7527 allocs/op</code></pre>
+</div>
+</div>
+</div>
+</div>
+<div>
+<h2 id="_thematic_ideas"><a href="#_thematic_ideas"></a><a href="#_thematic_ideas">Thematic ideas</a></h2>
+<div>
+<div>
+<dl>
+<dt>Allocations affect performance</dt>
+<dd>
+<p>The garbage collector might be fast to allocate and efficient to collect, but not allocating will always be faster.</p>
+</dd>
+<dt>Eliminating allocations through API design</dt>
+<dd>
+<p>Most of the speedups of this package come from reducing allocations; specifically the time <em>not</em> spent in the heap allocation path, and the time not spent in GC cycles, is available for scanning.</p>
+</dd>
+<dt>API design influences performance</dt>
+<dd>
+<p>The <code>encoding/json.Decoder</code> API <em>requires</em> allocations as returning a primitive value via an interface causes it to escape to the heap — it effectively becomes a pointer to the value.
+When dealing with <em>data</em>, allocations, can be the biggest performance cost of an algorithm.
+You’re benchmarking the garbage collector at that point.</p>
+</dd>
+<dt>Careful attention to the per byte and per token overheads</dt>
+<dd>
+<p>Optimising the hot path to convert functions per byte into per token functions is the second biggest performance win.</p>
+</dd>
+</dl>
+</div>
+<p>I started this project because I wanted to apply some ideas that I had seen to a problem in Go.
+I believed that it was possible implement an efficient JSON parser based on my <em>assumption</em> that <code>encoding/json</code> was slower than it could be because of its API.</p>
+<p>It turned out there is 2-3x performance in some unmarshalling paths and between 8x and 10x performance in tokenisation, if you’re prepared to accept a different API.</p>
+<h2 id="_thank_you">Thank you</h2>
+<div>
+<ul>
+<li>
+<p>Thank you to Valentine and all the GopherCon Singapore organisers. ❤️</p>
+</li>
+<li>
+<p>Link to this presentation: <a href="https://dave.cheney.net/paste/gophercon-sg-2023.html">dave.cheney.net/paste/gophercon-sg-2023.html</a></p>
+<p><span><img src="https://dave.cheney.net/paste/diag-qrcode-md5-0418cdece501fe14783856b5d8a300dd.svg" alt="Diagram" width="165" height="165"></span></p>
+</li>
+<li>
+<p>Link to the code: <a href="https://github.com/pkg/json">github.com/pkg/json</a></p>
+<p><span><img src="https://dave.cheney.net/paste/diag-qrcode-md5-047ae2db0a30168cd212a1253f2862b5.svg" alt="Diagram" width="145" height="145"></span></p>
+</li>
+</ul>
+</div>
+</div>
+</div>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Exclusive access for LLM companies to largest Chinese nonfiction book collection (163 pts)]]></title>
             <link>https://annas-blog.org/duxiu-exclusive.html</link>
             <guid>38149093</guid>
             <pubDate>Sun, 05 Nov 2023 07:30:00 GMT</pubDate>
@@ -85,7 +1435,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Grok (163 pts)]]></title>
+            <title><![CDATA[Grok (166 pts)]]></title>
             <link>https://twitter.com/xai/status/1721027348970238035</link>
             <guid>38148396</guid>
             <pubDate>Sun, 05 Nov 2023 05:02:33 GMT</pubDate>
@@ -93,7 +1443,7 @@
 <div id="readability-page-1" class="page"><div id="ScriptLoadFailure"><form action="" method="GET"><div><p><span>Something went wrong, but don’t fret — let’s give it another shot.</span></p><br></div></form></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The world nearly adopted a calendar with 13 months of 28 days (101 pts)]]></title>
+            <title><![CDATA[The world nearly adopted a calendar with 13 months of 28 days (103 pts)]]></title>
             <link>https://www.washingtonpost.com/history/2023/11/04/battle-sabbath-13-month-calendar/</link>
             <guid>38147981</guid>
             <pubDate>Sun, 05 Nov 2023 03:53:41 GMT</pubDate>
@@ -1338,7 +2688,7 @@ Couldn't get https://www.washingtonpost.com/history/2023/11/04/battle-sabbath-13
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Daylight saving time can seriously affect your health (114 pts)]]></title>
+            <title><![CDATA[Daylight saving time can seriously affect your health (115 pts)]]></title>
             <link>https://apnews.com/article/daylight-saving-2023-fall-back-a3738d5c74301b8068825927c49fc6b4</link>
             <guid>38146837</guid>
             <pubDate>Sun, 05 Nov 2023 00:47:48 GMT</pubDate>
@@ -1374,7 +2724,7 @@ Couldn't get https://www.washingtonpost.com/history/2023/11/04/battle-sabbath-13
                                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Soda additive linked to thyroid toxicity may finally get banned by FDA (117 pts)]]></title>
+            <title><![CDATA[Soda additive linked to thyroid toxicity may finally get banned by FDA (120 pts)]]></title>
             <link>https://arstechnica.com/health/2023/11/50-years-later-fda-proposes-banning-a-food-additive-it-said-is-not-safe/</link>
             <guid>38146696</guid>
             <pubDate>Sun, 05 Nov 2023 00:26:25 GMT</pubDate>
@@ -1417,7 +2767,7 @@ Couldn't get https://www.washingtonpost.com/history/2023/11/04/battle-sabbath-13
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[My experience taking Tesla to court about FSD (128 pts)]]></title>
+            <title><![CDATA[My experience taking Tesla to court about FSD (130 pts)]]></title>
             <link>https://teslamotorsclub.com/tmc/threads/my-experience-taking-tesla-to-court-about-fsd.315086/</link>
             <guid>38146676</guid>
             <pubDate>Sun, 05 Nov 2023 00:23:40 GMT</pubDate>
@@ -1433,7 +2783,111 @@ Couldn't get https://teslamotorsclub.com/tmc/threads/my-experience-taking-tesla-
 Couldn't get https://www.thelocal.se/20231103/tesla-strike-widens-as-swedish-union-expands-blockade: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[SARS-CoV-2 Infection Affects Energy Stores in the Body, Causing Organ Failure (172 pts)]]></title>
+            <title><![CDATA[Show HN: Gogosseract, a Go Lib for CGo-Free Tesseract OCR via Wazero (101 pts)]]></title>
+            <link>https://github.com/Danlock/gogosseract</link>
+            <guid>38146154</guid>
+            <pubDate>Sat, 04 Nov 2023 23:06:34 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.com/Danlock/gogosseract">https://github.com/Danlock/gogosseract</a>, See on <a href="https://news.ycombinator.com/item?id=38146154">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div data-target="readme-toc.content">
+            <article itemprop="text"><h2 tabindex="-1" id="user-content-gogosseract" dir="auto"><a href="#gogosseract">gogosseract</a></h2>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer nofollow" href="https://camo.githubusercontent.com/41980b085ca17919db5aaee09256f29cae56f4b5bc0317394082ac7dc3ae9c97/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f436f7665726167652d37302e342532352d627269676874677265656e"><img src="https://camo.githubusercontent.com/41980b085ca17919db5aaee09256f29cae56f4b5bc0317394082ac7dc3ae9c97/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f436f7665726167652d37302e342532352d627269676874677265656e" alt="Coverage" data-canonical-src="https://img.shields.io/badge/Coverage-70.4%25-brightgreen"></a>
+<a href="https://goreportcard.com/report/github.com/danlock/gogosseract" rel="nofollow"><img src="https://camo.githubusercontent.com/a02d20523f0e90a38253e51b11b0959c629f3efbd518b32a4fcf1e18dc03eb85/68747470733a2f2f676f7265706f7274636172642e636f6d2f62616467652f6769746875622e636f6d2f64616e6c6f636b2f676f676f73736572616374" alt="Go Report Card" data-canonical-src="https://goreportcard.com/badge/github.com/danlock/gogosseract"></a>
+<a href="https://pkg.go.dev/github.com/danlock/gogosseract" rel="nofollow"><img src="https://camo.githubusercontent.com/6a26164bd0b77c89ebb91fc5536da3bcf58ee80eb5e6210428b3f869d2d85467/68747470733a2f2f706b672e676f2e6465762f62616467652f6769746875622e636f6d2f64616e6c6f636b2f676f676f737365726163742e737667" alt="Go Reference" data-canonical-src="https://pkg.go.dev/badge/github.com/danlock/gogosseract.svg"></a></p>
+<p dir="auto">A reimplementation of <a href="https://github.com/otiai10/gosseract">https://github.com/otiai10/gosseract</a> without CGo, running Tesseract compiled to WASM with Emscripten via Wazero.</p>
+<p dir="auto">Tesseract is an Optical Character Recognition library written in C++.</p>
+<p dir="auto">The WASM is generated from my <a href="https://github.com/Danlock/tesseract-wasm">personal</a> fork of robertknight's well written tesseract-wasm project.</p>
+<p dir="auto">Note that Tesseract is only compiled with support for the LSTM neural network OCR engine, and not for "classic" Tesseract.</p>
+<h2 tabindex="-1" id="user-content-training-data" dir="auto"><a href="#training-data">Training Data</a></h2>
+<p dir="auto">Tesseract requires training data in order to accurately recognize text. The official source is <a href="https://github.com/tesseract-ocr/tessdata_fast">here</a>. Strategies for dealing with this include downloading it at runtime, or embedding the file within your Go binary using go:embed at compile time.</p>
+<h2 tabindex="-1" id="user-content-accuracy" dir="auto"><a href="#accuracy">Accuracy</a></h2>
+<p dir="auto">Tesseract can work better if the input images are preprocessed. See this page for tips.</p>
+<p dir="auto"><a href="https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html" rel="nofollow">https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html</a></p>
+<h2 tabindex="-1" id="user-content-examples" dir="auto"><a href="#examples">Examples</a></h2>
+<p dir="auto">Using Tesseract to parse text from an image.</p>
+<div data-snippet-clipboard-copy-content="    trainingDataFile, err := os.Open(&quot;eng.traineddata&quot;)
+    handleErr(err)
+
+    cfg := gogosseract.Config{
+        Language: &quot;eng&quot;,
+        TrainingData: trainingDataFile,
+    }
+    // While Tesseract's logs are very useful for debugging, you have the option to silence or redirect it
+    cfg.Stderr = io.Discard
+    cfg.Stdout = io.Discard
+    // Compile the Tesseract WASM and run it, loading in the TrainingData and setting any Config Variables provided
+    tess, err := gogosseract.New(ctx, cfg)
+    handleErr(err)
+
+    imageFile, err := os.Open(&quot;image.png&quot;)
+    handleErr(err)
+
+    err = tess.LoadImage(ctx, imageFile, gogosseract.LoadImageOptions{})
+    handleErr(err)
+
+    text, err = tess.GetText(ctx, func(progress int32) { log.Printf(&quot;Tesseract parsing is %d%% complete.&quot;, progress) })
+    handleErr(err)
+    // Closing the Tesseract instance will clean up everything used by Tesseract and it's WASM module
+    handleErr(tess.Close(ctx))"><pre><code>    trainingDataFile, err := os.Open("eng.traineddata")
+    handleErr(err)
+
+    cfg := gogosseract.Config{
+        Language: "eng",
+        TrainingData: trainingDataFile,
+    }
+    // While Tesseract's logs are very useful for debugging, you have the option to silence or redirect it
+    cfg.Stderr = io.Discard
+    cfg.Stdout = io.Discard
+    // Compile the Tesseract WASM and run it, loading in the TrainingData and setting any Config Variables provided
+    tess, err := gogosseract.New(ctx, cfg)
+    handleErr(err)
+
+    imageFile, err := os.Open("image.png")
+    handleErr(err)
+
+    err = tess.LoadImage(ctx, imageFile, gogosseract.LoadImageOptions{})
+    handleErr(err)
+
+    text, err = tess.GetText(ctx, func(progress int32) { log.Printf("Tesseract parsing is %d%% complete.", progress) })
+    handleErr(err)
+    // Closing the Tesseract instance will clean up everything used by Tesseract and it's WASM module
+    handleErr(tess.Close(ctx))
+</code></pre></div>
+<p dir="auto">Using a Pool of Tesseract workers for thread safe concurrent image parsing.</p>
+<div data-snippet-clipboard-copy-content="    cfg := gogosseract.Config{
+        Language: &quot;eng&quot;,
+        TrainingData: trainingDataFile,
+    }
+    // Create 10 Tesseract instances that can process image requests concurrently.
+    pool, err := gogosseract.NewPool(ctx, 10, gogosseract.PoolConfig{Config: cfg})
+    handleErr(err)
+    defer Pool.Close()
+
+    // ParseImage loads the image and waits until the Tesseract worker sends back your result.
+    hocr, err := pool.ParseImage(ctx, img, gogosseract.ParseImageOptions{
+        IsHOCR: true,
+    })
+    handleErr(err)
+"><pre><code>    cfg := gogosseract.Config{
+        Language: "eng",
+        TrainingData: trainingDataFile,
+    }
+    // Create 10 Tesseract instances that can process image requests concurrently.
+    pool, err := gogosseract.NewPool(ctx, 10, gogosseract.PoolConfig{Config: cfg})
+    handleErr(err)
+    defer Pool.Close()
+
+    // ParseImage loads the image and waits until the Tesseract worker sends back your result.
+    hocr, err := pool.ParseImage(ctx, img, gogosseract.ParseImageOptions{
+        IsHOCR: true,
+    })
+    handleErr(err)
+
+</code></pre></div>
+</article>
+          </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[SARS-CoV-2 Infection Affects Energy Stores in the Body, Causing Organ Failure (174 pts)]]></title>
             <link>https://news.unchealthcare.org/2023/10/researchers-show-sars-cov-2-infection-affects-energy-stores-in-the-body-causing-organ-failure/</link>
             <guid>38146122</guid>
             <pubDate>Sat, 04 Nov 2023 23:02:13 GMT</pubDate>
@@ -1458,7 +2912,7 @@ Couldn't get https://www.thelocal.se/20231103/tesla-strike-widens-as-swedish-uni
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[New Microsoft Exchange zero-days allow RCE, data theft attacks (150 pts)]]></title>
+            <title><![CDATA[New Microsoft Exchange zero-days allow RCE, data theft attacks (151 pts)]]></title>
             <link>https://www.bleepingcomputer.com/news/microsoft/new-microsoft-exchange-zero-days-allow-rce-data-theft-attacks/</link>
             <guid>38145461</guid>
             <pubDate>Sat, 04 Nov 2023 21:43:19 GMT</pubDate>
@@ -1494,7 +2948,7 @@ Couldn't get https://www.thelocal.se/20231103/tesla-strike-widens-as-swedish-uni
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The cottage industry of YouTube obituary pirates (126 pts)]]></title>
+            <title><![CDATA[The cottage industry of YouTube obituary pirates (128 pts)]]></title>
             <link>https://www.wired.com/story/youtube-obituary-pirates/</link>
             <guid>38145054</guid>
             <pubDate>Sat, 04 Nov 2023 20:58:15 GMT</pubDate>
@@ -1502,7 +2956,7 @@ Couldn't get https://www.thelocal.se/20231103/tesla-strike-widens-as-swedish-uni
 <div id="readability-page-1" class="page"><div data-testid="ArticlePageChunks"><div data-journey-hook="client-content" data-testid="BodyWrapper"><p><span>A few weeks</span> ago, a friend of mine found out that a childhood classmate had died unexpectedly. They hadn’t stayed in touch, but he was sad and curious about what had happened, so he did what people do when they hear that someone they know has passed away: Googled her obituary. What he found was odd—so much so that he texted to ask if I’d ever heard of such a thing. Along with pages hosting her official obit, he saw 10 separate YouTube videos of different people casually reciting information about her death.</p><p>He’s now part of a group united by an unsettling but increasingly commonplace experience. People who lose somebody, whether it’s a dearly cherished family member or a long-lost acquaintance, must now navigate a slimy cottage industry of profiteers trying to hijack their attention. Instead of finding important funeral details or where to write a remembrance or send flowers, they are confronted by a flood of low-budget videos crudely summarizing the death notices of the person they’ve lost.</p><p><a href="https://www.wired.com/story/morbid-war-online-obituaries/">Obituary pirating</a>, where people scrape and republish obituaries from funeral homes and websites like Legacy.com, has been an ethically dubious business for years. Piracy websites are often skilled enough at search engine optimization to rise to the top of search results, and they use the resulting traffic to charge a premium for digital ads that appear next to text lifted wholesale from funeral homes, local newspapers, and other authorized obituary publishers. Occasionally, these pirate sites go a step further, manipulating bereaved people into <a data-offer-url="https://thebao.ca/notice-to-the-consumer-beware-of-online-obituary-piracy/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://thebao.ca/notice-to-the-consumer-beware-of-online-obituary-piracy/&quot;}" href="https://thebao.ca/notice-to-the-consumer-beware-of-online-obituary-piracy/" rel="nofollow noopener" target="_blank">buying sympathy gifts</a> like candles or flowers and pocketing the money.</p><p>The flood of YouTube obituary videos is a janky update on this practice. Some of these channels upload dozens of death notice summaries every hour, abandoning any pretense of looking like an official source of information in an effort to churn out as many videos as they can.</p><p><span>Although text-based obituary</span> pirating has been a scourge on the industry for years, these videos are a <a data-offer-url="https://www.marketingbrew.com/stories/2023/04/25/why-are-people-reading-obituaries-on-youtube" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.marketingbrew.com/stories/2023/04/25/why-are-people-reading-obituaries-on-youtube&quot;}" href="https://www.marketingbrew.com/stories/2023/04/25/why-are-people-reading-obituaries-on-youtube" rel="nofollow noopener" target="_blank">more recent phenomenon</a>. “This is a new one for me,” says Jessica Koth, director of public relations for the National Funeral Directors Association. “These videos are not sanctioned or authorized by the funeral home or family of the person who died. I would imagine they would be quite upsetting to the families involved.”</p><p>Unhappy posts about the practice abound on Reddit, where for the past few years people have complained about how tasteless it is and wondered why it is happening and whether they can do anything to stop it. “These people are monetizing our loved ones’ deaths,” says one such message.</p></div><div data-journey-hook="client-content" data-testid="BodyWrapper"><p>“It’s predatory toward people who are heavily grieving,” says another. “If there’s nothing that can be done about this, that’s extremely sad.”</p><p>The more prolific channels upload new videos every few minutes. Many look nearly identical and feature men sitting alone and speaking directly to the camera. They often appear to be lounging at home. (It’s hard to verify exactly where they are; I reached out to the proprietors of several accounts, but none responded.) Others narrate obituaries over corny slideshows of candles and photos of the deceased sourced from social media. Their subscriber numbers are modest, making it all even more puzzling; on the higher end, channels will have a few thousand subscribers and millions of overall views. The highest follower count I found was slightly over 26,000; the page with the highest views had a grand total of around 1.7 million.</p><p>Sometimes these obituary YouTubers promote products in the video description, like a $225 vitamin C cream for sale on Amazon. Sometimes they just list strings of SEO-baiting keywords, like “death,” “cause of death,” “die,” “RIP,” and “what happened.” While each channel differs from the next in small ways, there’s a unifying aesthetic—everything looks rushed and careless, and there’s no hint of emotion or acknowledgement that they’re discussing someone’s greatest tragedy.</p><p>“The audio is crappy, they’ve got fans on,” funeral marketing consultant Robin Heppell says. “It’s not professionally done.”</p><p>That’s because the business model focuses on quantity over quality. Many of the videos have no views at all; when they do, they rarely crack double digits. The success or failure of individual videos isn’t important, as long as they accumulate enough views in the aggregate.</p><p>Despite their shoddiness, the obituary YouTube channels <em>are</em> sometimes amassing enough followers and views to meet YouTube’s Partner Program requirements and start making money off advertisements. (YouTube did not respond to requests for comment.)</p><p>Some of these YouTubers openly describe their projects as money-making ventures, like Quoddos Taunsvi, a Pakistan-based vlogger who <a href="https://www.youtube.com/@quddostaunsvi2300/about">brags</a> that following his videos will bring riches: “surely you will earn thounsands $ [sic] per month.” Others make glancing attempts to defend what they do. One channel includes a disclaimer about how its videos are protected by the fair use doctrine. According to intellectual property lawyer Bhamati Viswanathan, this is likely true. “Bummer for the families, but I don’t see what they could do other than appeal to the creators on grounds of taste, sensitivity, basic kindness,” she says.</p><p>The obituary pirates aren’t the only group explicitly trying to ramp up engagement on death-announcement content. <em>Editor &amp; Publisher</em> magazine, for example, hosted a <a href="https://www.youtube.com/watch?v=B2ogAXtuKoM">webinar</a> last year called “Optimizing obituaries to drive traffic and increase revenue.” Newspapers take out <a data-offer-url="https://ipublishmedia.com/biggest-surprise-targeted-obits-facebook-love/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://ipublishmedia.com/biggest-surprise-targeted-obits-facebook-love/&quot;}" href="https://ipublishmedia.com/biggest-surprise-targeted-obits-facebook-love/" rel="nofollow noopener" target="_blank">targeted ads</a> on Facebook specifically to draw more eyes to obituaries. But if local papers presumably have the community’s interests in mind when they share death notices, those reading obits on YouTube seem to be in it solely for the clicks.</p></div><div data-journey-hook="client-content" data-testid="BodyWrapper"><p>While some YouTubers exclusively post obituary content, others intersperse obituary readings with summaries of other news. One of these channels, Event Click, recently posted photos of an orangutan throwing a possum from its enclosure in Australia’s Perth Zoo. “I would presume it did not survive the fall,” says a robotic voice narrating the video. Before I could watch that video, I had to watch an ad from Etsy. (WIRED reached out to several companies whose ads appeared before obituary videos for comment, including BetterHelp, 1-800-Flowers, and Etsy. As of this writing, none have responded.)</p><p>Anjali Bal, a marketing professor at Babson College in Massachusetts, finds these videos “morbid and weird” and views the business strategy as ultimately short-sighted. They play on a surge of interest in keywords related to recent deaths, pumping out low-effort content in an attempt to capitalize on this temporary flow of web traffic. “In the short term it boosts the page,” she says. “In the long term these things are uncomfortable for the consumer and will not lead to long-term engagement.”</p><p><span>This genre, while</span> bizarre, does have analogs, albeit ones that seem far more aligned with the public interest. Short-form video is an increasingly central source of news, including videos that repackage original reporting from elsewhere for viewers with shorter attention spans. This isn’t always a bad thing; a TikToker named Kelsey Russell, for instance, has gained an audience by <a data-offer-url="https://embedded.substack.com/p/gen-z-loves-the-newspaper-on-tiktok" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://embedded.substack.com/p/gen-z-loves-the-newspaper-on-tiktok&quot;}" href="https://embedded.substack.com/p/gen-z-loves-the-newspaper-on-tiktok" rel="nofollow noopener" target="_blank">recapping</a> &nbsp;pieces from <em>The New York Times</em> for a younger generation. While the YouTube obituary videos lack Russell’s panache or thoughtfulness, the most generous reading is that they too recap information that audiences are seeking out in an easily-digestible form.</p><p>The rise of this type of video is also directly connected to a broad and enduring cultural fascination with mortality. Obituaries are big business because people are captivated by death; this is one reason serial-killer content has turned into such a reliably popular genre. “Reading obituaries seems like a budget version of the true crime format,” says Josh Cohen, founder of the creator-economy news website TubeFilter. As Cohen points out, YouTube is filled with people copying what works. “There’s tons of knockoffs,” he says.</p><p>In the past, obituary pirates have <a href="https://www.cbc.ca/news/canada/newfoundland-labrador/afterlife-obituary-class-action-lawsuit-1.5119601">been punished</a> for their misdeeds. In 2019, for example, a Canadian website called Afterlife that scraped and republished obituaries was ordered to pay $20 million (CDN) in restitution to grieving families. In that case, the class action plaintiffs successfully argued that lifting the obituaries and accompanying photos they’d put online to honor their loved ones was copyright infringement. But in more recent examples, the YouTuber obituary pirates tend to summarize information they’ve found online, rather than repeating it verbatim. While distasteful, it’s not illegal to callously recount the details of other people’s misfortune. (If it were, several prominent true-crime podcasters would certainly be in jail.)</p><p>It seems unlikely that this trend will die down as long as there’s money to be made, even if it’s a modest sum—and the rise of AI tools may make the situation even more infuriating. Last week, Microsoft’s MSN news site was roundly castigated for an incoherent and <a data-offer-url="https://searchengineland.com/microsoft-brandon-hunter-useless-ai-obituary-432008" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://searchengineland.com/microsoft-brandon-hunter-useless-ai-obituary-432008&quot;}" href="https://searchengineland.com/microsoft-brandon-hunter-useless-ai-obituary-432008" rel="nofollow noopener" target="_blank">oddly hostile</a> obituary for former NBA player Brandon Hunter; critics assumed the garbled article was written by AI, as the company had <a href="https://www.theguardian.com/technology/2020/may/30/microsoft-sacks-journalists-to-replace-them-with-robots">laid off</a> human staffers in favor of algorithmically generated content three years earlier. (Microsoft never confirmed whether the offending story was AI-generated, but it was removed nonetheless.)</p><p>My friend’s experience struck him as strange and crass enough to ask a tech reporter—me—if I’d ever heard of it. But what is viewed as creepy now may look quaint in the future. Considering how the obituary pirates on YouTube prioritize speed and volume above coherence and dignity, it’d be more surprising if they didn’t embrace artificial intelligence in their quest to profit off curiosity and heartache.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bevy 0.12 (316 pts)]]></title>
+            <title><![CDATA[Bevy 0.12 (321 pts)]]></title>
             <link>https://bevyengine.org/news/bevy-0-12/</link>
             <guid>38144417</guid>
             <pubDate>Sat, 04 Nov 2023 19:39:45 GMT</pubDate>
@@ -3793,7 +5247,7 @@ The mobile example is also executed on the same devices as the daily mobile chec
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[NewPipe – The lightweight YouTube experience for Android (606 pts)]]></title>
+            <title><![CDATA[NewPipe – The lightweight YouTube experience for Android (621 pts)]]></title>
             <link>https://newpipe.net/</link>
             <guid>38144400</guid>
             <pubDate>Sat, 04 Nov 2023 19:38:51 GMT</pubDate>
@@ -4075,7 +5529,7 @@ The mobile example is also executed on the same devices as the daily mobile chec
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AI and Open Source in 2023 (112 pts)]]></title>
+            <title><![CDATA[AI and Open Source in 2023 (114 pts)]]></title>
             <link>https://magazine.sebastianraschka.com/p/ai-and-open-source-in-2023</link>
             <guid>38143984</guid>
             <pubDate>Sat, 04 Nov 2023 18:50:07 GMT</pubDate>
@@ -4136,7 +5590,7 @@ The mobile example is also executed on the same devices as the daily mobile chec
 </ul></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Software that supports your body should always respect your freedom (266 pts)]]></title>
+            <title><![CDATA[Software that supports your body should always respect your freedom (268 pts)]]></title>
             <link>https://www.fsf.org/blogs/community/software-that-supports-your-body-should-always-respect-your-freedom</link>
             <guid>38143180</guid>
             <pubDate>Sat, 04 Nov 2023 17:26:59 GMT</pubDate>
@@ -4334,129 +5788,6 @@ openly <a href="https://www.fsf.org/blogs/community/call-for-sessions-extended-u
 <div id="readability-page-1" class="page"><div><h4 translated="">Discover more from atomic14</h4><p>This is a newsletter for the Atomic14 blog - https://blog.atomic14.com and YouTube Channel - https://www.youtube.com/@atomic14
 
 Sign up to get notified when new content is published so that you never miss out!</p> </div><div dir="auto"><p>You can watch the video here:</p><div id="youtube2-H_0zSbzLJ6g" data-attrs="{&quot;videoId&quot;:&quot;H_0zSbzLJ6g&quot;,&quot;startTime&quot;:null,&quot;endTime&quot;:null}" data-component-name="Youtube2ToDOM"><p><iframe src="https://www.youtube-nocookie.com/embed/H_0zSbzLJ6g?rel=0&amp;autoplay=0&amp;showinfo=0&amp;enablejsapi=0" frameborder="0" loading="lazy" gesture="media" allow="autoplay; fullscreen" allowautoplay="true" allowfullscreen="true" width="728" height="409"></iframe></p></div><p><span>I seem to have been accumulating a whole bunch of USB powered devices. I’ve got the </span><a href="https://youtu.be/eHrgdIJnAF0" rel="nofollow ugc noopener">mini hotplate</a><span>, a small power supply, and two USB soldering irons!</span></p><p>The mini hotplate takes 20 volts and uses around 60W when it’s heating up.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg" width="819" height="986" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:986,&quot;width&quot;:819,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:130066,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F99a1a768-1c77-448c-9137-371eaec1ecd9_819x986.jpeg 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>The power supply also wants 20 volts.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg" width="1309" height="795" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:795,&quot;width&quot;:1309,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:179761,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F62b6c129-eb46-4191-90f8-1bd249f5cd32_1309x795.jpeg 1456w" sizes="100vw"></picture></div></a></figure></div><p>And one of the soldering irons is limited to 12 volts, and the other will use 20 volts.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg" width="1456" height="244" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:244,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:132364,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F04358e94-6a1e-4cee-8c1c-1331feb03679_2276x381.jpeg 1456w" sizes="100vw"></picture></div></a></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg" width="1456" height="312" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:312,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:107911,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fee016c9c-518a-4955-9502-a7b8cb2177b1_1797x385.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>It’s not a massive problem, but I do only have one 65W USB-C supply coming into workbench. I want more, I want much much more!</p><p><span>There don’t seem to be any powered USB-C hubs, so I went shopping on AliExpress and eventually came across this nice </span><a href="https://s.click.aliexpress.com/e/_DFuFbd5" rel="nofollow ugc noopener">board</a><span>:</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg" width="1456" height="1456" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1456,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:4234359,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F6c44bf0c-e32c-45d4-9ea0-045d6603cbbd_3840x3840.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>This has four standard USB sockets on the top which all support QC2 and QC3</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg" width="892" height="454" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:454,&quot;width&quot;:892,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:99768,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e711edc-73c6-4952-8600-ca354025e528_892x454.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>And it’s got four USB-C sockets on the bottom:</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg" width="1456" height="1740" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/add92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1740,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:3073372,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fadd92ad4-5288-422f-9526-b4b571b8a917_2854x3411.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>These support pretty much all the protocols you can think of!</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg" width="878" height="532" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:532,&quot;width&quot;:878,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:100737,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F43b59ca3-cf1c-4f3f-a7ef-cbfedbaf8db1_878x532.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Testing out how much current the board can deliver gives us a great result - it can easily do 65 watts!</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg" width="1456" height="819" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:819,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:500269,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dd65da9-757e-4d27-a941-8dfd5f760669_2560x1440.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>For those of you who are interested in what’s on the board, I’ve tried to capture the IC numbers in this picture:</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg" data-component-name="Image2ToDOM" rel="nofollow ugc noopener"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg" width="1456" height="1456" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1456,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:3985243,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F811d9072-b20c-4a5e-b62c-41f4c9938b68_3840x3840.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>There’s a datasheet here for the chip here: https://cdn.hackaday.io/files/1765587553857472/SW3518.pdf (it’s all in Chinese though!).</p><p>It’s pretty good though - I’ve now got 4 USB-C supplies on my bench, all of them capable of 65W of power.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Othello Is Solved (570 pts)]]></title>
-            <link>https://arxiv.org/abs/2310.19387</link>
-            <guid>38141366</guid>
-            <pubDate>Sat, 04 Nov 2023 14:35:56 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://arxiv.org/abs/2310.19387">https://arxiv.org/abs/2310.19387</a>, See on <a href="https://news.ycombinator.com/item?id=38141366">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="labstabs"><p>
-    <label for="tabone">Bibliographic Tools</label></p><div>
-      <h2>Bibliographic and Citation Tools</h2>
-      <div>
-          <p><label>
-              
-              <span></span>
-              <span>Bibliographic Explorer Toggle</span>
-            </label>
-          </p>
-          
-        </div>
-        
-        
-        
-    </div>
-
-
-    <p>
-    <label for="tabtwo">Code, Data, Media</label></p><div>
-      <h2>Code, Data and Media Associated with this Article</h2>
-      
-      
-      
-      
-      
-      
-    </div>
-
-
-      <p>
-      <label for="labstabs-demos-input" id="labstabs-demos-label">Demos</label></p><div>
-        <h2>Demos</h2>
-        
-        
-        
-      </div>
-      <p>
-      <label for="tabfour">Related Papers</label></p><div>
-        <h2>Recommenders and Search Tools</h2>
-        
-        
-        
-        
-        
-        
-      </div>
-
-      <p>
-      <label for="tabfive">
-        About arXivLabs
-      </label></p><div>
-            <h2>arXivLabs: experimental projects with community collaborators</h2>
-            <p>arXivLabs is a framework that allows collaborators to develop and share new arXiv features directly on our website.</p>
-            <p>Both individuals and organizations that work with arXivLabs have embraced and accepted our values of openness, community, excellence, and user data privacy. arXiv is committed to these values and only works with partners that adhere to them.</p>
-            <p>Have an idea for a project that will add value for arXiv's community? <a href="https://info.arxiv.org/labs/index.html"><strong>Learn more about arXivLabs</strong></a>.</p>
-          </div>
-
-    </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Always paste without formatting on macOS (200 pts)]]></title>
-            <link>https://scottswezey.com/always-paste-without-formatting-macos/</link>
-            <guid>38141320</guid>
-            <pubDate>Sat, 04 Nov 2023 14:31:17 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://scottswezey.com/always-paste-without-formatting-macos/">https://scottswezey.com/always-paste-without-formatting-macos/</a>, See on <a href="https://news.ycombinator.com/item?id=38141320">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="site-main">
-<article>
-<header>
-
-
-<p>When copying and pasting on a Mac, most applications will retain the formatting of whatever you copied. Use this trick to paste unformatted text.</p>
-
-<figure>
-<img srcset="https://scottswezey.com/content/images/size/w300/2022/09/macos-keyboard-shortcuts-paste-unformatted.png 300w,
-                            https://scottswezey.com/content/images/size/w600/2022/09/macos-keyboard-shortcuts-paste-unformatted.png 600w,
-                            https://scottswezey.com/content/images/size/w1000/2022/09/macos-keyboard-shortcuts-paste-unformatted.png 1000w,
-                            https://scottswezey.com/content/images/size/w2000/2022/09/macos-keyboard-shortcuts-paste-unformatted.png 2000w" sizes="(min-width: 1400px) 1400px, 92vw" src="https://scottswezey.com/content/images/size/w2000/2022/09/macos-keyboard-shortcuts-paste-unformatted.png" alt="Always paste without formatting on macOS">
-</figure>
-</header>
-<section>
-<p>When copying and pasting on a Mac, most applications will retain the formatting of whatever you copied. If that bugs you as much as it bugs me, try this trick to switch up the default to pasting unformatted text. Or more accurately, having the pasted text ignore its own formatting and match the text where it's pasted.</p><ol><li>Open the <code>System Preferences</code> app.</li><li>Go to <code>Keyboard &gt; Shortcuts</code>.</li><li>Click on <code>App Shortcuts</code>.</li><li>Add a new shortcut.</li><li>Choose <strong><code>All Applications</code></strong> for the Application, and type <code><strong>Paste and Match Style</strong></code>. Enter <code><strong>⌘V</strong></code> for the Keyboard Shortcut. Click <code>Add</code>.</li></ol><p>Next time you copy/paste, the copied text will fit in with the style of wherever it's &nbsp;pasted. Cool.</p>
-</section>
-
-</article>
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[In KDE, the Desktop Cube is back (189 pts)]]></title>
-            <link>https://www.phoronix.com/news/KDE-Wayland-Color-Mgmt</link>
-            <guid>38141173</guid>
-            <pubDate>Sat, 04 Nov 2023 14:13:51 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.phoronix.com/news/KDE-Wayland-Color-Mgmt">https://www.phoronix.com/news/KDE-Wayland-Color-Mgmt</a>, See on <a href="https://news.ycombinator.com/item?id=38141173">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-<p><img alt="KDE" src="https://www.phoronix.com/assets/categories/kde.webp" width="100" height="100"></p><p>
-KDE developer Nate Graham is out with his usual weekly recap highlighting all of the interesting accomplishments for this open-source desktop for the past week. But with not having posted last weekend, this edition highlights the many achievements made by the KDE camp over the past two weeks.
-</p><p>
-There's been a lot happening in the KDE world as the developers prepare to wrap up October. Some of the latest KDE highlights include:
-</p><p>
-- KDE Plasma Wayland now supports per-screen color management. Assigning ICC color profiles to each screen will now work correctly under KDE on Wayland. 
-</p><p>
-- The KDE Desktop Cube effect has returned via the kdeplasma-addons repository. Here's the screenshot shared by Nate that will surely bring back Compiz/Beryl memories for long-time Linux users:
-</p><p><img src="https://www.phoronix.net/image.php?id=2023&amp;image=kde_desktop_cube" alt="KDE Desktop Cube"></p>
-<p>- Many small UI improvements to KDE Discover.
-</p><p>
-- KFontView now works as expected on Wayland.
-</p><p>
-- KRunner's "Recent Documents" runner is enjoying more than twice the performance as previously.
-</p><p>
-- Fixing a case where when logging into Plasma Wayland it would cause KWin to crash immediately and return to the log-in screen.
-</p><p>
-- Fixing the most common crash in Plasma that could happen when closing notifications.
-</p><p>
-- Many other bug fixes.
-</p><p>
-More details on these KDE changes via <a href="https://pointieststick.com/2023/10/27/these-past-2-weeks-in-kde-wayland-color-management-the-desktop-cube-returns-and-optional-shadows-in-spectacle/">Nate's blog</a>.</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
