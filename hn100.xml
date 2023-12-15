@@ -4,12 +4,226 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 15 Dec 2023 16:00:04 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 15 Dec 2023 17:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[How Lego builds a new Lego set (166 pts)]]></title>
+            <title><![CDATA[Database Fundamentals (141 pts)]]></title>
+            <link>https://tontinton.com/posts/database-fundementals/</link>
+            <guid>38655066</guid>
+            <pubDate>Fri, 15 Dec 2023 15:28:30 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://tontinton.com/posts/database-fundementals/">https://tontinton.com/posts/database-fundementals/</a>, See on <a href="https://news.ycombinator.com/item?id=38655066">Hacker News</a></p>
+<div id="readability-page-1" class="page"><section><p>About a year ago, I tried thinking which database I should choose for my next project, and came to the realization that I don't really know the differences of databases enough. I went to different database websites and saw mostly marketing and words I don't understand.</p><p>This is when I decided to read the excellent books <code>Database Internals</code> by Alex Petrov and <code>Designing Data-Intensive Applications</code> by Martin Kleppmann.</p><p>The books piqued my curiosity enough to write my own little database I called <a href="https://github.com/tontinton/dbeel">dbeel</a>.</p><p>This post is basically a short summary of these books, with a focus on the fundamental problems a database engineer thinks about in the shower.</p><h2 id="bashdb">bashdb</h2><p>Let's start with the simplest database program ever written, just 2 bash functions (we'll call it <code>bashdb</code>):</p><pre data-lang="bash"><code data-lang="bash"><span>#!/bin/bash
+</span><span>
+</span><span>db_set</span><span>() {
+</span><span>    </span><span>echo </span><span>"$</span><span>1</span><span>,$</span><span>2</span><span>" </span><span>&gt;&gt;</span><span> database
+</span><span>}
+</span><span>
+</span><span>db_get</span><span>() {
+</span><span>    </span><span>grep </span><span>"^$</span><span>1</span><span>,"</span><span> database </span><span>| </span><span>sed</span><span> -e </span><span>"s/^$</span><span>1</span><span>,//" </span><span>| </span><span>tail</span><span> -n</span><span> 1
+</span><span>}
+</span></code></pre><p>Try it out:</p><pre data-lang="sh"><code data-lang="sh"><span>$</span><span> db_set 500 </span><span>'{"movie": "Airplane!", "rating": 9}'
+</span><span>
+</span><span>$</span><span> db_set 111 </span><span>'{"movie": "Tokio Drift", "rating": 6}'
+</span><span>
+</span><span>$</span><span> db_get 500
+</span><span>{</span><span>"movie"</span><span>: </span><span>"Airplane!"</span><span>, </span><span>"rating"</span><span>: 9}
+</span></code></pre><p>Before you continue reading, I want you to pause and think about why you wouldn't use <code>bashdb</code> in production.</p><pre><code><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>Some space for you to think :)
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span></code></pre><p>You probably came up with at least a dozen issues in <code>bashdb</code>. Now I won't go over <em>all</em> of the possible issues, for this post I will focus on the following ones:</p><ul><li><strong>Durability</strong> - If the machine crashes after a successful <code>db_set</code>, the data might be lost, as it was not flushed to disk.</li><li><strong>Atomicity</strong> - If the machine crashes while you call <code>db_set</code>, data might be written partially, corrupting our data.</li><li><strong>Isolation</strong> - If one process calls <code>db_get</code>, while another calls <code>db_set</code> concurrently on the same item, the first process might read only part of the data, leading to a corrupt result.</li><li><strong>Performance</strong> - <code>db_get</code> uses <code>grep</code>, so search goes line by line and is <code>O(n)</code>, <code>n</code> = all items saved.</li></ul><p>Could you figure out these problems yourself? If you could, well done, you don't need me, you already understand databases 😀</p><p>In the next section, we'll try get rid of these problems, to make <code>bashdb</code> a <em>real</em> database we might use in production (not really, please don't, just use <code>PostgreSQL</code>).</p><h2 id="improving-bashdb-to-be-acid">Improving bashdb to be ACID</h2><p>Before we begin, know that I did not come up with most of these problems on my own, they are part of an acronym named <code>ACID</code>, which almost all databases strive to guarantee:</p><ul><li><strong>Atomicity</strong> - Not to be confused with multi-threading's definition of atomicity (which is more similar to isolation), a transaction is considered atomic when a fault happens in the middle of a write, and the database either undos or aborts it completely, as if the write never started, leaving no partially written data.</li><li><strong>Consistency</strong> - This one doesn't really belong on ACID as a property of databases, as it is a property of the application.</li><li><strong>Isolation</strong> - No race conditions in concurrent accesses to the same data. There are multiple isolation levels, and we will discuss some of them later.</li><li><strong>Durability</strong> - The first thing that comes to mind when talking about a database. It should store data you wrote to it, forever, even in the event of monkeys pulling the power plug out.</li></ul><blockquote><p>Not all databases need to guarantee ACID, for some use cases, it is fine to drop guarantees for performance reasons.</p></blockquote><p>But <em>how</em> can we make <code>bashdb</code> ACID?</p><p>We can start with durability, as it's pretty easy to make <code>bashdb</code> durable by running <code>sync</code> right after writing in <code>db_set</code>:</p><pre data-lang="bash"><code data-lang="bash"><span>db_set</span><span>() {
+</span><span>    </span><span>echo </span><span>"$</span><span>1</span><span>,$</span><span>2</span><span>" </span><span>&gt;&gt;</span><span> database </span><span>&amp;&amp; </span><span>sync</span><span> -d</span><span> database
+</span><span>}
+</span></code></pre><p>But wait a minute, what is going on, what is <code>sync</code> really doing? And what is that <code>-d</code>?</p><h3 id="durability">Durability</h3><p>The <code>write</code> syscall writes a buffer to a file, but who said it writes to disk?</p><p>The buffer you write could end up in any cache along the way to the non volatile memory. For example, the kernel stores the buffer in the page cache with each page marked as dirty, meaning it will flush it to disk sometime in the future.</p><p>To make matters worse, the disk device, or something managing your disks (for example a RAID system), might have a write cache as well.</p><p>So how do you tell all the systems in the middle to flush all dirty pages to the disk? For that we have <code>fsync</code> / <code>fdatasync</code>, let's see what <code>man</code> has to say:</p><pre><code><span>$ man 2 fsync
+</span><span>
+</span><span>...
+</span><span>
+</span><span>fsync() transfers ("flushes") all modified in-core data of (i.e., modified buffer cache pages for)
+</span><span>the file referred to by the file descriptor fd to the disk device (or other permanent storage
+</span><span>device) so that all changed information can be retrieved even if the system crashes or is rebooted.
+</span><span>This includes writing through or flushing a disk cache if present.
+</span><span>The call blocks until the device reports that the transfer has completed.
+</span><span>
+</span><span>...
+</span><span>
+</span><span>fdatasync() is similar to fsync(), but does not flush modified metadata unless that metadata itself
+</span><span>in order to allow a subsequent data  retrieval to be correctly handled.
+</span><span>
+</span><span>...
+</span></code></pre><p>In short, <code>fdatasync</code> flushes the dirty raw buffers we gave <code>write</code>. <code>fsync</code> also flushes the file's metadata like <code>mtime</code>, which we don't really care about.</p><p>The <code>sync</code> program is basically like running <code>fsync</code> on all dirty pages, unless a specific file is specified as one of the arguments. It has the <code>-d</code> flag for us to call <code>fdatasync</code> instead of <code>fsync</code>.</p><p>The biggest drawback in adding <code>sync</code> is that we get worse performance. Usually sync is slower than even the write itself. But hey, at least we are now <em>durable</em>.</p><blockquote><p>A short but important note about fsync. When fsync() returns success it means "all writes since the last fsync have hit disk" when you might have assumed it means "all writes since the last SUCCESSFUL fsync have hit disk". PostgreSQL learned about this only recently (2018), which led to them modifying the behavior of syncing from retrying fsync until a success is returned, to simply panic on fsync failure. This incident got famous and was named fsyncgate. You can learn a lot more about fsync failures <a href="https://www.usenix.org/system/files/atc20-rebello.pdf">here</a>.</p></blockquote><blockquote><p>Dear <code>MongoDB</code> users, know that by default writes are <a href="https://www.mongodb.com/docs/manual/core/journaling/writes">synced every 100ms</a>, meaning it is not 100% durable.</p></blockquote><h3 id="isolation">Isolation</h3><p>The simplest way to have multiprocess isolation in <code>bashdb</code> is to add a lock before we read / write to the storage file.</p><p>There's a program in linux called <code>flock</code>, which locks a file, and you can even provide it with the <code>-s</code> flag, to specify that you will not modify the file, meaning all callers who specify <code>-s</code> are allowed to read the file concurrently. <code>flock</code> blocks until it has taken the lock.</p><blockquote><p>flock simply calls the flock syscall</p></blockquote><p>With such an awesome program, <code>bashdb</code> can guarantee <em>isolation</em>, here's the code:</p><pre data-lang="bash"><code data-lang="bash"><span>db_set</span><span>() {
+</span><span>    (
+</span><span>        </span><span>flock</span><span> 9 </span><span>&amp;&amp; </span><span>echo </span><span>"$</span><span>1</span><span>,$</span><span>2</span><span>" </span><span>&gt;&gt;</span><span> database
+</span><span>    ) </span><span>9</span><span>&gt;</span><span>database.lock
+</span><span>}
+</span><span>
+</span><span>db_get</span><span>() {
+</span><span>    (
+</span><span>        </span><span>flock</span><span> -s</span><span> 9 </span><span>&amp;&amp; </span><span>grep </span><span>"^$</span><span>1</span><span>,"</span><span> database </span><span>| </span><span>sed</span><span> -e </span><span>"s/^$</span><span>1</span><span>,//" </span><span>| </span><span>tail</span><span> -n</span><span> 1
+</span><span>    ) </span><span>9</span><span>&gt;</span><span>database.lock
+</span><span>}
+</span></code></pre><p>The biggest drawback is that we are now locking the entire database whenever we write to it.</p><p>The only things left are atomicity and improving the algorithm to not be <code>O(n)</code>.</p><h2 id="bad-news">Bad News</h2><p>I'm sorry, this is as far as I could get with <code>bashdb</code>, I could not find a simple way to ensure atomicity in bash ☹️</p><p>And even if it was possible, we still need to fix the <code>O(n)</code> situation.</p><p>Before beginning the <code>bashdb</code> adventure, I knew that we won't be able to easily solve all these problems in less than 10 lines of bash, but by trying to, you've hopefully started to get a feel for the problems database engineers face.</p><h2 id="storage-engine">Storage Engine</h2><p>Let's start with the first big component of a database, the <code>Storage Engine</code>.</p><p>The purpose of the storage engine is to provide an abstraction over reading and writing data to persistent storage, with the main goal to be <strong>fast</strong>, i.e. have <strong>high throughput</strong> and <strong>low latency</strong> on requests.</p><p>But what makes software slow?</p><pre><code><span>Latency Comparison Numbers (~2012)
+</span><span>----------------------------------
+</span><span>L1 cache reference                           0.5 ns
+</span><span>Branch mispredict                            5   ns
+</span><span>L2 cache reference                           7   ns                      14x L1 cache
+</span><span>Mutex lock/unlock                           25   ns
+</span><span>Main memory reference                      100   ns                      20x L2 cache, 200x L1 cache
+</span><span>Compress 1K bytes with Zippy             3,000   ns        3 us
+</span><span>Send 1K bytes over 1 Gbps network       10,000   ns       10 us
+</span><span>Read 4K randomly from SSD              150,000   ns      150 us          ~1GB/sec SSD
+</span><span>Read 1 MB sequentially from memory     250,000   ns      250 us
+</span><span>Round trip within same datacenter      500,000   ns      500 us
+</span><span>Read 1 MB sequentially from SSD      1,000,000   ns    1,000 us    1 ms  ~1GB/sec SSD, 4X memory
+</span><span>Disk seek                           10,000,000   ns   10,000 us   10 ms  20x datacenter roundtrip
+</span><span>Read 1 MB sequentially from disk    20,000,000   ns   20,000 us   20 ms  80x memory, 20X SSD
+</span><span>Send packet CA-&gt;Netherlands-&gt;CA    150,000,000   ns  150,000 us  150 ms
+</span></code></pre><p>If L1 cache reference took as long as a heart beat (around half a second), reading 1 MB sequentially from SSD would take ~12 days and reading 1 MB sequentially from disk would take ~8 months.</p><p>This is why the main limitation of storage engines is the disk itself, and thus all designs try to minimize disk I/O and disk seeks as much as possible. Some designs even get rid of disks in favor of SSDs (although they are much more expensive).</p><p>A storage engine design usually consists of:</p><ul><li>The underlying data structure to store items on disk.</li><li>ACID transactions. <ul><li>Some may skip this to achieve better performance for specific use cases where ACID is not important.</li></ul></li><li>Some cache - to not read from disk <em>every</em> time. <ul><li>Most use buffered I/O to let the OS cache for us.</li></ul></li><li>API layer - SQL / document / graph / ...</li></ul><p>Storage engine data structures come in all shapes and sizes, I'm going to focus on the 2 categories you will most likely find in the wild - mutable and immutable data structures.</p><p>Mutable means that after writing data to a file, the data can be overwritten later in the future, while immutable means that after writing data to a file, it can only be read again.</p><h2 id="mutable-b-trees">Mutable B-Trees</h2><p>To achieve the goal of maintaining good performance as the amount of data scales up, the data structure we use should be able to search an item in at most logarithmic time, and not linear time like in <code>bashdb</code>.</p><p>A simple data structure you are probably familiar with is the BST (binary search tree), where lookups are made in <code>O(log n)</code> time.</p><p>The problem with BSTs is nodes are placed randomly apart from each other, which means that after reading a node while traversing the tree, the next node is most likely going to be somewhere far away on disk. To minimize disk I/O &amp; seeks, each page read from disk should be read as much as possible from memory again, without reaching to disk.</p><p>The property we're looking for is called "spatial locality", and one of the most famous "spatially local" variations of BSTs are B-trees.</p><p>B-tree generalizes BST, allowing for nodes with more than two children. Here's what they look like:</p><pre><code><span>                  ------------------------------------
+</span><span>                  |     7     |     16     |    |    |
+</span><span>                  ------------------------------------
+</span><span>                 /            |             \
+</span><span>-----------------     ----------------       -----------------
+</span><span>| 1 | 2 | 5 | 6 |     | 9 | 12 |  |  |       | 18 | 21 |  |  |
+</span><span>-----------------     ----------------       -----------------
+</span></code></pre><p>With the search algorithm in pseudo python code:</p><pre data-lang="python"><code data-lang="python"><span>def </span><span>get</span><span>(</span><span>node</span><span>, </span><span>key</span><span>):
+</span><span>    </span><span>for </span><span>i, child </span><span>in </span><span>enumerate</span><span>(node</span><span>.</span><span>children):
+</span><span>        </span><span>if not </span><span>child:
+</span><span>            </span><span>return </span><span>None
+</span><span>
+</span><span>        </span><span>if </span><span>child</span><span>.</span><span>key </span><span>== </span><span>key:
+</span><span>            </span><span># Found it!
+</span><span>            </span><span>return </span><span>child</span><span>.</span><span>value
+</span><span>
+</span><span>        </span><span>if </span><span>child</span><span>.</span><span>key </span><span>&gt; </span><span>key:
+</span><span>            </span><span>return </span><span>get</span><span>(node</span><span>.</span><span>nodes[i], key)
+</span><span>
+</span><span>    </span><span>return </span><span>get</span><span>(node</span><span>.</span><span>nodes[</span><span>-</span><span>1</span><span>], key)
+</span></code></pre><p>On each read of a page from disk (usually 4KB or 8KB), we iterate over multiple nodes sequentially from memory and the various CPU caches, trying to keep the least amount of bytes read go to waste.</p><p>Remember, reading from memory and the CPU caches is a few order of magnitudes faster than disk, so much faster in fact, that it can be considered to be basically free in comparison.</p><p>I know some of you reading this right now think to themselves <em>"Why not binary search instead of doing it linearly?"</em>, to you I say, please look at the L1 / L2 cache reference times in the latency comparison numbers table again. Also, modern CPUs execute multiple operations in parallel when it operates on sequential memory thanks to <a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a>, <a href="https://en.wikipedia.org/wiki/Instruction_pipelining">instruction pipelining</a> and <a href="https://en.wikipedia.org/wiki/Cache_prefetching">prefetching</a>. You would be surprised just how far reading sequential memory can take you in terms of performance.</p><p>There's a variation of the B-tree that takes this model even further, called a B+ tree, where the final leaf nodes hold a value and all other nodes hold only keys, thus fetching a page from disk results in a lot more keys to compare.</p><p>B-trees, to be space optimized, need to sometimes reclaim space as a consequence of data fragmentation created by operations on the tree like:</p><ul><li>Big value updates - updating a value into a larger value might overwrite data of the next node, so the tree relocates the item to a different location, leaving a "hole" in the original page.</li><li>Small value updates - updating a value to a smaller value leaves a "hole" at the end.</li><li>Deletes - deletion causes a "hole" right where the deleted value used to reside.</li></ul><p>The process that takes care of space reclamation and page rewrites can sometimes be called vacuum, compaction, page defragmentation, and maintenance. It is usually done in the background to not interfere and cause latency spikes to user requests.</p><blockquote><p>See for example how in <code>PostgreSQL</code> you can configure an <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html">auto vacuum daemon</a>.</p></blockquote><p>B-trees are most commonly used as the underlying data structure of an index (<code>PostgreSQL</code> creates B-tree indexes by default), or all data (I've seen <code>DynamoDB</code> once jokingly called <em>"a distributed B-tree"</em>).</p><h2 id="immutable-lsm-tree">Immutable LSM Tree</h2><p>As we have already seen in the latency comparison numbers table, disk seeks are really expensive, which is why the idea of sequentially written immutable data structures got so popular.</p><p>The idea is that if you only append data to a file, the disk needle doesn't need to move as much to the next position where data will be written. On write heavy workloads it has been proven very beneficial.</p><p>One such append only data structure is called the <code>Log Structured Merge tree</code> or <code>LSM tree</code> in short, and is what powers <em>a lot</em> of modern database storage engines, such as <code>RocksDB</code>, <code>Cassandra</code> and my personal favorite <code>ScyllaDB</code>.</p><p>LSM trees' general concept is to buffer writes to a data structure in memory, preferably one that is easy to iterate in a sorted fashion (for example <code>AVL tree</code> / <code>Red Black tree</code> / <code>Skip List</code>), and once it reaches some capacity, flush it sorted to a new file called a <code>Sorted String Table</code> or <code>SSTable</code>. An SSTable stores sorted data, letting us leverage binary search and sparse indexes to lower the amount of disk I/O.</p><img src="https://tontinton.com/lsm_tree_write.svg"><p>To maintain durability, when data is written to memory, the action is stored in a <code>Write-Ahead Log</code> or <code>WAL</code>, which is read on program's startup to reset state to as it was before shutting down / crashing.</p><p>Deletions are also appended the same way a write would, it simply holds a tombstone instead of a value. The tombstones get deleted in the compaction process detailed later.</p><p>The read path is where it a bit wonky, reading from an LSM tree is done by first searching for the item of the provided key in the data structure in memory, if not found, it then searches for the item by iterating over all SSTables on disk, from the newest one to the oldest.</p><img src="https://tontinton.com/lsm_tree_read.svg"><p>You can probably already tell that as more and more data is written, there will be more SSTables to go through to find an item of a specific key, and even though each file is sorted, going over a lot of small files is slower than going over one big file with all items (lookup time complexity: <code>log(num_files * table_size) &lt; num_files * log(table_size)</code>). This is another reason why LSM trees require compaction, in addition to removing tombstones.</p><p>In other words: compaction combines a few small SSTables into one big SSTable, removing all tombstones in the process, and is usually run as a background process.</p><img src="https://tontinton.com/lsm_tree_compact.svg"><p>Compaction can be implemented using a binary heap / priority queue, something like:</p><pre data-lang="python"><code data-lang="python"><span>def </span><span>compact</span><span>(</span><span>sstables</span><span>, </span><span>output_sstable</span><span>): 
+</span><span>    </span><span># Ordered by ascending key. pop() results in the item of the smallest key.
+</span><span>    heap </span><span>= </span><span>heapq</span><span>.</span><span>heapify</span><span>([(sstable</span><span>.</span><span>next</span><span>(), sstable) </span><span>for </span><span>sstable </span><span>in </span><span>sstables])
+</span><span>
+</span><span>    </span><span>while </span><span>(item, sstable) </span><span>:= </span><span>heap</span><span>.</span><span>pop</span><span>()
+</span><span>        </span><span>if not </span><span>item</span><span>.</span><span>is_tombstone</span><span>():
+</span><span>            output_sstable</span><span>.</span><span>write</span><span>(item)
+</span><span>
+</span><span>        </span><span>if </span><span>item </span><span>:= </span><span>sstable</span><span>.</span><span>next</span><span>():
+</span><span>            </span><span># For code brevity, imagine pushing an item with a key that exists
+</span><span>            </span><span># in the heap removes the item with the smaller timestamp,
+</span><span>            </span><span># resulting in last write wins.
+</span><span>            heap</span><span>.</span><span>push</span><span>((item, sstable))
+</span></code></pre><blockquote><p>For a real working example in rust 🦀, <a href="https://github.com/tontinton/dbeel/blob/ee3de152a5/src/storage_engine/lsm_tree.rs#L1038">click here</a>.</p></blockquote><p>To optimize an LSM tree, you should decide <em>when</em> to compact and on <em>which</em> sstable files. <code>RocksDB</code> for example implements <a href="https://github.com/facebook/rocksdb/wiki/Leveled-Compaction">Leveled Compaction</a>, where the newly flushed sstables are said to reside in level 0, and once a configured N number of files are created in a level, they are compacted and the new file is promoted to the next level.</p><p>It's important to handle removal of tombstones with care to not cause data resurrection. An item might be removed and then resurrected on compaction with another file that holds that item, even if the write happened before the deletion, there is no way to know once deleted in a previous compaction. <code>RocksDB</code> keeps tombstones around until a compaction of files that result in a promotion to the last level.</p><h3 id="bloom-filters">Bloom Filters</h3><p>LSM trees can be further optimized by something called a bloom filter.</p><p>A bloom filter is a probabilistic set data structure that lets you to efficiently check whether an item doesn't exist in a set. Checking whether an item exists in the set results in either <code>false</code>, which means the item is definitely not in the set, or in <code>true</code>, which means the item is <strong>maybe</strong> in the set, and that's why it's called a <em>probabilistic</em> data structure.</p><p>The beauty is that the space complexity of a bloom filter set of <code>n</code> items is <code>O(log n)</code>, while a regular set with <code>n</code> items is <code>O(n)</code>.</p><p>How do they work? The answer is hash functions! On insertion, they run multiple different hash functions on the inserted key, then take the results and store 1 in the corresponding bit (<code>result % number_of_bits</code>).</p><pre data-lang="python"><code data-lang="python"><span># A bloom filter's bitmap of size 8 (bits).
+</span><span>bloom </span><span>= </span><span>[</span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>]
+</span><span>
+</span><span># Inserting key - first run 2 hash functions.
+</span><span>Hash1</span><span>(key1) </span><span>= </span><span>100
+</span><span>Hash2</span><span>(key1) </span><span>= </span><span>55
+</span><span>
+</span><span># Then calculate corresponding bits.
+</span><span>bits </span><span>= </span><span>[</span><span>100 </span><span>% </span><span>8</span><span>, </span><span>55 </span><span>% </span><span>8</span><span>] </span><span>= </span><span>[</span><span>4</span><span>, </span><span>7</span><span>]
+</span><span>
+</span><span># Set 1 to corresponding bits.
+</span><span>bloom[</span><span>4</span><span>] </span><span>= </span><span>1
+</span><span>bloom[</span><span>7</span><span>] </span><span>= </span><span>1
+</span><span>
+</span><span># After insertion it should look like:
+</span><span>[</span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>1</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>1</span><span>]
+</span></code></pre><p>Now comes the exciting part - checking!</p><pre data-lang="python"><code data-lang="python"><span>bloom </span><span>= </span><span>[</span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>1</span><span>, </span><span>0</span><span>, </span><span>0</span><span>, </span><span>1</span><span>]
+</span><span>
+</span><span># To check a key, simply run the 2 hash functions and find the corresponding
+</span><span># bits, exactly like you would on insertion:
+</span><span>Hash1</span><span>(key2) </span><span>= </span><span>34
+</span><span>Hash2</span><span>(key2) </span><span>= </span><span>35
+</span><span>
+</span><span>bits </span><span>= </span><span>[</span><span>34 </span><span>% </span><span>8</span><span>, </span><span>35 </span><span>% </span><span>8</span><span>] </span><span>= </span><span>[</span><span>2</span><span>, </span><span>3</span><span>]
+</span><span>
+</span><span># And then check whether all the corresponding bits hold 1, if true, the item
+</span><span># maybe exists in the set, otherwise it definitely isn't.
+</span><span>result </span><span>= </span><span>[bloom[</span><span>2</span><span>], bloom[</span><span>3</span><span>]] </span><span>= </span><span>[</span><span>0</span><span>, </span><span>0</span><span>] </span><span>= </span><span>false
+</span><span>
+</span><span># false. key2 was never inserted in the set, otherwise those exact same bits
+</span><span># would have all been set to 1.
+</span></code></pre><blockquote><p>Think about why it is that even when all checked bits are 1, it doesn't guarantee that the same exact key was inserted before.</p></blockquote><p>A nice benefit of bloom filters is that you can control the chance of being certain that the item doesn't exist in the set, by allocating more memory for the bitmap and by adding more hash functions. There's even <a href="https://hur.st/bloomfilter/">calculators</a> for it.</p><p>LSM trees can store a bloom filter for each SSTable, to skip searching in SSTables if their bloom filter validates that an item doesn't exist in it. Otherwise, we search the SSTable normally, even if the item doesn't necessarily exist in it.</p><h2 id="write-ahead-log">Write Ahead Log</h2><p>Remember ACID? Let's talk briefly about how storage engines achieve ACID transactions.</p><p>Atomicity and durability are properties of whether data is correct at all times, even when power shuts down the machine.</p><p>The most popular method to survive sudden crashes is to log all transaction actions into a special file called a <code>Write-Ahead Log</code> / <code>WAL</code> (we touched on this briefly in the <code>LSM tree</code> section).</p><p>When the database process starts, it reads the <code>WAL</code> file, and reconstructs the state of the data, skipping all transactions that don't have a commit log, thus achieving atomicity.</p><p>Also, as long a write request's data is written + flushed to the <code>WAL</code> file before the user receives the response, the data is going to be 100% read at startup, meaning you also achieve durability.</p><p>WALs are basically a sort of <a href="https://martinfowler.com/eaaDev/EventSourcing.html">event sourcing</a> of the transactional events.</p><h2 id="isolation-1">Isolation</h2><p>To achieve isolation, you can either:</p><ul><li>Use pessimistic locks - Block access to data that is currently being written to.</li><li>Use optimistic locks - Update a copy of the data and then commit it only whether the data was not modified during the transaction, if it did, retry on the new data. Also known as optimistic concurrency control.</li><li>Read a copy of the data - MVCC (Multiversion concurrency control) is a common method used to avoid blocking user requests. In MVCC when data is mutated, instead of locking + overwriting it, you create a new version of the data that new requests read from. Once no readers remain that are reading the old data it can be safely removed. With MVCC, each user sees a <em>snapshot</em> of the database at a specific instant in time.</li></ul><p>Some applications don't require perfect isolation (or <code>Serializable Isolation</code>), and can relax their read isolation levels.</p><p>The ANSI/ISO standard SQL 92 includes 3 different possible outcomes from reading data in a transaction, while another transaction might have updated that data:</p><ul><li><strong>Dirty reads</strong> - A dirty read occurs when a transaction retrieves a row that has been updated by another transaction that is not yet committed.</li></ul><pre data-lang="sql"><code data-lang="sql"><span>BEGIN</span><span>;
+</span><span>SELECT</span><span> age </span><span>FROM</span><span> users </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>-- retrieves 20
+</span><span>
+</span><span>
+</span><span>                                        </span><span>BEGIN</span><span>;
+</span><span>                                        </span><span>UPDATE</span><span> users </span><span>SET</span><span> age </span><span>= </span><span>21 </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>                                        </span><span>-- no commit here
+</span><span>
+</span><span>
+</span><span>SELECT</span><span> age </span><span>FROM</span><span> users </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>-- retrieves in 21
+</span><span>COMMIT</span><span>;
+</span></code></pre><ul><li><strong>Non-repeatable reads</strong> - A non-repeatable read occurs when a transaction retrieves a row twice and that row is updated by another transaction that is committed in between.</li></ul><pre data-lang="sql"><code data-lang="sql"><span>BEGIN</span><span>;
+</span><span>SELECT</span><span> age </span><span>FROM</span><span> users </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>-- retrieves 20
+</span><span>
+</span><span>
+</span><span>                                        </span><span>BEGIN</span><span>;
+</span><span>                                        </span><span>UPDATE</span><span> users </span><span>SET</span><span> age </span><span>= </span><span>21 </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>                                        </span><span>COMMIT</span><span>;
+</span><span>
+</span><span>
+</span><span>SELECT</span><span> age </span><span>FROM</span><span> users </span><span>WHERE</span><span> id </span><span>= </span><span>1</span><span>;
+</span><span>-- retrieves 21
+</span><span>COMMIT</span><span>;
+</span></code></pre><ul><li><strong>Phantom reads</strong> - A phantom read occurs when a transaction retrieves a set of rows twice and new rows are inserted into or removed from that set by another transaction that is committed in between.</li></ul><pre data-lang="sql"><code data-lang="sql"><span>BEGIN</span><span>;
+</span><span>SELECT</span><span> name </span><span>FROM</span><span> users </span><span>WHERE</span><span> age </span><span>&gt; </span><span>17</span><span>;
+</span><span>-- retrieves Alice and Bob
+</span><span>	
+</span><span>
+</span><span>                                        </span><span>BEGIN</span><span>;
+</span><span>                                        </span><span>INSERT INTO</span><span> users </span><span>VALUES</span><span> (</span><span>3</span><span>, </span><span>'Carol'</span><span>, </span><span>26</span><span>);
+</span><span>                                        </span><span>COMMIT</span><span>;
+</span><span>
+</span><span>
+</span><span>SELECT</span><span> name </span><span>FROM</span><span> users </span><span>WHERE</span><span> age </span><span>&gt; </span><span>17</span><span>;
+</span><span>-- retrieves Alice, Bob and Carol
+</span><span>COMMIT</span><span>;
+</span></code></pre><p>Your application might not need a guarantee of no dirty reads for example in a specific transaction, so it can choose a different isolation level to allow greater performance, as to achieve higher isolation levels, you usually sacrifice performance.</p><p>Here are isolation levels defined by the ANSI/SQL 92 standard from highest to lowest (higher levels guarantee at least everything lower levels guarantee):</p><ul><li><strong>Serializable</strong> - The highest isolation level. Reads always return data that is committed, including range based writes on multiple rows (avoiding phantom reads).</li><li><strong>Repeatable reads</strong> - Phantom reads are acceptable.</li><li><strong>Read committed</strong> - Non-repeatable reads are acceptable.</li><li><strong>Read uncommitted</strong> - The lowest isolation level. Dirty reads are acceptable.</li></ul><blockquote><p>The ANSI/SQL 92 standard isolation levels are often criticized for not being complete. For example, many MVCC implementations offer <a href="https://en.wikipedia.org/wiki/Snapshot_isolation">snapshot isolation</a> and not serializable isolation (for the differences, read the provided wikipedia link). If you want to learn more about MVCC, I recommend reading about <a href="https://db.in.tum.de/~muehlbau/papers/mvcc.pdf">HyPer</a>, a fast serializable MVCC algorithm.</p></blockquote><p>So to conclude the storage engine part of this post, the fundamental problem you solve writing a storage engine are: how to store / retrieve data while trying to guarantee some ACID transactions in the most performant way.</p><blockquote><p>One topic I left out is the API to choose when writing a database / storage engine, but I'll leave a post called <a href="https://www.scattered-thoughts.net/writing/against-sql/">"Against SQL"</a> for you to start exploring the topic yourself.</p></blockquote><h2 id="distributed-systems">Distributed Systems</h2><p>Going distributed should be a last mile resort, introducing it to a system adds a <strong>ton</strong> of complexity, as we will soon learn. Please avoid using distributed systems when non distributed solutions suffice.</p><blockquote><p>A distributed system is one in which the failure of a computer you didn’t even know existed can render your own computer unusable. ~Leslie Lamport</p></blockquote><p>The common use cases of needing to distribute data across multiple machines are:</p><ul><li><strong>Availability</strong> - If for some reason the machine running the database crashes / disconnects from our users, we might still want to let users use the application. By distributing data, when one machine fails, you can simply point requests to another machine holding the "redundant" data.</li><li><strong>Horizontal Scaling</strong> - Conventionally, when an application needed to serve more user requests than it can handle, we would have upgraded the machine's resources (faster / more disk, RAM, CPUs). This is called <code>Vertical Scaling</code>. It can get very expensive and for some workloads there just doesn't exist hardware to match the amount of resources needed. Also, most of the time you don't need all those resources, except in peaks of traffic (imagine shopify on black Friday). Another strategy called <code>Horizontal Scaling</code>, is to operate on multiple separate machines connected over a network, seemingly working as a single machine.</li></ul><p>Sounds like a dream, right? What can go wrong with going distributed?</p><p>Well, you have now introduced operational complexity (deployments / etc...) and more importantly partitioning / network partitioning, infamous for being the P in something called the CAP theorem.</p><p>The CAP theorem states that a system can guarantee only 2 of the following 3:</p><ul><li><strong>Consistency</strong> - Reads receive the most recent write.</li><li><strong>Availability</strong> - All requests succeed, no matter the failures.</li><li><strong>Partition Tolerance</strong> - The system continues to operate despite dropped / delayed messages between nodes.</li></ul><p>To understand why this is, imagine a database operating on a single machine. It is definitely <em>partition tolerant</em>, as messages in the system are not sent through something like a network, but through function calls operating on the same hardware (CPU / memory). It is also <em>consistent</em>, as the state of the data is saved on the same hardware (memory / disk) that all other read / write requests operate on. Once the machine fails (be it software failures like SIGSEGV or hardware failures like the disk overheating) all new requests to it fail, violating <em>availability</em>.</p><p>Now imagine a database operating on 2 machines with separate CPUs, memory and disks, connected through some cable. When a request to one of the machines fails, for whatever reason, the system can choose to do one of the following:</p><ul><li>Cancel the request, thus sacrificing <em>availability</em> for <em>consistency</em>.</li><li>Allow the request to continue only on the working machine, meaning once the other machine will now have inconsistent data (reads from it will not return the most recent write), thus sacrificing <em>consistency</em> for <em>availability</em>. When a system does this, it is called eventually consistent.</li></ul><p>The original <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf">dynamo paper</a> is famous for many things, one of them being amazon stating that amazon.com's shopping cart should be highly available, and that it's more important to them than consistency. In the unlikely scenario a user sees 2 of the same item in the shopping cart, they will simply remove one of them, which is a better situation then them not being able to purchase and pay money!</p><blockquote><p>I really enjoy out of the box thinking of sacrificing something that adds software complexity (like consistency in amazon's shopping cart) for a simpler human solution like the user getting a refund. Software complexity can get more expensive to operate than having a refund budget for example.</p></blockquote><p>To achieve <em>availability</em> it's not enough to have multiple nodes together combining all the data, there must also be data redundancy, or in other words, for each item a node stores there must be at least 1 other node to store a copy of that item. These nodes are usually called <strong>replicas</strong>, and the process of copying the data is called <strong>replication</strong>.</p><p>Assigning more replica nodes means that the system will be more <em>available</em>, with the obvious drawback of needing more resources to store all these copies.</p><blockquote><p>Copies of data don't need to be stored "whole", they can be split and scattered across multiple nodes using a technique called erasure coding, which also has some interesting <a href="https://brooker.co.za/blog/2023/01/06/erasure.html">latency characteristics</a> (by the way brooker's blog is simply amazing for learning distributed systems).</p></blockquote><h2 id="consistent-hashing">Consistent Hashing</h2><p>Now that you have multiple nodes, you need some kind of load balancing / data partitioning method. When a request to store some data comes in, how do you determine which node receives the request?</p><p>You could go for the simplest solution, which is to simply always take a primary key (some id) in addition to the data, hash the key and modulo the result by the number of available nodes, something like:</p><pre data-lang="python"><code data-lang="python"><span>def </span><span>get_owning_node</span><span>(</span><span>nodes</span><span>, </span><span>key</span><span>):
+</span><span>    </span><span>return </span><span>nodes[</span><span>hash</span><span>(key) </span><span>% </span><span>len</span><span>(nodes)] 
+</span></code></pre><p>This modulo method works fine, until a node is either added or removed from the cluster. Once that happens, the calculation returns a different result because the number of available nodes changed, meaning a different node will be selected for the same key. To accommodate, each node can migrate keys that should now live on different nodes, but then almost all items are migrated, which is really expensive.</p><p>One method to lower the amount of items to be migrated on node addition / removal that is used by some databases (e.g. <code>Dynamo</code> and <code>Cassandra</code>) is <code>Consistent Hashing</code>.</p><p>Consistent hashing creates a ring of nodes instead of an array, placing each node's name hash on the ring. Then each request's key is hashed just like before, but instead of doing the modulo operation, we get the first node in the ring whose name's hash is greater or equal to the request key hash:</p><pre data-lang="python"><code data-lang="python"><span># Assume nodes are sorted, with the first node having the smallest hash value.
+</span><span>def </span><span>get_owning_node</span><span>(</span><span>nodes</span><span>, </span><span>key</span><span>):
+</span><span>    </span><span>if </span><span>len</span><span>(nodes) </span><span>== </span><span>0</span><span>:
+</span><span>        </span><span>return </span><span>None
+</span><span>
+</span><span>    key_hash </span><span>= </span><span>hash</span><span>(key)
+</span><span>
+</span><span>    </span><span>for </span><span>node </span><span>in </span><span>nodes:
+</span><span>        </span><span>if </span><span>node</span><span>.</span><span>hash </span><span>&gt;= </span><span>key_hash:
+</span><span>            </span><span>return </span><span>node
+</span><span>
+</span><span>    </span><span>return </span><span>nodes[</span><span>0</span><span>]
+</span></code></pre><p>For a visual explanation, imagine a ring that goes from 0 -&gt; 99, holding nodes with the names "half", "quarter" and "zero" whose hashes are 50, 25 and 0 respectively:</p><pre><code><span>   zero
+</span><span> /      \
+</span><span>|     quarter 
+</span><span> \      /
+</span><span>   half
+</span></code></pre><p>Let's say a user now wants to set an item with the key "four-fifths", with a hash value of 80. The first node with a name hash greater or equal to 80 is "half" (with hash value of 50), so that's the node to receive the request!</p><p>Choosing replicas is very simple, when an item is set to be stored on a specific node, go around the ring counter-clockwise, the next node will store a copy of that item. In our example, "zero" is the replica node for all items "half" owns, so when "half" dies and requests will now be routed to "zero", it can serve these requests, keeping our system <em>available</em>. This method is sometimes called <code>Leaderless Replication</code> and is used by "Dynamo" style databases like <code>Cassandra</code>.</p><blockquote><p>Another method is to choose a leader node and replica nodes is <code>Leader Election</code>, which is a huge topic on its own that I won't get into in this post.</p></blockquote><p>Now, what happens when a node is added to the cluster? Let's add a node named "three-quarters" with a hash value of 75, the item "four-fifths" should be migrated to the new "three-quarters" node, as new requests to it will now point to it.</p><p>This migration process is a lot less expensive than what we previously had in the modulo solution. The number of keys that need to be migrated is equal to <code>num_keys / num_nodes</code> on average.</p><p>A cool trick is to introduce the concept of virtual nodes, where you add multiple instances of a node to the ring, to lower the chances of some nodes owning more items than other nodes (in our example "half" will store twice as many items on average than the other nodes). You can generate virtual node names by for example adding an index as a suffix to the node name ("half-0", "half-1", etc...) and then the hash will result in a completely different location on the ring.</p><p>Here's a more detailed example of a migration in a cluster with a replication factor of 3:</p><img src="https://tontinton.com/migration.svg"><blockquote><p>Same colored nodes are virtual nodes of the same node, green arrows show to which node an item is being migrated to, red arrows show item deletions from nodes and the brown diamonds are items.</p></blockquote><h2 id="leaderless-replication">Leaderless Replication</h2><p>In a leaderless setup, you get amazing <em>availability</em>, while sacrificing <em>consistency</em>. If the owning node is down on a write request, it will be written to the replica, and once the owning node is up and running again, a read request will read stale data.</p><p>When <em>consistency</em> is needed for a specific request, read requests can be sent in parallel to several replica nodes as well as to the owning node. The client will pick the most up to date data. Write requests are usually sent in parallel to all replica nodes but wait for an acknowledgement from only some of them. By choosing the number of read requests and number of write requests acknowledge, you can tune the <em>consistency</em> level on a request level.</p><p>To know whether a request is <em>consistent</em>, you just need to validate that <code>R + W &gt; N/2 + 1</code>, where:</p><ul><li><strong>N</strong> - Number of nodes holding a copy of the data.</li><li><strong>W</strong> - Number of nodes that will acknowledge a write for it to succeed.</li><li><strong>R</strong> - Number of nodes that have to respond to a read operation for it to succeed.</li></ul><blockquote><p>Sending a request to a majority of nodes (where <code>W</code> or <code>R</code> is equal to <code>N/2 + 1</code>) is called a quorum.</p></blockquote><p>Picking the correct read as the latest written one is called <code>Conflict Resolution</code> and it is not a simple task, you might think that simply comparing timestamps and choosing the biggest one is enough, but using times in a distributed system are unreliable.</p><blockquote><p>This didn't stop <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html#data-versioning">Cassandra from using timestamps</a> though.</p></blockquote><p>Each machine has its own hardware clock, and the clocks <em>drift</em> apart as they are not perfectly accurate (usually a quartz crystal oscillator). Synchronizing clocks using NTP (Network Time Protocol), where a server returns the time from a more accurate time source such as a GPS receiver, is not enough to provide accurate results, as the NTP request is over the network (another distributed system) and we can't know exactly how much time will pass before receiving a response.</p><blockquote><p>Google's <code>Spanner</code> actually did achieve consistency with clocks, by uses special high precision time hardware and its API exposes the time range uncertainty of each timestamp. You can read more about it <a href="https://research.google/pubs/pub39966.pdf">here</a>.</p></blockquote><p>But if clocks are so unreliable, how else are we supposed to know which value is correct?</p><p>Some systems (for example <code>Dynamo</code>) try to solve this partially using <code>Version Vectors</code>, where you attach a (node, counter) pair for each version of an item, which gives you the ability to find causality between the different versions. By finding versions of values that are definitely newer (have a higher counter) you can remove some versions of a value, which makes the problem easier.</p><img src="https://tontinton.com/version_vector.svg"><blockquote><p>An example showing how easily conflicts arise. At the end we are left with {v2, v3} as the conflicting values for the same key. The reason I removed v1 is to show that by using something like <code>Version Vectors</code>, versions of values can be safely removed to minimize the amount of conflicts. To learn more on <code>Version Vectors</code> and their implementations, I recommend reading <a href="https://github.com/ricardobcl/Dotted-Version-Vectors">Dotted Version Vectors</a>.</p></blockquote><p>We could also decide to simply let the application decide how to deal with conflicts, by returning all conflicting values for the requested item. The application might know a lot more on the data than the database, so why not let it resolve conflicts? This is what <code>Riak KV</code> does for example.</p><blockquote><p>An idea I think about often is that you could even allow users to compile conflict resolution logic as a WASM module, and upload it to the database, so that when conflicts occur, the database resolves them, never relying on the application.</p></blockquote><p>There are lots of different ideas to reduce conflicts in an eventually consistent system, they usually fall under the umbrella term <code>Anti Entropy</code>.</p><h2 id="anti-entropy">Anti Entropy</h2><p>Here are examples of some of the most popular <code>Anti Entropy</code> mechanisms:</p><p><strong>Read Repair</strong> - After a client chooses the "latest" value from a read request that went to multiple nodes (by conflict resolution), it sends that value back to all the nodes that don't currently store that value, thus <em>repairing</em> them.</p><p><strong>Hinted Handoff</strong> - When a write request can't reach one of the target nodes, send it instead as a "hint" to some other node. As soon as that target node is available again, send it the saved "hint". On a quorum write, this mechanism is also called <code>Sloppy Quorum</code>, which provides even better <em>availability</em> for quorum requests.</p><p><strong>Merkle Trees</strong> - Because read repair only fixes queried data, a lot of data can still become inconsistent for a long time. Nodes can choose to start a synchronization process by talking to each other and see the differences in data. This is really expensive when there is a lot of data (<code>O(n)</code>). To make the sync algorithm faster (<code>O(log n)</code>) we can introduce <a href="https://en.wikipedia.org/wiki/Merkle_tree">merkle trees</a>. A merkle tree stores the hash of a range of the data in lowest leaf nodes, with the parent leaf nodes being a combined hash of the 2 of its children, thus creating a hierarchy of hashes up to the root of the tree. The sync process now starts by one node comparing the root of the merkle tree to another node's merkle tree, if the hashes are the same, it means they have exactly the same data. If the hashes differ, the leaf hashes are checked the same way, recursively until the inconsistent data is found.</p><p><strong>Gossip Dissemination</strong> - Send broadcast events to all nodes in the cluster in a simple and reliable way, by imitating how humans spread rumors or a disease. You send the event message to a configured number of randomly chosen nodes (called the "fanout"), then when they receive the message they repeat the process and send the message to another set of randomly chosen <code>N</code> nodes. To not repeat the message forever in the cluster, a node stops broadcasting a gossip message when it sees it a configured number of times. To get a feel for how data converges using gossip, head over to the <a href="https://www.serf.io/docs/internals/simulator.html">simulator</a>! As an optimization, gossip messages are usually sent using UDP, as the mechanism is just that reliable.</p><h2 id="conclusion">Conclusion</h2><p>There is a lot more to talk about databases, be it the use of <a href="https://yarchive.net/comp/linux/o_direct.html">O_DIRECT</a> in linux and implementing your own page cache, failure detection in distributed systems, consensus algorithms like <a href="https://raft.github.io/">raft</a>, distributed transactions, leader election, and an almost infinite amount more.</p><p>I hope I have piqued your curiosity enough to explore the world of databases further, or provided the tools for you to better understand which database to pick in your next project 😀</p></section></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Delta Dental says data breach exposed info of 7M people (110 pts)]]></title>
+            <link>https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/</link>
+            <guid>38654805</guid>
+            <pubDate>Fri, 15 Dec 2023 14:59:37 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/">https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/</a>, See on <a href="https://news.ycombinator.com/item?id=38654805">Hacker News</a></p>
+Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/: Error: Request failed with status code 503]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How Lego builds a new Lego set (201 pts)]]></title>
             <link>https://www.theverge.com/c/23991049/lego-ideas-polaroid-onestep-behind-the-scenes-price</link>
             <guid>38653456</guid>
             <pubDate>Fri, 15 Dec 2023 12:25:26 GMT</pubDate>
@@ -683,7 +897,7 @@
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[WebP is so great except it's not (156 pts)]]></title>
+            <title><![CDATA[WebP is so great except it's not (176 pts)]]></title>
             <link>https://eng.aurelienpierre.com/2021/10/webp-is-so-great-except-its-not/</link>
             <guid>38653110</guid>
             <pubDate>Fri, 15 Dec 2023 11:32:44 GMT</pubDate>
@@ -853,7 +1067,7 @@
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Oxlint – written in Rust – 50-100 Times Faster than ESLint (211 pts)]]></title>
+            <title><![CDATA[Oxlint – written in Rust – 50-100 Times Faster than ESLint (232 pts)]]></title>
             <link>https://oxc-project.github.io/blog/2023-12-12-announcing-oxlint.html</link>
             <guid>38652887</guid>
             <pubDate>Fri, 15 Dec 2023 10:48:24 GMT</pubDate>
@@ -861,7 +1075,246 @@
 <div id="readability-page-1" class="page"><div data-v-d1cebd69=""><header data-v-6584a84b=""><h2 data-v-6584a84b="">Oxlint General Availability</h2></header><p>We're thrilled to announce that oxlint is now generally available! This milestone signifies our team's ability to promptly address and triage issues.</p><p>Oxlint is a JavaScript linter designed to catch erroneous or useless code without requiring any configurations by default.</p><h2 id="how-to-use" tabindex="-1">How to Use <a href="#how-to-use" aria-label="Permalink to &quot;How to Use&quot;">​</a></h2><p>At this stage, oxlint is <strong>not intended to fully replace ESLint</strong>; it serves as an enhancement when ESLint's slowness becomes a bottleneck in your workflow.</p><p>For faster feedback loops, we recommend running oxlint before ESLint in your lint-staged or CI setup, considering it only takes a few seconds to run on large codebases.</p><p>To test oxlint in your JavaScript / TypeScript codebase, simply execute the following command at the root directory of your repository:</p><div><p><label for="tab-zlT1HlT">npm</label><label for="tab-bS3cme4">pnpm</label><label for="tab-eHmabbt">yarn</label><label for="tab-qvH706H">bun</label><label for="tab-NTSJzp6">deno</label></p><div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>npx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>npx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>pnpm</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>pnpm</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>yarn</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>yarn</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>bunx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>bunx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>deno</span><span> </span><span>run</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>deno</span><span> </span><span>run</span><span> </span><span>oxlint@latest</span></span></code></pre></div></div></div><p>Alternatively, refer to the <a href="https://oxc-project.github.io/docs/guide/usage/linter.html">installation guide</a> for detailed instructions.</p><h2 id="design" tabindex="-1">Design <a href="#design" aria-label="Permalink to &quot;Design&quot;">​</a></h2><h3 id="_50-100-times-faster-than-eslint" tabindex="-1">50-100 Times Faster than ESLint <a href="#_50-100-times-faster-than-eslint" aria-label="Permalink to &quot;50-100 Times Faster than ESLint&quot;">​</a></h3><p>In real-world scenarios, Shopify reported that their 75 CI minutes ESLint run is now only 10 seconds.</p><p>From Jason Miller, Shopify DX and creator of Preact:</p><blockquote><p>oxlint has been a massive win for us at Shopify. Our previous linting setup took 75 minutes to run, so we were fanning it out across 40+ workers in CI.</p><p>By comparison, oxlint takes around 10 seconds to lint the same codebase on a single worker, and the output is easier to interpret.</p><p>We even caught a few bugs that were hidden or skipped by our old setup when we migrated!</p></blockquote><p>The majority of the performance gains stem from Oxlint being purposefully designed for performance, utilizing Rust and parallel processing as key factors.</p><h3 id="lint-for-correctness" tabindex="-1">Lint for Correctness <a href="#lint-for-correctness" aria-label="Permalink to &quot;Lint for Correctness&quot;">​</a></h3><p>Oxlint defaults to identifying erroneous, redundant, or confusing code — prioritizing correctness over unnecessary nitpicking rules (categorized as <code>perf</code>, <code>suspicious</code>, <code>pedantic</code>, or <code>style</code>), which are disabled by default.</p><h3 id="ease-of-use" tabindex="-1">Ease of Use <a href="#ease-of-use" aria-label="Permalink to &quot;Ease of Use&quot;">​</a></h3><p>Setting up new JavaScript / TypeScript codebases is becoming increasingly complex. There's a high likelihood of encountering compatibility issues among your tools, potentially resulting in hours of wasted time.</p><p>That's why we designed oxlint to be zero-config out of the box; even Node.js is not a requirement. Most adjustments can be made through the command-line, and reading from ESLint configuration file is currently work in progress.</p><h3 id="enhanced-diagnostics" tabindex="-1">Enhanced Diagnostics <a href="#enhanced-diagnostics" aria-label="Permalink to &quot;Enhanced Diagnostics&quot;">​</a></h3><p>Understanding linter messages can be challenging. Oxlint aims to simplify this by pinpointing root causes and providing helpful messages — eliminating the need for lengthy rule documentation reading, saving valuable time.</p><p>Running <code>oxlint -D perf</code> in the <a href="https://github.com/microsoft/vscode" target="_blank" rel="noreferrer">vscode repository</a>:</p><p><img width="100%" src="https://github.com/oxc-project/oxc/assets/1430279/094a3b24-0433-42ae-aad2-48a7dec2b985"></p><h3 id="consolidated-rules" tabindex="-1">Consolidated Rules <a href="#consolidated-rules" aria-label="Permalink to &quot;Consolidated Rules&quot;">​</a></h3><p>Oxlint does not provide a plugin system yet, but we are actively consolidating rules from popular plugins like TypeScript, React, Jest, Unicorn, JSX-a11y and Import.</p><p>We recognize the importance of plugins in the JavaScript ecosystem and are also investigating a DSL-based plugin system.</p><p>However, you might appreciate a standalone linter — no need to manage a list of plugin dependencies, navigate through <a href="https://github.com/antfu/eslint-ts-patch" target="_blank" rel="noreferrer">compatibility issues</a>, or <a href="https://github.com/import-js/eslint-plugin-import/pull/2504#issuecomment-1191057877" target="_blank" rel="noreferrer">resort to forked plugins due to version constraints</a>.</p><hr><p>Happy linting and have a joyful holiday season!</p><p>To get started, follow the <a href="https://oxc-project.github.io/docs/guide/usage/linter.html">installation guide</a>, or <a href="https://oxc-project.github.io/docs/guide/introduction.html">learn more about the oxc project</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: AI/ML papers to catch up with current state of AI? (135 pts)]]></title>
+            <title><![CDATA[An Interactive Guide to the Fourier Transform (111 pts)]]></title>
+            <link>https://betterexplained.com/articles/an-interactive-guide-to-the-fourier-transform/</link>
+            <guid>38652794</guid>
+            <pubDate>Fri, 15 Dec 2023 10:29:40 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://betterexplained.com/articles/an-interactive-guide-to-the-fourier-transform/">https://betterexplained.com/articles/an-interactive-guide-to-the-fourier-transform/</a>, See on <a href="https://news.ycombinator.com/item?id=38652794">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+<p>The Fourier Transform is one of deepest insights ever made. Unfortunately, the meaning is buried within dense equations:</p>
+<p><img src="https://betterexplained.com/wp-content/plugins/wp-latexrender/pictures/45c088dbb767150fc0bacfeb49dd49e5.png" width="189" height="54" alt="\displaystyle{X_k = \sum_{n=0}^{N-1} x_n \cdot e^{-i 2 \pi k n / N}}"></p>
+<p><img src="https://betterexplained.com/wp-content/plugins/wp-latexrender/pictures/faeb9c5bf2e60add63ae4a70b293c7b4.png" width="202" height="54" alt="\displaystyle{x_n = \frac{1}{N} \sum_{k=0}^{N-1} X_k \cdot e^{i 2 \pi k n / N}}"></p>
+<p>Yikes. Rather than jumping into the symbols, let's experience the key idea firsthand. Here's a plain-English metaphor:</p>
+<ul>
+<li><strong>What does the Fourier Transform do?</strong> Given a smoothie, it finds the recipe.</li>
+<li><strong>How?</strong> Run the smoothie through filters to extract each ingredient.</li>
+<li><strong>Why?</strong> Recipes are easier to analyze, compare, and modify than the smoothie itself.</li>
+<li><strong>How do we get the smoothie back?</strong> Blend the ingredients.</li>
+</ul>
+<p>Here's the "math English" version of the above:</p>
+<ul>
+<li>The Fourier Transform takes a time-based pattern, measures every possible cycle, and returns the overall "cycle recipe" (the amplitude, offset, &amp; rotation speed for every cycle that was found).</li>
+</ul>
+<p>Time for the equations? No! Let's get our hands dirty and <em>experience</em> how any pattern can be built with cycles, with live simulations.</p>
+<p>If all goes well, we'll have an aha! moment and intuitively realize why the Fourier Transform is possible. We'll save the detailed math analysis for the follow-up.</p>
+<p>This isn't a force-march through the equations, it's the casual stroll I wish I had. Onward!</p>
+<p><iframe src="https://www.youtube.com/embed/iN0VG9N2q0U?ecver=2" width="640" height="360" frameborder="0" allowfullscreen=""></iframe></p>
+<h2>From Smoothie to Recipe</h2>
+<p>A math transformation is a change of perspective. We change our notion of quantity from "single items" (lines in the sand, tally system) to "groups of 10" (decimal) depending on what we're counting. Scoring a game? Tally it up. Multiplying? Decimals, please.</p>
+<p>The Fourier Transform changes our perspective from consumer to producer, turning <em>What do I have?</em> into <em>How was it made?</em></p>
+<p>In other words: given a smoothie, let's find the recipe.</p>
+<p>Why? Well, recipes are great descriptions of drinks. You wouldn't share a drop-by-drop analysis, you'd say "I had an orange/banana smoothie". A recipe is more easily categorized, compared, and modified than the object itself.</p>
+<p>So... given a smoothie, how do we find the recipe?</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/smoothie-to-recipe-20121030-223058.png.webp" type="image/webp"><img decoding="async" alt="fourier transform analogy smoothie to recipe" src="https://betterexplained.com/wp-content/uploads/images/smoothie-to-recipe-20121030-223058.png" height="300"></picture></p>
+<p>Well, imagine you had a few filters lying around:</p>
+<ul>
+<li>Pour through the "banana" filter. 1 oz of bananas are extracted.</li>
+<li>Pour through the "orange" filter. 2 oz of oranges.</li>
+<li>Pour through the "milk" filter. 3 oz of milk.</li>
+<li>Pour through the "water" filter. 3 oz of water.</li>
+</ul>
+<p>We can reverse-engineer the recipe by filtering each ingredient. The catch?</p>
+<ul>
+<li><p><strong>Filters must be independent</strong>. The banana filter needs to capture bananas, and nothing else. Adding more oranges should never affect the banana reading.</p></li>
+<li><p><strong>Filters must be complete</strong>. We won't get the real recipe if we leave out a filter ("There were mangoes too!"). Our collection of filters must catch every possible ingredient.</p></li>
+<li><p><strong>Ingredients must be combine-able</strong>. Smoothies can be separated and re-combined without issue (A cookie? Not so much. Who wants crumbs?). The ingredients, when separated and combined in any order, must make the same result.</p></li>
+</ul>
+<h2>See The World As Cycles</h2>
+<p>The Fourier Transform takes a specific viewpoint: <strong>What if any signal could be filtered into a bunch of circular paths?</strong></p>
+<p>Whoa. This concept is mind-blowing, and poor Joseph Fourier had his idea rejected at first. (<em>Really Joe, even a staircase pattern can be made from circles?</em>)</p>
+<p>And despite <a href="http://wiki.answers.com/Q/What_is_the_history_of_fourier_series">decades of debate</a> in the math community, we expect students to internalize the idea without issue. Ugh. Let's walk through the intuition.</p>
+<p>The Fourier Transform finds the recipe for a signal, like our smoothie process:</p>
+<ul>
+<li>Start with a time-based signal</li>
+<li>Apply filters to measure each possible "circular ingredient"</li>
+<li>Collect the full recipe, listing the amount of each "circular ingredient"</li>
+</ul>
+<p>Stop. Here's where most tutorials excitedly throw engineering applications at your face. Don't get scared; think of the examples as "Wow, we're finally seeing the source code (DNA) behind previously confusing ideas".</p>
+<ul>
+<li><p>If earthquake vibrations can be separated into "ingredients" (vibrations of different speeds &amp; amplitudes), buildings can be designed to avoid interacting with the strongest ones.</p></li>
+<li><p>If sound waves can be separated into ingredients (bass and treble frequencies), we can boost the parts we care about, and hide the ones we don't. The crackle of random noise can be removed. Maybe similar "sound recipes" can be compared (music recognition services compare recipes, not the raw audio clips).</p></li>
+<li><p>If computer data can be represented with oscillating patterns, perhaps the least-important ones can be ignored. This "lossy compression" can drastically shrink file sizes (and why JPEG and MP3 files are much smaller than raw .bmp or .wav files).</p></li>
+<li><p>If a radio wave is our signal, we can use filters to listen to a particular channel. In the smoothie world, imagine each person paid attention to a different ingredient: Adam looks for apples, Bob looks for bananas, and Charlie gets cauliflower (sorry bud).</p></li>
+</ul>
+<p>The Fourier Transform is useful in engineering, sure, but it's a metaphor about finding the root causes behind an observed effect.</p>
+<h2>Think With Circles, Not Just Sinusoids</h2>
+<p>One of my giant confusions was separating the definitions of "sinusoid" and "circle".</p>
+<ul>
+<li>A "sinusoid" is a specific back-and-forth pattern (a <a href="https://betterexplained.com/articles/intuitive-understanding-of-sine-waves/">sine</a> or cosine wave), and 99% of the time, it refers to motion in one dimension.</li>
+<li>A "circle" is a round, 2d pattern you probably know. If you enjoy using 10-dollar words to describe 10-cent ideas, you might call a circular path a "complex sinusoid".</li>
+</ul>
+<p>Labeling a circular path as a "complex sinusoid" is like describing a word as a "multi-letter". You zoomed into the wrong level of detail. Words are about concepts, not the letters they can be split into!</p>
+<p>The Fourier Transform is about circular paths (not 1-d sinusoids) and <a href="https://betterexplained.com/articles/intuitive-understanding-of-eulers-formula/">Euler's formula</a> is a clever way to generate one:</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/euler/equal_paths.png.webp" type="image/webp"><img decoding="async" src="https://betterexplained.com/wp-content/uploads/euler/equal_paths.png" alt="euler path"></picture></p>
+<p>Must we use imaginary exponents to move in a circle? Nope. But it's convenient and compact. And sure, we can describe our path as coordinated motion in two dimensions (real and imaginary), but don't forget the big picture: we're just moving in a circle.</p>
+<h2>Following Circular Paths</h2>
+<p>Let's say we're chatting on the phone and, like usual, I want us to draw the same circle simultaneously. (<em>You promised!</em>) What should I say?</p>
+<ul>
+<li>How big is the circle? (Amplitude, i.e. size of radius)</li>
+<li>How fast do we draw it? (Frequency. 1 circle/second is a frequency of 1 Hertz (Hz) or 2*pi radians/sec)</li>
+<li>Where do we start? (Phase angle, where 0 degrees is the x-axis)</li>
+</ul>
+<p>I could say "2-inch radius, start at 45 degrees, 1 circle per second, go!". After half a second, we should each be pointing to: starting point + amount traveled = 45 + 180 = 225 degrees (on a 2-inch circle).</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/circular-path-parameters-20121201-203317.png.webp" type="image/webp"><img decoding="async" alt="circular path with parameters" src="https://betterexplained.com/wp-content/uploads/images/circular-path-parameters-20121201-203317.png" width="500"></picture></p>
+<p>Every circular path needs a size, speed, and starting angle (amplitude/frequency/phase). We can even combine paths: imagine tiny motorcars, driving in circles at different speeds.</p>
+<p>The combined position of <em>all the cycles</em> is our signal, just like the combined flavor of <em>all the ingredients</em> is our smoothie.</p>
+<p>Here's a simulation of a basic circular path:</p>
+
+<p>(Based on <a href="http://treeblurb.com/dev_math/sin_canv00.html">this animation</a>, here's <a href="https://gist.github.com/kazad/8bb682da198db597558c">the source code</a>. Modern browser required. Click the graph to pause/unpause.)</p>
+<p>The magnitude of each cycle is listed in order, starting at 0Hz. Cycles <code>[0 1]</code> means</p>
+<ul>
+<li>0 amplitude for the 0Hz cycle (0Hz = a constant cycle, stuck on the x-axis at zero degrees)</li>
+<li>1 amplitude for the 1Hz cycle (completes 1 cycle per time interval)</li>
+</ul>
+<p>Now the tricky part:</p>
+<ul>
+<li><strong>The blue graph measures the <em>real part</em> of the cycle</strong>. Another lovely math confusion: the real axis of the circle, which is usually horizontal, has its magnitude shown on the vertical axis. You can mentally rotate the circle 90 degrees if you like.</li>
+<li><strong>The time points are spaced at the fastest frequency</strong>. A 1Hz signal needs 2 time points for a start and stop (a single data point doesn't have a frequency). The time values <code>[1 -1]</code> shows the amplitude at these equally-spaced intervals.</li>
+</ul>
+<p>With me? <code>[0 1]</code> is a pure 1Hz cycle.</p>
+<p>Now let's add a 2Hz cycle to the mix. <code>[0 1 1]</code> means "Nothing at 0Hz, 1Hz of amplitude 1, 2Hz of amplitude 1":</p>
+
+<p>Whoa. The little motorcars are getting wild: the green lines are the 1Hz and 2Hz cycles, and the blue line is the combined result. Try toggling the green checkbox to see the final result clearly. The combined "flavor" is a sway that starts at the max and dips low for the rest of the interval.</p>
+<p>The yellow dots are when we actually measure the signal. With 3 cycles defined (0Hz, 1Hz, 2Hz), each dot is 1/3 of the way through the signal. In this case, cycles <code>[0 1 1]</code> generate the time values <code>[2 -1 -1]</code>, which starts at the max (2) and dips low (-1).</p>
+<p>Oh! We can't forget phase, the starting angle! Use <code>magnitude:angle</code> to set the phase. So <code>[0 1:45]</code> is a 1Hz cycle that starts at 45 degrees:</p>
+
+<p>This is a shifted version of <code>[0 1]</code>. On the time side we get <code>[.7 -.7]</code> instead of <code>[1 -1]</code>, because our cycle isn't exactly lined up with our measuring intervals, which are still at the halfway point (this could be desired!).</p>
+<p><strong>The Fourier Transform finds the set of cycle speeds, amplitudes and phases to match any time signal.</strong></p>
+<p>Our signal becomes an abstract notion that we consider as "observations in the time domain" or "ingredients in the frequency domain".</p>
+<p>Enough talk: try it out! In the simulator, type any time or cycle pattern you'd like to see. If it's time points, you'll get a collection of cycles (that combine into a "wave") that matches your desired points.</p>
+<p><a href="https://betterexplained.com/wp-content/uploads/images/time-patterns-20121205-164541.png" target="_blank" rel="noopener">
+<picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/time-patterns-20121205-164541.png.webp" type="image/webp"><img decoding="async" alt="fourier transform examples" src="https://betterexplained.com/wp-content/uploads/images/time-patterns-20121205-164541.png" width="550px"></picture></a></p>
+<p>But… doesn't the combined wave have strange values between the yellow time intervals? Sure. But who's to say whether a signal travels in straight lines, or curves, or zips into other dimensions when we aren't measuring it? It behaves exactly as we need at the equally-spaced moments we asked for.</p>
+<h2>Making A Spike In Time</h2>
+<p>Can we make a spike in time, like <code>(4 0 0 0)</code>, using cycles? I'll use parentheses <code>()</code> for a sequence of time points, and brackets <code>[]</code> for a sequence of cycles.</p>
+<p>Although the spike seems boring to us time-dwellers (<em>one data point, that's it?</em>), think about the complexity in the cycle world. Our cycle ingredients must start aligned (at the max value, 4) and then "explode outwards", each cycle with partners that cancel it in the future. Every remaining point is zero, which is a tricky balance with multiple cycles running around (we can't just "turn them off").</p>
+<p>Let's walk through each time point:</p>
+<ul>
+<li><p>At time 0, the first instant, every cycle ingredient is at its max. Ignoring the other time points, <code>(4 ? ? ?)</code> can be made from 4 cycles (0Hz 1Hz 2Hz 3Hz), each with a magnitude of 1 and phase of 0 (i.e., 1 + 1 + 1 + 1 = 4).</p></li>
+<li><p>At every future point (t = 1, 2, 3), the sum of all cycles must cancel.</p></li>
+</ul>
+<p>Here's the trick: when two cycles are on opposites sides of the circle (North &amp; South, East &amp; West, etc.) their combined position is zero (3 cycles can cancel if they're spread evenly at 0, 120, and 240 degrees).</p>
+<p>Imagine a constellation of points moving around the circle. Here's the position of each cycle at every instant:</p>
+<pre>Time 0 1 2 3 
+------------
+0Hz: 0 0 0 0 
+1Hz: 0 1 2 3
+2Hz: 0 2 0 2
+3Hz: 0 3 2 1
+</pre>
+<p>Notice how the the 3Hz cycle starts at 0, gets to position 3, then position "6" (with only 4 positions, 6 <a href="https://betterexplained.com/articles/fun-with-modular-arithmetic/">modulo</a> 4 = 2), then position "9" (9 modulo 4 = 1).</p>
+<p>When our cycle is 4 units long, cycle speeds a half-cycle apart (2 units) will either be lined up (difference of 0, 4, 8…) or on opposite sides (difference of 2, 6, 10…).</p>
+<p>OK. Let's drill into each time point:</p>
+<ul>
+<li>Time 0: All cycles at their max (total of 4)</li>
+<li>Time 1: 1Hz and 3Hz cancel (positions 1 &amp; 3 are opposites), 0Hz and 2Hz cancel as well. The net is 0.</li>
+<li>Time 2: 0Hz and 2Hz line up at position 0, while 1Hz and 3Hz line up at position 2 (the opposite side). The total is still 0.</li>
+<li>Time 3: 0Hz and 2Hz cancel. 1Hz and 3Hz cancel.</li>
+<li>Time 4 (repeat of t=0): All cycles line up.</li>
+</ul>
+<p>The trick is having individual speeds cancel (0Hz vs 2Hz, 1Hz vs 3Hz), or having the lined-up pairs cancel (0Hz + 2Hz vs 1Hz + 3Hz).</p>
+<p>When every cycle has equal power and 0 phase, we start aligned and cancel afterwards. (I don't have a nice proof yet -- any takers? -- but you can see it yourself. Try <code>[1 1]</code>, <code>[1 1 1]</code>, <code>[1 1 1 1]</code> and notice the signals we generate: <code>(2 0)</code>, <code>(3 0 0)</code>, <code>(4 0 0 0)</code>).</p>
+<p>In my head, I label these signals as "time spikes": they have a value for a single instant, and are zero otherwise (the fancy name is a <a href="https://en.wikipedia.org/wiki/Dirac_delta_function">delta function</a>.)</p>
+<p>Here's how I visualize the initial alignment, followed by a net cancellation:</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/fourier-interference-20121211-171719.png.webp" type="image/webp"><img decoding="async" alt="fourier transform constructive and destructive interference" src="https://betterexplained.com/wp-content/uploads/images/fourier-interference-20121211-171719.png" width="400px"></picture></p>
+<h2>Moving The Time Spike</h2>
+<p>Not everything happens at t=0. Can we change our spike to <code>(0 4 0 0)</code>?</p>
+<p>It seems the cycle ingredients should be similar to <code>(4 0 0 0)</code>, but the cycles must align at t=1 (one second in the future). Here's where phase comes in.</p>
+<p>Imagine a race with 4 runners. Normal races have everyone lined up at the starting line, the <code>(4 0 0 0)</code> time pattern. Boring.</p>
+<p>What if we want everyone to <em>finish</em> at the same time? Easy. Just move people forward or backwards by the appropriate distance. Maybe granny can start 2 feet in front of the finish line, Usain Bolt can start 100m back, and they can cross the tape holding hands.</p>
+<p>Phase shifts, the starting angle, are delays in the cycle universe. Here's how we adjust the starting position to delay every cycle 1 second:</p>
+<ul>
+<li>A 0Hz cycle doesn't move, so it's already aligned</li>
+<li>A 1Hz cycle goes 1 revolution in the entire 4 seconds, so a 1-second delay is a quarter-turn. Phase shift it 90 degrees backwards (-90) and it gets to phase=0, the max value, at t=1.</li>
+<li>A 2Hz cycle is twice as fast, so give it twice the angle to cover (-180 or 180 phase shift -- it's across the circle, either way).</li>
+<li>A 3Hz cycle is 3x as fast, so give it 3x the distance to move (-270 or +90 phase shift)</li>
+</ul>
+<p>If time points <code>(4 0 0 0)</code> are made from cycles <code>[1 1 1 1]</code>, then time points <code>(0 4 0 0)</code> are made from <code>[1 1:-90 1:180 1:90]</code>. (Note: I'm using "1Hz", but I mean "1 cycle over the entire time period").</p>
+<p>Whoa -- we're working out the cycles in our head!</p>
+<p>The interference visualization is similar, except the alignment is at t=1.</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/delayed-spike-20121214-162623.png.webp" type="image/webp"><img decoding="async" alt="fourier transform time spike" src="https://betterexplained.com/wp-content/uploads/images/delayed-spike-20121214-162623.png" width="400px"></picture></p>
+<p>Test your intuition: Can you make <code>(0 0 4 0)</code>, i.e. a 2-second delay? 0Hz has no phase. 1Hz has 180 degrees, 2Hz has 360 (aka 0), and 3Hz has 540 (aka 180), so it's <code>[1 1:180 1 1:180]</code>.</p>
+<h2>Discovering The Full Transform</h2>
+<p>The big insight: our signal is just a bunch of time spikes! If we merge the recipes for each time spike, we should get the recipe for the full signal.</p>
+<p>The Fourier Transform builds the recipe frequency-by-frequency:</p>
+<ul>
+<li>Separate the full signal (a b c d) into "time spikes": (a 0 0 0) (0 b 0 0) (0 0 c 0) (0 0 0 d)</li>
+<li>For any frequency (like 2Hz), the <em>tentative</em> recipe is "a/4 + b/4 + c/4 + d/4" (the amplitude of each spike is split among all frequencies)</li>
+<li>Wait! We need to offset each spike with a phase delay (the angle for a "1 second delay" depends on the frequency).</li>
+<li>Actual recipe for a frequency = a/4 (no offset) + b/4 (1 second offset) + c/4 (2 second offset) + d/4 (3 second offset).</li>
+</ul>
+<p>We can then loop through every frequency to get the full transform.</p>
+<p>Here's the conversion from "math English" to full math:</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/fourier-explained-20121219-224649.png.webp" type="image/webp"><img decoding="async" alt="fourier transform plain english" src="https://betterexplained.com/wp-content/uploads/images/fourier-explained-20121219-224649.png" width="500px"></picture></p>
+<p>A few notes:</p>
+<ul>
+<li>N = number of time samples we have</li>
+<li>n = current sample we're considering (0 .. N-1)</li>
+<li>x<sub>n</sub> = value of the signal at time n</li>
+<li>k = current frequency we're considering (0 Hertz up to N-1 Hertz)</li>
+<li>X<sub>k</sub> = amount of frequency k in the signal (amplitude and phase, a complex number)</li>
+<li>The 1/N factor is usually moved to the <em>reverse transform</em> (going from frequencies back to time). This <a href="http://math.stackexchange.com/questions/58163/dft-why-are-the-definitions-for-inverse-and-forward-commonly-switched">is allowed</a>, though I prefer 1/N in the forward transform since it gives the <em>actual</em> sizes for the time spikes. You can get wild and even use $1/\sqrt{N}$ on both transforms (going forward and back creates the 1/N factor).</li>
+<li>n/N is the percent of the time we've gone through. 2 * pi * k is our speed in radians / sec. e^-ix is our backwards-moving circular path. The combination is how far we've moved, for this speed and time.</li>
+<li>The raw equations for the Fourier Transform just say "add the complex numbers". Many programming languages cannot handle complex numbers directly, so you convert everything to rectangular coordinates and add those.</li>
+</ul>
+<h2>Onward</h2>
+<p>This was my most challenging article yet. The Fourier Transform has several flavors (discrete/continuous/finite/infinite), covers deep math (Dirac delta functions), and it's easy to get lost in details. I was constantly bumping into the edge of my knowledge.</p>
+<p>But there's always simple analogies out there -- I refuse to think otherwise. Whether it's a smoothie or Usain Bolt &amp; Granny crossing the finish line, take a simple understanding and refine it. The analogy is flawed, and that's ok: it's a raft to use, and leave behind once we cross the river.</p>
+<p>I realized how feeble my own understanding was when I couldn't work out the transform of <code>(1 0 0 0)</code> in my head. For me, it was like saying I knew addition but, gee whiz, I'm not sure what "1 + 1 + 1 + 1" would be. Why not? Shouldn't we have an intuition for the simplest of operations?</p>
+<p>That discomfort led me around the web to build my intuition. In addition to the references in the article, I'd like to thank:</p>
+<ul>
+<li><a href="http://www.scotthyoung.com/blog/">Scott Young</a>, for the initial impetus for this post</li>
+<li><a href="http://shaheengandhi.com/">Shaheen Gandhi</a>, Roger Cheng, and <a href="http://britcruise.com/">Brit Cruise</a> for kicking around ideas &amp; refining the analogy</li>
+<li><a href="http://cns-alumni.bu.edu/~slehar/fourier/fourier.html">Steve Lehar</a> for great examples of the Fourier Transform on images</li>
+<li><a href="http://www.complextoreal.com/chapters/fft1.pdf">Charan Langton</a> for her detailed walkthrough</li>
+<li><a href="https://ccrma.stanford.edu/~jos/log/">Julius Smith</a> for a fantastic walkthrough of the Discrete Fourier Transform (what we covered today)</li>
+<li><a href="http://worrydream.com/#!/LearnableProgramming">Bret Victor</a> for his techniques on visualizing learning</li>
+</ul>
+<p>Today's goal was to <em>experience</em> the Fourier Transform. We'll save the advanced analysis for next time.</p>
+<p>Happy math.</p>
+<h2>Appendix: Projecting Onto Cycles</h2>
+<p>Stuart Riffle has a <a href="https://web.archive.org/web/20120418231513/http://www.altdevblogaday.com/2011/05/17/understanding-the-fourier-transform/">great interpretation</a> of the Fourier Transform:</p>
+<p><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/images/DerivedDFT.png.webp" type="image/webp"><img decoding="async" alt="fourier transform colorized" src="https://betterexplained.com/wp-content/uploads/images/DerivedDFT.png"></picture></p>
+<p>Imagine spinning your signal in a centrifuge and checking for a bias. I have a correction: we must spin <em>backwards</em> (the exponent in the equation above should be $e^{-i 2 \pi...}$). You already know why: we need a phase <em>delay</em> so spikes appear in the <em>future</em>.</p>
+<h2>Appendix: Another Awesome Visualization</h2>
+<p><a href="http://toxicdump.org/blog/">Lucas Vieira</a>, author of excellent <a href="https://en.wikipedia.org/wiki/User:Kieff/Gallery">Wikipedia animations</a>, was <a href="http://blog.matthen.com/post/42112703604/the-smooth-motion-of-rotating-circles-can-be-used">inspired</a> to make this interactive animation:</p>
+<p><a href="https://web.archive.org/web/20170201145911/http://toxicdump.org/stuff/FourierToy.swf">Fourier Toy - Click to download, requires flash</a></p>
+<p><a href="http://toxicdump.org/stuff/FourierToy.swf"><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-300x126.png.webp 300w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-768x323.png.webp 768w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-1024x431.png.webp 1024w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-320x135.png.webp 320w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-200x84.png.webp 200w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy-400x168.png.webp 400w, https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2012/12/Fourier_Toy.png.webp 1438w" sizes="(max-width: 300px) 100vw, 300px" type="image/webp"><img loading="lazy" decoding="async" src="https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-300x126.png" alt="Fourier_Toy" width="300" height="126" srcset="https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-300x126.png 300w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-768x323.png 768w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-1024x431.png 1024w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-320x135.png 320w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-200x84.png 200w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy-400x168.png 400w, https://betterexplained.com/wp-content/uploads/2012/12/Fourier_Toy.png 1438w" sizes="(max-width: 300px) 100vw, 300px"></picture></a></p>
+
+<p>(<a href="http://www.reddit.com/r/math/comments/17v8cv/visualized_fourier/c89c3pa">Detailed list</a> of control options)</p>
+<p>The Fourier Transform is about cycles added to cycles added to cycles. Try making a "time spike" by setting a amplitude of 1 for every component (press Enter after inputting each number). Fun fact: with enough terms, you can draw any shape, even <a href="https://www.youtube.com/watch?v=QVuU2YCwHjw&amp;feature=youtu.be">Homer Simpson</a>.</p>
+<iframe loading="lazy" src="https://www.youtube.com/embed/QVuU2YCwHjw" width="420" height="315" frameborder="0" allowfullscreen="allowfullscreen"></iframe>
+<p>Check out <a href="http://www.jezzamon.com/fourier/">http://www.jezzamon.com/fourier/</a> for a great tool to draw any shape using epicycles.</p>
+<p><a href="http://www.jezzamon.com/fourier/"><picture><source srcset="https://betterexplained.com/wp-content/webp-express/webp-images/uploads/2019/01/Fourier-Transforms-2019-01-12-15-11-48.png.webp" type="image/webp"><img decoding="async" alt="An Interactive Guide To The Fourier Transform" src="https://betterexplained.com/wp-content/uploads/2019/01/Fourier-Transforms-2019-01-12-15-11-48.png" width="500"></picture>
+</a></p>
+<h2>Appendix: Article with R code samples</h2>
+<p>João Neto made a great writeup, with technical (R) code samples here:</p>
+<p><a href="http://www.di.fc.ul.pt/~jpn/r/fourier/fourier.html">http://www.di.fc.ul.pt/~jpn/r/fourier/fourier.html</a></p>
+<h2>Appendix: Using the code</h2>
+<p>All the code and examples are open source (MIT licensed, do what you like).</p>
+<ul>
+<li><a href="https://betterexplained.com/examples/fourier/">Interactive example</a> (view source)</li>
+<li><a href="https://gist.github.com/129d477ddb1c8025c9ac">Github gist</a></li>
+<li><a href="http://www.reddit.com/r/programming/comments/156a9i/an_interactive_guide_to_the_fourier_transform/c7k9b1t?context=3">Reddit discussion</a> on details of the computation, I'm pb_zeppelin</li>
+</ul>
+<h2>Other Posts In This Series</h2><ol>
+<li><a href="https://betterexplained.com/articles/a-visual-intuitive-guide-to-imaginary-numbers/" title="A Visual, Intuitive Guide to Imaginary Numbers">A Visual, Intuitive Guide to Imaginary Numbers</a></li>
+<li><a href="https://betterexplained.com/articles/intuitive-arithmetic-with-complex-numbers/" title="Intuitive Arithmetic With Complex Numbers">Intuitive Arithmetic With Complex Numbers</a></li>
+<li><a href="https://betterexplained.com/articles/understanding-why-complex-multiplication-works/" title="Understanding Why Complex Multiplication Works">Understanding Why Complex Multiplication Works</a></li>
+<li><a href="https://betterexplained.com/articles/intuitive-guide-to-angles-degrees-and-radians/" title="Intuitive Guide to Angles, Degrees and Radians">Intuitive Guide to Angles, Degrees and Radians</a></li>
+<li><a href="https://betterexplained.com/articles/intuitive-understanding-of-eulers-formula/" title="Intuitive Understanding Of Euler's Formula">Intuitive Understanding Of Euler's Formula</a></li>
+<li><a href="https://betterexplained.com/articles/an-interactive-guide-to-the-fourier-transform/" title="An Interactive Guide To The Fourier Transform">An Interactive Guide To The Fourier Transform</a></li>
+<li><a href="https://betterexplained.com/articles/intuitive-convolution/" title="Intuitive Guide to Convolution">Intuitive Guide to Convolution</a></li>
+<li><a href="https://betterexplained.com/articles/intuitive-understanding-of-sine-waves/" title="Intuitive Understanding of Sine Waves">Intuitive Understanding of Sine Waves</a></li>
+<li><a href="https://betterexplained.com/articles/linear-algebra-guide/" title="An Intuitive Guide to Linear Algebra">An Intuitive Guide to Linear Algebra</a></li>
+<li><a href="https://betterexplained.com/articles/matrix-multiplication/" title="A Programmer's Intuition for Matrix Multiplication">A Programmer's Intuition for Matrix Multiplication</a></li>
+<li><a href="https://betterexplained.com/articles/imaginary-multiplication-exponents/" title="Imaginary Multiplication vs. Imaginary Exponents">Imaginary Multiplication vs. Imaginary Exponents</a></li>
+<li><a href="https://betterexplained.com/articles/hyperbolic-functions/" title="Intuitive Guide to Hyperbolic Functions">Intuitive Guide to Hyperbolic Functions</a></li>
+</ol>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[HNInternal: Ask HN: AI/ML papers to catch up with current state of AI? (145 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=38652736</link>
             <guid>38652736</guid>
             <pubDate>Fri, 15 Dec 2023 10:19:14 GMT</pubDate>
@@ -932,7 +1385,7 @@
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Godot: A Collaboration with Google and the Forge (114 pts)]]></title>
+            <title><![CDATA[Godot: A Collaboration with Google and the Forge (124 pts)]]></title>
             <link>https://godotengine.org/article/collaboration-with-google-forge-2023/</link>
             <guid>38651818</guid>
             <pubDate>Fri, 15 Dec 2023 07:16:12 GMT</pubDate>
@@ -953,7 +1406,7 @@
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AMD's Next GPU Is a 3D-Integrated Superchip (125 pts)]]></title>
+            <title><![CDATA[AMD's Next GPU Is a 3D-Integrated Superchip (139 pts)]]></title>
             <link>https://spectrum.ieee.org/amd-mi300</link>
             <guid>38650937</guid>
             <pubDate>Fri, 15 Dec 2023 04:18:19 GMT</pubDate>
@@ -961,7 +1414,7 @@
 <div id="readability-page-1" class="page"><div data-headline="AMD’s Next GPU Is a 3D-Integrated Superchip" data-elid="2666454143" data-post-url="https://spectrum.ieee.org/amd-mi300" data-authors="Samuel K. Moore" data-page-title="AMD’s Next GPU Is a 3D-Integrated Superchip - IEEE Spectrum"><p><a href="https://spectrum.ieee.org/tag/amd">AMD</a> lifted the hood on its next AI accelerator chip, the Instinct MI300, at the<a href="https://www.amd.com/en/corporate/events/advancing-ai.html" target="_blank"> AMD Advancing AI</a> event today, and it’s an unprecedented feat of <a href="https://spectrum.ieee.org/tag/3d-integration" target="_blank">3D integration</a>. MI300, a version of which will power the <a href="https://en.wikipedia.org/wiki/El_Capitan_(supercomputer)" target="_blank">El Capitan</a> supercomputer, is a layer cake of computing, memory, and communication that’s three slices of silicon high and that can sling as much as 17 terabytes of data vertically between those slices. The result is as much as a 3.4-fold boost in speed for certain machine-learning-critical calculations. The chip offers both contrasts and similarities to competing approaches such as Nvidia’s <a href="https://spectrum.ieee.org/nvidia-supercomputing-cpu-puts-intel-under-pressure" target="_blank">Grace Hopper superchip</a> and Intel’s supercomputer accelerator <a href="https://spectrum.ieee.org/intel-s-exascale-supercomputer-chip-is-a-master-class-in-3d-integration" target="_self">Ponte Vecchio</a>.<br></p><p>MI300a stacks three CPU <a href="https://spectrum.ieee.org/tag/chiplets" target="_blank">chiplets</a> (called compute complex dies, or CCDs, in AMD’s lingo) and six accelerator chiplets (XCDs) on top of four input-output dies (IODs), all on top of a piece of silicon that links them together to eight stacks of high-bandwidth DRAM that ring the superchip. (The MI300x substitutes the CCDs for two more XCDs, for an accelerator-only system.) With the scaling of transistors in the plane of the silicon slowing down, 3D stacking is seen as a key method to get more transistors into the same area and keep driving Moore’s Law forward.</p><p><img alt="Grey, labeled rectangles with orange and gold vertical lines connecting them." data-rm-shortcode-id="b87acda6384d54374dd4564223f0574f" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/grey-labeled-rectangles-with-orange-and-gold-vertical-lines-connecting-them.jpg?id=50661489&amp;width=980" height="240" id="a7fd1" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/grey-labeled-rectangles-with-orange-and-gold-vertical-lines-connecting-them.jpg?id=50661489&amp;width=980" width="1057"><small data-gramm="false" data-lt-tmp-id="lt-246886" placeholder="Add Photo Caption..." spellcheck="false">Compute and AI chiplets are stacked on top of I/O and cache chiplets in the MI300a.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>“It’s a truly amazing silicon stack up that delivers the highest density performance that industry knows how to produce at this time,” says <a href="https://spectrum.ieee.org/chiplet" target="_self">Sam Naffziger</a>, a senior vice president and corporate fellow at AMD. The integration is done using two Taiwan Semiconductor Manufacturing Co. technologies, <a href="https://3dfabric.tsmc.com/english/dedicatedFoundry/technology/SoIC.htm" rel="noopener noreferrer" target="_blank">SoIC (system on integrated chips) and CoWoS (chip on wafer on substrate)</a>. The latter stacks smaller chips on top of larger ones using hybrid bonding, which links copper pads on each chip directly without solder. It is used to produce AMD’s <a href="https://spectrum.ieee.org/amd-3d-stacking-intel-graphcore" target="_self">V-Cache,</a> a cache-memory expanding chiplet that stacks on its highest-end CPU chiplets. The former, CoWos, stacks chiplets on a larger piece of silicon, called an interposer, which is built to contain high-density interconnects.</p><h2>Similarities and differences between AMD and Nvidia</h2><p>There are both similarities and differences to chief rival Nvidia’s approach. Just as Nvidia did in its Hopper architecture, AMD’s accelerator architecture, CDNA3, added the capability of computing with <a href="https://www.nvidia.com/en-us/data-center/h100/#:~:text=AI%2Dfused%20HPC%20applications%20can,operations%2C%20with%20zero%20code%20changes." rel="noopener noreferrer" target="_blank">truncated 32-bit numbers called TF32</a> and with two different forms of 8-bit floating-point numbers. The latter attribute is used to speed the training of certain parts of transformer neural networks, such as large language models. They also both include a <a href="https://spectrum.ieee.org/nvidia-gpu" target="_self">scheme that reduces the size of the neural network</a>, called 4:2 sparsity.</p><p>Another similarity is the inclusion of both CPU and GPU in the same <a href="https://spectrum.ieee.org/tag/3d-packaging" target="_blank">package</a>. In many AI computer systems, GPUs and CPUs are separately packaged chips deployed in a 4 to 1 ratio. One advantage to joining them together in a single superchip is that both CPU and GPU have high-bandwidth access to the same cache and high-bandwidth DRAM (HBM) in a way that won’t trip each other up as they read and write data.</p><p>Nvidia’s <a href="https://developer.nvidia.com/blog/nvidia-grace-hopper-superchip-architecture-in-depth/" target="_blank">Grace Hopper</a> is such a superchip combination linking the Grace CPU to the Hopper GPU through Nvidia’s Nvidia NVLink Chip-2-Chip interconnects. AMD’s MI300a is as well, by integrating three CPU dies designed for its Genoa line and six XCD accelerators using its AMD Infinity Fabric interconnect technology.</p><p>But a casual glance at Grace Hopper and MI300 show some profound differences. Grace and Hopper are each individual dies that integrate all of a system-on-chip’s needed functional blocks—compute, I/O, and cache. They are linked horizontally, and they are large—nearly at the size limit of photolithography technology.</p><p>AMD took a different approach, one that it has followed for several generations of its CPUs and that rival <a href="https://spectrum.ieee.org/tag/intel">Intel</a> used for its 3D-stacked supercomputer accelerator Ponte Vecchio. The concept is called system-technology-co-optimization, or STCO. That means designers started by breaking the chip down into its functions and decided which functions needed which manufacturing technology.</p><p data-rm-resized-container="25%"><img alt="" data-rm-shortcode-id="824acf053d8de4f6c76ec91569d65c78" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/a-slice-of-mi300-stack-from-the-carrier-silicon-at-the-top-to-the-solder-ball-at-the-bottom-of-the-package.jpg?id=50682953&amp;width=980" height="3661" id="cde2e" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/a-slice-of-mi300-stack-from-the-carrier-silicon-at-the-top-to-the-solder-ball-at-the-bottom-of-the-package.jpg?id=50682953&amp;width=980" width="1126"><small placeholder="Add Photo Caption...">A slice of MI300 stack from the carrier silicon at the top to the solder ball at the bottom of the package.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>“What we wanted to do with MI300 was to scale beyond what was possible in a single monolithic GPU. So we deconstructed it into pieces and then built it back up,” says <a href="https://www.linkedin.com/in/alan-smith-amd/" rel="noopener noreferrer" target="_blank">Alan Smith</a>, a senior fellow and the chief architect for Instinct. Although it’s been doing so for several generations of CPUs, the MI300 is the first time the company has made GPU chiplets and bound them in a single system.</p><p>“Breaking the GPU into chiplets allowed us to put the compute in the most advanced process node while keeping the rest of the chip in technology that’s more appropriate for cache and I/O,” he says. In the case of the MI300, all the compute was built using TSMC’s N5 process, the most advanced available and the one used for Nvidia’s top-line GPUs. Neither the I/O functions nor the system’s cache memory benefit from N5, so AMD chose a less-expensive technology (N6) for those. Therefore, those two functions could then be built together on the same chiplet.</p><p>With the functions broken up, all the pieces of silicon involved in the MI300 are small. The largest, the I/O dies, are not even half the size of Hopper. And the CCDs are only about one-fifth the size of the I/O die. The small sizes make a big difference. Generally, smaller chips yield better. That is, a single wafer will provide a higher proportion of working small chips than it would large chips. “3D integration isn’t free,” says Naffziger. But the higher yield offsets the cost, he says.</p><h2>Luck and experience</h2><p>The design involved some clever reuse of existing technologies and designs, a few compromises, and a little luck, according to Naffziger, an IEEE Fellow. The reuse came in two instances. First, AMD was able to do the 3D integration with a degree of confidence because it had already been using the exact same pitch of vertical interconnects—9 micrometers—in its V-cache product.</p><p>As an optional add-on that AMD was able to charge extra for, V-cache offers little risk that poor yield or other problems will have a big impact on the company. “It’s been a great thing to enable us to wring out the manufacturing problems and all the design complexities of 3D stacking without endangering the main product line,” says Naffziger.</p><p>The other instance of reuse was a bit chancier. When the MI300 team decided that a CPU/GPU combination was needed, Naffziger “somewhat sheepishly” asked the head of the team designing the Zen4 CCD for the <a href="https://www.amd.com/en/events/epyc4" target="_blank">Genoa CPU</a> if the CCD could be made to fit the MI300’s needs. That team was under pressure to meet an earlier deadline than expected, but a day later they responded. Naffziger was in luck; the Zen4 CCD had a small blank space in just the right spot to make the vertical connections to the MI300 I/O die and their associated circuitry without a disruption to the overall design.</p><p>Nevertheless, there was still some geometry that needed solving. To make all the internal communications work, the four I/O chiplets had to be facing each other on a particular edge. That meant making a mirror-image version of the chiplet. Because it was codesigned with the I/O chiplet, the XCD and its vertical connections were built to link up with both versions of the I/O. But there was no messing with the CCD, which they were lucky to have at all. So instead the I/O was designed with redundant connections, so that no matter which version of the chiplet it sat on, the CCD would connect.</p><p><img alt="Multicolor rectangle with capital lettering in places." data-rm-shortcode-id="fd7dd6159bc9fba3eaf956a11c231d6e" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/multicolor-rectangle-with-capital-lettering-in-places.jpg?id=50662187&amp;width=980" height="412" id="917d3" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/multicolor-rectangle-with-capital-lettering-in-places.jpg?id=50662187&amp;width=980" width="896"><small placeholder="Add Photo Caption...">To get everything to line up, the IOD chiplets had to be made as mirrors of each other, and the accelerator (XCD) and compute (CCD) chiplets had to be rotated.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>The power grid, which has to deliver hundreds of amperes of current to the compute dies at the top of the stack, faced similar challenges because it too had to accommodate all the various chiplet orientations, Naffziger noted.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pipe Dreams: The life and times of Yahoo Pipes (275 pts)]]></title>
+            <title><![CDATA[Pipe Dreams: The life and times of Yahoo Pipes (296 pts)]]></title>
             <link>https://retool.com/pipes</link>
             <guid>38650878</guid>
             <pubDate>Fri, 15 Dec 2023 04:07:09 GMT</pubDate>
@@ -969,7 +1422,7 @@
 <div id="readability-page-1" class="page"><div font-family="TiemposText" font-weight="400"><div><p>“He was very kind to write this very nice review of it,” Sadri reflected, “and that exploded interest, and caused our servers all to melt down.”</p></div><div><p>As launch day went on, usage didn’t taper off. The demand for Pipes required vastly more resources than it had available, and Yahoo put all hands on deck to support keeping the nascent system running.</p></div><div><p>Ho remembers “just sitting in my chair the entire <!-- -->[<!-- -->launch<!-- -->]<!-- --> day until late in the evening, just bringing up machines.” Yahoo’s data-center team started shifting servers that they had already prepped for deployment for other groups into service for Pipes.</p></div><div><p>“Every time it came up, everybody jumped on it and it crashed again, and everybody cycled back into a waiting state,” said Trevor, the lead engineer. “It felt bad at the time, but in retrospect, it was awesome.”</p></div><div><p>Raffel said Yahoo co-founder Jerry Yang told him to use his name to get whatever he needed to keep Pipes running then: “I’d never done that before. I certainly haven’t done that since.”</p></div><div><p>The beta launch’s popularity caught the team so off guard that they hadn’t even prepared a crash page. (Though that soon changed: Trevor said that the first thing they created after the beta launch was a page that read something like “our pipes are clogged.”)</p></div><div><p>In the days and weeks following, the team started to see more of the loose threads they hadn’t been able to stitch up in the sudden sprint to an unexpectedly momentous launch. Among a variety of issues, once someone created a Pipe, it ran forever.</p></div><div><p>There was no end-time built in or a need for someone to login to refresh or request a feed. (Even if there had been, RSS newsreaders polled for updates automatically.) Raffel said the team didn’t consider “just how many zombie things would get generated. <!-- -->[<!-- -->...<!-- -->]<!-- --> We kind of put ourselves in a situation where, fairly quickly, we had a lot of usage from things that may or may not actually <!-- -->[<!-- -->have been<!-- -->]<!-- --> real users.”</p></div><div><p>Still, many others agreed with O’Reilly’s sentiments. The <em>InfoWorld</em> writer turned <a href="https://blog.jonudell.net/2007/02/12/annotate-the-web-then-rewire-it/" target="_blank" rel="noopener noreferrer">Microsoft evangelist Jon Udell</a> blogged about a week after the beta launch, “The dominant way in which most people will ‘program’ the web is by writing metadata, not code, and we’ll need an interface as friendly and powerful as Pipes to help them do that.”</p></div><div><p>Yahoo threw more servers at Pipes, the programmers optimized the least inefficient code, and within a few months, Pipes’ reliability stabilized. But just as it was rising it was also—already—nearly fixed in amber.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: My Go SQLite driver did poorly on a benchmark, so I fixed it (191 pts)]]></title>
+            <title><![CDATA[Show HN: My Go SQLite driver did poorly on a benchmark, so I fixed it (195 pts)]]></title>
             <link>https://github.com/ncruces/go-sqlite-bench</link>
             <guid>38650570</guid>
             <pubDate>Fri, 15 Dec 2023 02:44:23 GMT</pubDate>
@@ -1207,7 +1660,7 @@ It's free.</p>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google Groups ending support for Usenet (254 pts)]]></title>
+            <title><![CDATA[Google Groups ending support for Usenet (256 pts)]]></title>
             <link>https://support.google.com/groups/answer/11036538?hl=en</link>
             <guid>38649554</guid>
             <pubDate>Fri, 15 Dec 2023 00:37:37 GMT</pubDate>
@@ -1239,7 +1692,7 @@ It's free.</p>
 </div>         <div data-stats-id="11036538" data-stats-ve="20" data-stats-visible-imp="" id="article-survey-container"><h2>Was this helpful?</h2><p>How can we improve it?</p></div>    </article>            </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Stanford Prison Experiment was hugely influential. We learned it was a fraud (2018) (154 pts)]]></title>
+            <title><![CDATA[The Stanford Prison Experiment was hugely influential. We learned it was a fraud (2018) (157 pts)]]></title>
             <link>https://www.vox.com/2018/6/13/17449118/stanford-prison-experiment-fraud-psychology-replication</link>
             <guid>38648883</guid>
             <pubDate>Thu, 14 Dec 2023 23:26:58 GMT</pubDate>
@@ -1454,7 +1907,7 @@ It's free.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Airdraw (247 pts)]]></title>
+            <title><![CDATA[Show HN: Airdraw (249 pts)]]></title>
             <link>https://www.airdraw.io/</link>
             <guid>38647938</guid>
             <pubDate>Thu, 14 Dec 2023 22:02:44 GMT</pubDate>
@@ -1462,7 +1915,7 @@ It's free.</p>
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Mitchell reflects as he departs HashiCorp (639 pts)]]></title>
+            <title><![CDATA[Mitchell reflects as he departs HashiCorp (643 pts)]]></title>
             <link>https://www.hashicorp.com/blog/mitchell-reflects-as-he-departs-hashicorp</link>
             <guid>38647484</guid>
             <pubDate>Thu, 14 Dec 2023 21:27:17 GMT</pubDate>
@@ -1479,7 +1932,7 @@ It's free.</p>
 <p>All the best.</p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Journal of Universal Rejection (112 pts)]]></title>
+            <title><![CDATA[The Journal of Universal Rejection (114 pts)]]></title>
             <link>https://universalrejection.org/</link>
             <guid>38647101</guid>
             <pubDate>Thu, 14 Dec 2023 20:54:23 GMT</pubDate>
@@ -1657,7 +2110,7 @@ Ghil'ad Zuckermann, University of Adelaide, Australia (Endangered Languages, Jew
 	</div><p>Michigan Capitol Confidential is the news source produced by the Mackinac Center for Public Policy. Michigan Capitol Confidential reports with a free-market news perspective.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Postfix 25 years old today (106 pts)]]></title>
+            <title><![CDATA[Postfix 25 years old today (107 pts)]]></title>
             <link>https://marc.info/?l=postfix-users&amp;m=170256002601828&amp;w=2</link>
             <guid>38647053</guid>
             <pubDate>Thu, 14 Dec 2023 20:50:28 GMT</pubDate>
@@ -1714,7 +2167,7 @@ To unsubscribe send an email to postfix-users-leave@postfix.org
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OnnxStream: Stable Diffusion XL 1.0 Base on a Raspberry Pi Zero 2 (102 pts)]]></title>
+            <title><![CDATA[OnnxStream: Stable Diffusion XL 1.0 Base on a Raspberry Pi Zero 2 (103 pts)]]></title>
             <link>https://github.com/vitoplantamura/OnnxStream/tree/c0cb4b3d7b419e4b10129904fbe16b850ca5d385</link>
             <guid>38646969</guid>
             <pubDate>Thu, 14 Dec 2023 20:43:22 GMT</pubDate>
@@ -2124,7 +2577,7 @@ python -m onnxruntime.tools.make_dynamic_shape_fixed --input_name encoder_hidden
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple partly halts Beeper's iMessage app again, suggesting a long fight ahead (272 pts)]]></title>
+            <title><![CDATA[Apple partly halts Beeper's iMessage app again, suggesting a long fight ahead (273 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2023/12/apple-partly-halts-beepers-imessage-app-again-suggesting-a-long-fight-ahead/</link>
             <guid>38646903</guid>
             <pubDate>Thu, 14 Dec 2023 20:37:01 GMT</pubDate>
@@ -2527,563 +2980,6 @@ It's a bold strategy, and Gelsinger appeared confident as he led his team throug
 <p>* <strong>Tags queried based on last Top 20:</strong> JavaScript, Python, Java, PHP, C#, CSS, TypeScript, C++, Ruby, C, Swift, Shell, R, Go, Scala, Objective-C, Kotlin, PowerShell, Rust, Dart</p>
 <p><strong>Disclaimer:</strong> GitHub and Google Cloud are RedMonk clients. Stack Overflow and OpenAI (ChatGPT) are not.</p>
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Canadian internet bill S-210 is a step closer to becoming law (220 pts)]]></title>
-            <link>https://www.michaelgeist.ca/2023/12/the-most-dangerous-canadian-internet-bill-youve-never-heard-of-is-a-step-closer-to-becoming-law/</link>
-            <guid>38643369</guid>
-            <pubDate>Thu, 14 Dec 2023 16:43:36 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.michaelgeist.ca/2023/12/the-most-dangerous-canadian-internet-bill-youve-never-heard-of-is-a-step-closer-to-becoming-law/">https://www.michaelgeist.ca/2023/12/the-most-dangerous-canadian-internet-bill-youve-never-heard-of-is-a-step-closer-to-becoming-law/</a>, See on <a href="https://news.ycombinator.com/item?id=38643369">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section id="content" role="main">
-
-	<div><p><img src="https://www.michaelgeist.ca/wp-content/uploads/2021/09/34462663835_aff7fad1fb_k-780x350.jpg" alt="2017 Freedom of Expression Awards by Elina Kansikas for Index on Censorship https://flic.kr/p/Uvmaie (CC BY-SA 2.0)" width="780" height="350"></p><p>2017 Freedom of Expression Awards by Elina Kansikas for Index on Censorship https://flic.kr/p/Uvmaie (CC BY-SA 2.0)</p></div>
-
-	<span><a href="https://www.michaelgeist.ca/category/news/" rel="category tag">News</a></span>
-	
-
-
-	
-		<p>
-
-						December 14, 2023
-						</p><!-- /.post-meta -->
-
-
-		<div id="post-19923">
-				<p><span>After years of battles over Bills C-11 and C-18, few Canadians will have the appetite for yet another troubling Internet bill. But given a bill that envisions government-backed censorship, mandates age verification to use search engines or social media sites, and creates a framework for court-ordered website blocking, there is a need to pay attention. <a href="https://www.parl.ca/DocumentViewer/en/44-1/bill/S-210/third-reading">Bill S-210</a>, or the </span><em><span>Protecting Young Persons from Exposure to Pornography Act</span></em><span>, was passed by the Senate in April after Senators were reluctant to reject a bill framed as protecting children from online harm. The same scenario appears to be playing out in the House of Commons, where yesterday a majority of the House <a href="https://x.com/HoCChamber/status/1735038570753102106?s=20">voted for the bill at second reading</a>, sending it to the Public Safety committee for review. The bill, which is the brainchild of <a href="https://x.com/mivillej/status/1735041108764188967?s=20">Senator Julie Miville-Duchêne</a>, is not a government bill. In fact, government ministers voted against it. Instead, the bill is backed by the Conservatives, Bloc and NDP with a smattering of votes from backbench Liberal MPs. Canadians can be forgiven for being confused that after&nbsp;months of championing Internet freedoms, raising fears of censorship, and expressing concern about CRTC overregulation of the Internet, Conservative MPs were quick to <a href="https://x.com/GarnettGenuis/status/1735043817965764793?s=20">call out</a> those who <a href="https://x.com/annarobertsmp/status/1735080924012818833?s=20">opposed the bill </a>(the House sponsor is Conservative MP Karen Vecchio).&nbsp;</span></p>
-<p><span>I appeared before the <a href="https://www.michaelgeist.ca/2022/02/age-verification-requirements-for-twitter-or-website-blocking-for-reddit-my-appearance-on-bill-s-210-at-the-senate-standing-committee-on-legal-and-constitutional-affairs/"><span>Senate committee that studied the bill in February 2022</span></a>, where I argued that “</span><span>by bringing together website blocking, face recognition technologies, and stunning overbreadth that would capture numerous mainstream services, the bill isn’t just a slippery slope, it is an avalanche.” As I did then, I should preface criticism of the bill by making it clear that underage access to inappropriate content is indeed a legitimate concern. I think the best way to deal with the issue includes education, digital skills, and parental oversight of Internet use including the use of personal filters or blocking tools if desired. Moreover, if there are Canadian-based sites that are violating the law in terms of the content they host, they should absolutely face investigation and potential charges. </span></p>
-<p><span>However, Bill S-210 goes well beyond personal choices to limit underage access to sexually explicit material on Canadian sites. Instead, it envisions government-enforced global website liability for failure to block underage access, backed by website blocking and mandated age verification systems that are likely to include face recognition technologies. The government establishes this regulatory framework and is likely to task the CRTC with providing the necessary administration. While there are surely good intentions with the bill, the risks and potential harms it poses are significant.</span></p>
-<p><span>The basic framework of Bill S-210 is that it creates an offence for any organization making available sexually explicit material to anyone under the age of 18 for commercial purposes. The penalty for doing so is $250,000 for the first offence and up to $500,000 for any subsequent offences. Organizations (broadly defined under the Criminal Code) can rely on three potential defences:</span></p>
-<ol>
-<li><span>The organization instituted a “</span><span>prescribed age-verification method” to limit access. It would be up to the government to determine what methods qualify with due regard for reliability and privacy. There is a major global business of vendors that sell these technologies and who are vocal proponents of this kind of legislation.</span></li>
-<li><span>The organization can make the case that there is “legitimate purpose related to science, medicine, education or the arts.” </span></li>
-<li><span>The organization took steps required to limit access after having received a notification from the enforcement agency (likely the CRTC).</span></li>
-</ol>
-<p><span>The enforcement of the bill is left to the designated regulatory agency, which can issue notifications of violations to websites and services. Those notices can include the steps the agency wants followed to bring the site into compliance. This literally means the government via its regulatory agency will dictate to sites how they must interact with users to ensure no underage access. If the site fails to act as instructed within 20 days, the regulator can apply for a court order mandating that Canadian ISPs block the site from their subscribers. The regulator would be required to identify which ISPs are subject to the blocking order. </span></p>
-<p><span>The website blocking provisions are focused on limiting user access and can therefore be applied to websites anywhere in the world with Canadian ISPs required to ensure that the sites are rendered inaccessible. And what about the risk of overblocking? The bill not only envisions the possibility of blocking lawful content or limiting access to those over 18, it expressly permits it. Section 9(5) states that if the court determines that an order is needed, it may have the effect of preventing access to “material other than sexually explicit material made available by the organization” or limiting access to anyone, not just young people. This raises the prospect of full censorship of lawful content under court order based on notices from a government agency.&nbsp;</span></p>
-<p><span>If that isn’t bad enough, there are two additional serious concerns. First, the bill is not limited to pornography sites. Rather, it applies to any site or service that makes sexually explicit materials available. This would presumably include search engines, social media sites such as Twitter, or chat forums such as Reddit, where access to explicit material is not hard to find. If the bill was limited solely to sites whose primary purpose is the commercial distribution of sexually explicit material, it might be more defensible. As it stands now, the overbroad approach leaves this bill vulnerable to constitutional challenge.</span></p>
-<p><span>Second, consider the way sites are supposed to comply with the law, by establishing age verification systems. This effectively means that sites will require their users to register with commercial age verification systems in order to run a search or access some tweets. And the age verification systems raise real privacy concerns, including mandated face recognition as part of the verification process.</span></p>
-<p>Senate private members bills rarely become law, but this bill is suddenly on the radar screen in a big way. The bill should not have come this far and should not be supported. Creating safeguards for underage access to inappropriate content is a laudable goal, but not at the cost of government-backed censorship, mandated face recognition, and age-approval requirements to use some of the most popular sites and services in the world.</p>
-
-				
-
-								
-
-			</div><!-- #post-19923 -->
-
-		
-
-					
-		
-		
-		
-
-
-
-		<!-- #comments -->
-		
-</section></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Ubiquiti showing other users' consoles (276 pts)]]></title>
-            <link>https://community.ui.com/questions/Security-Issue-Cloud-Site-Manager-presented-me-your-consoles-not-mine/376ec514-572d-476d-b089-030c4313888c</link>
-            <guid>38643348</guid>
-            <pubDate>Thu, 14 Dec 2023 16:42:06 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://community.ui.com/questions/Security-Issue-Cloud-Site-Manager-presented-me-your-consoles-not-mine/376ec514-572d-476d-b089-030c4313888c">https://community.ui.com/questions/Security-Issue-Cloud-Site-Manager-presented-me-your-consoles-not-mine/376ec514-572d-476d-b089-030c4313888c</a>, See on <a href="https://news.ycombinator.com/item?id=38643348">Hacker News</a></p>
-<div id="readability-page-1" class="page"><p><span>Loading <span>Ubiquiti </span><span>Community</span></span></p></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[FunSearch: Making new discoveries in mathematical sciences using LLMs (309 pts)]]></title>
-            <link>https://deepmind.google/discover/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/</link>
-            <guid>38643076</guid>
-            <pubDate>Thu, 14 Dec 2023 16:24:12 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://deepmind.google/discover/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/">https://deepmind.google/discover/blog/funsearch-making-new-discoveries-in-mathematical-sciences-using-large-language-models/</a>, See on <a href="https://news.ycombinator.com/item?id=38643076">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="content">
-      
-  <article>
-    
-  
-    
-  
-  
-  
-    
-
-    
-    
-      
-        <div>
-          
-            
-            
-              
-              
-
-<div>
-    <div>
-      <p>Research</p>
-      
-
-      
-        <dl>
-          
-            <dt>Published</dt>
-            <dd>
-              <time datetime="2023-12-14">
-                14 December 2023
-              </time>
-            </dd>
-          
-          
-            <dt>Authors</dt>
-            
-          
-        </dl>
-      
-
-      
-    </div>
-
-    
-    
-    
-    <picture>
-      <source media="(min-width: 1024px)" type="image/webp" width="1072" height="603" srcset="https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w1072-h603-n-nu-rw 1x, https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w2144-h1206-n-nu-rw 2x"><source media="(min-width: 600px)" type="image/webp" width="928" height="522" srcset="https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w928-h522-n-nu-rw 1x, https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w1856-h1044-n-nu-rw 2x"><source type="image/webp" width="528" height="297" srcset="https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w528-h297-n-nu-rw 1x, https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w1056-h594-n-nu-rw 2x">
-      <img alt="Snippets of code and colourful streams of light" height="603" src="https://lh3.googleusercontent.com/fWc7Wtt0ge3XaM53Dwgbscfc2t7qG9mHLlES7lNwdW8lce9iiJKw_sRcXcaild2ZNm3nIjlvzO-4aMGv8EkLE6usq180w4e7ljHpWMdLQGt0NylmQYQ=w1072-h603-n-nu" width="1072">
-    </picture>
-    
-  
-  </div>
-            
-          
-            
-            
-              
-              <div>
-  <p data-block-key="4lvaj">By searching for “functions” written in computer code, FunSearch made the first discoveries in open problems in mathematical sciences using LLMs</p><p data-block-key="7k21c">Large Language Models (LLMs) are useful assistants - they excel at combining concepts and can read, write and code to help people solve problems. But could they discover entirely new knowledge?</p><p data-block-key="c3ioi">As LLMs have been shown to “hallucinate” factually incorrect information, using them to make verifiably correct discoveries is a challenge. But what if we could harness the creativity of LLMs by identifying and building upon only their very best ideas?</p><p data-block-key="c9jsm">Today, in a <a href="https://www.nature.com/articles/s41586-023-06924-6" rel="noopener" target="_blank">paper published in Nature</a>, we introduce FunSearch, a method to search for new solutions in mathematics and computer science. FunSearch works by pairing a pre-trained LLM, whose goal is to provide creative solutions in the form of computer code, with an automated “evaluator”, which guards against hallucinations and incorrect ideas. By iterating back-and-forth between these two components, initial solutions “evolve” into new knowledge. The system searches for “functions” written in computer code; hence the name FunSearch.</p><p data-block-key="79msm">This work represents the first time a new discovery has been made for challenging open problems in science or mathematics using LLMs. FunSearch discovered new solutions for the cap set problem, a longstanding open problem in mathematics. In addition, to demonstrate the practical usefulness of FunSearch, we used it to discover more effective algorithms for the “bin-packing” problem, which has ubiquitous applications such as making data centers more efficient.</p><p data-block-key="6hrod">Scientific progress has always relied on the ability to share new understanding. What makes FunSearch a particularly powerful scientific tool is that it outputs programs that reveal <i>how</i> its solutions are constructed, rather than just what the solutions are. We hope this can inspire further insights in the scientists who use FunSearch, driving a virtuous cycle of improvement and discovery.</p><h2 data-block-key="cqrj5">Driving discovery through evolution with language models</h2><p data-block-key="3lfpb">FunSearch uses an evolutionary method powered by LLMs, which promotes and develops the highest scoring ideas. These ideas are expressed as computer programs, so that they can be run and evaluated automatically. First, the user writes a description of the problem in the form of code. This description comprises a procedure to evaluate programs, and a seed program used to initialize a pool of programs.</p><p data-block-key="33p7f">FunSearch is an iterative procedure; at each iteration, the system selects some programs from the current pool of programs, which are fed to an LLM. The LLM creatively builds upon these, and generates new programs, which are automatically evaluated. The best ones are added back to the pool of existing programs, creating a self-improving loop. FunSearch uses <a href="https://ai.google/discover/palm2/" rel="noopener" target="_blank">Google’s PaLM 2</a>, but it is compatible with other LLMs trained on code.</p>
-</div>
-            
-          
-            
-            
-              
-              
-
-
-
-
-<figure>
-  
-  
-    <figcaption>
-      <p data-block-key="8b2b2">The FunSearch process. The LLM is shown a selection of the best programs it has generated so far (retrieved from the programs database), and asked to generate an even better one. The programs proposed by the LLM are automatically executed, and evaluated. The best programs are added to the database, for selection in subsequent cycles. The user can at any point retrieve the highest-scoring programs discovered so far.</p>
-    </figcaption>
-  
-</figure>
-            
-          
-            
-            
-              
-              <div>
-  <p data-block-key="4lvaj">Discovering new mathematical knowledge and algorithms in different domains is a notoriously difficult task, and largely beyond the power of the most advanced AI systems. To tackle such challenging problems with FunSearch, we introduced multiple key components. Instead of starting from scratch, we start the evolutionary process with common knowledge about the problem, and let FunSearch focus on finding the most critical ideas to achieve new discoveries. In addition, our evolutionary process uses a strategy to improve the diversity of ideas in order to avoid stagnation. Finally, we run the evolutionary process in parallel to improve the system efficiency.</p><h2 data-block-key="293lm">Breaking new ground in mathematics</h2><p data-block-key="c10fe">We first address the <a href="https://en.wikipedia.org/wiki/Cap_set" rel="noopener" target="_blank">cap set problem</a>, an open challenge, which has vexed mathematicians in multiple research areas for decades. Renowned mathematician Terence Tao once described it as his <a href="https://terrytao.wordpress.com/2007/02/23/open-question-best-bounds-for-cap-sets/" rel="noopener" target="_blank">favorite open question</a>. We collaborated with Jordan Ellenberg, a professor of mathematics at the University of Wisconsin–Madison, and author of an <a href="https://arxiv.org/abs/1605.09223" rel="noopener" target="_blank">important breakthrough on the cap set problem</a>.</p><p data-block-key="6gov3">The problem consists of finding the largest set of points (called a <i>cap set</i>) in a high-dimensional grid, where no three points lie on a line. This problem is important because it serves as a model for other problems in extremal combinatorics - the study of how large or small a collection of numbers, graphs or other objects could be. Brute-force computing approaches to this problem don’t work – the number of possibilities to consider quickly becomes greater than the number of atoms in the universe.</p><p data-block-key="2vb6l">FunSearch generated solutions - in the form of programs - that in some settings discovered the largest cap sets ever found. This represents the <a href="https://link.springer.com/article/10.1023/A:1027365901231" rel="noopener" target="_blank">largest increase</a> in the size of cap sets in the past 20 years. Moreover, FunSearch outperformed state-of-the-art computational solvers, as this problem scales well beyond their current capabilities.</p>
-</div>
-            
-          
-            
-            
-              
-              
-            
-          
-            
-            
-              
-              
-
-
-
-
-<figure>
-  
-  
-    <figcaption>
-      <p data-block-key="ewhw0">Interactive figure showing the evolution from the seed program (top) to a new higher-scoring function (bottom). Each circle is a program, with its size proportional to the score assigned to it. Only ancestors of the program at the bottom are shown. The corresponding function produced by FunSearch for each node is shown on the right (see full program using this function in the paper).</p>
-    </figcaption>
-  
-</figure>
-            
-          
-            
-            
-              
-              <div>
-  <p data-block-key="4lvaj">These results demonstrate that the FunSearch technique can take us beyond established results on hard combinatorial problems, where intuition can be difficult to build. We expect this approach to play a role in new discoveries for similar theoretical problems in combinatorics, and in the future it may open up new possibilities in fields such as communication theory.</p><h2 data-block-key="cc0t2">FunSearch favors concise and human-interpretable programs</h2><p data-block-key="ektms">While discovering new mathematical knowledge is significant in itself, the FunSearch approach offers an additional benefit over traditional computer search techniques. That’s because FunSearch isn’t a black box that merely generates solutions to problems. Instead, it generates programs that describe <i>how</i> those solutions were arrived at. This show-your-working approach is how scientists generally operate, with new discoveries or phenomena explained through the process used to produce them.</p><p data-block-key="6f8qq">FunSearch favors finding solutions represented by highly compact programs - solutions with a low Kolmogorov complexity†. Short programs can describe very large objects, allowing FunSearch to scale to large needle-in-a-haystack problems. Moreover, this makes FunSearch’s program outputs easier for researchers to comprehend. Ellenberg said: “FunSearch offers a completely new mechanism for developing strategies of attack. The solutions generated by FunSearch are far conceptually richer than a mere list of numbers. When I study them, I learn something”.</p><p data-block-key="jp5n">What’s more, this interpretability of FunSearch’s programs can provide actionable insights to researchers. As we used FunSearch we noticed, for example, intriguing symmetries in the code of some of its high-scoring outputs. This gave us a new insight into the problem, and we used this insight to refine the problem introduced to FunSearch, resulting in even better solutions. We see this as an exemplar for a collaborative procedure between humans and FunSearch across many problems in mathematics.</p>
-</div>
-            
-          
-            
-            
-              
-              
-
-
-
-
-<figure>
-  
-  
-    <figcaption>
-      <p data-block-key="8jaj9">Left: Inspecting code generated by FunSearch yielded further actionable insights (highlights added by us). Right: The raw “admissible” set constructed using the (much shorter) program on the left.</p>
-    </figcaption>
-  
-</figure>
-            
-          
-            
-            
-              
-              <figure>
-  <blockquote><p data-block-key="jt2vi">The solutions generated by FunSearch are far conceptually richer than a mere list of numbers. When I study them, I learn something.</p></blockquote>
-  <figcaption><p data-block-key="qcni1">Jordan Ellenberg, collaborator and professor of mathematics at the University of Wisconsin–Madison</p></figcaption>
-</figure>
-            
-          
-            
-            
-              
-              <div>
-  <h2 data-block-key="4lvaj">Addressing a notoriously hard challenge in computing</h2><p data-block-key="a8qqv">Encouraged by our success with the theoretical cap set problem, we decided to explore the flexibility of FunSearch by applying it to an important practical challenge in computer science. The “bin packing” problem looks at how to pack items of different sizes into the smallest number of bins. It sits at the core of many real-world problems, from loading containers with items to allocating compute jobs in data centers to minimize costs.</p><p data-block-key="1n4qj">The online bin-packing problem is typically addressed using algorithmic rules-of-thumb (heuristics) based on human experience. But finding a set of rules for each specific situation - with differing sizes, timing, or capacity – can be challenging. Despite being very different from the cap set problem, setting up FunSearch for this problem was easy. FunSearch delivered an automatically tailored program (adapting to the specifics of the data) that outperformed established heuristics – using fewer bins to pack the same number of items.</p>
-</div>
-            
-          
-            
-            
-              
-              
-
-
-
-
-<figure>
-  
-  
-    <figcaption>
-      <p data-block-key="n0rzx">Illustrative example of bin packing using existing heuristic – Best-fit heuristic (left), and using a heuristic discovered by FunSearch (right).</p>
-    </figcaption>
-  
-</figure>
-            
-          
-            
-            
-              
-              <div>
-  <p data-block-key="4lvaj">Hard combinatorial problems like online bin packing can be tackled using other AI approaches, <a href="https://deepmind.google/impact/optimizing-computer-systems-with-more-generalized-ai-tools/" rel="noopener" target="_blank">such as neural networks</a> and reinforcement learning. Such approaches have proven to be effective too, but may also require significant resources to deploy. FunSearch, on the other hand, outputs code that can be easily inspected and deployed, meaning its solutions could potentially be slotted into a variety of real-world industrial systems to bring swift benefits.</p><h2 data-block-key="1htm1">LLM-driven discovery for science and beyond</h2><p data-block-key="drmg1">FunSearch demonstrates that if we safeguard against LLMs’ hallucinations, the power of these models can be harnessed not only to produce new mathematical discoveries, but also to reveal potentially impactful solutions to important real-world problems.</p><p data-block-key="bd36s">We envision that for many problems in science and industry - longstanding or new - generating effective and tailored algorithms using LLM-driven approaches will become common practice.</p><p data-block-key="8uv2j">Indeed, this is just the beginning. FunSearch will improve as a natural consequence of the wider progress of LLMs, and we will also be working to broaden its capabilities to address a variety of society’s pressing scientific and engineering challenges.</p>
-</div>
-            
-          
-            
-            
-              
-              
-
-
-            
-          
-            
-            
-              
-              
-            
-          
-            
-            
-              
-              
-
-
-
-  
-    
-  
-
-            
-          
-        </div>
-      
-    
-
-    
-  
-  
-
-  
-
-  </article>
-
-    </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[The AI Trust Crisis (291 pts)]]></title>
-            <link>https://simonwillison.net/2023/Dec/14/ai-trust-crisis/</link>
-            <guid>38643046</guid>
-            <pubDate>Thu, 14 Dec 2023 16:22:36 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://simonwillison.net/2023/Dec/14/ai-trust-crisis/">https://simonwillison.net/2023/Dec/14/ai-trust-crisis/</a>, See on <a href="https://news.ycombinator.com/item?id=38643046">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-
-
-
-<p>14th December 2023</p>
-
-<p>Dropbox added some <a href="https://help.dropbox.com/view-edit/dropbox-ai-how-to">new AI features</a>. In the past couple of days these have attracted a firestorm of criticism. Benj Edwards rounds it up in  <a href="https://arstechnica.com/information-technology/2023/12/dropbox-spooks-users-by-sending-data-to-openai-for-ai-search-features/">Dropbox spooks users with new AI features that send data to OpenAI when used</a>.</p>
-<p>The key issue here is that people are worried that their private files on Dropbox are being passed to OpenAI to use as training data for their models—a claim that is strenuously denied by Dropbox.</p>
-<p>As far as I can tell, Dropbox built some sensible features—summarize on demand, “chat with your data” via Retrieval Augmented Generation—and did a moderately OK job of communicating how they work... but when it comes to data privacy and AI, a “moderately OK job” is a failing grade. Especially if you hold as much of people’s private data as Dropbox does!</p>
-<p>Two details in particular seem really important. Dropbox have an <a href="https://www.dropbox.com/ai-principles">AI principles document</a> which includes this:</p>
-<blockquote>
-<p>Customer trust and the privacy of their data are our foundation. We will not use customer data to train AI models without consent.</p>
-</blockquote>
-<p>They also have a checkbox hidden <a href="https://www.dropbox.com/account/ai">deep in their settings</a> that looks like this:</p>
-<p><img src="https://static.simonwillison.net/static/2023/dropbox-third-party.png" alt="Third-party AI: Use artificial intelligence (Al) from third-party partners so you can work faster in Dropbox. We only use technology partners we have vetted. Your data is never used to train their internal models, and is deleted from third-party servers within 30 days. Learn more. There is a toggle set to On."></p>
-<p>I took that screenshot on my own account. It’s toggled “on”—but I never turned it on myself.</p>
-<p>Does that mean I’m marked as “consenting” to having my data used to train AI models?</p>
-<p>I don’t think so: I think this is a combination of confusing wording and the eternal vagueness of what the term “consent” means in a world where everyone agrees to the terms and conditions of everything without reading them.</p>
-<p>But a LOT of people have come to the conclusion that this means their private data—which they pay Dropbox to protect—is now being funneled into the OpenAI training abyss.</p>
-<h4 id="people-dont-believe-openai">People don’t believe OpenAI</h4>
-<p>Here’s copy from that Dropbox preference box, talking about their “third-party partners”—in this case OpenAI:</p>
-<blockquote>
-<p>Your data is never used to train their internal models, and is deleted from third-party servers within 30 days.</p>
-</blockquote>
-<p>It’s increasing clear to me like people simply <strong>don’t believe OpenAI</strong> when they’re told that data won’t be used for training.</p>
-<p>What’s really going on here is something deeper then: AI is facing a crisis of trust.</p>
-<p>I quipped <a href="https://twitter.com/simonw/status/1735086765814542802">on Twitter</a>:</p>
-<blockquote>
-<p>“OpenAI are training on every piece of data they see, even when they say they aren’t” is the new “Facebook are showing you ads based on overhearing everything you say through your phone’s microphone”</p>
-</blockquote>
-<p>Here’s what I meant by that.</p>
-<h4 id="facebook-dont-spy-microphone">Facebook don’t spy on you through your microphone</h4>
-<p>Have you heard the one about Facebook spying on you through your phone’s microphone and showing you ads based on what you’re talking about?</p>
-<p>This theory has been floating around for years. From a technical perspective it should be easy to disprove:</p>
-<ul>
-<li>Mobile phone operating systems don’t allow apps to invisibly access the microphone.</li>
-<li>Privacy researchers can audit communications between devices and Facebook to confirm if this is happening.</li>
-<li>Running high quality voice recognition like this at scale is extremely expensive—I had a conversation with a friend who works on server-based machine learning at Apple a few years ago who found the entire idea laughable.</li>
-</ul>
-<p>The non-technical reasons are even stronger:</p>
-<ul>
-<li>Facebook say they aren’t doing this. The risk to their reputation if they are caught in a lie is astronomical.</li>
-<li>As with many conspiracy theories, too many people would have to be “in the loop” and not blow the whistle.</li>
-<li>Facebook don’t need to do this: there are much, much cheaper and more effective ways to target ads at you than spying through your microphone. These methods have been working incredibly well for years.</li>
-<li>Facebook gets to show us thousands of ads a year. 99% of those don’t correlate in the slightest to anything we have said out loud. If you keep rolling the dice long enough, eventually a coincidence will strike.</li>
-</ul>
-<p>Here’s the thing though: <em>none of these arguments matter</em>.</p>
-<p>If you’ve ever experienced Facebook showing you an ad for something that you were talking about out-loud about moments earlier, you’ve already dismissed everything I just said. You have personally experienced anecdotal evidence which overrides all of my arguments here.</p>
-<p>Here’s a Reply All podcast episode from Novemember 2017 that explores this issue: <a href="https://gimletmedia.com/shows/reply-all/z3hlwr">109 Is Facebook Spying on You?</a>. Their conclusion: Facebook are not spying through your microphone. But if someone already believes that there is no argument that can possibly convince them otherwise.</p>
-<p>I’ve experienced this effect myself—over the past few years I’ve tried talking people out of this, as part of my own personal fascination with how sticky this conspiracy theory is.</p>
-<p>The key issue here is the same as the OpenAI training issue: people <strong>don’t believe</strong> these companies when they say that they aren’t doing something.</p>
-<p>One interesting difference here is that in the Facebook example people have personal evidence that makes them believe they understand what’s going on.</p>
-<p>With AI we have almost the complete opposite: AI models are weird black boxes, built in secret and with no way of understanding what the training data was or how it influences the model.</p>
-<p>As with so much in AI, people are left with nothing more than “vibes” to go on. And the vibes are bad.</p>
-<h4 id="this-really-matters">This really matters</h4>
-<p>Trust is really important. Companies lying about what they do with your privacy is a very serious allegation.</p>
-<p>A society where big companies tell blatant lies about how they are handling our data—and get away with it without consequences—is a very unhealthy society.</p>
-<p>A key role of government is to prevent this from happening. If OpenAI are training on data that they said they wouldn’t train on, or if Facebook are spying on us through our phone’s microphones, they should be hauled in front of regulators and/or sued into the ground.</p>
-<p>If we believe that they are doing this without consequence, and have been getting away with it for years, our intolerance for corporate misbehavior becomes a victim as well. We risk letting companies get away with real misconduct because we incorrectly believed in conspiracy theories.</p>
-<p>Privacy is important, and very easily misunderstood. People both overestimate and underestimate what companies are doing, and what’s possible. This isn’t helped by the fact that AI technology means the scope of what’s possible is changing at a rate that’s hard to appreciate even if you’re deeply aware of the space.</p>
-<p>If we want to protect our privacy, we need to understand what’s going on. More importantly, we need to be able to trust companies to honestly and clearly explain what they are doing with our data.</p>
-<p>On a personal level we risk losing out on useful tools. How many people cancelled their Dropbox accounts in the last 48 hours? How many more turned off that AI toggle, ruling out ever evaluating if those features were useful for them or not?</p>
-<h4 id="what-can-we-do">What can we do about it?</h4>
-<p>There is something that the big AI labs could be doing to help here: tell us how you are training!</p>
-<p>The fundamental question here is about training data: what are OpenAI using to train their models?</p>
-<p>And the answer is: we have no idea! The entire process could not be more opaque.</p>
-<p>Given that, is it any wonder that when OpenAI say “we don’t train on data submitted via our API” people have trouble believing them?</p>
-<p>The situation with ChatGPT itself is even more messy. OpenAI say that they DO use ChatGPT interactions to improve their models—even those from paying customers, with the exception of the “call us” priced <a href="https://openai.com/blog/introducing-chatgpt-enterprise">ChatGPT Enterprise</a>.</p>
-<p>If I paste a private document into ChatGPT to ask for a summary, will snippets of that document be leaked to future users after the next model update? Without more details on HOW they are using ChatGPT to improve their models I can’t come close to answering that question.</p>
-<p>Clear explanations of how this stuff works could go a long way to improving the trust relationship OpenAI have with their users, and the world at large.</p>
-<p>Maybe take a leaf from large scale platform companies. They publish public post-mortem incident reports on outages, to regain trust with their customers through transparency about exactly what happened and the steps they are taking to prevent it from happening again. Dan Luu has collected a <a href="https://github.com/danluu/post-mortems">great list of examples</a>.</p>
-<h4 id="opportunity-local-models">An opportunity for local models</h4>
-<p>One consistent theme I’ve seen in conversations about this issue is that people are much more comfortable trusting their data to local models that run on their own devices than models hosted in the cloud.</p>
-<p>The good news is that local models are consistently both increasing in quality and shrinking in size.</p>
-<p>I figured out how to run Mixtral-8x7b-Instruct <a href="https://fedi.simonwillison.net/@simon/111577242044966329">on my laptop</a> last night—the first local model I’ve tried which really does seem to be equivalent in quality to ChatGPT 3.5.</p>
-<p>Microsoft’s <a href="https://www.microsoft.com/en-us/research/blog/phi-2-the-surprising-power-of-small-language-models/">Phi-2</a> is a fascinating new model in that it’s only 2.7 billion parameters (most useful local models start at 7 billion) but claims state-of-the-art performance against some of those larger models. And they trained it for around $35,000.</p>
-<p>While I’m excited about the potential of local models, I’d hate to see us lose out on the power and convenience of the larger hosted models over privacy concerns which turn out to be incorrect.</p>
-<p>The intersection of AI and privacy is a critical issue. We need to be able to have the highest quality conversations about it, with maximum transparency and understanding of what’s actually going on.</p>
-<p>This is hard already, and it’s made even harder if we straight up disbelieve anything that companies tell us. Those companies need to earn our trust. How can we help them do that?</p>
-
-
-
-
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[JWST Captures Image of Supernova That 'Absolutely Shattered' a Star (149 pts)]]></title>
-            <link>https://www.smithsonianmag.com/smart-news/james-webb-telescope-captures-image-of-supernova-that-absolutely-shattered-a-star-180983421/</link>
-            <guid>38643017</guid>
-            <pubDate>Thu, 14 Dec 2023 16:19:46 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.smithsonianmag.com/smart-news/james-webb-telescope-captures-image-of-supernova-that-absolutely-shattered-a-star-180983421/">https://www.smithsonianmag.com/smart-news/james-webb-telescope-captures-image-of-supernova-that-absolutely-shattered-a-star-180983421/</a>, See on <a href="https://news.ycombinator.com/item?id=38643017">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-article-body="">
-        
-          <figure>
-            <img src="https://th-thumbnailer.cdn-si-edu.com/q6VwXaAU92PSQVO1HUWQzIhenCw=/1000x750/filters:no_upscale():focal(873x931:874x932)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/c2/4e/c24efef7-dc5c-45a9-9a5f-3937bfcf728b/stsci-01hggzdyh8ghhssnwzd71mf0xh.png" alt="A colorized image of the remnants of supernova" itemprop="image">
-            <figcaption>
-              
-                The supernova remnant Cassiopeia A, captured by NASA's James Webb Space Telescope in near-infrared light. The image shows the expanding material from the blast colliding with gas released by the star before the explosion.
-              <span>NASA, ESA, CSA, STScI, Danny Milisavljevic (Purdue University), Ilse De Looze (UGent), Tea Temim (Princeton University)</span>
-            </figcaption>
-          </figure>
-        
-
-        
-
-        <p>NASA’s James Webb Space Telescope has seen the remains of a supernova explosion in a new light. The remnants, called <a href="https://www.britannica.com/place/Cassiopeia-A">Cassiopeia A</a> (or Cas A for short), lie 11,000 light-years from Earth, in the constellation Cassiopeia.</p>
-
-<p>In April of this year, Webb <a href="https://www.smithsonianmag.com/smart-news/see-the-james-webb-telescopes-stunning-new-snapshot-of-an-exploded-star-180981973/">imaged</a> the stellar remains in <a href="https://webbtelescope.org/contents/news-releases/2023/news-2023-121">mid-infrared light</a>. Now, the newly released snapshot shows Cas A’s colorful, orb-like wisps<strong> </strong>captured using Webb’s Near-Infrared Camera (NIRCam).</p>
-
-<p>“With NIRCam’s resolution, we can now see how the dying star absolutely shattered when it exploded, leaving filaments akin to tiny shards of glass behind,” <a href="https://www.physics.purdue.edu/people/faculty/dmilisav.php">Danny Milisavljevic</a>, an astronomer at Purdue University who led the research, says in a <a href="https://www.nasa.gov/missions/webb/nasas-webb-stuns-with-new-high-definition-look-at-exploded-star/">statement</a> from NASA. “It’s really unbelievable after all these years studying Cas A to now resolve those details, which are providing us with transformational insight into how this star exploded.”</p><center><blockquote><div lang="en" dir="ltr"><p>To: You, From: The Universe </p><p>This stunning new Webb image is a gift from a past star. In near-infrared light, supernova remnant Cassiopeia A (Cas A) resembles a shiny ornament. Embedded within gas from the star are the materials for new stars &amp; planets: <a href="https://t.co/9kIvQtEnpb">https://t.co/9kIvQtEnpb</a> <a href="https://t.co/vzzaWrzPBA">pic.twitter.com/vzzaWrzPBA</a></p></div>— NASA Webb Telescope (@NASAWebb) <a href="https://twitter.com/NASAWebb/status/1734020677311639828?ref_src=twsrc%5Etfw">December 11, 2023</a></blockquote> </center>
-<p>Stars burn with fusion, which propels energy outward from their cores. But when aging, giant stars run out of fuel, their own gravity overwhelms fusion’s outward push. The star <a href="https://www.nationalgeographic.com/science/article/supernovae?loggedin=true&amp;rnd=1702397839656">collapses</a> in an explosion that spews its materials across the cosmos. Heavy elements in the universe are often <a href="https://www.sciencedaily.com/releases/2019/03/190318111945.htm">formed during supernovae</a>.</p>
-
-<p>The light from Cassiopeia A’s explosion reached Earth about 340 years ago. Scientists estimate that in its early days, the star that yielded the explosion had a mass <a href="https://chandra.harvard.edu/photo/2017/casa_life/">16 times that of the sun</a>, but it shrank to about five times the size of the sun before it blew. Since the explosion occurred thousands of light-years from Earth, it took thousands of years for its light to reach us.</p>
-
-<p>Previously, the Hubble Space Telescope, Spitzer Space Telescope, Chandra X-Ray Observatory and other telescopes had imaged Cas A, according to NASA. Chandra’s study revealed the amounts of different elements produced by the explosion. The supernova has spat out <a href="https://chandra.harvard.edu/photo/2017/casa_life/">10,000 times the mass of the Earth in sulfur</a>, 20,000 times Earth’s mass in silicon, 70,000 Earth masses of iron and a million Earth masses of oxygen.</p>
-
-<p>Webb’s NIRCam detects wavelengths of light that are broader than visible light and thus can’t be seen by the human eye. So, to compose the new image, researchers translated the infrared light in different colors.</p>
-
-<p>The bright orange and light pink areas in the new image represent the supernova’s inner shell and are made up of sulfur, oxygen, argon and neon from the star. Dust and molecules that will one day form new stars are in this gas, per NASA.</p>
-
-<figure>
-  
-    <img src="https://th-thumbnailer.cdn-si-edu.com/GX-mhR8OKSh185-g4ZJH9FBrbnA=/fit-in/1072x0/filters:focal(1000x562:1001x563)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/b3/be/b3be5990-0772-4ca6-9aa5-80b2e171392f/stsci-01hgh0xz8jhr7ayp4tygdxcekn.png" alt="A side-by-side comparison of two images of the same supernova remnant" loading="lazy">
-  
-
-  <figcaption>
-    
-      A comparison of the Webb Telescope's new near-infrared image of Cassiopeia A (left) and its mid-infrared image of the supernova from April (right). Some things seen in mid-infrared, like the green loop of light in the center, are not visible in near-infrared.
-    
-    
-      <span>NASA, ESA, CSA, STScI, Danny Milisavljevic (Purdue University), Ilse De Looze (UGent), Tea Temim (Princeton University)</span>
-    
-  </figcaption>
-</figure>
-<p>The researchers also compared the new image to the mid-infrared one from earlier this year. Orange and red in April’s image represent the edge of the remnant’s main inner shell, while this detail looks like wisps of smoke in the new picture. This boundary denotes where the supernova explosion collides with surrounding material that isn’t hot enough to be detected in near-infrared.</p>
-
-<p>A green loop of light in the mid-infrared image (which astronomers had nicknamed the “Green Monster”) is also not visible in Webb’s new view. Holes in that part of the image are outlined in ionized gas, appearing white and purple in the near-infrared image. This could be from the explosion pushing through and shaping gas from the star, according to NASA.</p>
-
-<p>With this new look at Cas A, Webb captured another intriguing feature: A blob that appears in the bottom right of the image is an example of a light echo, where light from the supernova is warming far-away dust. As that dust cools, it glows. This light echo, nicknamed Baby Cas A, is about 170 light-years behind the main supernova remnant.</p>
-
-        
-
-        
-
-        
-          
-  <div>
-      <p>Get the latest stories in your inbox every weekday.</p>
-      
-    </div>
-
-
-        
-
-        
-
-        
-          
-
-
-  
-    
-      
-    
-  
-
-  
-
-
-        
-
-         
-        
-
-        
-          
-            <section>
-              <nav>Filed Under: 
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/astronomy/">Astronomy</a>, 
-                  
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/james-webb-space-telescope/">James Webb Space Telescope</a>, 
-                  
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/milky-way/">Milky way</a>, 
-                  
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/nasa/">NASA</a>, 
-                  
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/outer-space/">Outer Space</a>, 
-                  
-                
-                  
-                    <a href="https://www.smithsonianmag.com/tag/telescope/">telescope</a>
-                  
-                
-              </nav>
-            </section>
-          
-        
-
-      </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[FCC votes to ban termination fees for cable and satellite services (122 pts)]]></title>
-            <link>https://www.cnbc.com/2023/12/13/fcc-votes-to-ban-termination-fees-for-cable-and-satellite-services.html</link>
-            <guid>38642977</guid>
-            <pubDate>Thu, 14 Dec 2023 16:16:38 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.cnbc.com/2023/12/13/fcc-votes-to-ban-termination-fees-for-cable-and-satellite-services.html">https://www.cnbc.com/2023/12/13/fcc-votes-to-ban-termination-fees-for-cable-and-satellite-services.html</a>, See on <a href="https://news.ycombinator.com/item?id=38642977">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>WASHINGTON — The <a href="https://www.fcc.gov/" target="_blank">Federal Communications Commission</a> on Wednesday voted to pass a measure banning cable and satellite companies from charging early termination fees.</p><p>"Consumers are tired of these junk fees," FCC Chairwoman <a href="https://www.fcc.gov/about/leadership/jessica-rosenworcel" target="_blank">Jessica Rosenworcel</a> said before casting the <a href="https://recapd.com/w-UeqR0B/86a21480582e5cf4a68cc1e6924e9c/?" target="_blank">deciding vote</a> at an open commission meeting.</p><p>"They now have more choices when it comes to video content but these friction-filled tactics to keep us subscribing to our current providers are aggravating and unfair," Rosenworcel added. "So, today we kick out a rulemaking to put an end to these practices."</p><p>The agency first <a href="https://www.cnbc.com/2023/11/21/biden-proposes-ban-on-cable-cord-cutting-fees.html">announced the proposal</a> in late November to force cable and direct broadcast satellite providers to drop fees for canceling services before the end of a contract period.</p><p>The rule will also require service providers to issue a prorated credit or rebate to customers for days remaining in the billing cycle after cancellation.</p><p>Two out of four commissioners voted against the measure.</p><p>The ban on early termination fees is part of the Biden administration's initiative against excessive surcharges, or "junk" fees, which are estimated to cost consumers <a href="https://www.whitehouse.gov/briefing-room/blog/2022/10/26/the-presidents-initiative-on-junk-fees-and-related-pricing-practices/" target="_blank">tens of billions of dollars</a>, according to the White House.</p><p>Cable companies could be raking in an <a href="https://advocacy.consumerreports.org/wp-content/uploads/2019/10/CR_WhatTheFeeReport_6F_sm-1.pdf" target="_blank">estimated $28 billion a year</a> on fees, according to a 2019 brief by Consumer Reports.</p><p>&nbsp;<em><strong>Don't miss these stories from CNBC PRO:</strong></em></p><ul><li><a href="https://www.cnbc.com/2023/12/05/five-stocks-to-buy-before-the-year-end-according-to-the-pros.html"><em>Five stocks to buy before the year-end, according to the pros</em></a></li><li><a href="https://www.cnbc.com/2023/12/04/morgan-stanley-fund-manager-names-4-top-stocks-to-buy-on-the-cheap.html"><em>Morgan Stanley fund manager names 4 top stocks to buy 'on the cheap'</em></a></li><li><a href="https://www.cnbc.com/2023/12/10/jpmorgan-picks-china-stocks-to-buy-now-alibabas-not-on-the-list.html"><em>JPMorgan picks China stocks to buy now. Alibaba's not on the list</em></a></li><li><a href="https://www.cnbc.com/2023/12/11/analysts-love-this-self-driving-car-tech-stock-and-give-it-over-400percent-upside.html"><em>Analysts love this self-driving car tech stock and give it over 400% upside</em></a></li></ul></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Cruise slashes 24% of self-driving car workforce in sweeping layoffs (125 pts)]]></title>
-            <link>https://techcrunch.com/2023/12/14/cruise-slashes-24-of-self-driving-car-workforce-in-sweeping-layoffs/</link>
-            <guid>38642791</guid>
-            <pubDate>Thu, 14 Dec 2023 16:02:44 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://techcrunch.com/2023/12/14/cruise-slashes-24-of-self-driving-car-workforce-in-sweeping-layoffs/">https://techcrunch.com/2023/12/14/cruise-slashes-24-of-self-driving-car-workforce-in-sweeping-layoffs/</a>, See on <a href="https://news.ycombinator.com/item?id=38642791">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-	<p>
-						
-			<h2>Cruise, the GM self-driving car subsidiary, is laying off 900 workers to slash costs and revamp the company, TechCrunch exclusively learned.</h2>
-		</p>
-
-			
-	
-			<p><img src="https://techcrunch.com/wp-content/uploads/2023/11/GettyImages-1497020096.jpg?w=648">
-		</p>
-	</div><div>
-				<p id="speakable-summary"><span>Cruise, the embattled</span> GM self-driving car subsidiary, is laying off 900 employees, or about 24% of its workforce, TechCrunch has exclusively learned. The layoffs are part of a plan to slash costs and attempt to revamp the company following an October 2 incident that left a pedestrian stuck under and then dragged by one of its robotaxis.</p>
-<p>An email, penned by newly minted president and CTO Mo Elshenawy, was sent this morning to the entire 3,800-person workforce. The email, which TechCrunch has viewed, began with a resigned tone: “We knew this day was coming, but that does not make it any less difficult—especially for those whose jobs are affected,” Elshenawy wrote. Workers were expected to be informed within the hour or receiving the company wide email, as to whether they would be losing their job.</p>
-<p>GM, which acquired Cruise in 2016, was rewarded by shareholders for the cutbacks. GM shares rose 4.8% to $35.64 following the news.</p>
-<p>Cruise is targeting non-engineering jobs in the layoffs, particularly those people who worked in the field, commercial operations and corporate staffing, according to the email. The company has also ended additional assignments of contingent workers who supported its driverless operations. Engineering, a category that makes up the bulk of the Cruise workforce, is largely being preserved, according to the content of the email and discussions with internal sources.</p>
-<p>The email continued:</p>
-<blockquote><p><span>Today, we are making staff reductions that will affect 24% of full-time Cruisers, through no fault of their own.&nbsp; We are simplifying and focusing our efforts to return with an exceptional service in one city to start with and focusing on the Bolt platform for this first step before we scale. As a result, we are reducing our employee counts in operations and other areas. These impacts are largely outside of engineering, although some Tech positions are impacted also.</span></p></blockquote>
-<p dir="ltr">Workers will remain on the payroll through February 12 and will be eligible for an additional 8 weeks of pay, with long-term employees offered an additional 2 weeks’ pay per every year at Cruise over 3 years, according to the email to staff. Anyone laid off will also receive their 2023 bonus (eligible target payout) on Jan. 5, 2024. Other parts of the severance package includes health benefits through the end of May, two months contribution into their 401(k) plan and continued time on payroll through March 24 for immigrants in lieu of a lump-sum severance payment to allow visa holders additional time to help transition and manage their immigration status.</p>
-<p>The company also said that all employees, regardless of whether they were laid off, will receive&nbsp; their January 15th vesting through its employee share-selling program.</p>
-<p dir="ltr" role="presentation"><span>Cruise issued a statement confirming the layoffs.</span></p>
-<p dir="ltr">“We shared the difficult news that we are reducing our workforce, primarily in commercial operations and related corporate functions,” the emailed statement reads. “These changes reflect our decision to focus on more deliberate commercialization plans with safety as our north star. We are supporting impacted Cruisers with strong severance and benefits packages and are grateful to the departing employees who played important roles in building Cruise and supporting our mission.”</p>
-<p dir="ltr">The layoffs come just a day after nine senior leaders (SLT) at Cruise, who worked in its commercial operations, legal and policy departments, <a href="https://techcrunch.com/2023/12/13/cruise-leaders-booted-following-initial-safety-probe/" target="_blank" rel="noopener">were dismissed</a> by the company’s board. COO Gil West and David Estrada, who was head of government affairs, were among that group.</p>
-<p dir="ltr">Elshenawy reiterated the company would be narrowing and refocusing its efforts, information shared last month following the<a href="https://techcrunch.com/2023/11/19/cruise-co-founder-and-ceo-kyle-vogt-resigns/" target="_blank" rel="noopener"> resignation of co-founder and CEO Kyle Vogt</a> and some executive shuffling that included <a href="https://techcrunch.com/2023/11/14/gm-inserts-exec-at-cruise-as-safety-review-expands-manual-self-driving-paused/" target="_blank" rel="noopener">appointing Craig Glidden</a>, GM’s EVP of legal and policy and a Cruise board member, as chief administrative officer at Cruise. Jon McNeill, a member of GM’s board, was also named vice chairman of the Cruise board. McNeill, who joined the Cruise board recently and was previously chief operating officer at Lyft and president of Tesla, now serves alongside GM Chair and CEO Mary Barra.</p>
-<p id="speakable-summary">Cruise executives said at the time they wanted to take a measured business approach that preserves cash and improves safety culture in an attempt to put GM’s troubled autonomous vehicle subsidiary on the right path. The first steps in that rebuilding plan, which included pausing production on its Origin robotaxi, were laid out in an internal email sent to employees in late November by Elshenawy, who was executive vice president of engineering at Cruise and ascended into the president role after co-founder and Vogt resigned.</p>
-<p>Elshenawy repeated that intent in the Thursday morning email stating that the company was “simplifying and focusing our efforts to return with an exceptional service in one city to start with and focusing on the Bolt platform for this first step before we scale.”</p>
-<p>Cruise used all-electric Chevy Bolt vehicles, which have been specifically manufactured to support its self-driving system, in its robotaxi fleet. The company intended to shift towards a custom-built autonomous vehicle called the Origin.</p>
-<p dir="ltr">The layoffs have been largely expected at Cruise for weeks now. Last month. Barra reiterated plans for Cruise to be more “deliberate” when operations eventually resume at the troubled self-driving vehicle subsidiary. For GM, that includes <a href="https://techcrunch.com/2023/11/29/gm-to-slash-spending-at-cruise-by-hundreds-of-millions-of-dollars/" target="_blank" rel="noopener">slashing spending</a> at Cruise “by hundreds of millions of dollars” in 2024, an action that most expected would result in widespread layoffs.</p>
-<p>GM and the Cruise board have been scrambling ever since the October 2 incident put the company in the crosshairs of state, local and federal agencies. However’s Cruise’s robotaxi operations in San Francisco have been criticized by the public and city officials almost immediately after the California Public Utilities Commission issued the company in August the final permit required to operate commercially. Videos of Cruise robotaxis blocking traffic and driving into a construction site were shared on social media. But it was a crash with an emergency response vehicle that began to chip away at the company’s seemingly impenetrable exterior.</p>
-<p><em>This story is developing ….</em></p>
-			</div></div>]]></description>
         </item>
     </channel>
 </rss>
