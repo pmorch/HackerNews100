@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 15 Dec 2023 17:00:07 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 15 Dec 2023 18:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Database Fundamentals (141 pts)]]></title>
+            <title><![CDATA[Database Fundamentals (235 pts)]]></title>
             <link>https://tontinton.com/posts/database-fundementals/</link>
             <guid>38655066</guid>
             <pubDate>Fri, 15 Dec 2023 15:28:30 GMT</pubDate>
@@ -215,7 +215,7 @@
 </span></code></pre><p>Let's say a user now wants to set an item with the key "four-fifths", with a hash value of 80. The first node with a name hash greater or equal to 80 is "half" (with hash value of 50), so that's the node to receive the request!</p><p>Choosing replicas is very simple, when an item is set to be stored on a specific node, go around the ring counter-clockwise, the next node will store a copy of that item. In our example, "zero" is the replica node for all items "half" owns, so when "half" dies and requests will now be routed to "zero", it can serve these requests, keeping our system <em>available</em>. This method is sometimes called <code>Leaderless Replication</code> and is used by "Dynamo" style databases like <code>Cassandra</code>.</p><blockquote><p>Another method is to choose a leader node and replica nodes is <code>Leader Election</code>, which is a huge topic on its own that I won't get into in this post.</p></blockquote><p>Now, what happens when a node is added to the cluster? Let's add a node named "three-quarters" with a hash value of 75, the item "four-fifths" should be migrated to the new "three-quarters" node, as new requests to it will now point to it.</p><p>This migration process is a lot less expensive than what we previously had in the modulo solution. The number of keys that need to be migrated is equal to <code>num_keys / num_nodes</code> on average.</p><p>A cool trick is to introduce the concept of virtual nodes, where you add multiple instances of a node to the ring, to lower the chances of some nodes owning more items than other nodes (in our example "half" will store twice as many items on average than the other nodes). You can generate virtual node names by for example adding an index as a suffix to the node name ("half-0", "half-1", etc...) and then the hash will result in a completely different location on the ring.</p><p>Here's a more detailed example of a migration in a cluster with a replication factor of 3:</p><img src="https://tontinton.com/migration.svg"><blockquote><p>Same colored nodes are virtual nodes of the same node, green arrows show to which node an item is being migrated to, red arrows show item deletions from nodes and the brown diamonds are items.</p></blockquote><h2 id="leaderless-replication">Leaderless Replication</h2><p>In a leaderless setup, you get amazing <em>availability</em>, while sacrificing <em>consistency</em>. If the owning node is down on a write request, it will be written to the replica, and once the owning node is up and running again, a read request will read stale data.</p><p>When <em>consistency</em> is needed for a specific request, read requests can be sent in parallel to several replica nodes as well as to the owning node. The client will pick the most up to date data. Write requests are usually sent in parallel to all replica nodes but wait for an acknowledgement from only some of them. By choosing the number of read requests and number of write requests acknowledge, you can tune the <em>consistency</em> level on a request level.</p><p>To know whether a request is <em>consistent</em>, you just need to validate that <code>R + W &gt; N/2 + 1</code>, where:</p><ul><li><strong>N</strong> - Number of nodes holding a copy of the data.</li><li><strong>W</strong> - Number of nodes that will acknowledge a write for it to succeed.</li><li><strong>R</strong> - Number of nodes that have to respond to a read operation for it to succeed.</li></ul><blockquote><p>Sending a request to a majority of nodes (where <code>W</code> or <code>R</code> is equal to <code>N/2 + 1</code>) is called a quorum.</p></blockquote><p>Picking the correct read as the latest written one is called <code>Conflict Resolution</code> and it is not a simple task, you might think that simply comparing timestamps and choosing the biggest one is enough, but using times in a distributed system are unreliable.</p><blockquote><p>This didn't stop <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html#data-versioning">Cassandra from using timestamps</a> though.</p></blockquote><p>Each machine has its own hardware clock, and the clocks <em>drift</em> apart as they are not perfectly accurate (usually a quartz crystal oscillator). Synchronizing clocks using NTP (Network Time Protocol), where a server returns the time from a more accurate time source such as a GPS receiver, is not enough to provide accurate results, as the NTP request is over the network (another distributed system) and we can't know exactly how much time will pass before receiving a response.</p><blockquote><p>Google's <code>Spanner</code> actually did achieve consistency with clocks, by uses special high precision time hardware and its API exposes the time range uncertainty of each timestamp. You can read more about it <a href="https://research.google/pubs/pub39966.pdf">here</a>.</p></blockquote><p>But if clocks are so unreliable, how else are we supposed to know which value is correct?</p><p>Some systems (for example <code>Dynamo</code>) try to solve this partially using <code>Version Vectors</code>, where you attach a (node, counter) pair for each version of an item, which gives you the ability to find causality between the different versions. By finding versions of values that are definitely newer (have a higher counter) you can remove some versions of a value, which makes the problem easier.</p><img src="https://tontinton.com/version_vector.svg"><blockquote><p>An example showing how easily conflicts arise. At the end we are left with {v2, v3} as the conflicting values for the same key. The reason I removed v1 is to show that by using something like <code>Version Vectors</code>, versions of values can be safely removed to minimize the amount of conflicts. To learn more on <code>Version Vectors</code> and their implementations, I recommend reading <a href="https://github.com/ricardobcl/Dotted-Version-Vectors">Dotted Version Vectors</a>.</p></blockquote><p>We could also decide to simply let the application decide how to deal with conflicts, by returning all conflicting values for the requested item. The application might know a lot more on the data than the database, so why not let it resolve conflicts? This is what <code>Riak KV</code> does for example.</p><blockquote><p>An idea I think about often is that you could even allow users to compile conflict resolution logic as a WASM module, and upload it to the database, so that when conflicts occur, the database resolves them, never relying on the application.</p></blockquote><p>There are lots of different ideas to reduce conflicts in an eventually consistent system, they usually fall under the umbrella term <code>Anti Entropy</code>.</p><h2 id="anti-entropy">Anti Entropy</h2><p>Here are examples of some of the most popular <code>Anti Entropy</code> mechanisms:</p><p><strong>Read Repair</strong> - After a client chooses the "latest" value from a read request that went to multiple nodes (by conflict resolution), it sends that value back to all the nodes that don't currently store that value, thus <em>repairing</em> them.</p><p><strong>Hinted Handoff</strong> - When a write request can't reach one of the target nodes, send it instead as a "hint" to some other node. As soon as that target node is available again, send it the saved "hint". On a quorum write, this mechanism is also called <code>Sloppy Quorum</code>, which provides even better <em>availability</em> for quorum requests.</p><p><strong>Merkle Trees</strong> - Because read repair only fixes queried data, a lot of data can still become inconsistent for a long time. Nodes can choose to start a synchronization process by talking to each other and see the differences in data. This is really expensive when there is a lot of data (<code>O(n)</code>). To make the sync algorithm faster (<code>O(log n)</code>) we can introduce <a href="https://en.wikipedia.org/wiki/Merkle_tree">merkle trees</a>. A merkle tree stores the hash of a range of the data in lowest leaf nodes, with the parent leaf nodes being a combined hash of the 2 of its children, thus creating a hierarchy of hashes up to the root of the tree. The sync process now starts by one node comparing the root of the merkle tree to another node's merkle tree, if the hashes are the same, it means they have exactly the same data. If the hashes differ, the leaf hashes are checked the same way, recursively until the inconsistent data is found.</p><p><strong>Gossip Dissemination</strong> - Send broadcast events to all nodes in the cluster in a simple and reliable way, by imitating how humans spread rumors or a disease. You send the event message to a configured number of randomly chosen nodes (called the "fanout"), then when they receive the message they repeat the process and send the message to another set of randomly chosen <code>N</code> nodes. To not repeat the message forever in the cluster, a node stops broadcasting a gossip message when it sees it a configured number of times. To get a feel for how data converges using gossip, head over to the <a href="https://www.serf.io/docs/internals/simulator.html">simulator</a>! As an optimization, gossip messages are usually sent using UDP, as the mechanism is just that reliable.</p><h2 id="conclusion">Conclusion</h2><p>There is a lot more to talk about databases, be it the use of <a href="https://yarchive.net/comp/linux/o_direct.html">O_DIRECT</a> in linux and implementing your own page cache, failure detection in distributed systems, consensus algorithms like <a href="https://raft.github.io/">raft</a>, distributed transactions, leader election, and an almost infinite amount more.</p><p>I hope I have piqued your curiosity enough to explore the world of databases further, or provided the tools for you to better understand which database to pick in your next project 😀</p></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Delta Dental says data breach exposed info of 7M people (110 pts)]]></title>
+            <title><![CDATA[Delta Dental says data breach exposed info of 7M people (150 pts)]]></title>
             <link>https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/</link>
             <guid>38654805</guid>
             <pubDate>Fri, 15 Dec 2023 14:59:37 GMT</pubDate>
@@ -223,7 +223,7 @@
 Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-data-breach-exposed-info-of-7-million-people/: Error: Request failed with status code 503]]></description>
         </item>
         <item>
-            <title><![CDATA[How Lego builds a new Lego set (201 pts)]]></title>
+            <title><![CDATA[How Lego builds a new Lego set (234 pts)]]></title>
             <link>https://www.theverge.com/c/23991049/lego-ideas-polaroid-onestep-behind-the-scenes-price</link>
             <guid>38653456</guid>
             <pubDate>Fri, 15 Dec 2023 12:25:26 GMT</pubDate>
@@ -897,7 +897,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[WebP is so great except it's not (176 pts)]]></title>
+            <title><![CDATA[WebP is so great except it's not (198 pts)]]></title>
             <link>https://eng.aurelienpierre.com/2021/10/webp-is-so-great-except-its-not/</link>
             <guid>38653110</guid>
             <pubDate>Fri, 15 Dec 2023 11:32:44 GMT</pubDate>
@@ -1067,7 +1067,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Oxlint – written in Rust – 50-100 Times Faster than ESLint (232 pts)]]></title>
+            <title><![CDATA[Oxlint – written in Rust – 50-100 Times Faster than ESLint (243 pts)]]></title>
             <link>https://oxc-project.github.io/blog/2023-12-12-announcing-oxlint.html</link>
             <guid>38652887</guid>
             <pubDate>Fri, 15 Dec 2023 10:48:24 GMT</pubDate>
@@ -1075,7 +1075,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 <div id="readability-page-1" class="page"><div data-v-d1cebd69=""><header data-v-6584a84b=""><h2 data-v-6584a84b="">Oxlint General Availability</h2></header><p>We're thrilled to announce that oxlint is now generally available! This milestone signifies our team's ability to promptly address and triage issues.</p><p>Oxlint is a JavaScript linter designed to catch erroneous or useless code without requiring any configurations by default.</p><h2 id="how-to-use" tabindex="-1">How to Use <a href="#how-to-use" aria-label="Permalink to &quot;How to Use&quot;">​</a></h2><p>At this stage, oxlint is <strong>not intended to fully replace ESLint</strong>; it serves as an enhancement when ESLint's slowness becomes a bottleneck in your workflow.</p><p>For faster feedback loops, we recommend running oxlint before ESLint in your lint-staged or CI setup, considering it only takes a few seconds to run on large codebases.</p><p>To test oxlint in your JavaScript / TypeScript codebase, simply execute the following command at the root directory of your repository:</p><div><p><label for="tab-zlT1HlT">npm</label><label for="tab-bS3cme4">pnpm</label><label for="tab-eHmabbt">yarn</label><label for="tab-qvH706H">bun</label><label for="tab-NTSJzp6">deno</label></p><div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>npx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>npx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>pnpm</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>pnpm</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>yarn</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>yarn</span><span> </span><span>dlx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>bunx</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>bunx</span><span> </span><span>oxlint@latest</span></span></code></pre></div><div><p><span>sh</span></p><pre><code><span><span>$</span><span> </span><span>deno</span><span> </span><span>run</span><span> </span><span>oxlint@latest</span></span></code></pre><pre><code><span><span>$</span><span> </span><span>deno</span><span> </span><span>run</span><span> </span><span>oxlint@latest</span></span></code></pre></div></div></div><p>Alternatively, refer to the <a href="https://oxc-project.github.io/docs/guide/usage/linter.html">installation guide</a> for detailed instructions.</p><h2 id="design" tabindex="-1">Design <a href="#design" aria-label="Permalink to &quot;Design&quot;">​</a></h2><h3 id="_50-100-times-faster-than-eslint" tabindex="-1">50-100 Times Faster than ESLint <a href="#_50-100-times-faster-than-eslint" aria-label="Permalink to &quot;50-100 Times Faster than ESLint&quot;">​</a></h3><p>In real-world scenarios, Shopify reported that their 75 CI minutes ESLint run is now only 10 seconds.</p><p>From Jason Miller, Shopify DX and creator of Preact:</p><blockquote><p>oxlint has been a massive win for us at Shopify. Our previous linting setup took 75 minutes to run, so we were fanning it out across 40+ workers in CI.</p><p>By comparison, oxlint takes around 10 seconds to lint the same codebase on a single worker, and the output is easier to interpret.</p><p>We even caught a few bugs that were hidden or skipped by our old setup when we migrated!</p></blockquote><p>The majority of the performance gains stem from Oxlint being purposefully designed for performance, utilizing Rust and parallel processing as key factors.</p><h3 id="lint-for-correctness" tabindex="-1">Lint for Correctness <a href="#lint-for-correctness" aria-label="Permalink to &quot;Lint for Correctness&quot;">​</a></h3><p>Oxlint defaults to identifying erroneous, redundant, or confusing code — prioritizing correctness over unnecessary nitpicking rules (categorized as <code>perf</code>, <code>suspicious</code>, <code>pedantic</code>, or <code>style</code>), which are disabled by default.</p><h3 id="ease-of-use" tabindex="-1">Ease of Use <a href="#ease-of-use" aria-label="Permalink to &quot;Ease of Use&quot;">​</a></h3><p>Setting up new JavaScript / TypeScript codebases is becoming increasingly complex. There's a high likelihood of encountering compatibility issues among your tools, potentially resulting in hours of wasted time.</p><p>That's why we designed oxlint to be zero-config out of the box; even Node.js is not a requirement. Most adjustments can be made through the command-line, and reading from ESLint configuration file is currently work in progress.</p><h3 id="enhanced-diagnostics" tabindex="-1">Enhanced Diagnostics <a href="#enhanced-diagnostics" aria-label="Permalink to &quot;Enhanced Diagnostics&quot;">​</a></h3><p>Understanding linter messages can be challenging. Oxlint aims to simplify this by pinpointing root causes and providing helpful messages — eliminating the need for lengthy rule documentation reading, saving valuable time.</p><p>Running <code>oxlint -D perf</code> in the <a href="https://github.com/microsoft/vscode" target="_blank" rel="noreferrer">vscode repository</a>:</p><p><img width="100%" src="https://github.com/oxc-project/oxc/assets/1430279/094a3b24-0433-42ae-aad2-48a7dec2b985"></p><h3 id="consolidated-rules" tabindex="-1">Consolidated Rules <a href="#consolidated-rules" aria-label="Permalink to &quot;Consolidated Rules&quot;">​</a></h3><p>Oxlint does not provide a plugin system yet, but we are actively consolidating rules from popular plugins like TypeScript, React, Jest, Unicorn, JSX-a11y and Import.</p><p>We recognize the importance of plugins in the JavaScript ecosystem and are also investigating a DSL-based plugin system.</p><p>However, you might appreciate a standalone linter — no need to manage a list of plugin dependencies, navigate through <a href="https://github.com/antfu/eslint-ts-patch" target="_blank" rel="noreferrer">compatibility issues</a>, or <a href="https://github.com/import-js/eslint-plugin-import/pull/2504#issuecomment-1191057877" target="_blank" rel="noreferrer">resort to forked plugins due to version constraints</a>.</p><hr><p>Happy linting and have a joyful holiday season!</p><p>To get started, follow the <a href="https://oxc-project.github.io/docs/guide/usage/linter.html">installation guide</a>, or <a href="https://oxc-project.github.io/docs/guide/introduction.html">learn more about the oxc project</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[An Interactive Guide to the Fourier Transform (111 pts)]]></title>
+            <title><![CDATA[An Interactive Guide to the Fourier Transform (132 pts)]]></title>
             <link>https://betterexplained.com/articles/an-interactive-guide-to-the-fourier-transform/</link>
             <guid>38652794</guid>
             <pubDate>Fri, 15 Dec 2023 10:29:40 GMT</pubDate>
@@ -1314,7 +1314,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: AI/ML papers to catch up with current state of AI? (145 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: AI/ML papers to catch up with current state of AI? (156 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=38652736</link>
             <guid>38652736</guid>
             <pubDate>Fri, 15 Dec 2023 10:19:14 GMT</pubDate>
@@ -1385,7 +1385,309 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Godot: A Collaboration with Google and the Forge (124 pts)]]></title>
+            <title><![CDATA[Let it snow in your terminal (107 pts)]]></title>
+            <link>https://pypi.org/project/snowjob/</link>
+            <guid>38652339</guid>
+            <pubDate>Fri, 15 Dec 2023 08:56:59 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://pypi.org/project/snowjob/">https://pypi.org/project/snowjob/</a>, See on <a href="https://news.ycombinator.com/item?id=38652339">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content">
+
+
+
+
+<div>
+      <p>A python script that will make your terminal snow</p>
+    </div>
+
+<div data-controller="project-tabs">
+        <!-- mobile menu -->
+        <nav aria-label="Navigation for snowjob">
+          <ul role="tablist">
+            <li role="tab">
+              <a id="mobile-description-tab" href="#description" data-project-tabs-target="mobileTab" data-action="project-tabs#onTabClick" aria-selected="true" aria-label="Project description. Focus will be moved to the description.">
+                
+Project description              </a>
+            </li>
+            <li role="tab">
+              <a id="mobile-data-tab" href="#data" data-project-tabs-target="mobileTab" data-action="project-tabs#onTabClick" aria-label="Project details. Focus will be moved to the project details.">
+                
+Project details              </a>
+            </li>
+            <li role="tab">
+              <a id="mobile-history-tab" href="#history" data-project-tabs-target="mobileTab" data-action="project-tabs#onTabClick" aria-label="Release history. Focus will be moved to the history panel.">
+              
+Release history            </a>
+            </li>
+            <li role="tab">
+              <a id="mobile-files-tab" href="#files" data-project-tabs-target="mobileTab" data-action="project-tabs#onTabClick" aria-label="Download files. Focus will be moved to the project files.">
+                
+Download files              </a>
+            </li>
+          </ul>
+        </nav>
+
+        <div id="description" data-project-tabs-target="content" role="tabpanel" aria-labelledby="description-tab mobile-description-tab" tabindex="-1">
+          <h2>Project description</h2>
+          <div>
+            <p>A python script that allows your terminal to snow.</p>
+<p>You can find a bash(shell) script version of this here:
+<a href="https://gist.github.com/sontek/1505483" rel="nofollow">https://gist.github.com/sontek/1505483</a></p>
+<p>You can pass –stack if you want the snow to pile up</p>
+
+          </div>
+        </div>
+
+        <div id="data" data-project-tabs-target="content" role="tabpanel" aria-labelledby="mobile-data-tab" tabindex="-1">
+          <h2>Project details</h2>
+
+
+
+
+
+
+
+
+
+          <br>
+        </div>
+
+        
+
+          <div id="files" data-project-tabs-target="content" role="tabpanel" aria-labelledby="files-tab mobile-files-tab" tabindex="-1">
+            <h2>Download files</h2>
+            <p>Download the file for your platform. If you're not sure which to choose, learn more about <a href="https://packaging.python.org/installing/" title="External link" target="_blank" rel="noopener">installing packages</a>.</p>
+            <h3>
+Source Distribution            </h3>
+
+                  
+
+
+            <h3>
+Built Distributions            </h3>
+
+                
+    
+    
+    
+
+          </div>
+
+<div role="dialog" id="copy-hash-modal-0fa601bd-6da9-41a7-bdf7-1ff6505b0bf8">
+    <p><a href="#modal-close" title="Close">
+      
+      <span>Close</span>
+    </a></p><div>
+      <h3>
+<a href="https://pip.pypa.io/en/stable/topics/secure-installs/#hash-checking-mode" title="External link" target="_blank" rel="noopener">Hashes</a> for snowjob-0.0.4.tar.gz      </h3>
+      <table>
+        <caption>Hashes for snowjob-0.0.4.tar.gz</caption>
+        <thead>
+          <tr>
+            <th scope="col">Algorithm</th>
+            <th scope="col">Hash digest</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-controller="clipboard">
+            <th scope="row">SHA256</th>
+            <td><code data-clipboard-target="source">a7a261b5f1e65577bdd39ef0f3f595864031deabd1dc6b4c122fb89c4091e1d4</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">MD5</th>
+            <td><code data-clipboard-target="source">b70781b90fb9b50ccb2177a3af915e8e</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">BLAKE2b-256</th>
+            <td><code data-clipboard-target="source">b9f149240e0627b4d9cc7ff31b2772d646468c24c9776eea8d347def4d291bb2</code></td>
+            <td>
+              
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+  </div><div role="dialog" id="copy-hash-modal-5a418f60-57c3-4c32-88b9-538027912bc1">
+    <p><a href="#modal-close" title="Close">
+      
+      <span>Close</span>
+    </a></p><div>
+      <h3>
+<a href="https://pip.pypa.io/en/stable/topics/secure-installs/#hash-checking-mode" title="External link" target="_blank" rel="noopener">Hashes</a> for snowjob-0.0.4-py33-none-any.whl      </h3>
+      <table>
+        <caption>Hashes for snowjob-0.0.4-py33-none-any.whl</caption>
+        <thead>
+          <tr>
+            <th scope="col">Algorithm</th>
+            <th scope="col">Hash digest</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-controller="clipboard">
+            <th scope="row">SHA256</th>
+            <td><code data-clipboard-target="source">683d863a00d05c64834a44ce6be7fd0d86d9a226fc430fbc610ffbf234e2044d</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">MD5</th>
+            <td><code data-clipboard-target="source">ac7935231788306bc49580c3aab0ff53</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">BLAKE2b-256</th>
+            <td><code data-clipboard-target="source">ff393b90b00e44dbf52846db60ed6798d26c6eb01f87f471a85c6139fc9d8c63</code></td>
+            <td>
+              
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+  </div><div role="dialog" id="copy-hash-modal-1e20c0ed-f61e-4eef-a1ee-cdffd8eeb403">
+    <p><a href="#modal-close" title="Close">
+      
+      <span>Close</span>
+    </a></p><div>
+      <h3>
+<a href="https://pip.pypa.io/en/stable/topics/secure-installs/#hash-checking-mode" title="External link" target="_blank" rel="noopener">Hashes</a> for snowjob-0.0.4-py27-none-any.whl      </h3>
+      <table>
+        <caption>Hashes for snowjob-0.0.4-py27-none-any.whl</caption>
+        <thead>
+          <tr>
+            <th scope="col">Algorithm</th>
+            <th scope="col">Hash digest</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-controller="clipboard">
+            <th scope="row">SHA256</th>
+            <td><code data-clipboard-target="source">ad72e8351df366640efb9676077d1b2c0908e5162e3250ab135c7a4da62eba9a</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">MD5</th>
+            <td><code data-clipboard-target="source">91a80f338103846fd355b189a5a75553</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">BLAKE2b-256</th>
+            <td><code data-clipboard-target="source">b162386868fa31bd945497aeaa17716016af9a7b6746955be5bd6d7e8f3034c7</code></td>
+            <td>
+              
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+  </div><div role="dialog" id="copy-hash-modal-b2faf18d-c07a-418a-8a1e-e3b69fa997d4">
+    <p><a href="#modal-close" title="Close">
+      
+      <span>Close</span>
+    </a></p><div>
+      <h3>
+<a href="https://pip.pypa.io/en/stable/topics/secure-installs/#hash-checking-mode" title="External link" target="_blank" rel="noopener">Hashes</a> for snowjob-0.0.4-py3.3.egg      </h3>
+      <table>
+        <caption>Hashes for snowjob-0.0.4-py3.3.egg</caption>
+        <thead>
+          <tr>
+            <th scope="col">Algorithm</th>
+            <th scope="col">Hash digest</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-controller="clipboard">
+            <th scope="row">SHA256</th>
+            <td><code data-clipboard-target="source">8da0d66f7fa4e651c395fcf2dd77308fb2cd42a79daee8491fd9a7b7d789b1e5</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">MD5</th>
+            <td><code data-clipboard-target="source">5e5240a9afc85115af601e496e12c022</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">BLAKE2b-256</th>
+            <td><code data-clipboard-target="source">0ee9c8a5164fb58274514164b7899115a2e49c543f573e565b523b47f2fd69cf</code></td>
+            <td>
+              
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+  </div><div role="dialog" id="copy-hash-modal-0e903c05-cab8-4ce8-8b4c-166df75d2aad">
+    <p><a href="#modal-close" title="Close">
+      
+      <span>Close</span>
+    </a></p><div>
+      <h3>
+<a href="https://pip.pypa.io/en/stable/topics/secure-installs/#hash-checking-mode" title="External link" target="_blank" rel="noopener">Hashes</a> for snowjob-0.0.4-py2.7.egg      </h3>
+      <table>
+        <caption>Hashes for snowjob-0.0.4-py2.7.egg</caption>
+        <thead>
+          <tr>
+            <th scope="col">Algorithm</th>
+            <th scope="col">Hash digest</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr data-controller="clipboard">
+            <th scope="row">SHA256</th>
+            <td><code data-clipboard-target="source">60e6936a0e3ae0e806919ee1ad34f49123bdc73a7f322a6c3e7a22c47a56edd0</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">MD5</th>
+            <td><code data-clipboard-target="source">1f0bd139f6e88c439264821b87151b95</code></td>
+            <td>
+              
+            </td>
+          </tr>
+          <tr data-controller="clipboard">
+            <th scope="row">BLAKE2b-256</th>
+            <td><code data-clipboard-target="source">e893c6d2f40c7f91899cef931d02f6137e441ef52e122d44719de8c4181057cc</code></td>
+            <td>
+              
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+  </div>
+      </div>
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Godot: A Collaboration with Google and the Forge (126 pts)]]></title>
             <link>https://godotengine.org/article/collaboration-with-google-forge-2023/</link>
             <guid>38651818</guid>
             <pubDate>Fri, 15 Dec 2023 07:16:12 GMT</pubDate>
@@ -1406,7 +1708,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AMD's Next GPU Is a 3D-Integrated Superchip (139 pts)]]></title>
+            <title><![CDATA[AMD's Next GPU Is a 3D-Integrated Superchip (150 pts)]]></title>
             <link>https://spectrum.ieee.org/amd-mi300</link>
             <guid>38650937</guid>
             <pubDate>Fri, 15 Dec 2023 04:18:19 GMT</pubDate>
@@ -1414,7 +1716,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 <div id="readability-page-1" class="page"><div data-headline="AMD’s Next GPU Is a 3D-Integrated Superchip" data-elid="2666454143" data-post-url="https://spectrum.ieee.org/amd-mi300" data-authors="Samuel K. Moore" data-page-title="AMD’s Next GPU Is a 3D-Integrated Superchip - IEEE Spectrum"><p><a href="https://spectrum.ieee.org/tag/amd">AMD</a> lifted the hood on its next AI accelerator chip, the Instinct MI300, at the<a href="https://www.amd.com/en/corporate/events/advancing-ai.html" target="_blank"> AMD Advancing AI</a> event today, and it’s an unprecedented feat of <a href="https://spectrum.ieee.org/tag/3d-integration" target="_blank">3D integration</a>. MI300, a version of which will power the <a href="https://en.wikipedia.org/wiki/El_Capitan_(supercomputer)" target="_blank">El Capitan</a> supercomputer, is a layer cake of computing, memory, and communication that’s three slices of silicon high and that can sling as much as 17 terabytes of data vertically between those slices. The result is as much as a 3.4-fold boost in speed for certain machine-learning-critical calculations. The chip offers both contrasts and similarities to competing approaches such as Nvidia’s <a href="https://spectrum.ieee.org/nvidia-supercomputing-cpu-puts-intel-under-pressure" target="_blank">Grace Hopper superchip</a> and Intel’s supercomputer accelerator <a href="https://spectrum.ieee.org/intel-s-exascale-supercomputer-chip-is-a-master-class-in-3d-integration" target="_self">Ponte Vecchio</a>.<br></p><p>MI300a stacks three CPU <a href="https://spectrum.ieee.org/tag/chiplets" target="_blank">chiplets</a> (called compute complex dies, or CCDs, in AMD’s lingo) and six accelerator chiplets (XCDs) on top of four input-output dies (IODs), all on top of a piece of silicon that links them together to eight stacks of high-bandwidth DRAM that ring the superchip. (The MI300x substitutes the CCDs for two more XCDs, for an accelerator-only system.) With the scaling of transistors in the plane of the silicon slowing down, 3D stacking is seen as a key method to get more transistors into the same area and keep driving Moore’s Law forward.</p><p><img alt="Grey, labeled rectangles with orange and gold vertical lines connecting them." data-rm-shortcode-id="b87acda6384d54374dd4564223f0574f" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/grey-labeled-rectangles-with-orange-and-gold-vertical-lines-connecting-them.jpg?id=50661489&amp;width=980" height="240" id="a7fd1" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/grey-labeled-rectangles-with-orange-and-gold-vertical-lines-connecting-them.jpg?id=50661489&amp;width=980" width="1057"><small data-gramm="false" data-lt-tmp-id="lt-246886" placeholder="Add Photo Caption..." spellcheck="false">Compute and AI chiplets are stacked on top of I/O and cache chiplets in the MI300a.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>“It’s a truly amazing silicon stack up that delivers the highest density performance that industry knows how to produce at this time,” says <a href="https://spectrum.ieee.org/chiplet" target="_self">Sam Naffziger</a>, a senior vice president and corporate fellow at AMD. The integration is done using two Taiwan Semiconductor Manufacturing Co. technologies, <a href="https://3dfabric.tsmc.com/english/dedicatedFoundry/technology/SoIC.htm" rel="noopener noreferrer" target="_blank">SoIC (system on integrated chips) and CoWoS (chip on wafer on substrate)</a>. The latter stacks smaller chips on top of larger ones using hybrid bonding, which links copper pads on each chip directly without solder. It is used to produce AMD’s <a href="https://spectrum.ieee.org/amd-3d-stacking-intel-graphcore" target="_self">V-Cache,</a> a cache-memory expanding chiplet that stacks on its highest-end CPU chiplets. The former, CoWos, stacks chiplets on a larger piece of silicon, called an interposer, which is built to contain high-density interconnects.</p><h2>Similarities and differences between AMD and Nvidia</h2><p>There are both similarities and differences to chief rival Nvidia’s approach. Just as Nvidia did in its Hopper architecture, AMD’s accelerator architecture, CDNA3, added the capability of computing with <a href="https://www.nvidia.com/en-us/data-center/h100/#:~:text=AI%2Dfused%20HPC%20applications%20can,operations%2C%20with%20zero%20code%20changes." rel="noopener noreferrer" target="_blank">truncated 32-bit numbers called TF32</a> and with two different forms of 8-bit floating-point numbers. The latter attribute is used to speed the training of certain parts of transformer neural networks, such as large language models. They also both include a <a href="https://spectrum.ieee.org/nvidia-gpu" target="_self">scheme that reduces the size of the neural network</a>, called 4:2 sparsity.</p><p>Another similarity is the inclusion of both CPU and GPU in the same <a href="https://spectrum.ieee.org/tag/3d-packaging" target="_blank">package</a>. In many AI computer systems, GPUs and CPUs are separately packaged chips deployed in a 4 to 1 ratio. One advantage to joining them together in a single superchip is that both CPU and GPU have high-bandwidth access to the same cache and high-bandwidth DRAM (HBM) in a way that won’t trip each other up as they read and write data.</p><p>Nvidia’s <a href="https://developer.nvidia.com/blog/nvidia-grace-hopper-superchip-architecture-in-depth/" target="_blank">Grace Hopper</a> is such a superchip combination linking the Grace CPU to the Hopper GPU through Nvidia’s Nvidia NVLink Chip-2-Chip interconnects. AMD’s MI300a is as well, by integrating three CPU dies designed for its Genoa line and six XCD accelerators using its AMD Infinity Fabric interconnect technology.</p><p>But a casual glance at Grace Hopper and MI300 show some profound differences. Grace and Hopper are each individual dies that integrate all of a system-on-chip’s needed functional blocks—compute, I/O, and cache. They are linked horizontally, and they are large—nearly at the size limit of photolithography technology.</p><p>AMD took a different approach, one that it has followed for several generations of its CPUs and that rival <a href="https://spectrum.ieee.org/tag/intel">Intel</a> used for its 3D-stacked supercomputer accelerator Ponte Vecchio. The concept is called system-technology-co-optimization, or STCO. That means designers started by breaking the chip down into its functions and decided which functions needed which manufacturing technology.</p><p data-rm-resized-container="25%"><img alt="" data-rm-shortcode-id="824acf053d8de4f6c76ec91569d65c78" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/a-slice-of-mi300-stack-from-the-carrier-silicon-at-the-top-to-the-solder-ball-at-the-bottom-of-the-package.jpg?id=50682953&amp;width=980" height="3661" id="cde2e" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/a-slice-of-mi300-stack-from-the-carrier-silicon-at-the-top-to-the-solder-ball-at-the-bottom-of-the-package.jpg?id=50682953&amp;width=980" width="1126"><small placeholder="Add Photo Caption...">A slice of MI300 stack from the carrier silicon at the top to the solder ball at the bottom of the package.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>“What we wanted to do with MI300 was to scale beyond what was possible in a single monolithic GPU. So we deconstructed it into pieces and then built it back up,” says <a href="https://www.linkedin.com/in/alan-smith-amd/" rel="noopener noreferrer" target="_blank">Alan Smith</a>, a senior fellow and the chief architect for Instinct. Although it’s been doing so for several generations of CPUs, the MI300 is the first time the company has made GPU chiplets and bound them in a single system.</p><p>“Breaking the GPU into chiplets allowed us to put the compute in the most advanced process node while keeping the rest of the chip in technology that’s more appropriate for cache and I/O,” he says. In the case of the MI300, all the compute was built using TSMC’s N5 process, the most advanced available and the one used for Nvidia’s top-line GPUs. Neither the I/O functions nor the system’s cache memory benefit from N5, so AMD chose a less-expensive technology (N6) for those. Therefore, those two functions could then be built together on the same chiplet.</p><p>With the functions broken up, all the pieces of silicon involved in the MI300 are small. The largest, the I/O dies, are not even half the size of Hopper. And the CCDs are only about one-fifth the size of the I/O die. The small sizes make a big difference. Generally, smaller chips yield better. That is, a single wafer will provide a higher proportion of working small chips than it would large chips. “3D integration isn’t free,” says Naffziger. But the higher yield offsets the cost, he says.</p><h2>Luck and experience</h2><p>The design involved some clever reuse of existing technologies and designs, a few compromises, and a little luck, according to Naffziger, an IEEE Fellow. The reuse came in two instances. First, AMD was able to do the 3D integration with a degree of confidence because it had already been using the exact same pitch of vertical interconnects—9 micrometers—in its V-cache product.</p><p>As an optional add-on that AMD was able to charge extra for, V-cache offers little risk that poor yield or other problems will have a big impact on the company. “It’s been a great thing to enable us to wring out the manufacturing problems and all the design complexities of 3D stacking without endangering the main product line,” says Naffziger.</p><p>The other instance of reuse was a bit chancier. When the MI300 team decided that a CPU/GPU combination was needed, Naffziger “somewhat sheepishly” asked the head of the team designing the Zen4 CCD for the <a href="https://www.amd.com/en/events/epyc4" target="_blank">Genoa CPU</a> if the CCD could be made to fit the MI300’s needs. That team was under pressure to meet an earlier deadline than expected, but a day later they responded. Naffziger was in luck; the Zen4 CCD had a small blank space in just the right spot to make the vertical connections to the MI300 I/O die and their associated circuitry without a disruption to the overall design.</p><p>Nevertheless, there was still some geometry that needed solving. To make all the internal communications work, the four I/O chiplets had to be facing each other on a particular edge. That meant making a mirror-image version of the chiplet. Because it was codesigned with the I/O chiplet, the XCD and its vertical connections were built to link up with both versions of the I/O. But there was no messing with the CCD, which they were lucky to have at all. So instead the I/O was designed with redundant connections, so that no matter which version of the chiplet it sat on, the CCD would connect.</p><p><img alt="Multicolor rectangle with capital lettering in places." data-rm-shortcode-id="fd7dd6159bc9fba3eaf956a11c231d6e" data-rm-shortcode-name="rebelmouse-image" data-runner-src="https://spectrum.ieee.org/media-library/multicolor-rectangle-with-capital-lettering-in-places.jpg?id=50662187&amp;width=980" height="412" id="917d3" lazy-loadable="true" src="https://spectrum.ieee.org/media-library/multicolor-rectangle-with-capital-lettering-in-places.jpg?id=50662187&amp;width=980" width="896"><small placeholder="Add Photo Caption...">To get everything to line up, the IOD chiplets had to be made as mirrors of each other, and the accelerator (XCD) and compute (CCD) chiplets had to be rotated.</small><small placeholder="Add Photo Credit...">AMD</small></p><p>The power grid, which has to deliver hundreds of amperes of current to the compute dies at the top of the stack, faced similar challenges because it too had to accommodate all the various chiplet orientations, Naffziger noted.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pipe Dreams: The life and times of Yahoo Pipes (296 pts)]]></title>
+            <title><![CDATA[Pipe Dreams: The life and times of Yahoo Pipes (313 pts)]]></title>
             <link>https://retool.com/pipes</link>
             <guid>38650878</guid>
             <pubDate>Fri, 15 Dec 2023 04:07:09 GMT</pubDate>
@@ -1422,7 +1724,7 @@ Couldn't get https://www.bleepingcomputer.com/news/security/delta-dental-says-da
 <div id="readability-page-1" class="page"><div font-family="TiemposText" font-weight="400"><div><p>“He was very kind to write this very nice review of it,” Sadri reflected, “and that exploded interest, and caused our servers all to melt down.”</p></div><div><p>As launch day went on, usage didn’t taper off. The demand for Pipes required vastly more resources than it had available, and Yahoo put all hands on deck to support keeping the nascent system running.</p></div><div><p>Ho remembers “just sitting in my chair the entire <!-- -->[<!-- -->launch<!-- -->]<!-- --> day until late in the evening, just bringing up machines.” Yahoo’s data-center team started shifting servers that they had already prepped for deployment for other groups into service for Pipes.</p></div><div><p>“Every time it came up, everybody jumped on it and it crashed again, and everybody cycled back into a waiting state,” said Trevor, the lead engineer. “It felt bad at the time, but in retrospect, it was awesome.”</p></div><div><p>Raffel said Yahoo co-founder Jerry Yang told him to use his name to get whatever he needed to keep Pipes running then: “I’d never done that before. I certainly haven’t done that since.”</p></div><div><p>The beta launch’s popularity caught the team so off guard that they hadn’t even prepared a crash page. (Though that soon changed: Trevor said that the first thing they created after the beta launch was a page that read something like “our pipes are clogged.”)</p></div><div><p>In the days and weeks following, the team started to see more of the loose threads they hadn’t been able to stitch up in the sudden sprint to an unexpectedly momentous launch. Among a variety of issues, once someone created a Pipe, it ran forever.</p></div><div><p>There was no end-time built in or a need for someone to login to refresh or request a feed. (Even if there had been, RSS newsreaders polled for updates automatically.) Raffel said the team didn’t consider “just how many zombie things would get generated. <!-- -->[<!-- -->...<!-- -->]<!-- --> We kind of put ourselves in a situation where, fairly quickly, we had a lot of usage from things that may or may not actually <!-- -->[<!-- -->have been<!-- -->]<!-- --> real users.”</p></div><div><p>Still, many others agreed with O’Reilly’s sentiments. The <em>InfoWorld</em> writer turned <a href="https://blog.jonudell.net/2007/02/12/annotate-the-web-then-rewire-it/" target="_blank" rel="noopener noreferrer">Microsoft evangelist Jon Udell</a> blogged about a week after the beta launch, “The dominant way in which most people will ‘program’ the web is by writing metadata, not code, and we’ll need an interface as friendly and powerful as Pipes to help them do that.”</p></div><div><p>Yahoo threw more servers at Pipes, the programmers optimized the least inefficient code, and within a few months, Pipes’ reliability stabilized. But just as it was rising it was also—already—nearly fixed in amber.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: My Go SQLite driver did poorly on a benchmark, so I fixed it (195 pts)]]></title>
+            <title><![CDATA[Show HN: My Go SQLite driver did poorly on a benchmark, so I fixed it (204 pts)]]></title>
             <link>https://github.com/ncruces/go-sqlite-bench</link>
             <guid>38650570</guid>
             <pubDate>Fri, 15 Dec 2023 02:44:23 GMT</pubDate>
@@ -1660,7 +1962,7 @@ It's free.</p>
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google Groups ending support for Usenet (256 pts)]]></title>
+            <title><![CDATA[Google Groups ending support for Usenet (258 pts)]]></title>
             <link>https://support.google.com/groups/answer/11036538?hl=en</link>
             <guid>38649554</guid>
             <pubDate>Fri, 15 Dec 2023 00:37:37 GMT</pubDate>
@@ -1692,7 +1994,7 @@ It's free.</p>
 </div>         <div data-stats-id="11036538" data-stats-ve="20" data-stats-visible-imp="" id="article-survey-container"><h2>Was this helpful?</h2><p>How can we improve it?</p></div>    </article>            </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Stanford Prison Experiment was hugely influential. We learned it was a fraud (2018) (157 pts)]]></title>
+            <title><![CDATA[The Stanford Prison Experiment was hugely influential. We learned it was a fraud (2018) (160 pts)]]></title>
             <link>https://www.vox.com/2018/6/13/17449118/stanford-prison-experiment-fraud-psychology-replication</link>
             <guid>38648883</guid>
             <pubDate>Thu, 14 Dec 2023 23:26:58 GMT</pubDate>
@@ -1915,7 +2217,7 @@ It's free.</p>
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Mitchell reflects as he departs HashiCorp (643 pts)]]></title>
+            <title><![CDATA[Mitchell reflects as he departs HashiCorp (652 pts)]]></title>
             <link>https://www.hashicorp.com/blog/mitchell-reflects-as-he-departs-hashicorp</link>
             <guid>38647484</guid>
             <pubDate>Thu, 14 Dec 2023 21:27:17 GMT</pubDate>
@@ -2080,7 +2382,7 @@ Ghil'ad Zuckermann, University of Adelaide, Australia (Endangered Languages, Jew
 </big></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[After getting $824M in state aid, GM to cut 900 jobs at Orion Assembly (122 pts)]]></title>
+            <title><![CDATA[After getting $824M in state aid, GM to cut 900 jobs at Orion Assembly (123 pts)]]></title>
             <link>https://www.michigancapitolconfidential.com/news/after-getting-824m-in-state-aid-gm-to-cut-900-jobs-at-orion-assembly</link>
             <guid>38647097</guid>
             <pubDate>Thu, 14 Dec 2023 20:54:09 GMT</pubDate>
@@ -2771,214 +3073,6 @@ It's a bold strategy, and Gelsinger appeared confident as he led his team throug
 
 
 
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Mozilla expands extension support for Firefox for Android (487 pts)]]></title>
-            <link>https://blog.mozilla.org/en/mozilla/new-extensions-youll-love-now-available-on-firefox-for-android/</link>
-            <guid>38644608</guid>
-            <pubDate>Thu, 14 Dec 2023 17:58:48 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://blog.mozilla.org/en/mozilla/new-extensions-youll-love-now-available-on-firefox-for-android/">https://blog.mozilla.org/en/mozilla/new-extensions-youll-love-now-available-on-firefox-for-android/</a>, See on <a href="https://news.ycombinator.com/item?id=38644608">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="content">
-  <main id="main">
-
-    
-<article id="post-73805">
-  
-
-  <div>
-    
-<figure><img decoding="async" fetchpriority="high" width="1024" height="576" src="https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-1024x576.jpg" alt="" srcset="https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-1024x576.jpg 1024w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-300x169.jpg 300w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-768x432.jpg 768w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-1536x864.jpg 1536w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-1000x562.jpg 1000w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue-1279x719.jpg 1279w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2023/12/FX_Distilled_WorldofExtensions_blogheader_1920x1080_blue.jpg 1921w" sizes="(max-width: 1024px) 100vw, 1024px"></figure>
-
-
-
-<p>Today, Mozilla announced more than 450 new extensions (software that adds new features or functionality to the browser) to users on Firefox for Android at Mozilla’s <a href="https://addons.mozilla.org/en-US/android/">Addons.mozilla.org (AMO) Android page</a>. This milestone marks the launch of a new open extension ecosystem on mobile where developers are now free to create and publish extensions and users can easily access and install them on Firefox for Android.</p>
-
-
-
-<p>“Extensions were first created as a way for people to customize their own internet experience, from <a href="https://blog.mozilla.org/en/products/firefox/madonna-firefox-theme-designer/">artists designing themes</a> to developers who wanted to make extensions to improve people’s web experience,” said Vicky Chin, Vice President of Engineering at Firefox. “We’re thrilled to bring this experience to Firefox for Android, where we’re the only major Android browser to support an open extension ecosystem. In the coming months, we plan to enable more extensions for people to choose from and customize their own mobile internet experience.”&nbsp;</p>
-
-
-
-<h2>Our journey to an open extension ecosystem to benefit all</h2>
-
-
-
-<p>Browser extensions have become an essential part of everyone’s daily internet experience. Nearly half of all Firefox desktop users have installed an extension to customize their online experience. Extensions provide a wide array of powerful features — from privacy tools like anti-trackers and ad blockers, to productivity tools, tab managers, translators and so much more.&nbsp;&nbsp;</p>
-
-
-
-<p>Built on Mozilla’s mission for an open and accessible internet for all, Firefox works with an independent community of developers to offer extensions for people who want more <a href="https://blog.mozilla.org/en/products/firefox/extensions-addons/become-a-better-writer-with-these-five-extensions-for-firefox/">personal agency</a> out of their online experience. On desktop, there are thousands of extensions to help you become a <a href="https://blog.mozilla.org/en/products/firefox/extensions-addons/become-a-better-writer-with-these-five-extensions-for-firefox/">better writer</a>, <a href="https://blog.mozilla.org/en/products/firefox/firefox-tips/land-your-next-job-with-these-firefox-extensions/">land a job</a> or clean up a <a href="https://blog.mozilla.org/en/products/firefox/extensions-addons/extensions-for-cleaning-up-a-chaotic-desktop/">chaotic desktop</a>. While the new Android ecosystem will take time to develop the robust diversity of content that desktop extensions offer, quite a few major desktop extensions are already available on Firefox for Android, such as privacy focused content blockers <a href="https://addons.mozilla.org/en-US/firefox/addon/ublock-origin/">uBlock Origin</a> and <a href="https://addons.mozilla.org/en-US/firefox/addon/ghostery/">Ghostery</a>, anti-tracking gem <a href="https://addons.mozilla.org/en-US/firefox/addon/privacy-badger17/">Privacy Badger</a> and color customizer <a href="https://addons.mozilla.org/en-US/firefox/addon/darkreader/">Dark Reader</a>.&nbsp;</p>
-
-
-
-<p>In August, we <a href="https://blog.mozilla.org/addons/2023/08/10/prepare-your-firefox-desktop-extension-for-the-upcoming-android-release/">announced</a> that we had completed building the infrastructure needed to support an open extension ecosystem on Firefox for Android. We were ready for the next chapter: adding extensions. Since then, we’ve been working with developers to <a href="https://blog.mozilla.org/addons/2023/09/27/test-firefox-android-extensions-and-help-developers-prepare-for-an-open-mobile-ecosystem-in-december/">test</a> and make hundreds of extensions compatible on mobile. So, are you ready to customize your mobile browsing experience to make it faster, safer or simply more fun? Look no further with today’s release of extensions on Firefox for Android.&nbsp;</p>
-
-
-
-<h2>Extensions to help while you’re on the go, just in time for the holidays&nbsp;</h2>
-
-
-
-<p>We depend on our mobile devices for many things — quick informational searches, reading articles, listening to music, looking for recipes (like cookies for the annual cookie holiday exchange). So, we understand the value of having experiences that are simple, predictable and offer the time to focus. Here are some extensions available today to help achieve that <a href="https://en.wikipedia.org/wiki/Flow_(psychology)">flow</a>.</p>
-
-
-
-<ul>
-<li><a href="https://addons.mozilla.org/en-US/android/addon/midnight-lizard-quantum/?utm_source=addons.mozilla.org&amp;utm%20_medium=referral&amp;utm_content=search"><strong><em>Midnight Lizard</em></strong></a><strong><em> – Read easier&nbsp;</em><br></strong>We look at our mobile devices in so many different environments. Whether it’s outside with the sun or inside a dimly lit room, our eyes work hard to adjust. Midnight Lizard is one of those extensions your eyes will feel the difference and thank you. It can change the colors of the page, increase or decrease the brightness and contrast. Add a blue light filter, screen shader and of course, the ever-popular night mode. Midnight Lizard will keep your eyes in good shape!</li>
-
-
-
-<li><a href="https://addons.mozilla.org/en-US/android/addon/dark-background-light-text/?utm_source=addons.mozilla.org&amp;utm_medium=referral&amp;utm_content=search"><strong><em>Dark Background and Light Text</em></strong></a><strong><em> – Keep it simple</em><br></strong>This extension is well-loved by thousands of users for its simplicity. It’s helpful for folks who prefer to work in dark mode, or those with low vision where reading dark text on a white background is challenging. You’re free to customize it so that all web pages are rendered in this elegant way, or just select pages.</li>
-
-
-
-<li><a href="https://addons.mozilla.org/en-US/android/addon/worldwide-radio/"><strong><em>Worldwide Radio</em></strong></a><strong><em> – Get into the groove</em><br></strong>Access more than 50,000 radio stations from all over the world right from your Firefox for Android browser. In the mood for a bit of Brazilian Samba? How about some traditional Indian Hindustani? Techno beats from Berlin? The world’s music and real time talk radio is literally at your fingertips.</li>
-</ul>
-
-
-
-<h2>A big thank you to our developer community</h2>
-
-
-
-<p>We would like to thank all the developers who worked with us to make their extensions compatible for this launch of the open extension ecosystem on Firefox for Android. Hundreds attended our webinars and brought incredible creative energy to this project.&nbsp;</p>
-
-
-
-<p>“The opportunity for innovation is vast,” said Giorgio Natili, Firefox Director of Engineering. “It’s thrilling to see extension developers embrace this moment and create novel browsing experiences and features for Firefox for Android users. People don’t have to browse the mobile web in a strictly singular way anymore. With extensions, you’re free to change the way Firefox for Android looks and behaves. It’s only going to get better as more developers innovate within this exciting new space.”</p>
-
-
-
-<p>As more developers create mobile optimized content, you can expect a wave of new Firefox for Android extensions to emerge in the coming months. In the meantime, <a href="https://play.google.com/store/apps/details?id=org.mozilla.firefox">download</a> the latest Firefox for Android and shape your own internet experience with <a href="https://addons.mozilla.org/android/">Android extensions</a>.&nbsp;</p>
-
-
-
-<a href="https://play.google.com/store/apps/details?id=org.mozilla.firefox">
-  <p><img width="800" height="800" src="https://blog.mozilla.org/wp-content/blogs.dir/278/files/2021/10/Visual-Guidelines-800x800.png" alt="" decoding="async" srcset="https://blog.mozilla.org/wp-content/blogs.dir/278/files/2021/10/Visual-Guidelines-800x800.png 800w, https://blog.mozilla.org/wp-content/blogs.dir/278/files/2021/10/Visual-Guidelines-150x150.png 150w" sizes="(max-width: 800px) 100vw, 800px">  </p>
-  <div>
-     <h3>More than 450 new extensions now available for Firefox on Android users</h3>      <p><span>Download Firefox for Android</span>   </p></div>
-</a>
-  </div>
-
-</article><!-- #post-73805 -->
-
-  </main><!-- #main -->
-  
-
-<div id="related-articles">
-    <h2>Related Articles</h2>
-    
-  </div>
-
-
-
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Why did older computers and OSes use UPPER case instead of lower case? (147 pts)]]></title>
-            <link>https://retrocomputing.stackexchange.com/questions/28141/why-did-older-computers-and-oses-use-upper-case-instead-of-lower-case</link>
-            <guid>38644381</guid>
-            <pubDate>Thu, 14 Dec 2023 17:44:41 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://retrocomputing.stackexchange.com/questions/28141/why-did-older-computers-and-oses-use-upper-case-instead-of-lower-case">https://retrocomputing.stackexchange.com/questions/28141/why-did-older-computers-and-oses-use-upper-case-instead-of-lower-case</a>, See on <a href="https://news.ycombinator.com/item?id=38644381">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div itemprop="text">
-<h2>TL;DR: Upper Case Is Default for Latin Scripture.</h2>
-<p>Latin script is based on upper case and designed around that. Lower case is a later add on (see below) for cursive. Default use case for Latin script is Upper Case.</p>
-<hr>
-<h2>Character Encoding</h2>
-<p>Early codes and machinery used for writing didn't have any case at all, only letters. Lower and upper case glyphs are eye candy, usually not conveying any  substantial meaning. That's why neither <a href="https://en.wikipedia.org/wiki/Morse_code" rel="nofollow noreferrer">Morse</a> nor <a href="https://en.wikipedia.org/wiki/Braille" rel="nofollow noreferrer">Braille</a> carry them. Same goes for any other early transmission code, like the the ITA2 used for teletypes.</p>
-<p>After all, there is no need to have two sets when they are fully complementary. It wasn't until the mid 1960s that, with the upcoming ASCII encoding, lower case became a choice to be used.</p>
-<h2>Printing Requires a Choice</h2>
-<p>The whole point of choosing what case to be used only arises with the need for displaying those letters in print, or later on screen. Here using upper case is only natural, as</p>
-<p><strong>Upper Case is</strong></p>
-<ul>
-<li><p><strong>most commonly accepted</strong></p>
-<p>across Europe, independent of culture and writing style due being the oldest form.</p>
-</li>
-<li><p><strong>best readable</strong>,</p>
-<p>due being a two line script (*1) developed for best readability (*2) - a feature that comes quite handy with low quality output (*3).</p>
-</li>
-<li><p><strong>most inclusive</strong> / <strong>least offensive</strong> one.</p>
-<p>Writing all all upper case will always be proper, while writing all lower may be offending to some - like when addressing a person.</p>
-</li>
-</ul>
-<h2>Then There Was Data</h2>
-<p>When it comes to data handling it's important to remember that letters were only added as afterthought. Punch card, the most original mean of data storage, had at first only numbers. Next some punctuation (decimal point, currency sign, hash, etc) were added, while letters were the last major modification.</p>
-<p>Same goes for equipment to print from punch cards (printing tabulators) or on punch cards (interpreters). They originally also could only do numbers and punctuation, while letters were added last. <a href="https://en.wikipedia.org/wiki/Powers_Accounting_Machine" rel="nofollow noreferrer">Powers</a> first in 1921, while IBM followed in 1931. Of course, when printed they were done so in upper case.</p>
-<p>It wasn't until the mid 1960s that lower case became a distinct, additional set on punch cards and mainframes.</p>
-<h2>But I Type Lower Case</h2>
-<p>Not really. Early machinery, no matter if teletype or terminal, did not produce lower or upper case when typed, but just letters, as there was no case (see above). This single case was usually displayed as uppercase (reasoning see above).</p>
-<p>The Apple II is eventually the last major application of that principle. pressing a letter always produced only a single code, no matter if Shift was pressed or not and this letter was displayed in upper case.</p>
-<p>Similar worked next to all early computing equipment. When terminals allowing entry of lower and upper case letters became a thing, mainframes still only got a single case delivered as communication equipment (terminal controllers, I/O handler) simply converted both to the single encoding the host used.</p>
-<p>That way terminals with lower case and such without would by default be operated all equal, allowing a smooth transition and high degree of compatibility.</p>
-<h2>Then Why is Unix Lower Case?</h2>
-<p>The main purpose of low end machines of the 1970s was about to get any work done - translation layers like common in mainframes were a luxury one could do without. Unix being a prime example as it was all about getting a certain functionality to production. Combine this with now widely available (ASCII based) lowercase enabled terminals and one gets lower case as default input. Including all the hassles of case sensitive input.</p>
-<p>CP/M and in turn MS-DOS being a nice counter example as here the command line is by default translated to upper case, simplifying handling.</p>
-<h2>Bottom Line</h2>
-<p>There is no single reason and especially not one constructed as an afterthought. It was an evolutionary process influenced by need, capabilities and usage.</p>
-<hr>
-<h2>History is Upper Case</h2>
-<ul>
-<li><p>Latin, developed around <strong>7th century BC</strong> was originally a two line script(*1).</p>
-</li>
-<li><p>By the <strong>first century AD</strong> papyri show sloppy written letters forming lower case (minuscule), which developed into <a href="https://en.wikipedia.org/wiki/Roman_cursive" rel="nofollow noreferrer">Roman Cursive</a>.</p>
-</li>
-<li><p>Until the <strong>8th century</strong> those forms of  developed into <a href="https://en.wikipedia.org/wiki/Carolingian_minuscule" rel="nofollow noreferrer">Carolingian Minuscule</a> like today's lower case.</p>
-</li>
-<li><p>It took another 3-500 years (<strong>11th/13th century</strong>) until Gothic script (<a href="https://en.wikipedia.org/wiki/Blackletter" rel="nofollow noreferrer">Blackletter</a>) finalized them to what we know today.</p>
-</li>
-<li><p>Rules of when to use upper and lower case only became widely accepted during the <strong>16th/17th century</strong>, not at least by development of the printing press.</p>
-</li>
-<li><p>The English way of writing mostly lower case is even more recent and dates to the <strong>early 18th century</strong>.</p>
-</li>
-</ul>
-<p>Bottom Line: Thruout history it was Upper Case first.</p>
-<hr>
-<p>*1 - Two line scripts, like old Greek and Latin, uses a single case with all letters of the same height, limited between those two lines. Lower case needs three lines, or four with descender (itself a later, Gothic addition). Might remind you about school, doesn't it :))</p>
-<p>*2 - Roman Majuscule developed to be readable from distance and off of low quality material. Roman Minuscule are a form of short hand trading readability for space usage and speed in writing(*4). More appropriate for notes and private correspondence than official exchange.</p>
-<p>*3 - Note that your keyboard is (most likely) also labelled with upper case letters. A convention done since early typewriter days. They are until today more easy to identify than lower case - so not (only) heritage.</p>
-<p>*4 - <a href="https://en.wikipedia.org/wiki/Ligature_(writing)" rel="nofollow noreferrer">Ligatures</a> make a great point here. They were a further evolution promoting increasing density and speed of cursive - and almost exclusive found with lower case letters. While usually not considered letters in their own, typesetters had dedicated letters for each ligature.</p>
-    </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Weak-to-Strong Generalization (139 pts)]]></title>
-            <link>https://openai.com/research/weak-to-strong-generalization</link>
-            <guid>38643995</guid>
-            <pubDate>Thu, 14 Dec 2023 17:20:13 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://openai.com/research/weak-to-strong-generalization">https://openai.com/research/weak-to-strong-generalization</a>, See on <a href="https://news.ycombinator.com/item?id=38643995">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="content"><!--[--><!--[--><div><p>A core challenge for aligning future superhuman AI systems (superalignment) is that humans will need to supervise AI systems much smarter than them. We study a simple analogy: can small models supervise large models? We show that we can use a GPT-2-level model to elicit most of GPT-4’s capabilities—close to GPT-3.5-level performance—generalizing correctly even to hard problems where the small model failed. This opens up a new research direction that allows us to directly tackle a central challenge of aligning future superhuman models while making iterative empirical progress today.<br></p></div><!--]--><!--[--><div id="the-superalignment-problem" data-heading=""><p><h2>The superalignment problem</h2></p></div><!--]--><!--[--><div><p>We believe superintelligence—AI vastly smarter than humans—could be developed within the next ten years. However, we still do not know how to reliably steer and control superhuman AI systems. Solving this problem is essential for ensuring that even the most advanced AI systems in the future remain safe and beneficial to humanity.&nbsp;</p><p>We formed the <a href="https://openai.com/blog/introducing-superalignment" rel="noopener noreferrer" target="_blank">Superalignment team</a> earlier this year to solve this problem of superintelligence alignment. Today, we are releasing the team’s first paper, which introduces a new research direction for empirically aligning superhuman models.</p><p>Current alignment methods, such as reinforcement learning from human feedback (RLHF), rely on human supervision. However, future AI systems will be capable of extremely complex and creative behaviors that will make it hard for humans to reliably supervise them. For example, superhuman models may be able to write millions of lines of novel—and potentially dangerous—computer code that would be very hard even for expert humans to understand.&nbsp;</p><p>Relative to superhuman AI models, humans will be “weak supervisors.”<em> </em>This is a core challenge for AGI alignment: how can weak supervisors trust and control substantially stronger models?<br></p></div><!--]--><!--[--><div id="our-setup" data-heading=""><p><h2>Our setup</h2></p></div><!--]--><!--[--><div><p>To make progress on this core challenge, we propose an analogy we can empirically study today: <strong>can we use a smaller (less capable) model to supervise a larger (more capable) model?</strong><br></p></div><!--]--><!--[--><div><figure><p><img src="https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=10&amp;height=10&amp;quality=50" width="2041" height="1164" alt="Superalignmentblog Artwork Transparent" loading="lazy" data-nuxt-img="" sizes="(max-width: 744px) 100vw, (max-width: 1280px) 100vw, (max-width: 1440px) 100vw, 100vw" srcset="https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=400 400w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=800 800w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=1000 1000w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=1400 1400w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=2000 2000w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=2600 2600w, https://images.openai.com/blob/7f37b3a2-c7fa-4e5d-b5eb-e0a8c6794223/SuperAlignmentBlog_Artwork_Transparent.png?trim=0,0,0,0&amp;width=3200 3200w" aria-hidden="false"></p><figcaption><p><strong>A simple analogy for superalignment: </strong>In traditional machine learning (ML), humans supervise AI systems weaker than themselves (left). To align superintelligence, humans will instead need to supervise AI systems smarter than them (center). We cannot directly study this problem today, but we can study a simple analogy: can small models supervise larger models (right)?<br></p></figcaption></figure></div><!--]--><!--[--><div><p>Naively, we might not expect a strong model to perform better than the weak supervisor that provides its training signal—it may simply learn to imitate all the errors the weak supervisor makes. On the other hand, strong pretrained models have excellent raw capabilities—we don't need to teach them new tasks from scratch, we just need to elicit their latent knowledge. The critical question is then: will the strong model generalize according to the weak supervisor's underlying intent—leveraging its full capabilities to solve the task even on difficult problems where the weak supervisor can only provide incomplete or flawed training labels?<br></p></div><!--]--><!--[--><div id="our-results" data-heading=""><p><h2>Our results</h2></p></div><!--]--><!--[--><!--]--><!--[--><div><figure layout="auto" data-v-22aefd69=""><div data-v-22aefd69=""><!----><!--[--><!--]--><figcaption data-v-22aefd69=""><strong>Typical weak-to-strong generalization across NLP benchmarks:</strong> We use a GPT-2-level model as a weak supervisor to finetune GPT-4.</figcaption></div></figure></div><!--]--><!--[--><div><p>We can significantly improve generalization in many settings. We use a simple method that&nbsp; encourages the strong model to be more confident—including confidently disagreeing with the weak supervisor if necessary. <strong>When we supervise GPT-4 with a GPT-2-level model using this method on NLP tasks, the resulting model typically performs somewhere between GPT-3 and GPT-3.5.</strong> We are able to recover much of GPT-4’s capabilities with only much weaker supervision.</p><p>This method is a proof of concept with important limitations; for example, it still doesn’t work on ChatGPT preference data. However, we also find signs of life with other approaches, such as optimal early stopping and bootstrapping from small to intermediate to large models.</p><p>Collectively, our results suggest that (1) naive human supervision—such as reinforcement learning from human feedback (RLHF)—could scale poorly to superhuman models without further work, but (2) it is feasible to substantially improve weak-to-strong generalization.<br></p></div><!--]--><!--[--><div id="research-opportunities" data-heading=""><p><h2>Research opportunities</h2></p></div><!--]--><!--[--><div><p>There are still important disanalogies between our current empirical setup and the ultimate problem of aligning superhuman models. For example, it may be easier for future models to imitate weak human errors than for current strong models to imitate current weak model errors, which could make generalization harder in the future.&nbsp;</p><p>Nevertheless, we believe our setup captures some key difficulties of aligning future superhuman models, enabling us to start making empirical progress on this problem today. There are many promising directions for future work, including fixing the disanalogies in our setup, developing better scalable methods, and advancing our scientific understanding of when and how we should expect good weak-to-strong generalization.</p><p><strong>We believe this is an exciting opportunity for the ML research community to make progress on alignment.</strong> To kickstart more research in this area,</p><ul><li>We are releasing <a href="https://github.com/openai/weak-to-strong" rel="noopener noreferrer" target="_blank">open source code</a> to make it easy to get started with weak-to-strong generalization experiments today.</li><li>We are launching a <a href="https://openai.com/blog/superalignment-fast-grants" rel="noopener noreferrer" target="_blank">$10 million grants program</a> for graduate students, academics, and other researchers to work on superhuman AI alignment broadly. We’re especially excited to support research related to weak-to-strong generalization.</li></ul><p>Figuring out how to align future superhuman AI systems to be safe has never been more important, and it is now easier than ever to make empirical progress on this problem. We are excited to see what breakthroughs researchers discover.<br></p></div><!--]--><!--]--></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[What's Going on with Language Rankings? (122 pts)]]></title>
-            <link>https://redmonk.com/rstephens/2023/12/14/language-rankings-update/</link>
-            <guid>38643923</guid>
-            <pubDate>Thu, 14 Dec 2023 17:15:27 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://redmonk.com/rstephens/2023/12/14/language-rankings-update/">https://redmonk.com/rstephens/2023/12/14/language-rankings-update/</a>, See on <a href="https://news.ycombinator.com/item?id=38643923">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-<p>As the inbound DMs and emails attest, at least a few of you out there having been waiting for RedMonk to drop our latest version of the programming language rankings. Our apologies about the delay: here’s our update on the process.</p>
-<p>Normally we run these rankings twice a year, with the goal of using publicly available data sets to track if there are any meaningful changes in how people are using programming languages. We correlate cumulative language usage as seen through non-forked PRs on public GitHub repos against questions asked on Stack Overflow.</p>
-<p>These metrics have always told an incomplete story at best. There are languages that were under- or over-represented by using public GitHub repos; there are communities that were under- or over-represented by looking at discussions happening in Stack Overflow. These metrics were not perfect by any means, but the two large, publicly facing datasets created an interesting decade plus long trend for RedMonk to track over time.</p>
-<p>Our last set of queries, however, provided us with data that required further investigation.</p>
-<h2>Stack Overflow</h2>
-<p>We’ve been internally discussing how we’re going to address the impact of AI-based code assistants on our language rankings since GitHub released Copilot in October 2021. However, it was when ChatGPT hit the market on November 30, 2022 and went from <a href="https://www.reuters.com/technology/chatgpt-sets-record-fastest-growing-user-base-analyst-note-2023-02-01/">0 to 100M users in two months</a> that we started seeing undeniable impacts on our source data.</p>
-<p>We’d already seen questions asked falling off from their peak. However, when we pulled data for our June 2023 rankings the collective decline was notable.</p>
-<p>The below chart takes questions asked on Stack Overflow about the top 20 programming languages (as determined from <a href="https://redmonk.com/sogrady/2023/05/16/language-rankings-1-23/">RedMonk’s analysis dated January 2023</a>) and look backed at historical semi-annual trends.</p>
-<p><a href="https://redmonk.com/rstephens/files/2023/12/stackovertime.png"><img decoding="async" src="https://redmonk.com/rstephens/files/2023/12/stackovertime.png" alt="Bar chart showing number of questions tagged on Stack Overflow for our top 20 languages. Questions peak in 2016-17 and begin to fall sharply in last year" width="100%" height="1000" srcset="https://redmonk.com/rstephens/files/2023/12/stackovertime.png 1000w, https://redmonk.com/rstephens/files/2023/12/stackovertime-520x520.png 520w, https://redmonk.com/rstephens/files/2023/12/stackovertime-150x150.png 150w, https://redmonk.com/rstephens/files/2023/12/stackovertime-768x768.png 768w, https://redmonk.com/rstephens/files/2023/12/stackovertime-480x480.png 480w, https://redmonk.com/rstephens/files/2023/12/stackovertime-300x300.png 300w, https://redmonk.com/rstephens/files/2023/12/stackovertime-627x627.png 627w" sizes="(max-width: 1000px) 100vw, 1000px"></a></p>
-<p>As you can see, the number of questions asked using these 20 Stack Overflow tags* declined almost 20% from the prior period. And this is just our first full period running these numbers post-ChatGPT. A cursory query about YTD indicates an even more stark change.</p>
-<p>It is undeniable that developer’s ability to instantaneously ask questions of a non-judgmental AI assistant that will give answers in context is going to have a marked negative impact on the usefulness of the public datasets provided by Stack Overflow.</p>
-<h2>GitHub</h2>
-<p>While we expected a change in Stack Overflow, we were not expecting significant anomalies in our data from GitHub (and to the extent that we were anticipating changes, we expected them to be upwards. The narrative about AI code assistants aiding development velocity and <a href="https://redmonk.com/kholterhoff/2023/06/27/ai-is-for-tinkerers/">benefitting tinkerers</a> has been prevalent.)</p>
-<p>However, the data we saw from GitHub Archive actually showed a roughly 25% decline in pull requests in 1H2023 as compared to 2H2022 PRs that we were not expecting.</p>
-<p>The dataset we use is a public dataset on BigQuery, and so we asked questions of both Google in terms of how the data was pulled in and of the GitHub team to see if they had seen similar changes on in their internal data.</p>
-<p>In the end, the change appears to not be an error in the available data and is largely lacking an explanation. The best guess thus far is that there was an overhang in increased activity from the pandemic and this is a return to expected activity, but we have no way of confirming whether that storyline is accurate.</p>
-<p>As of now this is not a declining trend we expect to continue, but these are numbers we will continue to watch with interest.</p>
-<h2>What Next?</h2>
-<p>The advent and rise of AI-based code assistants are already impacting the data that populates RedMonk’s language rankings. As questions and knowledge sharing moves from public forums to private tools, our ability to ascertain meaningful trends from said public data will be indefinitely altered.</p>
-<p>We will continue to track these trends and make determinations about how this change in sample size will impact our ability to perform the rankings.</p>
-<p>As of now, look for our next rankings in January 2024.</p>
-<hr>
-<p>* <strong>Tags queried based on last Top 20:</strong> JavaScript, Python, Java, PHP, C#, CSS, TypeScript, C++, Ruby, C, Swift, Shell, R, Go, Scala, Objective-C, Kotlin, PowerShell, Rust, Dart</p>
-<p><strong>Disclaimer:</strong> GitHub and Google Cloud are RedMonk clients. Stack Overflow and OpenAI (ChatGPT) are not.</p>
 </div></div>]]></description>
         </item>
     </channel>
