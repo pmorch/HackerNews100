@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 19 Jan 2024 23:00:10 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 20 Jan 2024 00:00:06 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[US government opens 22M acres of federal lands to solar (120 pts)]]></title>
+            <title><![CDATA[US government opens 22M acres of federal lands to solar (132 pts)]]></title>
             <link>https://electrek.co/2024/01/18/us-govt-opens-22-million-acres-federal-lands-solar/</link>
             <guid>39060601</guid>
             <pubDate>Fri, 19 Jan 2024 20:24:32 GMT</pubDate>
@@ -79,7 +79,7 @@
 	<p><em>FTC: We use income earning auto affiliate links.</em> <a href="https://electrek.co/about/#affiliate">More.</a></p>				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ceph: A Journey to 1 TiB/s (145 pts)]]></title>
+            <title><![CDATA[Ceph: A Journey to 1 TiB/s (178 pts)]]></title>
             <link>https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/</link>
             <guid>39060339</guid>
             <pubDate>Fri, 19 Jan 2024 20:02:55 GMT</pubDate>
@@ -159,7 +159,7 @@ ms_mon_service_mode = secure
 </code></pre><p>and the graphs from the FIO results:</p><p><img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Thread_Scaling_-_FIO_4MB_Throughput.svg" alt=""> <img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Thread_Scaling_-_FIO_4KB_IOPS.svg" alt=""></p><h2>Sleep; Erasure Coding</h2><p>After finally seeing the magical "1.0 TiB/s" screen I had been waiting weeks to see, I finally went to sleep. Nevertheless, I got up several hours later. There was still work to be done. All of the testing we had done so far was with 3X replication, but the customer would be migrating this hardware into an existing cluster deployed with 6+2 erasure coding. We needed to get some idea of what this cluster was capable of in the configuration they would be using.</p><p>I reconfigured the cluster again and ran through new tests. I picked PG/shard/client values from the earlier tests that appeared to work well. Performance was good, but I saw that the async messenger threads were working very hard. I decided to try increasing them beyond the defaults to see if they might help given the added network traffic.</p><p><img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Thread_Scaling_-_FIO_4MB_Throughput_EC62.svg" alt=""> <img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Thread_Scaling_-_FIO_4KB_IOPS_EC62.svg" alt=""></p><p>We could achieve well over 500GiB/s for reads and nearly 400GiB/s for writes with 4-5 async msgr threads. But why are the read results so much slower with EC than with replication? With replication, the primary OSD for a PG only has to read local data and send it to the client. The network overhead is essentially 1X. With 6+2 erasure coding, the primary must read 5 of the 6 chunks from replicas before it can then send the constructed object to the client. The overall network overhead for the request is roughly (1 + 5/6)X*. That's why we see slightly better than half the performance of 3X replication for reads. We have the opposite situation for writes. With 3X replication, the client sends the object to the primary, which then further sends copies over the network to two secondaries. This results in an aggregate network overhead of 3X. In the EC case, we only need to send 7/8 chunks to the secondaries (almost, but not quite, the same as the read case). For large writes, performance is actually faster.</p><p>* <em>Originally this article stated that 7/8 chunks had to be fetched for reads. The correct value is 5/6 chunks, unless fast reads are enabled. In that case it would be 7/6 chunks. Thanks to Joshua Baergen for catching this!</em></p><p>IOPS however, are another story. For very small reads and writes, Ceph will contact all participating OSDs in a PG for that object even when the data they store isn't relevant for the operation. For instance, if you are doing 4K reads and the data you are interested in is entirely stored in a single chunk on one of the OSDs, Ceph will still fetch data from all OSDs participating in the stripe. In the summer of 2023, Clyso <a href="https://github.com/ceph/ceph/pull/52746">resurrected</a> a PR from Xiaofei Cui that implements partial stripe reads for erasure coding to avoid this extra work. The effect is dramatic:</p><p><img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/FIO_4KB_Random_Read_IOPS_16_Client.svg" alt=""> <img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/FIO_4KB_Random_Read_Cycles_OP_16_Client.svg" alt=""></p><p>It's not clear yet if we will be able to get this merged for Squid, though Radoslaw Zarzynski, core lead for the Ceph project, has offered to help try to get this over the finish line.</p><h2>Squeezing in Msgr Encryption Testing</h2><p>Finally, we wanted to provide the customer with a rough idea of how much msgr-level encryption would impact their cluster if they decided to use it. The adrenaline of the previous night had long faded and I was dead tired at this point. I managed to run through both 3X replication and 6+2 erasure coding tests with msgr v2 encryption enabled and compared it against our previous test results.</p><p><img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Encryption_-_FIO_4MB_Throughput.svg" alt=""> <img src="https://ceph.io/en/news/blog/2024/ceph-a-journey-to-1tibps/images/Full_Cluster_Msgr_Encryption_-_FIO_4KB_IOPS.svg" alt=""></p><p>The biggest hit is to large reads. They drop from ~1 TiB/s to around 750 GiB/s. Everything else sees a more modest, though consistent hit. At this point, I had to stop. I really wanted to do PG scaling tests and even kernel RBD tests. It was time, though, to hand the systems back to the customer for re-imaging and then to one of my excellent colleagues at Clyso for integration.</p><h2>Finale</h2><p>So what's happened with this cluster since the end of the testing? All hardware was re-imaged and the new OSDs were deployed into the customer's existing HDD cluster. Dan's upmap-remapped script is being used to control the migration process and we've migrated around 80% of the existing data to the NVMe backed OSDs. By next week, the cluster should be fully migrated to the new NVMe based nodes. We've opted not to employ all of the tuning we've done here, at least not at first. Initially, we'll make sure the cluster behaves well under the existing, mostly default, configuration. We now have a mountain of data we can use to tune the system further if the customer hits any performance issues.</p><p>Since there was a ton of data and charts here, I want to recap some of the highlights. Here's an outline of the best numbers we were able to achieve on this cluster:</p><table><thead><tr><th></th><th>30 OSDs (3x)</th><th>100 OSDs (3x)</th><th>320 OSDs (3x)</th><th>630 OSDs (3x)</th><th>630 OSDs (EC62)</th></tr></thead><tbody><tr><td>Co-Located Fio</td><td>No</td><td>No</td><td>No</td><td>Yes</td><td>Yes</td></tr><tr><td>4MB Read</td><td>63 GiB/s</td><td>214 GiB/s</td><td>635 GiB/s</td><td>1025 GiB/s</td><td>547 GiB/s</td></tr><tr><td>4MB Write</td><td>15 GiB/s</td><td>46 GiB/s</td><td>133 GiB/s</td><td>270 GiB/s</td><td>387 GiB/s</td></tr><tr><td>4KB Rand Read</td><td>1.9M IOPS</td><td>5.8M IOPS</td><td>16.6M IOPS</td><td>25.5M IOPS</td><td>3.4M IOPS</td></tr><tr><td>4KB Rand Write</td><td>248K IOPS</td><td>745K IOPS</td><td>2.4M IOPS</td><td>4.9M IOPS</td><td>936K IOPS</td></tr></tbody></table><p>What's next? We need to figure out how to fix the laggy PG issue during writes. We can't have Ceph falling apart when the write workload scales up. Beyond that, we learned through this exercise that Ceph is perfectly capable of saturating 2x 100GbE NICs. To push the throughput envelope further we will need 200GbE+ when using 10 NVMe drives per node or more. IOPS is more nuanced. We know that PG count can have a big effect. We also know that the general OSD threading model is playing a big role. We consistently hit a wall at around 400-600K random read IOPS per node and we've seen it in multiple deployments. Part of this may be how the async msgr interfaces with the kernel and part of this may be how OSD threads wake up when new work is put into the shard queues. I've modified the OSD code in the past to achieve better results under heavy load, but at the expense of low-load latency. Ultimately, I suspect improving IOPS will take a multi-pronged approach and a rewrite of some of the OSD threading code.</p><p>To my knowledge, these are the fastest single-cluster Ceph results ever published and the first time a Ceph cluster has achieved 1 TiB/s. I think Ceph is capable of quite a bit more. If you have a faster cluster out there, I encourage you to publish your results! Thank you for reading, and if you have any questions or would like to talk more about Ceph performance, please feel free to <a href="mailto:mark.nelson@clyso.com">reach out</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Fujitsu bugs that sent innocent people to prison were known "from the start" (245 pts)]]></title>
+            <title><![CDATA[Fujitsu bugs that sent innocent people to prison were known "from the start" (274 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2024/01/fujitsu-bugs-that-sent-innocent-people-to-prison-were-known-from-the-start/</link>
             <guid>39059307</guid>
             <pubDate>Fri, 19 Jan 2024 18:40:44 GMT</pubDate>
@@ -205,7 +205,7 @@ ms_mon_service_mode = secure
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tart: VMs on macOS using Apple's native Virtualization.Framework (136 pts)]]></title>
+            <title><![CDATA[Tart: VMs on macOS using Apple's native Virtualization.Framework (148 pts)]]></title>
             <link>https://tart.run/</link>
             <guid>39059100</guid>
             <pubDate>Fri, 19 Jan 2024 18:24:04 GMT</pubDate>
@@ -1083,7 +1083,7 @@ ms_mon_service_mode = secure
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Surveillance-by-Design in Proposed Amendments to the UK Investigatory Powers Act (103 pts)]]></title>
+            <title><![CDATA[Surveillance-by-Design in Proposed Amendments to the UK Investigatory Powers Act (104 pts)]]></title>
             <link>https://www.lawfaremedia.org/article/surveillance-by-design-in-proposed-amendments-to-the-u.k.-investigatory-powers-act</link>
             <guid>39058122</guid>
             <pubDate>Fri, 19 Jan 2024 17:23:39 GMT</pubDate>
@@ -1119,7 +1119,7 @@ ms_mon_service_mode = secure
                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Americans are spending billions on stuff they forget to cancel (203 pts)]]></title>
+            <title><![CDATA[Americans are spending billions on stuff they forget to cancel (224 pts)]]></title>
             <link>https://www.wsj.com/business/cancel-subscriptions-save-money-streaming-peacock-da7e6123</link>
             <guid>39057993</guid>
             <pubDate>Fri, 19 Jan 2024 17:15:21 GMT</pubDate>
@@ -1127,7 +1127,7 @@ ms_mon_service_mode = secure
 Couldn't get https://www.wsj.com/business/cancel-subscriptions-save-money-streaming-peacock-da7e6123: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[Surf the web like it's 1999 (275 pts)]]></title>
+            <title><![CDATA[Surf the web like it's 1999 (298 pts)]]></title>
             <link>https://billsworld.neocities.org/</link>
             <guid>39057862</guid>
             <pubDate>Fri, 19 Jan 2024 17:08:14 GMT</pubDate>
@@ -1142,7 +1142,7 @@ Couldn't get https://www.wsj.com/business/cancel-subscriptions-save-money-stream
     </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Thailand finds 14.8M tonnes of lithium (310 pts)]]></title>
+            <title><![CDATA[Thailand finds 14.8M tonnes of lithium (340 pts)]]></title>
             <link>https://www.malaymail.com/news/money/2024/01/19/thailand-discovers-nearly-15-million-tonnes-of-lithium/113414</link>
             <guid>39057502</guid>
             <pubDate>Fri, 19 Jan 2024 16:44:20 GMT</pubDate>
@@ -1150,7 +1150,240 @@ Couldn't get https://www.wsj.com/business/cancel-subscriptions-save-money-stream
 <div id="readability-page-1" class="page"><div> <div> <picture> <source media="(min-width: 786px)" data-srcset="https://cdn4.premiumread.com/?url=https://malaymail.com/malaymail/uploads/images/2024/01/19/180204.jpg&amp;w=800&amp;q=100&amp;f=jpg&amp;t=2" type="image/jpg"> <source data-srcset="https://cdn4.premiumread.com/?url=https://malaymail.com/malaymail/uploads/images/2024/01/19/180204.jpg&amp;w=400&amp;q=100&amp;f=jpg&amp;t=2" type="image/jpg"> <img src="https://www.malaymail.com/news/money/2024/01/19/thailand-discovers-nearly-15-million-tonnes-of-lithium/this.src='https://www.malaymail.com/malaymail/uploads/images/2024/01/19/180204.jpg';this.removeAttribute('onerror');" data-src="https://cdn4.premiumread.com/?url=https://malaymail.com/malaymail/uploads/images/2024/01/19/180204.jpg&amp;w=800&amp;q=100&amp;f=jpg&amp;t=2" alt="Thailand discovers nearly 15 million tonnes of lithium" title="Thailand discovers nearly 15 million tonnes of lithium" onerror="this.src='https://www.malaymail.com/malaymail/uploads/images/2024/01/19/180204.jpg';this.removeAttribute('onerror');"> </picture></div> <p>Aerial view of brine ponds and processing areas of the lithium mine of the Chilean company SQM (Sociedad Quimica Minera) in the Atacama Desert, Calama, Chile, on September 12, 2022. Thailand has discovered nearly 15 million tonnes of lithium deposits, a government spokesman said today, a boost for the kingdom's goal of becoming a regional hub for electric vehicle production. — AFP pic </p> </div><p>Join us on our <a href="https://whatsapp.com/channel/0029Va4r2QG9RZAZurce8h3Z" target="_blank" rel="nofollow">WhatsApp Channel</a>, follow us on <a href="https://instagram.com/themalaymail" target="_blank" rel="nofollow">Instagram</a>, and receive <span>browser alerts</span> for the latest news you need to know.</p><div> <p>Friday, 19 Jan 2024 7:00 PM MYT</p> </div><div> <p>Advertisement</p><p>BANGKOK, Jan 19 — Thailand has discovered nearly 15 million tonnes of lithium deposits, a government spokesman said today, a boost for the kingdom’s goal of becoming a regional hub for electric vehicle production.</p><p>The find means Thailand has the third largest lithium resources, behind Bolivia and Argentina, but it is not yet clear how much can be exploited commercially.</p><p>The 14.8 million tonnes of lithium are distributed between two separate sites in the southern province of Phang Nga, government deputy spokeswoman Rudklao Intawong Suwankiri told The Nation television station.</p><p>Advertisement</p><p>“We are trying to find out how much can we use from the resources we found. It takes time,” Rudklao told The Nation.</p><p>Lithium is a key component in the manufacture of batteries used in electric cars, as well as smartphones and other electronics.</p><p>The government of Prime Minister Srettha Thavisin, which took over in August, has made it a priority to try to boost Thailand as a regional production hub for electric vehicles, building on the kingdom’s history of assembling conventional cars.</p><p>Advertisement</p><p>During the World Economic Forum meeting in Davos, Srettha met industry leaders including the deputy chairman of Bosch to urge him to invest in EV production in Thailand.</p><p>“It’s good news. It’s an opportunity for Thailand to become self-reliant in the production of EV batteries,” Rudklao said of the lithium discovery.</p><p>In December 2023, two Chinese EV giants said they would invest 2.3 billion baht (RM301 million) to develop Thailand as a production hub. — AFP</p> </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The 37signals Employee Handbook (106 pts)]]></title>
+            <title><![CDATA[Calculus on Computational Graphs: Backpropagation (2015) (106 pts)]]></title>
+            <link>https://colah.github.io/posts/2015-08-Backprop/</link>
+            <guid>39057461</guid>
+            <pubDate>Fri, 19 Jan 2024 16:42:06 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://colah.github.io/posts/2015-08-Backprop/">https://colah.github.io/posts/2015-08-Backprop/</a>, See on <a href="https://news.ycombinator.com/item?id=39057461">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="wrap">
+                            
+                            <p>Posted on August 31, 2015</p>
+<br>
+
+<h2 id="introduction">Introduction</h2>
+<p>Backpropagation is the key algorithm that makes training deep models computationally tractable. For modern neural networks, it can make training with gradient descent as much as ten million times faster, relative to a naive implementation. That’s the difference between a model taking a week to train and taking 200,000 years.</p>
+<p>Beyond its use in deep learning, backpropagation is a powerful computational tool in many other areas, ranging from weather forecasting to analyzing numerical stability – it just goes by different names. In fact, the algorithm has been reinvented at least dozens of times in different fields (see <a href="http://www.math.uiuc.edu/documenta/vol-ismp/52_griewank-andreas-b.pdf">Griewank (2010)</a>). The general, application independent, name is “reverse-mode differentiation.”</p>
+<p>Fundamentally, it’s a technique for calculating derivatives quickly. And it’s an essential trick to have in your bag, not only in deep learning, but in a wide variety of numerical computing situations.</p>
+<h2 id="computational-graphs">Computational Graphs</h2>
+<p>Computational graphs are a nice way to think about mathematical expressions. For example, consider the expression <span>\(e=(a+b)*(b+1)\)</span>. There are three operations: two additions and one multiplication. To help us talk about this, let’s introduce two intermediary variables, <span>\(c\)</span> and <span>\(d\)</span> so that every function’s output has a variable. We now have:</p>
+<p><span>\[c=a+b\]</span></p>
+<p><span>\[d=b+1\]</span></p>
+<p><span>\[e=c*d\]</span></p>
+<p>To create a computational graph, we make each of these operations, along with the input variables, into nodes. When one node’s value is the input to another node, an arrow goes from one to another.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-def.png" alt="">
+</p>
+<p>These sorts of graphs come up all the time in computer science, especially in talking about functional programs. They are very closely related to the notions of dependency graphs and call graphs. They’re also the core abstraction behind the popular deep learning framework <a href="http://deeplearning.net/software/theano/">Theano</a>.</p>
+<p>We can evaluate the expression by setting the input variables to certain values and computing nodes up through the graph. For example, let’s set <span>\(a=2\)</span> and <span>\(b=1\)</span>:</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-eval.png" alt="">
+</p>
+<p>The expression evaluates to <span>\(6\)</span>.</p>
+<h2 id="derivatives-on-computational-graphs">Derivatives on Computational Graphs</h2>
+<p>If one wants to understand derivatives in a computational graph, the key is to understand derivatives on the edges. If <span>\(a\)</span> directly affects <span>\(c\)</span>, then we want to know how it affects <span>\(c\)</span>. If <span>\(a\)</span> changes a little bit, how does <span>\(c\)</span> change? We call this the <a href="https://en.wikipedia.org/wiki/Partial_derivative">partial derivative</a> of <span>\(c\)</span> with respect to <span>\(a\)</span>.</p>
+<p>To evaluate the partial derivatives in this graph, we need the <a href="https://en.wikipedia.org/wiki/Sum_rule_in_differentiation">sum rule</a> and the <a href="https://en.wikipedia.org/wiki/Product_rule">product rule</a>:</p>
+<p><span>\[\frac{\partial}{\partial a}(a+b) = \frac{\partial a}{\partial a} + \frac{\partial b}{\partial a} = 1\]</span></p>
+<p><span>\[\frac{\partial}{\partial u}uv = u\frac{\partial v}{\partial u} + v\frac{\partial u}{\partial u} = v\]</span></p>
+<p>Below, the graph has the derivative on each edge labeled.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-eval-derivs.png" alt="">
+</p>
+<p>What if we want to understand how nodes that aren’t directly connected affect each other? Let’s consider how <span>\(e\)</span> is affected by <span>\(a\)</span>. If we change <span>\(a\)</span> at a speed of 1, <span>\(c\)</span> also changes at a speed of <span>\(1\)</span>. In turn, <span>\(c\)</span> changing at a speed of <span>\(1\)</span> causes <span>\(e\)</span> to change at a speed of <span>\(2\)</span>. So <span>\(e\)</span> changes at a rate of <span>\(1*2\)</span> with respect to <span>\(a\)</span>.</p>
+<p>The general rule is to sum over all possible paths from one node to the other, multiplying the derivatives on each edge of the path together. For example, to get the derivative of <span>\(e\)</span> with respect to <span>\(b\)</span> we get:</p>
+<p><span>\[\frac{\partial e}{\partial b}= 1*2 + 1*3\]</span></p>
+<p>This accounts for how b affects e through c and also how it affects it through d.</p>
+<p>This general “sum over paths” rule is just a different way of thinking about the <a href="https://en.wikipedia.org/wiki/Chain_rule#Higher_dimensions">multivariate chain rule</a>.</p>
+<h2 id="factoring-paths">Factoring Paths</h2>
+<p>The problem with just “summing over the paths” is that it’s very easy to get a combinatorial explosion in the number of possible paths.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/chain-def-greek.png" alt="">
+</p>
+<p>In the above diagram, there are three paths from <span>\(X\)</span> to <span>\(Y\)</span>, and a further three paths from <span>\(Y\)</span> to <span>\(Z\)</span>. If we want to get the derivative <span>\(\frac{\partial Z}{\partial X}\)</span> by summing over all paths, we need to sum over <span>\(3*3 = 9\)</span> paths:</p>
+<p><span>\[\frac{\partial Z}{\partial X} = \alpha\delta + \alpha\epsilon + \alpha\zeta + \beta\delta + \beta\epsilon + \beta\zeta + \gamma\delta + \gamma\epsilon + \gamma\zeta\]</span></p>
+<p>The above only has nine paths, but it would be easy to have the number of paths to grow exponentially as the graph becomes more complicated.</p>
+<p>Instead of just naively summing over the paths, it would be much better to factor them:</p>
+<p><span>\[\frac{\partial Z}{\partial X} = (\alpha + \beta + \gamma)(\delta + \epsilon + \zeta)\]</span></p>
+<p>This is where “forward-mode differentiation” and “reverse-mode differentiation” come in. They’re algorithms for efficiently computing the sum by factoring the paths. Instead of summing over all of the paths explicitly, they compute the same sum more efficiently by merging paths back together at every node. In fact, both algorithms touch each edge exactly once!</p>
+<p>Forward-mode differentiation starts at an input to the graph and moves towards the end. At every node, it sums all the paths feeding in. Each of those paths represents one way in which the input affects that node. By adding them up, we get the total way in which the node is affected by the input, it’s derivative.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/chain-forward-greek.png" alt="">
+</p>
+<p>Though you probably didn’t think of it in terms of graphs, forward-mode differentiation is very similar to what you implicitly learned to do if you took an introduction to calculus class.</p>
+<p>Reverse-mode differentiation, on the other hand, starts at an output of the graph and moves towards the beginning. At each node, it merges all paths which originated at that node.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/chain-backward-greek.png" alt="">
+</p>
+<p>Forward-mode differentiation tracks how one input affects every node. Reverse-mode differentiation tracks how every node affects one output. That is, forward-mode differentiation applies the operator <span>\(\frac{\partial}{\partial X}\)</span> to every node, while reverse mode differentiation applies the operator <span>\(\frac{\partial Z}{\partial}\)</span> to every node.<a href="#fn1" id="fnref1"><sup>1</sup></a></p>
+<!--
+The problem with just “summing over the paths” is that it’s very easy to get a combinatorial explosion in the number of possible paths.
+
+<div style="width:70%; margin-left:auto; margin-right:auto; margin-bottom:17px; margin-top:17px;">
+<img src="img/chain-def.png" alt="">
+</div>
+
+In the above diagram, there are three paths from $X$ to $Y$, and a further three paths from $Y$ to $Z$. If we want to get the derivative $\frac{\partial Z}{\partial X}$ by summing over all paths, we need to sum over $3*3 = 9$  paths:
+
+$$\frac{\partial Z}{\partial X} = ad + ae + af + bd + be+bf + cd + ce + cf$$
+
+The above only has nine paths, but it would be easy to have the number of paths to grow exponentially as the graph becomes more complicated.
+
+Instead of just naively summing over the paths, it would be much better to factor them:
+
+$$\frac{\partial Z}{\partial X} = (a+b+c)(d+e+f)$$
+
+This is where "forward-mode differentiation" and "reverse-mode differentiation" come in. They’re algorithms for efficiently computing the sum by factoring the paths. Instead of summing over all of the paths explicitly, they compute the same sum more efficiently by merging paths back together as possible. In fact, both algorithms touch each edge exactly once!
+
+Forward-mode differentiation starts at an input to the graph and moves towards the end. At every node, it sums all the paths feeding in. Each of those paths represents one way in which the input affects that node. By adding them up, we get the total way in which the node is affected by the input, it’s derivative.
+
+<div style="width:70%; margin-left:auto; margin-right:auto; margin-bottom:17px; margin-top:17px;">
+<img src="img/chain-forward.png" alt="">
+</div>
+
+Though you probably didn’t think of it in terms of graphs, forward-mode differentiation is very similar to what you implicitly learned to do if you took an introduction to calculus class.
+
+Reverse-mode differentiation, on the other hand, starts at an output of the graph and moves towards the beginning. At each node, it merges all paths which originated at that node.
+
+<div style="width:70%; margin-left:auto; margin-right:auto; margin-bottom:17px; margin-top:17px;">
+<img src="img/chain-reverse.png" alt="">
+</div>
+
+Forward-mode differentiation tracks how one input affects every node. Reverse-mode differentiation tracks how every node affects one output. That is, forward-mode differentiation applies the operator $\frac{\partial}{\partial X}$ to every node, while reverse mode differentiation applies the operator $\frac{\partial Z}{\partial}$ to every node.[^DynamicProgramming]
+
+[^DynamicProgramming]: This might feel a bit like [dynamic programming](https://en.wikipedia.org/wiki/Dynamic_programming). That's because it is!
+-->
+
+<h2 id="computational-victories">Computational Victories</h2>
+<p>At this point, you might wonder why anyone would care about reverse-mode differentiation. It looks like a strange way of doing the same thing as the forward-mode. Is there some advantage?</p>
+<p>Let’s consider our original example again:</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-eval-derivs.png" alt="">
+</p>
+<p>We can use forward-mode differentiation from <span>\(b\)</span> up. This gives us the derivative of every node with respect to <span>\(b\)</span>.</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-forwradmode.png" alt="">
+</p>
+<p>We’ve computed <span>\(\frac{\partial e}{\partial b}\)</span>, the derivative of our output with respect to one of our inputs.</p>
+<p>What if we do reverse-mode differentiation from <span>\(e\)</span> down? This gives us the derivative of <span>\(e\)</span> with respect to every node:</p>
+<p><img src="https://colah.github.io/posts/2015-08-Backprop/img/tree-backprop.png" alt="">
+</p>
+<p>When I say that reverse-mode differentiation gives us the derivative of e with respect to every node, I really do mean <em>every node</em>. We get both <span>\(\frac{\partial e}{\partial a}\)</span> and <span>\(\frac{\partial e}{\partial b}\)</span>, the derivatives of <span>\(e\)</span> with respect to both inputs. Forward-mode differentiation gave us the derivative of our output with respect to a single input, but reverse-mode differentiation gives us all of them.</p>
+<p>For this graph, that’s only a factor of two speed up, but imagine a function with a million inputs and one output. Forward-mode differentiation would require us to go through the graph a million times to get the derivatives. Reverse-mode differentiation can get them all in one fell swoop! A speed up of a factor of a million is pretty nice!</p>
+<p>When training neural networks, we think of the cost (a value describing how bad a neural network performs) as a function of the parameters (numbers describing how the network behaves). We want to calculate the derivatives of the cost with respect to all the parameters, for use in <a href="https://en.wikipedia.org/wiki/Gradient_descent">gradient descent</a>. Now, there’s often millions, or even tens of millions of parameters in a neural network. So, reverse-mode differentiation, called backpropagation in the context of neural networks, gives us a massive speed up!</p>
+<p>(Are there any cases where forward-mode differentiation makes more sense? Yes, there are! Where the reverse-mode gives the derivatives of one output with respect to all inputs, the forward-mode gives us the derivatives of all outputs with respect to one input. If one has a function with lots of outputs, forward-mode differentiation can be much, much, much faster.)</p>
+<h2 id="isnt-this-trivial">Isn’t This Trivial?</h2>
+<p>When I first understood what backpropagation was, my reaction was: “Oh, that’s just the chain rule! How did it take us so long to figure out?” I’m not the only one who’s had that reaction. It’s true that if you ask “is there a smart way to calculate derivatives in feedforward neural networks?” the answer isn’t that difficult.</p>
+<p>But I think it was much more difficult than it might seem. You see, at the time backpropagation was invented, people weren’t very focused on the feedforward neural networks that we study. It also wasn’t obvious that derivatives were the right way to train them. Those are only obvious once you realize you can quickly calculate derivatives. There was a circular dependency.</p>
+<p>Worse, it would be very easy to write off any piece of the circular dependency as impossible on casual thought. Training neural networks with derivatives? Surely you’d just get stuck in local minima. And obviously it would be expensive to compute all those derivatives. It’s only because we know this approach works that we don’t immediately start listing reasons it’s likely not to.</p>
+<p>That’s the benefit of hindsight. Once you’ve framed the question, the hardest work is already done.</p>
+<h2 id="conclusion">Conclusion</h2>
+<p>Derivatives are cheaper than you think. That’s the main lesson to take away from this post. In fact, they’re unintuitively cheap, and us silly humans have had to repeatedly rediscover this fact. That’s an important thing to understand in deep learning. It’s also a really useful thing to know in other fields, and only more so if it isn’t common knowledge.</p>
+<p>Are there other lessons? I think there are.</p>
+<p>Backpropagation is also a useful lens for understanding how derivatives flow through a model. This can be extremely helpful in reasoning about why some models are difficult to optimize. The classic example of this is the problem of vanishing gradients in recurrent neural networks.</p>
+<p>Finally, I claim there is a broad algorithmic lesson to take away from these techniques. Backpropagation and forward-mode differentiation use a powerful pair of tricks (linearization and dynamic programming) to compute derivatives more efficiently than one might think possible. If you really understand these techniques, you can use them to efficiently calculate several other interesting expressions involving derivatives. We’ll explore this in a later blog post.</p>
+<p>This post gives a very abstract treatment of backpropagation. I strongly recommend reading Michael Nielsen’s <a href="http://neuralnetworksanddeeplearning.com/chap2.html">chapter on it</a> for an excellent discussion, more concretely focused on neural networks.</p>
+<h2 id="acknowledgments">Acknowledgments</h2>
+<p>Thank you to <a href="http://research.google.com/pubs/GregCorrado.html">Greg Corrado</a>, <a href="https://shlens.wordpress.com/">Jon Shlens</a>, <a href="http://bengio.abracadoudou.com/">Samy Bengio</a> and <a href="http://www.vision.caltech.edu/anelia/">Anelia Angelova</a> for taking the time to proofread this post.</p>
+<p>Thanks also to <a href="https://www.linkedin.com/pub/dario-amodei/4/493/393">Dario Amodei</a>, <a href="http://michaelnielsen.org/">Michael Nielsen</a> and <a href="http://www.iro.umontreal.ca/~bengioy/yoshua_en/index.html">Yoshua Bengio</a> for discussion of approaches to explaining backpropagation. Also thanks to all those who tolerated me practicing explaining backpropagation in talks and seminar series!</p>
+<section>
+<hr>
+<ol>
+<li id="fn1"><p>This might feel a bit like <a href="https://en.wikipedia.org/wiki/Dynamic_programming">dynamic programming</a>. That’s because it is!<a href="#fnref1">↩</a></p></li>
+</ol>
+</section>
+
+
+
+
+<section>
+<hr>
+<h4>More Posts</h4>
+
+<a href="https://colah.github.io/posts/2014-07-Understanding-Convolutions/">
+<div>
+<p><img src="https://colah.github.io/posts/2014-07-Understanding-Convolutions/img/fig.png"></p><h3>Understanding Convolutions</h3>
+</div>
+</a>
+
+<a href="https://colah.github.io/posts/2015-08-Understanding-LSTMs/">
+<div>
+<p><img src="https://colah.github.io/images/post-covers/lstm.png"></p><h3>Understanding LSTM Networks</h3>
+</div>
+</a>
+
+<a href="https://colah.github.io/posts/2014-10-Visualizing-MNIST/">
+<div>
+<p><img src="https://colah.github.io/posts/2014-10-Visualizing-MNIST/img/fig.png"></p><h3>Visualizing MNIST</h3>
+<h4>An Exploration of Dimensionality Reduction</h4>
+</div>
+</a>
+
+<a href="https://colah.github.io/posts/2014-07-Conv-Nets-Modular/">
+<div>
+<p><img src="https://colah.github.io/posts/2014-07-Conv-Nets-Modular/img/fig.png"></p><h3>Conv Nets</h3> <h4>A Modular Perspective</h4>
+</div>
+</a>
+
+<!--
+
+
+
+<a href="../../posts/2014-10-Visualizing-MNIST/">
+<div class="post">
+<img src="../../posts/2014-10-Visualizing-MNIST/img/fig.png">
+<h3>Visualizing MNIST</h3>
+<h4>An Exploration of Dimensionality Reduction</h4>
+</div>
+</a>
+
+<a href="../../posts/2015-01-Visualizing-Representations/">
+<div class="post">
+<img src="../../posts/2015-01-Visualizing-Representations/img/fig.png">
+<h3>Visualizing Representations</h3>
+<h4>Deep Learning and Human Beings</h4>
+</div>
+</a>
+
+
+<a href="../../posts/2014-07-Understanding-Convolutions/">
+<div class="post">
+<img src="../../posts/2014-07-Understanding-Convolutions/img/fig.png">
+<h3>Understanding Convolutions</h3>
+</div>
+</a>
+
+
+<a href="../../posts/2014-12-Groups-Convolution/">
+<div class="post">
+<img src="../../posts/2014-12-Groups-Convolution/img/fig.png">
+<h3>Groups &amp; Group Convolutions</h3>
+</div>
+</a>
+
+<a href="https://christopherolah.wordpress.com/2011/08/08/the-real-3d-mandelbrot-set/">
+<div class="post">
+<img src="../../images/post-covers/mandelbrot.png">
+<h3>The Real 3D Mandelbrot Set</h3>
+<h4 style="margin-top:2px;"><i>On my old blog</i></h4>
+</div>
+</a>
+
+<a href="../../posts/2014-07-FFN-Graphs-Vis/">
+<div class="post">
+<img src="../../posts/2014-07-FFN-Graphs-Vis/img/graph-HP-ships-labeled.png">
+<h3>Fanfiction, Graphs, and PageRank</h3>
+</div>
+</a>
+
+-->
+
+<br>
+
+</section>
+
+
+
+
+
+
+
+
+
+                        </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The 37signals Employee Handbook (110 pts)]]></title>
             <link>https://basecamp.com/handbook</link>
             <guid>39057340</guid>
             <pubDate>Fri, 19 Jan 2024 16:33:54 GMT</pubDate>
@@ -1313,7 +1546,7 @@ Couldn't get https://www.wsj.com/business/cancel-subscriptions-save-money-stream
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Good books on philosophy of engineering? (138 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Good books on philosophy of engineering? (153 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=39057219</link>
             <guid>39057219</guid>
             <pubDate>Fri, 19 Jan 2024 16:23:04 GMT</pubDate>
@@ -1562,7 +1795,7 @@ And section 5 which starts out with:<pre><code>    5 Engineering 95
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Sourcehut network outage post-mortem (195 pts)]]></title>
+            <title><![CDATA[Sourcehut network outage post-mortem (208 pts)]]></title>
             <link>https://sourcehut.org/blog/2024-01-19-outage-post-mortem/</link>
             <guid>39056902</guid>
             <pubDate>Fri, 19 Jan 2024 15:55:40 GMT</pubDate>
@@ -1851,7 +2084,7 @@ unwavering emotional support during a challenging time.</p>
       </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Canadian man stuck in triangle of e-commerce fraud (209 pts)]]></title>
+            <title><![CDATA[Canadian man stuck in triangle of e-commerce fraud (217 pts)]]></title>
             <link>https://krebsonsecurity.com/2024/01/canadian-man-stuck-in-triangle-of-e-commerce-fraud/</link>
             <guid>39056733</guid>
             <pubDate>Fri, 19 Jan 2024 15:37:28 GMT</pubDate>
@@ -1901,7 +2134,7 @@ unwavering emotional support during a challenging time.</p>
 											</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Japan's first-ever soft lunar landing with SLIM spacecraft [video] (146 pts)]]></title>
+            <title><![CDATA[Japan's first-ever soft lunar landing with SLIM spacecraft [video] (159 pts)]]></title>
             <link>https://www.youtube.com/watch?v=2-yBlZplnKQ</link>
             <guid>39056403</guid>
             <pubDate>Fri, 19 Jan 2024 15:06:59 GMT</pubDate>
@@ -1909,7 +2142,7 @@ unwavering emotional support during a challenging time.</p>
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Researchers claim first functioning graphene-based chip (229 pts)]]></title>
+            <title><![CDATA[Researchers claim first functioning graphene-based chip (244 pts)]]></title>
             <link>https://spectrum.ieee.org/graphene-semiconductor</link>
             <guid>39056169</guid>
             <pubDate>Fri, 19 Jan 2024 14:52:41 GMT</pubDate>
@@ -2098,7 +2331,7 @@ https://media.npr.org/assets/img/2024/01/18/gettyimages-1935909781_custom-2845b4
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[French cheese under threat from lack of microbial diversity (103 pts)]]></title>
+            <title><![CDATA[French cheese under threat from lack of microbial diversity (115 pts)]]></title>
             <link>https://news.cnrs.fr/articles/french-cheese-under-threat</link>
             <guid>39055506</guid>
             <pubDate>Fri, 19 Jan 2024 14:01:05 GMT</pubDate>
@@ -2155,7 +2388,7 @@ https://media.npr.org/assets/img/2024/01/18/gettyimages-1935909781_custom-2845b4
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Silos are fine, as long as there is an API between them (120 pts)]]></title>
+            <title><![CDATA[Silos are fine, as long as there is an API between them (121 pts)]]></title>
             <link>https://fernandovillalba.substack.com/p/devops-dont-destroy-silos-transform</link>
             <guid>39055164</guid>
             <pubDate>Fri, 19 Jan 2024 13:32:08 GMT</pubDate>
@@ -2912,68 +3145,6 @@ mailing list</a><br>
             <pubDate>Fri, 19 Jan 2024 00:02:29 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.theguardian.com/technology/2024/jan/18/instagram-facebook-child-sexual-harassment">https://www.theguardian.com/technology/2024/jan/18/instagram-facebook-child-sexual-harassment</a>, See on <a href="https://news.ycombinator.com/item?id=39049799">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div id="maincontent"><p>Meta estimates about 100,000 children using Facebook and <a href="https://www.theguardian.com/technology/instagram" data-link-name="in body link" data-component="auto-linked-tag">Instagram</a> receive online sexual harassment each day, including “pictures of adult genitalia”, according to internal company documents made public late Wednesday.</p><p>The unsealed legal filing includes several allegations against the company based on information the New Mexico attorney general’s office received from presentations by <a href="https://www.theguardian.com/technology/meta" data-link-name="in body link" data-component="auto-linked-tag">Meta</a> employees and communications between staff. The documents describe an incident in 2020 when the 12-year-old daughter of an executive at Apple was solicited via IG Direct, Instagram’s messaging product.</p><p>“This is the kind of thing that pisses Apple off to the extent of threatening to remove us from the App Store,” a Meta employee fretted, according to the documents. A senior Meta employee described <a href="https://www.theguardian.com/technology/2023/nov/07/meta-facebook-employee-congress-testimony-instagram-child-harm-social-media" data-link-name="in body link">how his own daughter had been solicited via Instagram in testimony to the US Congress late last year</a>. His efforts to fix the problem were ignored, he said.</p><p>The filing is the <a href="https://www.theguardian.com/global-development/2023/dec/07/meta-platforms-are-marketplaces-for-child-predators-claims-lawsuit" data-link-name="in body link">latest in a lawsuit</a> initiated by the New Mexico attorney general’s office on 5 December, which alleges Meta’s social networks have become marketplaces for child predators. Raúl Torrez, the state’s attorney general, has accused Meta of enabling adults to find, message and groom children. The company has denied the suit’s claims, saying it “mischaracterizes our work using selective quotes and cherry-picked documents”.</p><p>Meta issued a statement in response to Wednesday’s filing: “We want teens to have safe, age-appropriate experiences online, and we have over 30 tools to support them and their parents. We’ve spent a decade working on these issues and hiring people who have dedicated their careers to keeping young people safe and supported online.”</p><p>A 2021 internal presentation on child safety was also referenced in the lawsuit. According to the suit, one slide stated that Meta is “underinvested in minor sexualization on IG, notable on sexualized comments on content posted by minors. Not only is this a terrible experience for creators and bystanders, it’s also a vector for bad actors to identify and connect with one another.”</p><p>The complaint also highlights Meta employees’ concerns over child safety. In a July 2020 internal Meta chat, one employee asked: “What specifically are we doing for child grooming (something I just heard about that is happening a lot on TikTok)?” According to the complaint, he received a response: “Somewhere between zero and negligible.”</p><p>Meta’s statement also says the company has taken “significant steps to prevent teens from experiencing unwanted contact, especially from adults”.</p><p>The New Mexico lawsuit follows a <a href="https://www.theguardian.com/news/2023/apr/27/how-facebook-and-instagram-became-marketplaces-for-child-sex-trafficking" data-link-name="in body link">Guardian investigation in April</a> that uncovered how Meta is failing to report or detect the use of its platforms for child trafficking. The investigation also revealed how Messenger, Facebook’s private messaging service, is used as a platform for traffickers to communicate to buy and sell children.</p><p>Meta employees discussed the use of Messenger “to coordinate trafficking activities” and facilitate “every human exploitation stage (recruitment, coordination, exploitation) is represented on our platform”, according to documents included in the suit.</p><p>Yet, an internal 2017 email describes executive opposition to scanning <a href="https://www.theguardian.com/technology/facebook" data-link-name="in body link" data-component="auto-linked-tag">Facebook</a> Messenger for “harmful content” because it would place the service “at a competitive disadvantage vs other apps who might offer more privacy”, the lawsuit states.</p><p>In December, <a href="https://www.theguardian.com/technology/2023/dec/08/facebook-messenger-encryption-child-sexual-abuse" data-link-name="in body link">Meta received widespread criticism</a> for rolling out end-to-end encryption for messages sent on Facebook and via Messenger. Encryption hides the contents of a message from anyone but the sender and the intended recipient by converting text and images into unreadable cyphers that are unscrambled on receipt. Child safety experts, policymakers and law enforcement have argued encryption obstructs efforts to rescue child sex-trafficking victims and the prosecution of predators. Privacy advocates praised the decision for shielding users from surveillance by governments and law enforcement.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[AlphaFold Found Possible Psychedelics (285 pts)]]></title>
-            <link>https://www.nature.com/articles/d41586-024-00130-8</link>
-            <guid>39049703</guid>
-            <pubDate>Thu, 18 Jan 2024 23:53:32 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.nature.com/articles/d41586-024-00130-8">https://www.nature.com/articles/d41586-024-00130-8</a>, See on <a href="https://news.ycombinator.com/item?id=39049703">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-                    <figure>
- <picture>
-  <source type="image/webp" srcset="https://media.nature.com/lw767/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638900.jpg?as=webp 767w, https://media.nature.com/lw319/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638900.jpg?as=webp 319w" sizes="(max-width: 319px) 319px, (min-width: 1023px) 100vw,  767px">
-  <img alt="An AlphaFold protein structure of the protein Vitellogenin." loading="lazy" src="https://media.nature.com/lw767/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638900.jpg">
-  <figcaption>
-   <p><span>Protein structures predicted by AlphaFold have helped to identify candidate drug compounds.</span><span>Credit: DeepMind</span></p>
-  </figcaption>
- </picture>
-</figure><p>Researchers have used the protein-structure-prediction tool AlphaFold to identify<sup><a href="#ref-CR1" data-track="click" data-action="anchor-link" data-track-label="go to reference" data-track-category="references">1</a></sup> hundreds of thousands of potential new psychedelic molecules — which could help to develop new kinds of antidepressant. The research shows, for the first time, that AlphaFold predictions — available at the touch of a button — can be just as useful for drug discovery as experimentally derived protein structures, which can take months, or even years, to determine.</p><article data-label="Related">
-  <a href="https://www.nature.com/articles/d41586-023-02984-w" data-track="click" data-track-label="recommended article"><img alt="" src="https://media.nature.com/w400/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26639072.jpg"><p>AlphaFold touted as next big thing for drug discovery — but is it?</p></a>
- </article><p>The development is a boost for AlphaFold, the artificial-intelligence (AI) tool developed by DeepMind in London that has been a game-changer in biology. The public AlphaFold database holds structure predictions for nearly every known protein. Protein structures of molecules implicated in disease are used in the pharmaceutical industry to identify and improve promising medicines. But some scientists had been starting to doubt whether AlphaFold's predictions could stand-in for gold standard experimental models in the hunt for new drugs.</p><p>“AlphaFold is an absolute revolution. If we have a good structure, we should be able to use it for drug design,” says Jens Carlsson, a computational chemist at the University of Uppsala in Sweden.</p><h2>AlphaFold scepticism</h2><p>Efforts to apply AlphaFold to finding new drugs have been met with considerable scepticism, says Brian Shoichet, a pharmaceutical chemist at the University of California, San Francisco. “There is a lot of hype. Whenever anybody says ‘such and such is going to revolutionize drug discovery’, it warrants some scepticism.”</p><p>Shoichet counts more than ten studies that have found AlphaFold’s predictions to be less useful than protein structures obtained with experimental methods, such as X-ray crystallography, when used to identify potential drugs in a modelling method called protein–ligand docking.</p><article data-label="Related">
-  <a href="https://www.nature.com/articles/d41586-022-00997-5" data-track="click" data-track-label="recommended article"><img alt="" src="https://media.nature.com/w400/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_20323140.png"><p>What's next for AlphaFold and the AI protein-folding revolution</p></a>
- </article><p>This approach — common in the early stages of drug discovery — involves modelling how hundreds of millions or billions of chemicals interact with key regions of a target protein, in the hope of identifying compounds that alter the protein’s activity. Previous studies have tended to find that when AlphaFold-predicted structures are used, the models are poor at singling out drugs already known to bind to a particular protein.</p><p>Researchers led by Shoichet and Bryan Roth, a structural biologist at the University of North Carolina at Chapel Hill, came to a similar conclusion when they checked AlphaFold structures of two proteins implicated in neuropsychiatric conditions against known drugs. The researchers wondered whether small differences from experimental structures might cause the predicted structures to miss certain compounds that bind to proteins — but also make them able to identify different ones that were no less promising.</p><p>To test this idea, the team used experimental structures of the two proteins to virtually screen hundreds of millions of potential drugs. One protein, a receptor that senses the neurotransmitter serotonin, was previously determined using cryo-electron microscopy. The structure of the other protein, called the σ-<sub>2</sub> receptor, had been mapped using X-ray crystallography.</p><h2>Drug differences</h2><p>They ran the same screen with models of the proteins plucked from the AlphaFold database. They then synthesized hundreds of the most promising compounds identified with either the predicted and experimental structures and measured their activity in the lab.</p><article data-label="Related">
-  <a href="https://www.nature.com/articles/d41586-020-03348-4" data-track="click" data-track-label="recommended article"><img alt="" src="https://media.nature.com/w400/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_18745984.jpg"><p>‘It will change everything’: DeepMind’s AI makes gigantic leap in solving protein structures</p></a>
- </article><p>The screens with predicted and experimental structures yielded completely different drug candidates. “There were no two molecules that were the same,” says Shoichet. “They didn’t even resemble each other.”</p><p>But to the team’s surprise, the ‘hit rates’ — the proportion of flagged compounds that actually altered protein activity in a meaningful way — were nearly identical for the two groups. And AlphaFold structures identified the drugs that activated the serotonin receptor most potently. The psychedelic drug LSD works partly through this route, and many researchers are looking for non-hallucinogenic compounds that do the same thing, as potential antidepressants. “It’s a genuinely new result,” says Shoichet.</p><h2>Prediction power</h2><p>In unpublished work, Carlsson’s team has found that AlphaFold structures are good at identifying drugs for a sought-after class of target called G-protein-coupled receptors, for which their hit rate is around 60%.</p><p>Having confidence in predicted protein structures could be game-changing for drug discovery, says Carlsson. Determining structures experimentally isn’t trivial, and many would-be targets might not yield to existing experimental tools. “It would be very convenient if we could push the button and get a structure we can use for ligand discovery,” he says.</p><figure>
- <picture>
-  <source type="image/webp" srcset="https://media.nature.com/lw767/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638902.jpg?as=webp 767w, https://media.nature.com/lw319/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638902.jpg?as=webp 319w" sizes="(max-width: 319px) 319px, (min-width: 1023px) 100vw,  767px">
-  <img alt="Photo illustration of the Isomorphic Labs logo displayed on a tablet." loading="lazy" src="https://media.nature.com/lw767/magazine-assets/d41586-024-00130-8/d41586-024-00130-8_26638902.jpg">
-  <figcaption>
-   <p><span>Isomorphic Labs, a spin-off company of Google’s DeepMind in London, is ramping up its drug-discovery efforts using AlphaFold.</span><span>Credit: Igor Golovniov/SOPA Images/LightRocket via Getty</span></p>
-  </figcaption>
- </picture>
-</figure><p>The two proteins that Shoichet and Roth’s team picked are good candidates for relying on AlphaFold, says Sriram Subramaniam, a structural biologist at the University of British Columbia in Vancouver, Canada. Experimental models of related proteins — including detailed maps of the regions where drugs bind to them — are readily available. "If you stack the deck, AlphaFold is a paradigm shift. It changes the way we do things," he adds.</p><p>“This is not a panacea,” says Karen Akinsanya, president of research and development for therapeutics at Schrödinger, a drug-software company based in New York City that is using AlphaFold. Predicted structures are helpful for some drug targets, but not others, and it’s not always clear which applies. In about 10% of cases, predictions AlphaFold deems highly accurate are substantially different from the experimental structure, a study<sup><a href="#ref-CR3" data-track="click" data-action="anchor-link" data-track-label="go to reference" data-track-category="references">3</a></sup> found.</p><p>And even when predicted structures can help to identify leads, more detailed experimental models are often needed to optimize the properties of a particular drug candidate, Akinsanya adds.</p><h2>Big bet</h2><p>Shoichet agrees that AlphaFold predictions are not universally useful. “There were a lot of models that we didn’t even try because we thought they were so bad,” he says. But he estimates that in about one-third of cases, an AlphaFold structure could jump-start a project. “Compared to actually going out and getting a new structure, you could advance the project by a couple of years and that’s huge,” he says.</p><p>That is the goal of Isomorphic Labs, DeepMind’s drug-discovery spin-off in London. On 7 January, the company announced deals worth a minimum of US$82.5 million — and up to $2.9 billion if business targets are met — to hunt for drugs on behalf of pharmaceutical giants Novartis and Eli Lilly using machine-learning tools such as AlphaFold.</p><p>The company says that the work will be aided by a new version of AlphaFold that can predict the structures of proteins when they are bound to drugs and other interacting molecules. DeepMind has not yet said when — or whether — the update will be made available to researchers, as earlier versions of AlphaFold have been. A competing tool called RoseTTAFold All-Atom<sup><a href="#ref-CR2" data-track="click" data-action="anchor-link" data-track-label="go to reference" data-track-category="references">2</a></sup> will be made available soon by its developers.</p><p>Such tools won’t fully replace experiments, scientists say, but their potential to help find new drugs shouldn’t be discounted. “There’s a lot of people that want AlphaFold to do everything, and a lot of structural biologists want to find reasons to say we are still needed,” says Carlsson. “Finding the right balance is difficult.”</p>
-                </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[10 Second Teleportation (111 pts)]]></title>
-            <link>https://upollo.ai/blog/10-second-teleportation</link>
-            <guid>39049691</guid>
-            <pubDate>Thu, 18 Jan 2024 23:53:05 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://upollo.ai/blog/10-second-teleportation">https://upollo.ai/blog/10-second-teleportation</a>, See on <a href="https://news.ycombinator.com/item?id=39049691">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><h2>The scenario</h2><p>We started seeing some strange devices show up for some of our customers' users. These devices would access the same page the user just had around 10 seconds after they did, from somewhere quite different.&nbsp;</p><figure><p><img src="https://assets-global.website-files.com/64fac35aa05c08386b2b8e30/65a76556fb21865989511ab5_dGgCe6qPSgE3eJly41jQTxBrVr7SkMtnAatYNmsA7n3l-fvJg0VukNfc90W6ZVPrmZnlhCGx41puHDTcjnW3siwxuNUiBQVS0HTkr-EnWzDKq4lFqweNCXeKLemgaZcodFvqsgVw4JEs0oMW3DHGg6Y.gif" alt=""></p></figure><h2>It’s obviously a VPN!</h2><p>We looked at where these requests were coming from places such as AWS in the central US, data centers in California and similar locations around the world. This could be someone switching on a VPN we thought.&nbsp;</p><p>But wait, these are different devices, they have none of the same cookies. If this were a VPN it would be the same device.</p><h2>It’s obviously a Virtual Desktop!</h2><p>Seeing a machine hosted in a data center and with all the users we saw coming from these locations working for large institutions we thought maybe it is just a remote cloud desktop.&nbsp;</p><p>We would expect a remote cloud desktop to be most likely Windows, to be comparatively speced to a real world desktop and to have similar behaviour to real desktop as well.&nbsp;</p><p>What we found were user agents purporting to be from a range of devices including mobile devices, all only ever loading a single page without any existing state like cookies. TLS fingerprints and other factors told us that these were consistently using an old version of Chrome.&nbsp;</p><p>So far the device doesn’t look like any legitimate user we had ever seen. It looked like automation of some kind as most users run a fairly up to date version of Chrome and don’t lie about their user agents.&nbsp;</p><p>The behavior itself is also strange, how did it load these pages which were often behind an authwall without ever logging in or having auth cookies? That seems very odd.&nbsp;</p><figure><p><img src="https://assets-global.website-files.com/64fac35aa05c08386b2b8e30/65a76556c69ba79463b0c4dc_d1Xx-YEv8lG-nAj8_A63Sip1XOpmD-9xYAFwuofGtjvZzdF_pQo7qxaqh3Q7zU6CzRs_yZYgiqs643s779Y0tSYXS3wXNMyVx_nEj_PWEdfOP3dMBtBOhiqGwB8AJpyduhv_JyX73Oz-JXo5BTLIGsU.gif" alt=""></p></figure><h2>It’s obviously some kind of security system!</h2><p>We had pieced together that this was:</p><ul role="list"><li>An automated system&nbsp;</li><li>That somehow had the page content from a user</li><li>Would render and execute all scripts on that page as if it was that user</li><li>Would not have any of the cookies or other context a user would have</li><li>Worked on a range of devices</li><li>Worked on HTTPS traffic&nbsp;</li><li>Only showed up randomly for users from large institutions&nbsp;</li></ul><p>This looks like a security system that randomly scans pages by grabbing the page contents, sending it to a render queue and then processing it. This is interesting as these pages can contain PII, financial details or other sensitive information and they are being processed on versions of Chrome seemingly tens of versions out of date, seemingly on a shared instance.&nbsp;</p><p>We got <a href="https://xkcd.com/356/" target="_blank">nerd sniped</a> at this point and wanted to know what this system was. It didn’t have any user agent data as that was always forged to match the users. It often ran out of AWS or other data centers and it was a number of organizations.&nbsp;</p><p>Finally we saw it start popping up from a data center that wasn’t a public one, Palo Alto Networks.&nbsp;</p><p>In the end after reading product page after product page, we couldn’t work out exactly what product it was. We are keen to find out so if you know,&nbsp; drop us a line and let us know!</p><p>These are now safely excluded from showing up for our users and is just one of the many things Upollo does to ensure it is giving accurate and actionable information to our customers.&nbsp;</p><p>We look forward to sharing more fun things from the internet soon.&nbsp;</p></div><div><div><h4>Join the Wave</h4><p>Ready to revolutionize how you recognize opportunities? Sign up for the waitlist below and be among the first to experience its transformative power when it launches.</p></div><div id="waitlist-hero"><div><p>Thanks!&nbsp;We'll let you know when you're off the waitlist.</p></div><div><p>Oops! Something went wrong while submitting the form.</p></div></div></div><div><h6>About the Author</h6><div><p>On a mission to help millions of businesses understand their users and grow faster!</p></div></div><div id="waitlist-hero"><div><p>Thanks!&nbsp;We'll let you know when you're off the waitlist.</p></div><div><p>Oops! Something went wrong while submitting the form.</p></div></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[YouTube and Spotify won't launch Apple Vision Pro apps, joining Netflix (156 pts)]]></title>
-            <link>https://www.bloomberg.com/news/articles/2024-01-18/youtube-and-spotify-join-netflix-in-not-launching-apple-vision-pro-apps</link>
-            <guid>39049217</guid>
-            <pubDate>Thu, 18 Jan 2024 23:07:29 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.bloomberg.com/news/articles/2024-01-18/youtube-and-spotify-join-netflix-in-not-launching-apple-vision-pro-apps">https://www.bloomberg.com/news/articles/2024-01-18/youtube-and-spotify-join-netflix-in-not-launching-apple-vision-pro-apps</a>, See on <a href="https://news.ycombinator.com/item?id=39049217">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section>
-    <section>
-        <h3>Why did this happen?</h3>
-        <p>Please make sure your browser supports JavaScript and cookies and that you are not
-            blocking them from loading.
-            For more information you can review our <a href="https://www.bloomberg.com/notices/tos">Terms of
-                Service</a> and <a href="https://www.bloomberg.com/notices/tos">Cookie Policy</a>.</p>
-    </section>
-    <section>
-        <h3>Need Help?</h3>
-        <p>For inquiries related to this message please <a href="https://www.bloomberg.com/feedback">contact
-            our support team</a> and provide the reference ID below.</p>
-        <p>Block reference ID:</p>
-    </section>
-</section></div>]]></description>
         </item>
     </channel>
 </rss>
