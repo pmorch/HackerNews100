@@ -4,12 +4,192 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 24 Jan 2024 09:00:06 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 24 Jan 2024 10:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Creator of everynoise.com laid off from Spotify (120 pts)]]></title>
+            <title><![CDATA[Making Rust binaries smaller by default (124 pts)]]></title>
+            <link>https://kobzol.github.io/rust/cargo/2024/01/23/making-rust-binaries-smaller-by-default.html</link>
+            <guid>39112486</guid>
+            <pubDate>Wed, 24 Jan 2024 01:29:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://kobzol.github.io/rust/cargo/2024/01/23/making-rust-binaries-smaller-by-default.html">https://kobzol.github.io/rust/cargo/2024/01/23/making-rust-binaries-smaller-by-default.html</a>, See on <a href="https://news.ycombinator.com/item?id=39112486">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div aria-label="Content">
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>Have you ever tried to compile a helloworld Rust program in <code>--release</code> mode? If yes, have
+you <em>seen its binary size</em>? Suffice to say, it’s not exactly small. Or at least it wasn’t small
+until recently. This post details how I found about the issue and my attempt to fix it in Cargo.</p>
+
+<h2 id="binary-size-analysis">Binary size analysis</h2>
+<p>I’m a member of the (relatively recently established)
+<a href="https://www.rust-lang.org/governance/teams/compiler#Binary%20size%20working%20group">#wg-binary-size</a> working group,
+which is trying to find opportunities to reduce the binary size footprint of Rust programs and libraries.
+Since I also maintain the <a href="https://kobzol.github.io/rust/rustc/2023/08/18/rustc-benchmark-suite.html">Rust benchmark suite</a>, my main
+task within the working group is to improve our tooling that measures and tracks the binary size of Rust programs.</p>
+
+<p>As part of that effort, I recently added a new <a href="https://github.com/rust-lang/rustc-perf/pull/1772">command</a> to
+the benchmark suite, which allows examining and comparing the sizes of individual sections and symbols of a Rust
+binary (or a library) between two versions of the compiler.</p>
+
+<p>The output of the command looks like this:</p>
+
+<p><img src="https://kobzol.github.io/assets/posts/cargo-strip-release-binaries/binary-size-analysis.png" alt="Output of the binary analysis command"></p>
+
+<p>While testing the command, I noticed something peculiar. When compiling the test binary in release mode
+(using <code>--release</code>), the analysis command showed that there are (DWARF) debug symbols in the binary. My
+immediate reaction was that I have a bug in my command and that I have to be compiling in debug mode by accident.
+Surely Cargo wouldn’t add debug symbols to my binary in release mode by default, right? Right?</p>
+
+<details>
+  <summary>My reaction to Cargo's behavior</summary>
+
+  <p><img src="https://kobzol.github.io/assets/posts/cargo-strip-release-binaries/cargo-meme.jpeg" alt="Anakin/Padmé meme about Cargo and debug symbols"></p>
+
+</details>
+
+
+
+<p>I spent maybe 15 minutes looking for the bug before I realized that there is no bug in my code. There <em>are</em> debug
+symbols in each Rust binary compiled in release mode by default, and this has been true for a <em>long time</em>. In fact,
+there is an <a href="https://github.com/rust-lang/cargo/issues/4122">old Cargo issue</a> (almost 7-year-old, to be precise) that
+mentions this exact problem.</p>
+
+<h2 id="why-does-this-happen">Why does this happen?</h2>
+<p>This is consequence of how the Rust standard library is distributed. When you compile a Rust crate, you don’t also
+compile the standard library<sup id="fnref:build-std" role="doc-noteref"><a href="#fn:build-std" rel="footnote">1</a></sup>. It comes precompiled, typically using Rustup, in the <code>rust-std</code> component.
+To reduce download bandwidth<sup id="fnref:reduced-size" role="doc-noteref"><a href="#fn:reduced-size" rel="footnote">2</a></sup>, it does not come in two variants (with and without debug symbols), but only in the
+more general variant with debug symbols.</p>
+
+<p>On Linux (and also other platforms), the debug symbols are embedded directly in the object files of the library itself
+by default (instead of being distributed via
+<a href="https://doc.rust-lang.org/cargo/reference/profiles.html#split-debuginfo">separate files</a>). Therefore, when you link
+to the standard library, you get these debug symbols “for free” also in your final binary, which causes binary size
+bloat.</p>
+
+<p>This actually contradicts Cargo’s <a href="https://doc.rust-lang.org/cargo/reference/profiles.html#debug">own documentation</a>,
+which claims that if you use <code>debug = 0</code> (which is the default for release builds), the resulting binary will not contain
+any debug symbols. But this is clearly not what happens now.</p>
+
+<p>EDIT: Just to clarify, Cargo was putting the debuginfo of the Rust standard library into your program by default.
+It was <em>not</em> including the debuginfo of your own crate in release mode by default.</p>
+
+<h2 id="why-is-it-a-problem">Why is it a problem?</h2>
+<p>If you take a look at the binary size of a Rust helloworld program compiled in release mode on Linux, you’ll
+notice that it has about ~4.3 MiB<sup id="fnref:rustc-version" role="doc-noteref"><a href="#fn:rustc-version" rel="footnote">3</a></sup>. While it’s true that we have a lot more disk space
+today than in the past, that’s still abhorrently much.</p>
+
+<p>Now, you might think that this is a non-issue, because anyone who wants to have smaller binaries simply strips them.
+That is a good point - in fact, after stripping the debug symbols from the mentioned helloworld binary<sup id="fnref:strip-cmd" role="doc-noteref"><a href="#fn:strip-cmd" rel="footnote">4</a></sup>,
+its size is reduced to merely <code>415 KiB</code>, only about 10% of the original size. However, the devil is in the <del>details</del>
+defaults.</p>
+
+<p>And <strong>defaults matter!</strong> Rust advertises itself as a language that produces highly efficient and optimal code, but this
+impression isn’t really supported by a helloworld application taking more than 4 megabytes of space on disk. I can
+imagine a situation where a seasoned C or C++ programmer wants to try Rust, compiles a small program in release
+mode, notices the resulting binary size, and then immediately gives up on the language and goes to make fun of
+it on the forums.</p>
+
+<p>Even though the issue goes away with just a single <code>strip</code> invocation, it is still a problem in my view. Rust tries to
+appeal to programmers coming from many different backgrounds, and not everyone knows that something like stripping
+binaries even exists. So it is important that we do a better job here, <em>by default</em>.</p>
+
+<blockquote>
+  <p>Note that the size of the <code>libstd</code> debug symbols is around 4 megabytes on Linux, and this size is constant, so even
+though for helloworld it takes ~90% of the size of the resulting binary, for larger programs its effect will be smaller.
+But still, four megabytes is nothing to sneeze at, since it is included in every Rust binary built everywhere by default.</p>
+</blockquote>
+
+<h2 id="proposing-a-change-to-cargo">Proposing a change to Cargo</h2>
+<p>After I have realized that this is the default behavior of Cargo, I have actually remembered that I have just
+rediscovered this exact issue perhaps for the third time already. I have just never really acted upon it before and then
+always managed to forget about it.</p>
+
+<p>This time, I was determined to do something about it. But where to start? Well, usually it’s not a bad idea to just
+ask around on the <a href="https://rust-lang.zulipchat.com/">Rust Zulip</a>, so I did <a href="https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/Setting.20.60strip.3Ddebuginfo.60.20by.20default.20when.20.60debug.3D0.60">exactly that</a>.
+It turns out that I wasn’t the first person to ask that very same question, and that it came up multiple times over the years.
+The proposed solution was to simply strip debug symbols from Rust programs in release mode by default, which would remove
+the binary size bloat problem. In the past, this used to be blocked by the stabilization of <code>strip</code> support in Cargo,
+but that has actually already happened back at the
+<a href="https://github.com/rust-lang/cargo/blob/master/CHANGELOG.md#cargo-159-2022-02-24">beginning of 2022</a>.</p>
+
+<p>So, why wasn’t this proposal implemented yet? Were there any big concerns or blockers? Well, not really. When I
+have asked around on Zulip, pretty much everyone thought that it would be a good idea. And while there were some
+earlier attempts to do this, they haven’t been pushed through.</p>
+
+<p>So, to sum up, it hasn’t been done yet because no one had done it yet :) So I set out to fix that. To test
+if stripping by default could work, I created a PR to the compiler and started a perf benchmark. The binary size
+<a href="https://perf.rust-lang.org/compare.html?start=e004adb5561b724ac18f5b24584648ca4e42b6ad&amp;end=9d280f70157edca19af117734c1223f5dd0dcd52&amp;stat=size%3Alinked_artifact&amp;tab=compile">results</a> (for tiny crates) looked pretty good, so that gave me hope that the approach of stripping by default
+could indeed work.</p>
+
+<p>Funnily enough, this change also made compilation time of tiny crates (like helloworld) up to
+<a href="https://perf.rust-lang.org/compare.html?start=e004adb5561b724ac18f5b24584648ca4e42b6ad&amp;end=9d280f70157edca19af117734c1223f5dd0dcd52&amp;stat=instructions%3Au&amp;tab=compile">2x faster</a>
+on Linux! How could that be, when we’re doing more work, by including stripping in the compilation process? Well,
+it turns out that the default Linux linker (<a href="https://ftp.gnu.org/old-gnu/Manuals/ld-2.9.1/html_chapter/ld_5.html"><code>bfd</code></a>)
+is brutally slow<sup id="fnref:bfd-speedup" role="doc-noteref"><a href="#fn:bfd-speedup" rel="footnote">5</a></sup>, so by removing the debug symbols from the final binary, we actually reduce the amount
+of work the linker needs to perform, which makes compilation faster. Sadly, this has an observable effect only for really
+tiny crates.</p>
+
+<blockquote>
+  <p>There is an ongoing effort to use a faster linker (<code>lld</code>) by default on Linux (again, defaults matter <img title=":smile:" alt=":smile:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f604.png" height="20" width="20">). Stay tuned!</p>
+</blockquote>
+
+<p>After showing these results to the Cargo maintainers, they have <a href="https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/Setting.20.60strip.3Ddebuginfo.60.20by.20default.20when.20.60debug.3D0.60/near/408965413">asked</a>
+me to write down a <a href="https://github.com/rust-lang/cargo/issues/4122#issuecomment-1868318860">proposal</a>
+on the original Cargo issue. In this mini-proposal, I have explained what change to the Cargo defaults I want to make,
+how it could be implemented, and what are other considerations of the change.</p>
+
+<p>For example, one thing that was noted is that if we strip the debug symbols by default, then backtraces of release builds
+will… not contain any debug info, such as line numbers. That is indeed true, but my claim is that these have not been useful
+anyway. If you have a binary that only has debug symbols for the standard library, but not for your own code, then even
+though the backtrace will contain some line numbers from <code>stdlib</code>, it will not really give you any useful context (you
+can compare the difference <a href="https://gist.github.com/Kobzol/27ad8fa8aae1ccb7642925ab99ca8897">here</a>).
+There were also some implementation considerations, for example how to handle situations where only some of your target’s
+dependencies request debug symbols. You can find more details in the
+<a href="https://github.com/rust-lang/cargo/issues/4122#issuecomment-1868318860">proposal</a>.</p>
+
+<p>After I wrote the proposal, it went through the <abbr title="Final Comments Period">FCP</abbr> process. The Cargo team members <a href="https://github.com/rust-lang/cargo/issues/4122#issuecomment-1868371491">voted</a>
+on it, and once it was <a href="https://github.com/rust-lang/cargo/issues/4122#issuecomment-1891039373">accepted</a> after a
+10-day waiting period designed for any last concerns (the <abbr title="Final Comments Period">FCP</abbr>), I could <a href="https://github.com/rust-lang/cargo/pull/13257">implement</a>
+the proposal, which was actually surprisingly straightforward.</p>
+
+<p>The PR has been <a href="https://github.com/rust-lang/cargo/pull/13257#issuecomment-1892589315">merged</a>
+a week ago, and it is now in nightly! <img title=":tada:" alt=":tada:" src="https://github.githubassets.com/images/icons/emoji/unicode/1f389.png" height="20" width="20"></p>
+
+<p>The TLDR of the change is that Cargo will now by default use <code>strip = "debuginfo"</code> for the <code>release</code> profile
+(unless you explicitly request debuginfo for some dependency):</p>
+<div><pre><code><span>[profile.release]</span>
+<span># v This is now used by default, if not provided</span>
+<span>strip</span> <span>=</span> <span>"debuginfo"</span>
+</code></pre></div>
+
+<p>In fact, this new default will be used for <em>any profile</em> which does not enable debuginfo anywhere in its dependency
+chain, not just for the <code>release</code> profile.</p>
+
+<p>There was one unresolved concern about using <code>strip</code> on macOS, because it seems that there can be some
+<a href="https://github.com/rust-lang/cargo/issues/11641">issues</a> with it. The change has been in nightly for a week and
+I haven’t seen any problems, but if this will cause any issues, we can also perform the debug symbols stripping selectively,
+only on some platforms (e.g. Linux and Windows). Let us know if you find any issues with stripping using Cargo on macOS!</p>
+
+<h2 id="conclusion">Conclusion</h2>
+<p>In the end, this was yet another case of “if you want it done, just do it”, which is common in open-source projects :)
+I’m glad the change went through, and I hope that we won’t find any major issues with it and that it will be stabilized
+in the upcoming months.</p>
+
+<p>If you have any comments or questions, please let me know on <a href="https://www.reddit.com/r/rust/comments/19dwxel/making_rust_binaries_smaller_by_default/">Reddit</a>.</p>
+
+
+  </div>
+
+</article>
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Creator of everynoise.com laid off from Spotify (121 pts)]]></title>
             <link>https://everynoise.com/#updates</link>
             <guid>39111730</guid>
             <pubDate>Tue, 23 Jan 2024 23:59:21 GMT</pubDate>
@@ -12600,7 +12780,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Appeals Court: FBI's Safe-Deposit Box Seizures Violated Fourth Amendment (279 pts)]]></title>
+            <title><![CDATA[Appeals Court: FBI's Safe-Deposit Box Seizures Violated Fourth Amendment (289 pts)]]></title>
             <link>https://reason.com/2024/01/23/appeals-court-fbis-safe-deposit-box-seizures-violated-fourth-amendment/</link>
             <guid>39111539</guid>
             <pubDate>Tue, 23 Jan 2024 23:36:24 GMT</pubDate>
@@ -12609,7 +12789,7 @@
 							<p>The FBI violated the Fourth Amendment when its agents rifled through the contents of more than 700 safe-deposit boxes in the aftermath of <a href="https://reason.com/2021/05/10/the-fbi-seized-heirlooms-coins-and-cash-from-hundreds-of-safe-deposit-boxes-in-beverly-hills-despite-knowing-some-belonged-to-honest-citizens/">a March 2021 raid</a>, a panel of federal appeals court judges <a href="https://www.documentcloud.org/documents/24372830-uspv-9th-cir-opinion">ruled unanimously</a> on Tuesday.</p> <p>In doing so, the judges at the 9th Circuit Court of Appeals confirmed what innocent victims of the raid and their attorneys have been arguing for years: that the FBI overstepped the bounds of its warrant issued in the case and failed to follow proper protocol when federal agents <a href="https://reason.com/2021/05/26/see-the-fbi-dig-through-an-innocent-womans-safe-deposit-box/">cracked open safe-deposit boxes</a>, ran the contents past drug-sniffing dogs, and tried to <a href="https://reason.com/2021/05/28/the-fbi-took-their-safe-deposit-box-and-everything-inside-it-two-months-later-theyre-still-waiting-for-it-to-be-returned/">seize some of the money and other valuables</a> found in the boxes.</p> <p>The 9th Circuit's ruling pivots on a detail of the case that <em>Reason&nbsp;</em>first highlighted more than a year ago: <a href="https://reason.com/2022/08/19/fbi-misled-judge-in-obtaining-warrant-to-seize-hundreds-of-safe-deposit-boxes/">the existence of so-called "supplemental instructions"</a> for the handling of the safe-deposit boxes seized at <a href="https://reason.com/tag/us-private-vaults/">U.S. Private Vaults</a> in Beverly Hills.</p> <p>The warrant authorizing the raid <a href="https://www.documentcloud.org/documents/20700649-21-notice-of-motion-and-motion-for-return-of-property-pursuant-to-fed-r-crim-p-41g#document/p10">expressly forbade</a> federal agents from engaging in a "criminal search or seizure of the contents of the safety [sic] deposit boxes." Under typical FBI procedure, the boxes should have been taken into custody until they could be returned to their rightful owners. But those "supplemental instructions" drawn up by the special agent in charge of the operation told agents to be on the lookout for cash stored inside the safe-deposit boxes and to note "anything which suggests the cash may be criminal proceeds."</p> <p>It is "particularly troubling," <a href="https://www.documentcloud.org/documents/24372830-uspv-9th-cir-opinion#document/p28">wrote</a> Judge Milan D. Smith Jr. in Tuesday's ruling, that the government was unable to provide any "limiting principle to how far a hypothetical 'inventory search' conducted pursuant to customized instructions can go."</p> <p>Elsewhere in the ruling, Smith <a href="https://www.documentcloud.org/documents/24372830-uspv-9th-cir-opinion#document/p26">theorized</a> that if a government agency were "given the discretion to create customized inventory policies" for "each car it impounds and each person detained, the ensuing search stops looking like an 'inventory' meant to simply protect property and looks more like a criminal investigation of that particular car or person, i.e, more like a 'ruse.'"</p> <p>"If there remained any doubt whether the government conducted a 'criminal search or seizure,' that doubt is put to rest by the fact that the government has already used some of the information from inside the boxes to obtain additional warrants to further its investigations and begin new ones," Smith wrote.</p> <p>"The Ninth Circuit today held that the FBI violated the Fourth Amendment rights of hundreds of people by breaking into their safe deposit boxes to try to forfeit everything worth taking," Robert Frommer, an attorney with the Institute for Justice, a libertarian legal nonprofit that represented some of the plaintiffs in the case, tells <em>Reason</em>. He said the case should bring renewed attention to <a href="https://ij.org/press-release/bipartisan-bill-in-congress-would-dramatically-reform-civil-forfeiture-laws/">a congressional proposal to reform federal forfeiture laws</a> in order to "stop federal cops from continuing to act like robbers."</p> <p>A spokesperson for the FBI declined to comment on the ruling and referred the matter to the U.S. Attorney's Office, which did not respond to <em>Reason's</em> request for comment.</p> <p>The FBI's ruse in the U.S. Private Vault's case seemed to unravel after the district court in August 2021 made public certain details of the raid's planning stages that <a href="https://reason.com/2022/07/26/what-is-the-fbi-hiding-about-its-raid-on-innocent-americans-safe-deposit-boxes/">the FBI had tried to keep hidden</a>. Those documents, including depositions with agents involved in plotting the raid, revealed that the FBI had planned to use civil forfeiture proceedings against the contents of the safe-deposit boxes but did not provide that information to the magistrate judge who issued the warrant for the raid. (Full disclosure: <em>Reason&nbsp;</em>submitted an&nbsp;<em>amicus</em> brief in the case arguing that the depositions and other documents should be made public.)</p> <p>District Court Judge R. Gary Klausner later <a href="https://reason.com/2022/09/30/federal-judge-decides-safe-deposit-boxes-arent-safe-from-fbi/">ruled</a> that "there can be no question that the government expected, or even hoped, to find criminal evidence during its inventory." However, Klausner upheld the FBI's conduct as being within the bounds of the Fourth Amendment because the improper conduct was not the sole reason why the FBI opened the safe-deposit boxes and searched through their contents.</p> <p>The Ninth Circuit said Tuesday that Klausner was wrong to reach that conclusion and remanded the case back to the district court.</p> <p>In the ruling, Smith wrote that the arrangement called to mind the various "writs of assistance" used by the British authorities to conduct nearly limitless searches of private property prior to the Revolutionary War.</p> <p>"It was those very abuses of power, after all, that led to the adoption of the Fourth Amendment in the first place," Smith concluded.</p> <p>And it is cases like this one that should remind all Americans why the Fourth Amendment still matters today.</p>						</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Anon Boeing engineer reveals why the 737 door blew off (191 pts)]]></title>
+            <title><![CDATA[Anon Boeing engineer reveals why the 737 door blew off (192 pts)]]></title>
             <link>https://leehamnews.com/2024/01/15/unplanned-removal-installation-inspection-procedure-at-boeing/#comment-509962</link>
             <guid>39111494</guid>
             <pubDate>Tue, 23 Jan 2024 23:30:52 GMT</pubDate>
@@ -12689,7 +12869,66 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Waterway Map (265 pts)]]></title>
+            <title><![CDATA[SimSIMD: Hardware-accelerated similarity metrics and distance functions (107 pts)]]></title>
+            <link>https://github.com/ashvardanian/SimSIMD</link>
+            <guid>39111114</guid>
+            <pubDate>Tue, 23 Jan 2024 22:53:11 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.com/ashvardanian/SimSIMD">https://github.com/ashvardanian/SimSIMD</a>, See on <a href="https://news.ycombinator.com/item?id=39111114">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="responsive-meta-container" data-turbo-replace="">
+      <p>
+        Vector Similarity Functions 3x-200x Faster than SciPy and NumPy — for Python, JavaScript, and C 11, supporting f64, f32, f16, i8, and binary vectors using SIMD for both x86 AVX2 &amp; AVX-512 and Arm NEON &amp; SVE 📐
+      </p>
+      <div>
+        
+        <p><span>
+          <a title="https://ashvardanian.com/posts/simsimd-faster-scipy/" role="link" target="_blank" rel="noopener noreferrer" href="https://ashvardanian.com/posts/simsimd-faster-scipy/">ashvardanian.com/posts/simsimd-faster-scipy/</a>
+        </span>
+      </p></div>
+
+    <h3>License</h3>
+  <p>
+    <a href="https://github.com/ashvardanian/SimSIMD/blob/main/LICENSE" data-analytics-event="{&quot;category&quot;:&quot;Repository Overview&quot;,&quot;action&quot;:&quot;click&quot;,&quot;label&quot;:&quot;location:sidebar;file:license&quot;}">
+      
+     Apache-2.0 license
+    </a>
+  </p>
+
+
+    <p>
+        <a href="https://github.com/ashvardanian/SimSIMD/stargazers">
+          
+          <span>391</span>
+          stars
+</a>        <a href="https://github.com/ashvardanian/SimSIMD/forks">
+          
+          <span>15</span>
+          forks
+</a>          <a href="https://github.com/ashvardanian/SimSIMD/branches">
+            
+            <span>Branches</span>
+</a>          <a href="https://github.com/ashvardanian/SimSIMD/tags">
+            
+            <span>Tags</span>
+</a>        <a href="https://github.com/ashvardanian/SimSIMD/activity">
+          
+          <span>Activity</span>
+</a>    </p>
+
+      <div>
+        <div data-view-component="true">
+        <a href="https://github.com/login?return_to=%2Fashvardanian%2FSimSIMD" rel="nofollow" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;star button&quot;,&quot;repository_id&quot;:613772664,&quot;auth_type&quot;:&quot;LOG_IN&quot;,&quot;originating_url&quot;:&quot;https://github.com/ashvardanian/SimSIMD&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="ef8c9bc1ab14555e5c3222268c374381d1a66137b267ad31aea74e96937b36cc" aria-label="You must be signed in to star a repository" data-view-component="true">    <span data-view-component="true">
+          Star
+</span>
+</a>        </div>
+        <p>
+                <a href="https://github.com/login?return_to=%2Fashvardanian%2FSimSIMD" rel="nofollow" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;notification subscription menu watch&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;LOG_IN&quot;,&quot;originating_url&quot;:&quot;https://github.com/ashvardanian/SimSIMD&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="9082bc13b4aef44895b0c5fa5641f013601129418702e7a4e015e21815b8b79e" aria-label="You must be signed in to change notification settings" data-view-component="true">    Notifications
+</a>
+        </p>
+          </div>
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Waterway Map (284 pts)]]></title>
             <link>https://waterwaymap.org</link>
             <guid>39110434</guid>
             <pubDate>Tue, 23 Jan 2024 21:51:06 GMT</pubDate>
@@ -12755,7 +12994,7 @@
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Those making $500/month on side projects in 2024 – Show and tell (111 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Those making $500/month on side projects in 2024 – Show and tell (112 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=39110194</link>
             <guid>39110194</guid>
             <pubDate>Tue, 23 Jan 2024 21:33:30 GMT</pubDate>
@@ -13108,7 +13347,7 @@ Error 403: access_denied
 							<p>Kate Judson is a lawyer who often deals with crimes that did not occur. As the executive director of the Wisconsin-based <a href="https://cifsjustice.org/#/main" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://cifsjustice.org/%23/main&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw2uDaJCq7jNDEQ_CzWL8msb">Center for Integrity in Forensic Sciences (CIFS)</a>, her job is to examine ostensible scientific evidence to see whether it backs up prosecutors' claims.</p> <p>"Some people who died were classified as victims of homicide when they were really the victim of illness, or accident, or suicide, or medical error—that kind of thing," says Judson. "We had a case of a family that lost their child. The caregiver was accused of attacking her. It was later discovered, based on new medical evidence, that the child had been really ill with a disease she was probably born with."</p> <p>Evidence can't bring a child back, obviously. But it can get an innocent person out of jail. And it can give a grieving family some peace of mind. To learn that your child "was held and comforted in their last moments, instead of attacked," says Judson, "would be important to know."</p> <p>When the center was founded four years ago, Judson left her job as a public defender to become its first employee. Now a staff of four works to keep bad science out of the courtroom. This includes:</p> <p><b>Ballistics:</b> Scientific proof "that you can match a projectile to its weapon is just not there," says Judson. While you can tell if a bullet comes from a particular <i>type</i> of gun— say, a Glock—that doesn't mean you can identify the specific gun that fired the bullet.</p> <p>In the seminal case <a href="https://www.washingtonpost.com/opinions/2020/02/28/dc-judge-issues-much-needed-opinion-junk-science/" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://www.washingtonpost.com/opinions/2020/02/28/dc-judge-issues-much-needed-opinion-junk-science/&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw2iqaOh5UfpSElYeA93rh-x"><i>United States v. Tibbs</i></a>, a D.C. Superior Court judge ruled that a ballistics expert could not testify that a gun discarded by Marquette Tibbs near a crime scene was indisputably the source of the casings found there. Why not? Because the ballistics field is really shaky, the judge determined, and lacks "validity."</p> <p><b>Hair identification:</b>&nbsp;In 2009, the National Research Council published <a href="https://www.ojp.gov/pdffiles1/nij/grants/228091.pdf" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://www.ojp.gov/pdffiles1/nij/grants/228091.pdf&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw06YGnU2m69bV67pvOTJEmw">a report about forensic science</a> "and that really marked a turning point in the birth of the forensic reform movement," says Judson. "It was the first time a big government agency brought together scientific experts and legal experts and said, 'Let's talk about what they're saying in court and whether it passes scientific muster.'"</p> <p>One big topic was hair samples. A hair with its root can provide actual DNA evidence, says Judson. But other comparisons of color and texture, even examined under the microscope, have led to many wrongful convictions. She points to the case of Santae Tribble, convicted of murder at 17, despite evidence that he had been elsewhere when the crime occurred.</p> <p>An FBI analyst at his trial testified that there was just a one in 10 million chance that the hair found on a stocking mask at the crime scene belonged to someone other than Tribble.</p> <p>But after spending over 20 years in prison, Tribble was cleared when the hairs were retested and <a href="https://www.davisvanguard.org/2020/08/fbi-hair-analysis-called-into-question-after-santae-tribbles-2012-exoneration/" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://www.davisvanguard.org/2020/08/fbi-hair-analysis-called-into-question-after-santae-tribbles-2012-exoneration/&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw1brU21CsaOaUyM7NQvIJLe">none of them matched</a>. (At least one was dog hair.)</p> <p>The Innocence Project, which works closely with the CIFS, got the FBI to admit that "even when hairs seem microscopically indistinguishable," it really couldn't say how unique those similarities are.</p> <p><b>Bite marks:</b> "They're not even good at counting the number of teeth," says Judson.</p> <p>One of the&nbsp;<a href="https://www.washingtonpost.com/news/the-watch/wp/2015/09/08/seventh-circuit-grants-immunity-to-bite-mark-experts-who-put-innocent-man-in-prison-for-23-years/" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://www.washingtonpost.com/news/the-watch/wp/2015/09/08/seventh-circuit-grants-immunity-to-bite-mark-experts-who-put-innocent-man-in-prison-for-23-years/&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw28JVpP4clnfDDpcutgcxbv">more famous bite mark cases</a> involved a woman raped, beaten, bitten, and stabbed to death in Wisconsin in 1984. A dental scientist named Lowell Thomas Johnson said the marks came from someone missing a tooth. When a neighbor, Robert Stinson, was questioned—and seen missing a tooth—he was charged with murder. The bite marks were the only evidence against him.</p> <p>He served 23 years. Then the Wisconsin Innocence Project got hold of the DNA of the saliva and blood on the victim's sweater. These didn't belong to Stinson. Instead, they belonged to another prisoner, Moses Price, who was serving 35 years for committing a subsequent murder. Price confessed, and Stinson was exonerated.</p> <p><b>Arson:</b>&nbsp;"Have you ever seen, in a campfire, a piece of wood that looks like alligator scales?" asks Judson. "It's called 'alligatoring." Until recently, it was considered an indicator of arson.</p> <p>Another supposed indicator was "something they used to call 'crazed glass,'" Judson says. "It's a pattern of breakage that they used to say came from arson. But after, again, real scientific experimentation, it turns out that that happens when hot glass gets water poured on it."</p> <p>Forensic analysts have been able to prove that even when a house burns down inadvertently, there can be evidence of crazed glass and alligatoring.</p> <p>"They found that fires, whether or not they involve any arson, whether or not they involve any accelerants, can get to the point that it's so hot that the air becomes super-heated and everything ignites at once," she says.</p> <p><b>Shaken babies:</b> A theory used to hold that if a baby died, and an autopsy found some specific symptoms—including bleeding behind the eyes—the child had likely been shaken to death.</p> <p>Then, 10 years ago, physicians Marcus Salvatori and Patrick Lantz had a novel idea: They performed autopsies on four children ages 3 and under who had died from infections. <a href="https://journals.sagepub.com/doi/abs/10.1177/0025802414527077?journalCode=msla">Those infants</a>&nbsp;had evidence of bleeding behind the eyes as well.</p> <p><a href="https://news.bloomberglaw.com/us-law-week/law-needs-to-keep-up-with-science-in-shaken-baby-syndrome-cases" target="_blank" rel="nofollow noopener" data-saferedirecturl="https://www.google.com/url?q=https://news.bloomberglaw.com/us-law-week/law-needs-to-keep-up-with-science-in-shaken-baby-syndrome-cases&amp;source=gmail&amp;ust=1705604803033000&amp;usg=AOvVaw1qWkoU4mLZwr3jJSQ8-zWw">At least 30 people</a> have been exonerated after serving years or decades for supposedly shaking a baby to death.</p> <p>"You don't expect kids to die, but the truth is, some do," says Judson. "And some die with unexplained bleeding."</p> <p>That can lead to a conviction, even though a crime never occurred.</p>						</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Why is machine learning 'hard'? (2016) (213 pts)]]></title>
+            <title><![CDATA[Why is machine learning 'hard'? (2016) (218 pts)]]></title>
             <link>https://ai.stanford.edu/~zayd/why-is-machine-learning-hard.html</link>
             <guid>39109481</guid>
             <pubDate>Tue, 23 Jan 2024 20:43:25 GMT</pubDate>
@@ -13212,7 +13451,7 @@ What is unique about machine learning is that it is ‘exponentially’ harder t
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Spotting LLMs with Binoculars: Zero-Shot Detection of Machine-Generated Text (127 pts)]]></title>
+            <title><![CDATA[Spotting LLMs with Binoculars: Zero-Shot Detection of Machine-Generated Text (131 pts)]]></title>
             <link>https://arxiv.org/abs/2401.12070</link>
             <guid>39109304</guid>
             <pubDate>Tue, 23 Jan 2024 20:29:35 GMT</pubDate>
@@ -13233,7 +13472,7 @@ What is unique about machine learning is that it is ‘exponentially’ harder t
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Boeing internal whistleblower RE: MAX DOOR (117 pts)]]></title>
+            <title><![CDATA[Boeing internal whistleblower RE: MAX DOOR (118 pts)]]></title>
             <link>https://www.airlinepilotforums.com/safety/146074-boeing-internal-whistleblower-re-max-door.html</link>
             <guid>39109222</guid>
             <pubDate>Tue, 23 Jan 2024 20:24:37 GMT</pubDate>
@@ -13277,7 +13516,7 @@ There�s lots more to be said about the culture that enabled this to happened, 
 					</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Open Infrastructure Map (172 pts)]]></title>
+            <title><![CDATA[Open Infrastructure Map (173 pts)]]></title>
             <link>https://openinframap.org</link>
             <guid>39109185</guid>
             <pubDate>Tue, 23 Jan 2024 20:20:47 GMT</pubDate>
@@ -13285,7 +13524,7 @@ There�s lots more to be said about the culture that enabled this to happened, 
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple dials back car's self-driving features and delays launch to 2028 (270 pts)]]></title>
+            <title><![CDATA[Apple dials back car's self-driving features and delays launch to 2028 (273 pts)]]></title>
             <link>https://www.bloomberg.com/news/articles/2024-01-23/apple-car-ev-set-to-debut-in-2028-with-limited-autonomous-driving</link>
             <guid>39107854</guid>
             <pubDate>Tue, 23 Jan 2024 18:53:18 GMT</pubDate>
@@ -13307,7 +13546,7 @@ There�s lots more to be said about the culture that enabled this to happened, 
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Direct pixel-space megapixel image generation with diffusion models (230 pts)]]></title>
+            <title><![CDATA[Direct pixel-space megapixel image generation with diffusion models (231 pts)]]></title>
             <link>https://crowsonkb.github.io/hourglass-diffusion-transformers/</link>
             <guid>39107620</guid>
             <pubDate>Tue, 23 Jan 2024 18:38:58 GMT</pubDate>
@@ -13591,7 +13830,7 @@ There�s lots more to be said about the culture that enabled this to happened, 
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Atlas – GIS and interactive maps in the browser (133 pts)]]></title>
+            <title><![CDATA[Show HN: Atlas – GIS and interactive maps in the browser (136 pts)]]></title>
             <link>https://atlas.co</link>
             <guid>39107483</guid>
             <pubDate>Tue, 23 Jan 2024 18:29:26 GMT</pubDate>
@@ -13607,7 +13846,7 @@ There�s lots more to be said about the culture that enabled this to happened, 
 <div id="readability-page-1" class="page"><div><blockquote>Today, Brex Founder and co-CEO Pedro Franceschi sent the following note to Brex employees: </blockquote><p>Team,</p><p>Today we’re restructuring Brex to become a high-velocity company. While our strategy and mission remain the same, we’re making some important changes today that will increase the intensity and quality of our execution.</p><p>Sadly as part of those changes, 282 people (roughly 20% of the company) will be leaving Brex today. Henrique and I are responsible for the decisions that led us here, and seeing so many talented folks go through this experience is never what you hope for as a founder. It’s incredibly hard to say goodbye, and we feel so grateful for their contributions building Brex into what it is now. We’re doing what we can do to ease the transition, and departing employees will receive:<br></p><ul><li>8 weeks of severance, with two additional weeks of pay for each additional year of service.</li><li>Waiver of the one-year equity cliff for those who haven’t reached theirs yet.<br></li><li>Outplacement support for job search assistance, and impacted people will be able to keep their laptops to assist with the transition.<br></li><li>Subsidized continued health coverage for 6 months through COBRA, including mental health support.<br></li></ul><p>I also want to offer more context on how we got to this decision. Since starting Brex in 2017, we’ve had one goal: deeply integrating fintech and software into a single platform that empowers teams to make better financial decisions. We started as a corporate card, and in six years, became the leader in the spend management space. Today we’re proud to serve 1 in every 3 startups in the US, tens of thousands of businesses from public launch to global public companies, and in 2023 alone, hundreds of thousands of new customers’ employees that are now using Brex to make better financial decisions.</p><p>To continue capturing the massive opportunity ahead, we’re hyper-focused on <strong>building a high-velocity product and growth machine</strong>. Looking inward, I realized we grew our org too quickly, making it harder to move at the speed we once did. This year, we decided to take a hard look at our current structure, and reduce the number of layers between leaders and the actual work that affects customers. This resulted in today’s hard decision. In addition, we’re also making the following changes to how we run the company:<br></p><p><strong>1. We’re flattening our org structure and reducing layers of management.</strong> Our goal is for leaders to operate closer to the metal, less siloed and more functionally, focused on few cross-company priorities. These changes begin with the leadership team and cascade across the org:<br></p><blockquote><strong>a. </strong>Michael Tannenbaum is transitioning from COO to a Brex board member. Camilla Morais is being promoted to COO and will report directly to me, together with our CFO Ben Gammell. Michael was our 2nd employee, and Brex wouldn’t exist without him. I can’t wait to continue working with Michael on our board.</blockquote><blockquote><strong>b.</strong> Cosmin Nicolaescu is transitioning from CTO into an advisor role this summer. James Reggio is being promoted to VP of Engineering and will report directly to me, together with Matt Bango, our VP of Design. Cos played a critical role building our engineering org and product for over 5 years, and I feel so grateful for all his contributions to Brex.</blockquote><p><strong>2.</strong> <strong>We’re emphasizing long-term thinking and ownership over short-term gains in our comp structure.</strong> The opportunity ahead of Brex is massive, and we want everyone staying to have high conviction and financial upside in our equity.</p><p><strong>3.</strong> <strong>We’re changing our operating model</strong>, expecting leaders to <a data-testid="rebirth-link" target="_self" href="https://www.brex.com/journal/operate-at-all-levels">operate at all levels</a> moving forward, promoting from within, increasing in-person collaboration in our hubs, and concentrating the time zones in which we operate.</p><p><strong>4.</strong> <strong>We're expanding on the financial improvements from 2023</strong>. With our focus on financial software and high-quality growth, we grew gross profit by 75%+ last year. While we're proud of those accomplishments, we still have a way to go to ensure high-velocity growth and profitability for years to come. Combined, these changes enable us to get there and become cash flow positive with the money we have in the bank.  </p><p>I’ll host an All Hands tomorrow to talk about how we’ll operate moving forward. While it’s incredibly hard to see so many talented teammates leave, I’m optimistic about this new phase of Brex: leaner, faster, and closer to customers.</p><p>This won’t be an easy change, but it’s a worthy one. While we’ve grown to hundreds of millions of dollars in revenue in a short span of time, Brex still serves less than 1% of the US market, and over the next few years, the opportunity ahead of us remains massive. Every single business needs to manage spend, and that’s much bigger than just helping them reduce costs. The goal of any finance team is to empower employees to make the best financial decisions that move their business forward. That’s precisely Brex’s mission and our right to win.<br></p><p>We have a unique opportunity over the next 5-10 years, and these changes will increase the intensity and quality of our execution, connecting us more deeply to customers needs, and putting us on a clear path towards profitability and independence. I feel so confident in this team’s ability to rise to the occasion and continue building a generational company.<br></p><p>Onwards,</p><p>Pedro</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Deadcode: Finding unreachable functions in Go (108 pts)]]></title>
+            <title><![CDATA[Deadcode: Finding unreachable functions in Go (109 pts)]]></title>
             <link>https://go.dev/blog/deadcode</link>
             <guid>39107084</guid>
             <pubDate>Tue, 23 Jan 2024 18:05:53 GMT</pubDate>
@@ -13973,7 +14212,7 @@ continuing to drain your life force. We call such undead functions
           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[From slow to SIMD: A Go optimization story (200 pts)]]></title>
+            <title><![CDATA[From slow to SIMD: A Go optimization story (206 pts)]]></title>
             <link>https://sourcegraph.com/blog/slow-to-simd</link>
             <guid>39106972</guid>
             <pubDate>Tue, 23 Jan 2024 17:57:31 GMT</pubDate>
@@ -15451,55 +15690,6 @@ Additional details are available for authorised Nintendo Switch developers in th
 </p><p><img src="https://qdrant.tech/blog/series-A-funding-round/preview/title.jpg" alt="Announcing Qdrant's $28M Series A Funding Round" loading="lazy">
 </p><div>
 <p>Today, we are excited to announce our $28M Series A funding round, which is led by Spark Capital with participation from our existing investors Unusual Ventures and 42CAP.</p><p>We have seen incredible user growth and support from our open-source community in the past two years - recently exceeding 5M downloads. This is a testament to our mission to build the most efficient, scalable, high-performance vector database on the market. We are excited to further accelerate this trajectory with our new partner and investor, Spark Capital, and the continued support of Unusual Ventures and 42CAP. This partnership uniquely positions us to empower enterprises with cutting edge vector search technology to build truly differentiating, next-gen AI applications at scale.</p><h2 id="the-emergence-and-relevance-of-vector-databases">The Emergence and Relevance of Vector Databases</h2><p>A paradigm shift is underway in the field of data management and information retrieval. Today, our world is increasingly dominated by complex, unstructured data like images, audio, video, and text. Traditional ways of retrieving data based on keyword matching are no longer sufficient. Vector databases are designed to handle complex high-dimensional data, unlocking the foundation for pivotal AI applications. They represent a new frontier in data management, in which complexity is not a barrier but an opportunity for innovation.</p><p>The rise of generative AI in the last few years has shone a spotlight on vector databases, prized for their ability to power retrieval-augmented generation (RAG) applications. What we are seeing now, both within AI and beyond, is only the beginning of the opportunity for vector databases. Within our Qdrant community, we already see a multitude of unique solutions and applications leveraging our technology for multimodal search, anomaly detection, recommendation systems, complex data analysis, and more.</p><h2 id="what-sets-qdrant-apart">What sets Qdrant apart?</h2><p>To meet the needs of the next generation of AI applications, Qdrant has always been built with four keys in mind: efficiency, scalability, performance, and flexibility. Our goal is to give our users unmatched speed and reliability, even when they are building massive-scale AI applications requiring the handling of billions of vectors. We did so by building Qdrant on Rust for performance, memory safety, and scale. Additionally, <a href="https://qdrant.tech/articles/filtrable-hnsw/">our custom HNSW search algorithm</a> and unique <a href="https://qdrant.tech/documentation/concepts/filtering/">filtering</a> capabilities consistently lead to <a href="https://qdrant.tech/benchmarks/">highest RPS</a>, minimal latency, and high control with accuracy when running large-scale, high-dimensional operations.</p><p>Beyond performance, we provide our users with the most flexibility in cost savings and deployment options. A combination of cutting-edge efficiency features, like <a href="https://qdrant.tech/documentation/guides/quantization/">built-in compression options</a>, <a href="https://qdrant.tech/documentation/guides/multiple-partitions/">multitenancy</a> and the ability to <a href="https://qdrant.tech/documentation/concepts/storage/">offload data to disk</a>, dramatically reduce memory consumption. Committed to privacy and security, crucial for modern AI applications, Qdrant now also offers on-premise and hybrid SaaS solutions, meeting diverse enterprise needs in a data-sensitive world. This approach, coupled with our open-source foundation, builds trust and reliability with engineers and developers, making Qdrant a game-changer in the vector database domain.</p><h2 id="whats-next">What’s next?</h2><p>We are incredibly excited about our next chapter to power the new generation of enterprise-grade AI applications. The support of our open-source community has led us to this stage and we’re committed to continuing to build the most advanced vector database on the market, but ultimately it’s up to you to decide! We invite you to <a href="https://cloud.qdrant.io/">test out</a> Qdrant for your AI applications today.</p></div></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[The Humble Brilliance of Italy's Moka Coffee Pot (242 pts)]]></title>
-            <link>https://www.atlasobscura.com/articles/make-coffee-moka-pot</link>
-            <guid>39101165</guid>
-            <pubDate>Tue, 23 Jan 2024 09:13:08 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.atlasobscura.com/articles/make-coffee-moka-pot">https://www.atlasobscura.com/articles/make-coffee-moka-pot</a>, See on <a href="https://news.ycombinator.com/item?id=39101165">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section id="article-body">
-<p><span>Bialetti, the Italian maker of </span>the moka pot, a stovetop coffee machine and one of the most iconic kitchen appliances ever created, announced in 2018 that <a href="https://www.telegraph.co.uk/news/2018/10/28/trouble-brewing-classic-italian-moka-pot-coffee-pods-dominate/">the company was in major trouble</a>—tens of millions of Euros in debt, unpaid salaries and taxes, revenues that are way down and look to be staying that way. In a press release, the company said there are “doubts over its continuity.” (Update: <a href="https://fortune.com/2021/04/24/bialetti-moka-pot-italian-icon-coffee-espresso-comeback/">Bialetti sales have been on the rise</a> since then.)</p>
-<p>The moka pot is a symbol of Italy: of postwar ingenuity and global culinary dominance. It is in the Museum of Modern Art, the Cooper-Hewitt Smithsonian Design Museum, and other temples to design. It is in the Guinness Book of World Records as the world’s most popular coffee maker, and was for decades commonplace to the point of ubiquity not only in Italy but in Cuba, Argentina, Australia, and the United States. It’s also widely misunderstood and maligned, with approval in the modern coffee world coming perhaps a bit too late, in only the past few years. Get one while you can.</p>
-<hr>
-<p><span>Italy’s place in the history </span>of global coffee culture is substantial, but for different reasons and in different ways than most people probably think. The various species of <em>Coffea</em>, the seeds of which are dried, roasted, and ground to make coffee, are native to east Africa, particularly Ethiopia. Coffee as a beverage first shows up in the historical record—which is not necessarily to say that it wasn’t consumed in its native Ethiopia first—in what is now Yemen. It spread quickly throughout the Middle East, North Africa, and firmly established itself as part of the culture in what are now Turkey and Iran.</p>
-<p>Europeans were late to the coffee party, but Italy, sharing the Mediterranean with the Arab and Greek worlds and not really very far from North Africa, was probably the gateway for coffee to spread westward. But for centuries after its introduction to Venice in the early 17th century, coffee was seen as an Arab affectation, something foreign and alternately exotic and threatening. “It was thought of as an Eastern thing, in that Orientalist way of thinking,” says Peter Giuliano, the chief research officer for the Specialty Coffee Association and a former co-owner of the influential Counter Culture coffee company.</p>
-<figure><img src="https://img.atlasobscura.com/no0cNnJd351ybBk5IUXGt6uXd5SxvSZ9248S3gjNY-A/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9jOTNjY2RmNmU3/M2U5YTEzYWVfNTUx/ODY5NzUzOF84OTNl/YWI1NzhhX28uanBn.jpg" alt="How do you make <em>your</em> coffee?" width="auto" data-kind="article-image" id="article-image-61505" data-src="https://img.atlasobscura.com/no0cNnJd351ybBk5IUXGt6uXd5SxvSZ9248S3gjNY-A/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9jOTNjY2RmNmU3/M2U5YTEzYWVfNTUx/ODY5NzUzOF84OTNl/YWI1NzhhX28uanBn.jpg"><figcaption>How do you make <em>your</em> coffee? <a target="_blank" href="https://www.flickr.com/photos/barkbud/5518697538/in/photolist-9pELvy-4uLvdu-bA2VAg-bn85F9-fLosWk-fLofmB-pQXdub-daZzjS-cziAfs-QLtb5L-bjiF2M-F3S4Wa-c2yQA3-H4Lxrm-cYjCFf-6FH5xk-kMQ6aV-PxrTYL-pqTv6w-cXms8C-cXjjn7-6FH5zH-cXjmij-e8Sae1-87FPNY-o6HXQ-9pBK2i-bn81c3-8BKJ3R-fLofDH-fLEP7f-cziyP3-VWgU1N-by7dWP-Kdprfd-cToNcb-pVTTwU-6pudo7-9Ugv8w-4ytYmR-fLENsj-hiPfyD-8CSGkk-AoJct-6FMaxC-VimLcB-6FH5B2-bn7ZsE-fLouo6-a9piLk">bark/CC BY 2.0</a></figcaption></figure>
-<p>Until the late 19th century, Italians drank coffee in pretty much the same way as the Turks. Coffee and water are combined in a long-handled metal pot called a <em>cezve</em> and held over a heat source; the mixture combines as it boils, and is poured into small cups, where the grounds settle to the bottom. Italy never really left behind the idea of small amounts of very strong coffee. The thinner, lighter, larger mugfuls of coffee were more a northern European, and North American, thing.</p>
-<p>Italians began coming up with their own gadgets for brewing coffee in the 19th century, but the biggest by far was the idea of applying pressure to coffee in order to create a strong, and more importantly fast, drink. This is the age of steam, a miraculous source of power that can unlock the world, and though it’s not entirely clear who originated the idea of using steam to brew coffee, certainly it was in Italy that it was popularized. The first known patent for a machine we might now recognize as an espresso machine was registered by Angelo Moriondo, who created a giant complicated steam-driven machine in 1884, but who never bothered to manufacture it. Luigi Bezzera, from Milan, modified the Moriondo patent, and <em>his</em> design was further modified (though less so than Bezzera’s) by Desidiero Pavoni, whose La Pavoni introduced the world to espresso in 1906, at a world’s fair held in Milan.</p>
-<figure><img src="https://img.atlasobscura.com/zykct1VJtaWI7e-AJbZ3zL3fvSZPf28BI_xs38fCUvI/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy80MzY0NzNiMTY1/Y2NkMjAzNGRfTGFf/UGF2b25pX2Jhci5q/cGc.jpg" alt="A La Pavoni espresso machine from around 1910." width="auto" data-kind="article-image" id="article-image-61530" data-src="https://img.atlasobscura.com/zykct1VJtaWI7e-AJbZ3zL3fvSZPf28BI_xs38fCUvI/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy80MzY0NzNiMTY1/Y2NkMjAzNGRfTGFf/UGF2b25pX2Jhci5q/cGc.jpg"><figcaption>A La Pavoni espresso machine from around 1910. <a target="_blank" href="https://it.wikipedia.org/wiki/La_Pavoni#/media/File:La_Pavoni_bar.jpg">Public domain</a></figcaption></figure>
-<p>Pavoni’s device was a large complex metal contraption that worked, roughly, like this. A compartment of water on the bottom of the device is heated by placing the entire thing on a flame. A tube leads up to a circular puck of ground coffee; because the entire device is sealed, as the water boils, pressure forces steam and hot water up through the tube and through the coffee grounds. That pressure brews coffee much more quickly than without the pressure, and the fast-brewed, strong coffee flows into a chamber, to be poured into cups.</p>
-<p>This is, not coincidentally, the exact same way the moka pot works, though on a much smaller scale.</p>
-<p>Pavoni’s device was a huge hit, but it was incredibly expensive and cumbersome. It wasn’t at all suitable for use at home, which was fine for a few decades because coffee had never been a beverage consumed at home anyway. It was, as in the Arab world, a communal activity. (As a side note, the fact that it was a communal and foreign-seeming ritual seems to have scared those in power in the Catholic world quite a bit at first; it took an official approval from Pope Clement VIII in 1600 to clear coffee’s dangerous connotations.) Coffee was too expensive, and the newly popular Pavoni brewing devices unsuited, to be making coffee at home.</p>
-<p>Jeffrey T. Schnapp outlines the history of the moka pot in a 2001 paper called <em>The Romance of Caffeine and Aluminum</em>. In 1918, he writes, a Piedmontese metalworker named Alfonso Bialetti returned home after a decade spent working with aluminum in France. Industrial production of aluminum was new, then; methods for working with it at any real scale had only been developed in 1886. He opened a shop, crafting strong, lightweight aluminum versions of pots and pans that had previously been only available in iron.</p>
-<p>Legend has it that the idea for the moka pot came from a laundry boiler, though that’s not confirmed. What is known is that the La Pavoni device was very trendy, and there was also a precedent for a smaller coffee machine: the <em>napoletana</em>. The <em>napoletana</em> is a small metal device with three sections: a chamber of water, a small puck of coffee in the middle, and a chamber on the other end for brewed coffee. Water is heated up with the water chamber on the bottom, and then the entire device is flipped upside-down, allowing the hot water to drip through the coffee beans and gather as coffee in the previously empty chamber. No pressure is involved.</p>
-<figure><img src="https://img.atlasobscura.com/elpk4vGot02XZNSqfZtvJuaIHju82cUVSNWQGltiN-4/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9kMDI2ZDE5YzMy/NDZmMWQ1MWVfQmlh/bGV0dGlfbW9rYV9l/eHByZXNzLW1hZGUt/aW4taXRhbHkuanBn.jpg" alt="The components of a Moka pot." width="auto" data-kind="article-image" id="article-image-61496" data-src="https://img.atlasobscura.com/elpk4vGot02XZNSqfZtvJuaIHju82cUVSNWQGltiN-4/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9kMDI2ZDE5YzMy/NDZmMWQ1MWVfQmlh/bGV0dGlfbW9rYV9l/eHByZXNzLW1hZGUt/aW4taXRhbHkuanBn.jpg"><figcaption>The components of a Moka pot. <a target="_blank" href="https://en.wikipedia.org/wiki/File:Bialetti_moka_express-made-in-italy.jpg">Jcmontero/CC BY-SA 4.0</a></figcaption></figure>
-<p>Bialetti worked on some combination of the La Pavoni and the <em>napoletana </em>for a few years and in 1933 patented his Bialetti Moka Express. It’s three-chambered, like the <em>napoletana</em>, but uses steam power to force hot water through the coffee, like the La Pavoni. The characteristic hourglass shape, with the eight-sided chambers, was there from the beginning.</p>
-<p>But the Moka Express design—today, “Bialetti Moka Express” is the specific product, while “moka pot” is the general term for this type of coffee maker—took a while to catch on. Italy still had to get embroiled in a couple of World Wars, and then recover.* By the 1950s, Italian design had some amazing advantages. All of the factories set up to create war materials were at a loss for products to make, as were a generation of skilled manufacturers. Vespa, Fiat, and Alfa Romeo designed incredible vehicles. And Bialetti’s Moka Express, which still boasted a futuristic and clever design, suddenly took off.</p>
-<figure><img src="https://img.atlasobscura.com/1w7Ac4TKhVUcgpdHzQxS4WbmfrvLPPEQ6pEPiyEEBJY/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy84ODIyYWVkYTIz/YmRmOTkwYzFfQkVM/TEVaWkEgJzU3IFBB/UEEnWzFdLkpQRw.jpg" alt="A 1957 advertisement for the Moka Express." width="auto" data-kind="article-image" id="article-image-61528" data-src="https://img.atlasobscura.com/1w7Ac4TKhVUcgpdHzQxS4WbmfrvLPPEQ6pEPiyEEBJY/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy84ODIyYWVkYTIz/YmRmOTkwYzFfQkVM/TEVaWkEgJzU3IFBB/UEEnWzFdLkpQRw.jpg"><figcaption>A 1957 advertisement for the Moka Express. <span>Courtesy of Bialetti</span></figcaption></figure>
-<p>Post-war Italy had a surging economy, a growing middle class, and the same access to the world’s products that the rest of Europe boasted. Alfonso Bialetti’s son, Renato, came back to Piedmont in 1946 to take over his father’s shop, and decided to stop making everything except one product: the Moka Express. The newly low price of aluminum and coffee, and a growing middle class of people who could buy products like this, made the moka pot a perfect device for the time. Renato was also a pretty shrewd businessman; in 1953, he commissioned the drawing of the company’s logo, <em>L’omino con i baffi</em>, “the little man with the mustache,” which has since been inseparable from the Moka Express. The Moka Express was “the first way that Italians could realistically make coffee at home that was some approximation of what they could get outside,” says Giuliano.</p>
-<p>Over the next 60 years, the moka pot would conquer the world. As of 2016, the <em>New York Times</em> notes that over 90 percent of Italian homes had one. It became so iconic that Renato Bialetti, when he died in early 2016, <a href="https://edition.cnn.com/2016/02/18/europe/italy-bialetti-moka-urn/index.html">was actually buried</a> in a large replica of the moka pot. It spread to some countries with large Italian immigrant populations, becoming common in the Italian-American communities in and around Philadelphia, New York City, and Chicago. Argentina and Australia, both of which received large waves of Italian immigration in the 20th century, are also home to plenty of moka pots. The Argentinian company Volturno has been so successful that the moka pot in Argentina is sometimes called a Volturno.</p>
-<figure><img src="https://img.atlasobscura.com/JVk8UTc2cJ4w5XQ6OtNKPmwtWgdS-_PADM7sRYSEbSY/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9lZjlmZGRjZDQx/OGUwNjlkMWRfQmlh/bGV0dGkuanBn.jpg" alt="Renato Bialetti." width="auto" data-kind="article-image" id="article-image-61529" data-src="https://img.atlasobscura.com/JVk8UTc2cJ4w5XQ6OtNKPmwtWgdS-_PADM7sRYSEbSY/rs:fill:12000:12000/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy9lZjlmZGRjZDQx/OGUwNjlkMWRfQmlh/bGV0dGkuanBn.jpg"><figcaption>Renato Bialetti. <span>Courtesy of Bialetti</span></figcaption></figure>
-<p>Cuba is a more interesting one. Coffee has a long history in Cuba; the climate, hot and wet with plenty of elevation, is ideal for growing coffee, and the crop has been grown there since the mid-1700s. Up until the Cuban Revolution in 1959, Cuba was one of the world’s great coffee producers, and also one of the world’s great coffee cultures. Coffee preparation varied; in the cities, espresso was common, and on coffee plantations, it was more typical to grind beans in a mortar called a <em>pilón</em> and steep with hot water before straining out the grounds with cloth.</p>
-<p>After the 1959 revolution, food rations came for coffee as well. Coffee is currently rationed to four ounces per person per month, coming in two packets. But these rations aren’t pure coffee; <a href="https://havanatimes.org/?p=120256">they are mixed</a> with fillers, sometimes toasted chickpeas (<em>cafe con chicharo</em>) to make the small amounts go further.</p>
-<p>Because the amounts of coffee are so low, and efficiency so important, Cubans began tinkering to come up with ways to create the best possible coffee with the materials they have. Cuban coffee in a Cuban or Cuban-American home is almost always made with a moka pot; the Cuban concoction <em>cafecito</em> is made by quickly whipping the first few drops of moka pot coffee with sugar, creating a paste that both flavors the coffee and simulates a classic espresso foam. Even outside of Cuba, where the coffee is not likely to be mixed with toasted beans, Cuban coffee is typically very sweet and very strong, almost always made with a pump machine in coffee shops and a moka pot at home.</p>
-<hr>
-<p><span>The moka pot’s struggles began </span>in the 1990s, and came in two forms. One, I think, is very interesting, but is not as large a factor in the demise of the moka pot as some might believe. The other is very boring and very obvious and is almost certainly the big problem. The latter is that people, in Italy and elsewhere, love coffee pods. Coffee pods, especially Nespresso, are wildly popular in Italy, because they are easy. I have very little else to say about coffee pods.</p>
-<p>The former problem, the more interesting one, took place within the coffee-nerd world.</p>
-<p>Inspired by Italian espresso bar culture, Starbucks almost single-handedly changed the entire concept of coffee in America. And the moka pot was not part of that. The espresso machine, which uses mechanical pressure (via pumps and/or levers), was the device used to make coffee in Italian coffee shops; the moka was strictly for the home. “In the ‘90s and early ‘00s, having some sort of ‘authentic’ Italian coffee chops were part of what was exciting and interesting about coffee,” says Giuliano, who lived through this phase at Counter Culture. In the 1990s, coffee shops, which greatly informed coffee consumption in the U.S. in general, looked to Italian coffee bars.</p>
-<figure><img src="https://img.atlasobscura.com/AD45jz2IV_0fMZ51kGnjMEXlyIdQS-8cJraADSV9LJ8/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy8yYzRmMTdhZjg0/NmUyNTMwNTFfMzk2/MjcyMjkwNF81Zjhi/YTk5YjhlX28uanBn.jpg" alt="Caffè Meletti in Ascoli Piceno, Italy." width="auto" data-kind="article-image" id="article-image-61504" data-src="https://img.atlasobscura.com/AD45jz2IV_0fMZ51kGnjMEXlyIdQS-8cJraADSV9LJ8/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy8yYzRmMTdhZjg0/NmUyNTMwNTFfMzk2/MjcyMjkwNF81Zjhi/YTk5YjhlX28uanBn.jpg"><figcaption>Caffè Meletti in Ascoli Piceno, Italy. <a target="_blank" href="https://www.flickr.com/photos/tommasomanzi/3962722904/in/photolist-73aZsG-4zAom5-f2aqbA-ssCGjr-cHomEG-d1QA99-9b4s5H-d1Ts9s-cJBavG-cGEYpY-qr7K2d-4zwgDn-aLikzK-5hehBC-4kytGF-EdbnWm-9QHLvb-aQs3mr-4zwp7T-8NKQVp-Tb4doe-dTQxDw-pmqTfv-BpuLwV-WeTT1g-cEk6kj-5UMS3x-cEN9GG-eR6Ryv-eR7efk-eRiduu-63FcQb-pN2Qdm-5nd6Rf-bEhJUG-e2oDUJ-28wdscF-5ndhvd-5Jp3Wv-pNFXuV-dmjXMr-eRiH15-eRiG3m-cFZRjW-5Jp4ee-9E2eWp-5n8MBn-cJBAuJ-bXgqNX-tPCtTw">Tommaso Manzi/CC BY-SA 2.0</a></figcaption></figure>
-<p>This ignored that Italians never really made espresso at home. They used the moka pot. Espresso machines, then and now, are gigantic, expensive, difficult to use, and incredibly inefficient from an energy perspective. They do not really make sense for the home. But Americans tried anyway, replacing their Mr. Coffees and French presses with underpowered home espresso machines, ignoring the entire time that there was another option, the one Italians used all along.</p>
-<p>After the Starbucks boom, American coffee culture changed rapidly, eventually coming to embrace drip coffee, especially a lighter, more acidic style common in Scandinavia and Japan. Espresso stayed, of course—with the glaring exception of the moka pot, Americans never really stopped looking to Italy for coffee, and even today most of the “serious” espresso machines come from Italian companies.</p>
-<p>The moka pot, which in the U.S. had previously had a light following, especially for Italian-Americans, became an object of extreme derision. Coffee purists cried that it couldn’t possibly produce espresso; the moka pot, like the La Pavoni, uses about 1.5 bars of pressure, while a pump espresso machine ideally hits about nine bars. This is, of course, a ridiculous argument; there is no actual definition of espresso, and in any case, the moka pot is at most a second cousin to the espresso machine. There’s no particular reason to compare a steam-driven stovetop machine to a pump-driven electrical device, but coffee people did.</p>
-<figure><img src="https://img.atlasobscura.com/Sey3kbxOTDwUjZ7C1SVOM9N9i8CyonMOGZnR2vLdVuo/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy85YWU3Y2Q0MWE0/MzEyN2RhNjlfUElY/TklPLTE5MTU4Ny01/MjU2eDM1MDkuanBl/Zw.jpg" alt="Espresso made with a pump-driven countertop machine." width="auto" data-kind="article-image" id="article-image-61531" data-src="https://img.atlasobscura.com/Sey3kbxOTDwUjZ7C1SVOM9N9i8CyonMOGZnR2vLdVuo/rt:fill/w:1200/el:1/q:81/sm:1/scp:1/ar:1/aHR0cHM6Ly9hdGxh/cy1kZXYuczMuYW1h/em9uYXdzLmNvbS91/cGxvYWRzL2Fzc2V0/cy85YWU3Y2Q0MWE0/MzEyN2RhNjlfUElY/TklPLTE5MTU4Ny01/MjU2eDM1MDkuanBl/Zw.jpg"><figcaption>Espresso made with a pump-driven countertop machine. <a target="_blank" href="https://pixnio.com/food-and-drink/coffee/hot-espresso-coffee-machine-coffee-mugs-beverage-caffeine#">Chevanon / Public domain</a></figcaption></figure>
-<p>The past few years have changed that, a little bit. Coffee people have softened their stance, and recognized the moka pot for what it is: an entirely different branch of the coffee machine tree, a very old, very clever, and very economical way to make coffee. The previous complaints about the moka pot fell away, and it is increasingly, in coffee circles, given credit for all its strengths.</p>
-<p>The nice thing about the moka pot is that it can create a very nice cup of strong coffee, and that the equipment you need is wholly affordable. Moka pots <a href="https://www.atlasobscura.com/unique-gifts/the-original-bialetti-moka-express">cost about 30 bucks</a>, and by using good coffee and a bit of technique, you can make as good an example of moka pot coffee as anyone in the world.</p>
-<p>The rediscovery of that fact by coffee nerds bodes well for the future of the moka pot, despite the troubles of Bialetti, the company. It remains a cool, inexpensive, highly functional example of mid-century modern design. In the same way that the single-cup pour-over cone was rediscovered and prized, sparking a whole new round of sales, maybe the moka pot is due for some revitalization and new trendiness. It seems impossible, or at least undesirable, for such a cool gadget to die.</p>
-<p><em><strong>*Correction:</strong> We originally referred to Italy losing two World Wars. That was a big mistake. Huge.</em></p>
-<p><em>Gastro Obscura covers the world’s most wondrous food and drink.
-<br>
-<a href="https://www.atlasobscura.com/newsletters/gastro-obscura">Sign up for our email, delivered twice a week</a>.</em></p>
-</section></div>]]></description>
         </item>
     </channel>
 </rss>
