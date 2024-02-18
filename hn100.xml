@@ -4,12 +4,950 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 18 Feb 2024 00:00:04 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 18 Feb 2024 01:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Headphone and Amp Impedance (2011) (131 pts)]]></title>
+            <title><![CDATA[My Notes on Gitlab's Postgres Schema Design (2022) (119 pts)]]></title>
+            <link>https://shekhargulati.com/2022/07/08/my-notes-on-gitlabs-postgres-schema-design/</link>
+            <guid>39413972</guid>
+            <pubDate>Sat, 17 Feb 2024 22:05:23 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://shekhargulati.com/2022/07/08/my-notes-on-gitlabs-postgres-schema-design/">https://shekhargulati.com/2022/07/08/my-notes-on-gitlabs-postgres-schema-design/</a>, See on <a href="https://news.ycombinator.com/item?id=39413972">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article id="post-6989">
+	<!-- .entry-header -->
+
+	
+	
+	<div>
+		
+<p>I spent some time going over the Postgres schema of Gitlab. GitLab is an alternative to Github. You can self host GitLab since it is an open source DevOps platform.</p>
+
+
+
+<p>My motivation to understand the schema of a big project like Gitlab was to compare it against schemas I am designing and learn some best practices from their schema definition. I can surely say I learnt a lot.</p>
+
+
+
+<blockquote>
+<p>I am aware that best practices are sometimes context dependent so you should not apply them blindly.</p>
+</blockquote>
+
+
+
+<p>The Gitlab schema file <code>structure.sql</code> [1] is more than 34000 lines of code. Gitlab is a monolithic Ruby on Rails application. The popular way to manage schema migration is using the <code>schema.rb</code> file. The reason the Gitlab team decided to adopt <code>structure.sql</code> instead is mentioned in on of their issues [2] in their issue tracker.</p>
+
+
+
+<blockquote>
+<p>Now what keeps us from using those features is the use of <code>schema.rb</code>. This can only contain standard migrations (using the Rails DSL), which aim to keep the schema file database system neutral and abstract away from specific SQL. This in turn means we are not able to use extended PostgreSQL features that are reflected in schema. Some examples include triggers, postgres partitioning, materialized views and many other great features.</p>
+
+
+
+<p>In order to leverage those features, we should consider using a plain SQL schema file (<code>structure.sql</code>) instead of a ruby/rails standard schema <code>schema.rb</code>.</p>
+
+
+
+<p>The change would entail switching <code>config.active_record.schema_format = :sql</code> and regenerate the schema in SQL. Possibly, some build steps would have to be adjusted, too.</p>
+</blockquote>
+
+
+
+<p>Now, let’s go over the things I learnt from Gitlab Postgres schema.</p>
+
+
+
+<p>Below are some of the tweets from people on this article. If you find this article useful please share and tag me <a href="https://twitter.com/shekhargulati" target="_blank" rel="noreferrer noopener">@shekhargulati</a></p>
+
+
+
+<figure></figure>
+
+
+
+<figure><div><blockquote data-width="550" data-dnt="true"><p lang="en" dir="ltr">If you want to learn a little bit how others are designing their database schemas you will like the analysis of the Gitlab schema. <a href="https://t.co/oxPC2HCj4g">https://t.co/oxPC2HCj4g</a></p>— Tobias_Petry.sql (@tobias_petry) <a href="https://twitter.com/tobias_petry/status/1547865598037659653?ref_src=twsrc%5Etfw">July 15, 2022</a></blockquote></div></figure>
+
+
+
+<figure></figure>
+
+
+
+<figure></figure>
+
+
+
+<figure></figure>
+
+
+
+<h2>1. Using the right primary key type for a table</h2>
+
+
+
+<p>In my work I have made the mistake of standardizing on primary key types. This means standardizing on either <code>bigint</code> or <code>uuid</code> so all tables will have the same type irrespective of their structure, access patterns, and growth rate.</p>
+
+
+
+<p>When your database is small this does not have any visible impact but as you grow primary keys have a visible impact on storage space, write speed, and read speed. So, we should give a proper thought process on choosing the right primary key type for a table.</p>
+
+
+
+<p>As I discussed in an earlier post[3] when you use Postgres native UUID v4 type instead of bigserial table size grows by 25% and insert rate drops to 25% of bigserial. This is a big difference. I also compared against ULID but it also performed poorly. One reason could be the ULID implementation.</p>
+
+
+
+<p>Given this context I was interested to learn how Gitlab chooses primary key types.</p>
+
+
+
+<p>Out of the 573 tables, 380 tables have bigserial primary key type, 170 have serial4 primary key type, and remaining 23 had composite primary keys.They had no table that used uuid v4 primary key or any other esoteric key type like ULID.</p>
+
+
+
+<figure><table><thead><tr><th>Name</th><th>Description</th><th>Range</th><th>Text</th></tr></thead><tbody><tr><td><code>serial</code></td><td>4 bytes</td><td>1 to 2147483647</td><td>~2.1 billion</td></tr><tr><td><code>bigserial</code></td><td>8 bytes</td><td>1 to 9223372036854775807</td><td>~9.2 quintillion</td></tr></tbody></table></figure>
+
+
+
+<blockquote>
+<p>1 quintillion is equal to 1000000000 billions</p>
+</blockquote>
+
+
+
+<p>The decision to choose serial or bigserial is dependent on the number of records in that table.</p>
+
+
+
+<p>Tables like <code>application_settings</code>, <code>badges</code>, <code>chat_teams</code>, <code>notification_settings</code>, <code>project_settings</code> use serial type. For some tables like <code>issues</code>, <code>web_hooks</code>, <code>merge_requests</code>, <code>projects</code> I was surprised to see that they had used the <code>serial</code> type.</p>
+
+
+
+<p>The serial type might work for self-hosted community or enterprise versions but for Gitlab.com SaaS service this can cause issues. For example, Github had 128 million public repositories in 2020. Even with 20 issues per repository it will cross the serial range. Also changing the type of the table is expensive. The table has to be rewritten, and you will have to wait. This will also be a problem if you have to shard the table.</p>
+
+
+
+<p>I performed a quick experiment that showed that for my table with two columns and 10million records it takes 11 seconds to change the data type from integer to bigint.</p>
+
+
+<div><pre title="">create table exp_bs(id serial primary key, n bigint not null);
+</pre></div>
+
+
+<p>Insert 10million records</p>
+
+
+<div><pre title="">insert into exp_bs(n) select g.n from generate_series(1,10000000) as g(n);
+</pre></div>
+
+
+<p>Change column type from integer to bigint.</p>
+
+
+<div><pre title="">alter table exp_bs alter column id TYPE bigint;
+</pre></div>
+
+<div><pre title="">ALTER TABLE
+Time: 10845.062 ms (00:10.845)
+</pre></div>
+
+
+<p>You will also have to alter the sequence to change its type as well. This operation is quick.</p>
+
+
+<div><pre title="">alter sequence exp_bs_id_seq as bigint;
+</pre></div>
+
+
+<p>This finished in 4ms</p>
+
+
+<div><pre title="">ALTER SEQUENCE
+Time: 4.505 ms
+</pre></div>
+
+
+<p>All the bigserial sequences start from 1 and go till the max value of bigint.</p>
+
+
+<div><pre title="">CREATE SEQUENCE audit_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+</pre></div>
+
+
+<h2>2. Use of internal and external ids</h2>
+
+
+
+<p>It is generally a good practice to not expose your primary keys to the external world. This is especially important when you use sequential auto-incrementing identifiers with type integer or bigint since they are guessable.</p>
+
+
+
+<p>So, I was curious to know what happens when you create a Gitlab issue. Do we expose the primary key id to the external user or do we use some other id? If you expose the <code>issues</code> table primary key id then when you create an issue in your project it will not start with 1 and you can easily guess how many issues exist in the GitLab. This is both unsafe and poor user experience.</p>
+
+
+
+<p>To avoid exposing your primary keys to the end user the common solution is use two ids. The first is your primary key id which remains internal to the system and never exposed to any public context. The second id is what we share with the external world. In my past experience I have used UUID v4 as the external id. As we discussed in the previous point there is a storage cost involved with using UUID.</p>
+
+
+
+<p>GitLab also uses internal and external ids in tables where ids have to be shared with the external world. Tables like <code>issues</code>, <code>ci_pipelines</code>, <code>deployments</code>, <code>epics</code>, and a few others have two ids – <code>id</code> and <code>iid</code>. Below is the part of the issue schema. As shown below <code>iid</code> has integer data type.</p>
+
+
+<div><pre title="">CREATE TABLE issues (
+    id integer NOT NULL,
+    title character varying,
+      project_id integer,
+    iid integer,
+    // rest of the columns removed
+)
+</pre></div>
+
+
+<p>As you can see there are <code>id</code> and <code>iid</code> columns. The value of the <code>iid</code> column is shared with the end user. An issue is uniquely identified using <code>project_id</code> and <code>iid</code>. This is because there could be multiple issues with the same <code>iid</code> . To make it more clear, if you create two projects and create one issue in each of the repositories then they both need to have a visible id of 1 as shown in the example below. Both the <code>sg</code> and <code>sg2</code> projects start with issue id 1. This is achieved using <code>iid</code>.</p>
+
+
+<div><pre title="">https://gitlab.com/shekhargulati123/sg/-/issues/1
+https://gitlab.com/shekhargulati123/sg2/-/issues/1
+</pre></div>
+
+
+<p>They have a unique index on <code>project_id</code> and <code>iid</code> to quickly and efficiently fetch an issue.</p>
+
+
+<div><pre title="">CREATE UNIQUE INDEX index_issues_on_project_id_and_iid ON public.issues USING btree (project_id, iid);
+</pre></div>
+
+
+<h2>3. Using <code>text</code> character type with check constraints</h2>
+
+
+
+<p>Postgres has three character types as described in their documentation[5].</p>
+
+
+
+<figure><table><thead><tr><th>Name</th><th>Description</th></tr></thead><tbody><tr><td><code>character varying(n)</code>, <code>varchar(n)</code></td><td>variable-length with limit</td></tr><tr><td><code>character(n)</code>, <code>char(n)</code></td><td>fixed-length, blank padded</td></tr><tr><td><code>text</code></td><td>variable unlimited length</td></tr></tbody></table></figure>
+
+
+
+<p>I have mostly used <code>character varying(n)</code> or <code>varchar(n)</code> to store String values. Gitlab schema uses both <code>character varying(n)</code> and <code>text</code> but more often they use <code>text</code> type. One such example table is shown below.</p>
+
+
+<div><pre title="">CREATE TABLE audit_events (
+    id bigint NOT NULL,
+    author_id integer NOT NULL,
+    entity_id integer NOT NULL,
+    entity_type character varying NOT NULL,
+    details text,
+    ip_address inet,
+    author_name text,
+    entity_path text,
+    target_details text,
+    created_at timestamp without time zone NOT NULL,
+    target_type text,
+    target_id bigint,
+    CONSTRAINT check_492aaa021d CHECK ((char_length(entity_path) &lt;= 5500)),
+    CONSTRAINT check_83ff8406e2 CHECK ((char_length(author_name) &lt;= 255)),
+    CONSTRAINT check_97a8c868e7 CHECK ((char_length(target_type) &lt;= 255)),
+    CONSTRAINT check_d493ec90b5 CHECK ((char_length(target_details) &lt;= 5500))
+)
+PARTITION BY RANGE (created_at);
+</pre></div>
+
+
+<p>You can see that apart from <code>entity_type</code> all other columns have <code>text</code> type. They have used <code>CHECK</code> to define length constraints.</p>
+
+
+
+<p>As mentioned in multiple posts[6,7] on the web there is not much performance difference between the two types. They both use <code>varlena</code> type under the hood.</p>
+
+
+
+<p>The problem with <code>varchar(n)</code> is that if n becomes more restrictive then it will require an exclusive lock. This can cause performance issues depending on the size of the table.</p>
+
+
+
+<p>The <code>text</code> column with <code>CHECK</code> constraint on the other hand does not have this issue. But it does cost a little during writes.</p>
+
+
+
+<p>Let’s do a quick experiment to prove it. We will start by creating a simple table</p>
+
+
+<div><pre title="">create table cv_exp (id bigint primary key, s varchar(200) default gen_random_uuid() not null);
+create index sidx on cv_exp (s);
+</pre></div>
+
+
+<p>Insert 10million records</p>
+
+
+<div><pre title="">insert into cv_exp(id) select g.n from generate_series(1,10000000) as g(n);
+</pre></div>
+
+
+<p>If we increase the length of s from 200 to 300 then it is instantaneous</p>
+
+
+<div><pre title="">alter table cv_exp alter column s type varchar(300);
+</pre></div>
+
+<div><pre title="">ALTER TABLE
+Time: 37.460 ms
+</pre></div>
+
+
+<p>But if we reduce the length of <code>s</code> from 300 to 100 then it does take considerable time.</p>
+
+
+<div><pre title="">alter table cv_exp alter column s type varchar(100);
+</pre></div>
+
+<div><pre title="">ALTER TABLE
+Time: 35886.638 ms (00:35.887)
+</pre></div>
+
+
+<p>As you can see it took 36 seconds.</p>
+
+
+
+<p>Let’s do the same with the text column.</p>
+
+
+<div><pre title="">create table text_exp (id bigint primary key, 
+s text default gen_random_uuid() not null,
+CONSTRAINT check_15e644d856 CHECK ((char_length(s) &lt;= 200)));
+</pre></div>
+
+
+<p>Insert 10 million records</p>
+
+
+<div><pre title="">insert into text_exp(id) select g.n from generate_series(1,10000000) as g(n);
+</pre></div>
+
+
+<p>There is no alter constraint in Postgres. You have to drop the constraint and then add a new constraint.</p>
+
+
+<div><pre title=""> alter table text_exp drop constraint check_15e644d856;
+</pre></div>
+
+
+<p>Now, add again</p>
+
+
+<div><pre title="">alter table text_exp add constraint check_15e644d856 CHECK ((char_length(s) &lt;= 100));
+</pre></div>
+
+<div><pre title="">ALTER TABLE
+Time: 1870.250 ms (00:01.870)
+</pre></div>
+
+
+<p>So, as you can see, the <code>text</code> type with <code>CHECK</code> constraint allows you to evolve the schema easily compared to <code>character varying</code> or <code>varchar(n)</code> when you have length checks.</p>
+
+
+
+<p>I also noticed that they used <code>character varying</code> where length checks are not required like as shown below.</p>
+
+
+<div><pre title="">CREATE TABLE project_custom_attributes (
+    id integer NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    project_id integer NOT NULL,
+    key character varying NOT NULL,
+    value character varying NOT NULL
+);
+</pre></div>
+
+
+<h2>4. Naming conventions</h2>
+
+
+
+<p>The naming follows the following convention.</p>
+
+
+
+<ul><li>All tables use plural forms. For example <code>issues</code>, <code>projects</code>, <code>audit_events</code>, <code>abuse_reports</code>, <code>approvers</code>, etc.</li><li>Tables use module name prefix to provide a namespace. For example, all tables belonging to merge request functionality start with <code>merge_request</code> prefix as shown in the listing below.<ul><li>merge_request_assignees</li><li>merge_request_blocks</li><li>merge_request_cleanup_schedules</li><li>merge_request_context_commit_diff_files</li><li>merge_request_context_commits</li><li>etc..</li></ul></li><li>Names of tables and columns follow snake_case convention. The underscore is used to combine two or more words. For example, <code>title</code>, <code>created_at</code>, <code>is_active</code>.</li><li>Columns expressing boolean follow either of the three naming convention depending on their purpose<ul><li>Feature toggles. For example <code>create_issue</code>, <code>send_email</code>, <code>packages_enabled</code>, <code>merge_requests_rebase_enabled</code>, etc</li><li>Entity State: Examples, <code>deployed</code>, <code>onboarding_complete</code>, <code>archived</code>, <code>hidden</code>, etc.</li><li>Qualifiers – They start with <code>is_xxx</code> or <code>has_xxx</code>. For example, <code>is_active</code>, <code>is_sample</code>, <code>has_confluence</code>, etc. I think these can be expressed using the above two.</li></ul></li><li>Indexes follow the convention <code>index_#{table_name}_on_#{column_1}_and_#{column_2}_#{condition}</code>. For example, <code>index_services_on_type_and_id_and_template_when_active</code>, <code>index_projects_on_id_service_desk_enabled</code>.</li></ul>
+
+
+
+<h2>5. Timestamp with timezone and without timezone</h2>
+
+
+
+<p>GitLab uses both <code>timestamp with timezone</code> and <code>timestamp without timezone</code>.</p>
+
+
+
+<p>My understanding is that the data type <code>timestamp without timezone</code> is used when the system performs an action and data type <code>timestamp with time zone</code> is used for user actions. For example, in the SQL shown below <code>created_at</code> and <code>updated_at</code> does use <code>timestamp without time zone</code> whereas <code>closed_at</code> uses <code>timestamp with time zone</code>.</p>
+
+
+<div><pre title="">CREATE TABLE issues (
+    id integer NOT NULL,
+    title character varying,
+
+    created_at timestamp without time zone,
+    updated_at timestamp without time zone,
+
+    closed_at timestamp with time zone,
+    closed_by_id integer,
+);
+</pre></div>
+
+
+<p>Another example is <code>merge_request_metrics</code> where <code>latest_closed_at</code>, <code>first_comment_at</code>, <code>first_commit_at</code> , and <code>last_commit_at</code> uses <code>timestamp with time zone</code> whereas <code>latest_build_started_at</code> , <code>latest_build_finished_at</code>, and <code>merge_at</code> they use <code>timestamp without timezone</code>. You might wonder why <code>merge_at</code> does not use a timezone. I think it is because the system can merge the request based on certain conditions or checks.</p>
+
+
+<div><pre title="">CREATE TABLE merge_request_metrics (
+    id integer NOT NULL,
+    latest_build_started_at timestamp without time zone,
+    latest_build_finished_at timestamp without time zone,
+    merged_at timestamp without time zone,
+    created_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone NOT NULL,
+
+    latest_closed_at timestamp with time zone,
+    first_comment_at timestamp with time zone,
+    first_commit_at timestamp with time zone,
+    last_commit_at timestamp with time zone,
+    first_approved_at timestamp with time zone,
+    first_reassigned_at timestamp with time zone
+);
+</pre></div>
+
+
+<h2>6. Foreign key constraints</h2>
+
+
+
+<p>A foreign key constraint is a logical association of rows between two tables. You typically use foreign keys to join tables in queries.</p>
+
+
+
+<blockquote>
+<p>A <strong>FOREIGN KEY</strong> constraint is a database construct, an implementation that forces the foreign key relationship’s integrity (referential integrity). Namely, it ensures that a child table can only reference a parent table when the appropriate row <em>exists</em> in the parent table. A constraint also prevents the existence of “orphaned rows” in different methods. – <a href="https://docs.planetscale.com/learn/operating-without-foreign-key-constraints">Link</a></p>
+</blockquote>
+
+
+
+<p>I have consulted in multiple projects in the last couple of years where team/architects decided not to use foreign key constraints. They mainly cite performance as the reason to not use foreign key constraints.</p>
+
+
+
+<p>One reason performance can degrade when you create foreign key is when you create it with <code>ON DELETE CASCADE</code> action. The way <code>ON DELETE CASCADE</code> action works is that if you delete a row in the parent table then any referencing row in the child table is also deleted within the same transaction. You might expect only one row to be deleted but you might end up deleting hundred or thousand or more child table rows as well. But, this will be an issue only when one parent row is linked with a large number of child table rows.</p>
+
+
+
+<p>There are two other reasons teams don’t use foreign key constraints. These are:</p>
+
+
+
+<ul><li>They don’t work well with online DDL schema migration operations especially in MySQL</li><li>It is difficult to maintain foreign key constraints once you shard your data into multiple database servers</li></ul>
+
+
+
+<blockquote>
+<p>MySQL compatible serverless database like PlanetScale(based on open source Vitess database) does not support foriegn keys.</p>
+</blockquote>
+
+
+
+<p>So, I was curious to learn if GitLab uses Foreign key constraints or not.</p>
+
+
+
+<p>GitLab uses foriegn key constraints in most tables except in a few tables like <code>audit_events</code> , <code>abuse_reports</code>, <code>web_hooks_logs</code>, <code>spam_logs</code>. I think there are two main reasons why they don’t use foreign key constraints in <code>audit_events</code> , <code>abuse_reports</code>, <code>web_hooks_logs</code>, <code>spam_logs</code>. These are:</p>
+
+
+
+<ul><li>These tables are immutable in nature. You don’t want to change them once entries are written to them</li><li>These tables can grow to millions(or more) of rows so even a small performance hit could have a big impact</li></ul>
+
+
+
+<p>The rest of the tables where GitLab uses foreign keys use both <code>ON DELETE CASCADE</code> , <code>ON DELETE RESTRICT</code> , and <code>ON DELETE SET NULL</code> actions. An example of each of them is shown below.</p>
+
+
+<div><pre title="">ALTER TABLE ONLY todos
+    ADD CONSTRAINT fk_rails_a27c483435 FOREIGN KEY (group_id) REFERENCES namespaces(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY projects
+    ADD CONSTRAINT fk_projects_namespace_id FOREIGN KEY (namespace_id) REFERENCES namespaces(id) ON DELETE RESTRICT;
+
+ALTER TABLE ONLY authentication_events
+    ADD CONSTRAINT fk_rails_b204656a54 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL;
+</pre></div>
+
+
+<ul><li><code>ON DELETE SET NULL</code> will set the referencing column on the child table to null for matching rows. It leads to orphaned rows but you can easily identify them because of NULL. In this action also, a single row deletion can lead to multiple rows getting updated in the child table. This may cause large transactions, excessive locking, and replication lag.</li><li><code>ON DELETE RESTRICT</code> prevents deletion of referenced child rows. This does not cause orphaned childs as you can’t delete a parent row if there are child rows that references it. You get exceptions like as shown below.</li></ul>
+
+
+<div><pre title="">  ERROR:  update or delete on table "a" violates foreign key constraint "fk_a_id" on table "b"
+  DETAIL:  Key (id)=(1) is still referenced from table "b".
+</pre></div>
+
+
+<h2>7. Partitioning big tables</h2>
+
+
+
+<p>GitLab uses partitioning to partition tables that can grow to a huge size. This is done to improve query performance.</p>
+
+
+
+<ul><li>PARTITION BY RANGE: This partitioning strategy works by partitioning table data based on the chosen range. This strategy is commonly used when you need to partition time-series data. The tables <code>audit_events</code> and <code>web_hook_logs</code> use this strategy.</li><li>PARTITION BY LIST: This partitioning strategy works by partitioning table data based on discrete values of a column. The table <code>loose_foreign_keys_deleted_records</code> uses this strategy.</li><li>PARTITION BY HASH: TThe table is partitioned by specifying a modulus and a remainder for each partition. Each partition will hold the rows for which the hash value of the partition key divided by the specified modulus will produce the specified remainder. The table <code>product_analytics_events_experimental</code> uses this strategy.</li></ul>
+
+
+
+<p>You can read more about Postgres partitioning in Postgres <a href="https://www.postgresql.org/docs/current/ddl-partitioning.html">documentation</a>.</p>
+
+
+
+<h2>8. Supporting LIKE search use cases with Trigrams and <code>gin_trgm_ops</code></h2>
+
+
+
+<p>GitLab uses GIN(Generalized Inverted Index) indexes to perform efficient searches.</p>
+
+
+
+<blockquote>
+<p>The GIN index type was designed to deal with data types that are subdividable and you want to search for individual component values (array elements, lexemes in a text document, etc)” – <a href="https://www.postgresql.org/message-id/flat/26038.1559516834%40sss.pgh.pa.us#ccb004aefc151d913e7a274a9b30c631">Tom Lane</a></p>
+</blockquote>
+
+
+
+<p>Due to the nature of the LIKE operation, which supports arbitrary wildcard expressions, this is fundamentally hard to index. One such example is the issues table where you might want to do something like search on title and description fields. So, we use the pg_trgm extension to create an index that works on trigrams.</p>
+
+
+<div><pre title="">CREATE INDEX index_issues_on_title_trigram ON issues USING gin (title gin_trgm_ops);
+CREATE INDEX index_issues_on_description_trigram ON issues USING gin (description gin_trgm_ops);
+</pre></div>
+
+
+<p>The GIN index makes searches performant. Let’s see that in action.</p>
+
+
+
+<p>We will create a simple table as shown below.</p>
+
+
+<div><pre title="">create table words(id serial primary key, word text not null);
+</pre></div>
+
+
+<p>Let’s insert some data. I pulled an English word list in CSV format from this <a href="https://www.bragitoff.com/2016/03/english-dictionary-in-csv-format/">link</a>.</p>
+
+
+<div><pre title="">\copy words(word) from '/Users/xxx/Aword.csv' CSV;
+</pre></div>
+
+<div><pre title="">select count(*) from words;
+</pre></div>
+
+<div><pre title=""> count
+-------
+ 11616
+(1 row)
+</pre></div>
+
+
+<p>We will create a btree index on the word column and later we will use the gin index to show its efficiency.</p>
+
+
+<div><pre title="">create index id1 on words using btree (word);
+</pre></div>
+
+
+<p>Let’s run the explain plan query.</p>
+
+
+<div><pre title="">EXPLAIN select * from words where word like '%bul%';
+</pre></div>
+
+<div><pre title="">                        QUERY PLAN
+-----------------------------------------------------------
+ Seq Scan on words  (cost=0.00..211.20 rows=1 width=14)
+   Filter: (word ~~ '%bul%'::text)
+(2 rows)
+</pre></div>
+
+
+<p>Now, let’s drop btree index;</p>
+
+
+
+
+
+<p>Install the <code>pg_trm</code> extension</p>
+
+
+<div><pre title="">CREATE EXTENSION pg_trgm;
+</pre></div>
+
+
+<p>Create the index.</p>
+
+
+<div><pre title="">create index index_words_on_word_trigram ON words USING gin (word gin_trgm_ops);
+</pre></div>
+
+
+<p>Now, let;s run explain</p>
+
+
+<div><pre title="">EXPLAIN select count(*) from words where word like '%bul%';
+</pre></div>
+
+<div><pre title="">                                             QUERY PLAN
+----------------------------------------------------------------------------------------------------
+ Aggregate  (cost=16.02..16.03 rows=1 width=8)
+   -&gt;  Bitmap Heap Scan on words  (cost=12.01..16.02 rows=1 width=0)
+         Recheck Cond: (word ~~ '%bul%'::text)
+         -&gt;  Bitmap Index Scan on index_words_on_word_trigram  (cost=0.00..12.01 rows=1 width=0)
+               Index Cond: (word ~~ '%bul%'::text)
+(5 rows)
+</pre></div>
+
+
+<p>GitLab also makes use of <code>tsvector</code> to support complete full text search.</p>
+
+
+
+<p>The advantages of doing text seach in your primary datastore are:</p>
+
+
+
+<ul><li>Real time indexes. No lag to create index</li><li>Access to the complete data</li><li>Less complexity in your architecture</li></ul>
+
+
+
+<h2>9. Use of <code>jsonb</code></h2>
+
+
+
+<p>As I discussed an earlier <a href="https://shekhargulati.com/2022/01/08/when-to-use-json-data-type-in-database-schema-design/">post</a> I use json data type in schema design for following use cases:</p>
+
+
+
+<ol><li>Dump request data that will be processed later</li><li>Support extra fields</li><li>One To Many Relationship where many side will not have to its own identity</li><li>Key Value use case</li><li>Simpler EAV design</li></ol>
+
+
+
+<p>GitLab schema design also uses <code>jsonb</code> data type in multiple tables. They use it mainly for 1 and 2 use cases in my list above. The advantage of using jsonb over storing in plain text is the efficient querying supported by Postgres on <code>jsonb</code> data type.</p>
+
+
+
+<p>The table <code>error_tracking_error_events</code> stores payload in jsonb data type. This is an example of dump request data that will be processed in a later use case. I covered a similar use case in my blog post so do read that for more information.</p>
+
+
+<div><pre title="">CREATE TABLE error_tracking_error_events (
+    id bigint NOT NULL,
+    payload jsonb DEFAULT '{}'::jsonb NOT NULL,
+  // rest removed
+);
+</pre></div>
+
+
+<p>You can use a JSON schema to validate the structure of a JSON document.</p>
+
+
+
+<p>Another example is the <code>operations_strategies</code> table shown below. You don’t know how many parameters you might receive so you need a flexible data type like <code>jsonb</code>.</p>
+
+
+<div><pre title="">CREATE TABLE operations_strategies (
+    id bigint NOT NULL,
+    feature_flag_id bigint NOT NULL,
+    name character varying(255) NOT NULL,
+    parameters jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+</pre></div>
+
+
+<p>An example of supporting extra fields use cases is shown below.</p>
+
+
+<div><pre title="">CREATE TABLE packages_debian_file_metadata (
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    package_file_id bigint NOT NULL,
+    file_type smallint NOT NULL,
+    component text,
+    architecture text,
+    fields jsonb,
+);
+</pre></div>
+
+
+<p>They also use jsonb for storing data that is already in JSON format. For example, in the table <code>vulnerability_finding_evidences</code> report data is already JSON so they saved it as is in <code>jsonb</code> data type.</p>
+
+
+<div><pre title="">CREATE TABLE vulnerability_finding_evidences (
+    id bigint NOT NULL,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    vulnerability_occurrence_id bigint NOT NULL,
+    data jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+</pre></div>
+
+
+<h2>10. Other tidbits</h2>
+
+
+
+<ul><li>Auditing fields like <code>updated_at</code> are only used in tables where records can be modified. For example <code>issues</code> has an <code>updated_at</code> column. For append-only immutable log tables like <code>audit_events</code> do not have an <code>updated_at</code> column as shown below in the code snippets. <code>issues</code> table with <code>updated_at</code> column</li></ul>
+
+
+<div><pre title="">  CREATE TABLE issues (
+      id integer NOT NULL,
+      title character varying,
+      author_id integer,
+      project_id integer,
+      created_at timestamp without time zone,
+      updated_at timestamp without time zone,
+      // removed remaining columns and constraints
+  );
+</pre></div>
+
+
+<p><code>audit_events</code> table with no <code>updated_at</code> column.</p>
+
+
+<div><pre title="">  CREATE TABLE audit_events (
+      id bigint NOT NULL,
+      author_id integer NOT NULL,
+      entity_id integer NOT NULL,
+      created_at timestamp without time zone NOT NULL,
+      // removed remaining columns and constraints
+  )
+</pre></div>
+
+
+<ul><li>Enums are stored as smallint rather than <code>character varying</code>. It saves space. The only problem is you can’t change the order of enum values. In the example shown below <code>reason</code> and <code>severity_level</code> are enums</li></ul>
+
+
+<div><pre title="">  CREATE TABLE merge_requests_compliance_violations (
+      id bigint NOT NULL,
+      violating_user_id bigint NOT NULL,
+      merge_request_id bigint NOT NULL,
+      reason smallint NOT NULL,
+      severity_level smallint DEFAULT 0 NOT NULL
+  );
+</pre></div>
+
+
+<ul><li>Optimistic locking is used in a few(8) tables like <code>issues</code> and <code>ci_builds</code> to protect against edits from multiple parties. Optimistic locking assumes that there will be minimum such conflicts of data and if it does happen then the application throws an exception and the update is ignored. Active Record supports optimistic locking if the <code>lock_version</code> field is present. Each update to the record increments the <code>lock_version</code> column and the locking facilities ensure that records instantiated twice will let the last one saved raise a <code>StaleObjectError</code> if the first was also updated. The <code>ci_builds</code> table shown below uses the ‘lock_version` column.</li></ul>
+
+
+<div><pre title="">  CREATE TABLE ci_builds (
+      status character varying,
+      finished_at timestamp without time zone,
+      trace text,
+
+        lock_version integer DEFAULT 0,
+
+        // removed columns
+      CONSTRAINT check_1e2fbd1b39 CHECK ((lock_version IS NOT NULL))
+  );
+</pre></div>
+
+
+<ul><li>Using inet for storing ip addresses. I was not aware of the <code>inet</code> type. They have used inet in <code>audit_events</code> and <code>authentication_events</code> tables</li></ul>
+
+
+<div><pre title="">  CREATE TABLE audit_events (
+      id bigint NOT NULL,
+      ip_address inet,
+    // other columns removed for clarity
+  );
+</pre></div>
+
+
+<p>GitLab has not used inet in all the tables that store <code>ip_address</code>. For example, in tables <code>ci_runners</code> and <code>user_agent_details</code>, they have stored it as <code>character varying</code>. I am not sure why they have not used the same type in all the tables that store ip addresses.</p>
+
+
+
+<p>You should prefer <code>inet</code> over storing an ip address as a plain text type as these types offer input error handling and specialized functions.</p>
+
+
+
+<p>Let’s quickly see it in action. We will start by creating a table with two fields – id, and <code>ip_addr</code></p>
+
+
+<div><pre title="">   create table e (id serial primary key, ip_addr inet not null);
+</pre></div>
+
+
+<p>We can insert a valid record like shown below.</p>
+
+
+<div><pre title="">  insert into e(ip_addr) values ('192.168.1.255');
+</pre></div>
+
+
+<p>We can also insert the record with a mask as shown below.</p>
+
+
+<div><pre title="">  insert into e(ip_addr) values ('192.168.1.5/24');
+</pre></div>
+
+
+<p>Both these records will get inserted</p>
+
+
+<div><pre title="">  select id, abbrev(ip_addr) from e;
+</pre></div>
+
+<div><pre title="">   id |     abbrev
+  ----+----------------
+    1 | 192.168.1.255
+    2 | 8.8.8.8
+    3 | 192.168.1.5/24
+  (3 rows)
+</pre></div>
+
+
+<p>If we try to save invalid data then insert will fail.</p>
+
+
+<div><pre title="">  insert into e(ip_addr) values ('192.168.1');
+</pre></div>
+
+<div><pre title="">  ERROR:  invalid input syntax for type inet: "192.168.1"
+  LINE 1: insert into e(ip_addr) values ('192.168.1');
+</pre></div>
+
+
+<p>You can inet operators supported by Postgres to check if an ip address is contained by subnet as shown below.</p>
+
+
+<div><pre title="">  select * from e where ip_addr &lt;&lt; inet '192.168.1.1/24';
+</pre></div>
+
+<div><pre title="">   id |    ip_addr
+  ----+---------------
+    1 | 192.168.1.255
+  (1 row)
+</pre></div>
+
+
+<p>If we want to check if subnet is contained or equal then we do following</p>
+
+
+<div><pre title="">  select * from e where ip_addr &lt;&lt;= inet '192.168.1.1/24';
+</pre></div>
+
+<div><pre title="">   id |    ip_addr
+  ----+----------------
+    1 | 192.168.1.255
+    3 | 192.168.1.5/24
+  (2 rows)
+</pre></div>
+
+
+<p>There are many other operators and functions supported by Postgres. You can read them in the Postgres <a href="https://www.postgresql.org/docs/current/functions-net.html">docs</a>.</p>
+
+
+
+<ul><li>Postgres ‘bytea<code>data type is used to store</code>SHA` , encrypted tokens, encrypted keys, encrypted password, fingerprints, etc.</li><li>Postgres array types are used for storing columns with multiple values as shown below.</li></ul>
+
+
+
+<blockquote>
+<p>Arrays are to be used when you are absolutely sure you don’t need to create any relationship between the items in the array with any other table. It should be used for a tightly coupled one to many relationship. – <a href="https://stackoverflow.com/a/56298555">Link</a></p>
+</blockquote>
+
+
+
+<p>For example in the table shown below we are storing <code>*_ids</code> as an array rather than storing them in a flat manner and defining relationships with other tables. You don’t know how many users and projects will be mentioned so it will be wasteful to create columns like <code>mentioned_user_id1</code> , <code>mentioned_user_id2</code>, <code>mentioned_user_id3</code> and so on.</p>
+
+
+<div><pre title="">  CREATE TABLE alert_management_alert_user_mentions (
+      id bigint NOT NULL,
+      alert_management_alert_id bigint NOT NULL,
+      note_id bigint,
+      mentioned_users_ids integer[],
+      mentioned_projects_ids integer[],
+      mentioned_groups_ids integer[]
+  );
+</pre></div>
+
+
+<p>Another common use case of Postgres array is to store fields like hosts, tags, urls.</p>
+
+
+<div><pre title="">  CREATE TABLE dast_site_profiles (
+      id bigint NOT NULL,
+      excluded_urls text[] DEFAULT '{}'::text[] NOT NULL,
+  );
+  CREATE TABLE alert_management_alerts (
+    id bigint NOT NULL,
+    hosts text[] DEFAULT '{}'::text[] NOT NULL,
+  );
+  CREATE TABLE ci_pending_builds (
+      id bigint NOT NULL,
+      tag_ids integer[] DEFAULT '{}'::integer[],
+  );
+</pre></div>
+
+
+<h2>Conclusion</h2>
+
+
+
+<p>I learnt a lot from the GitLab schema. They don’t blindly apply the same practices to all the table designs. Each table makes the best decision based on its purpose, the kind of data it stores, and its rate of growth.</p>
+
+
+
+<h2>References</h2>
+
+
+
+<ol><li>Gitlab schema <code>structure.sql</code> – <a href="https://gitlab.com/gitlab-org/gitlab/-/blob/master/db/structure.sql">Link</a></li><li>Issue 29465: Use structure.sql instead of schema.rb – <a href="https://gitlab.com/gitlab-org/gitlab/-/issues/29465">Link</a></li><li>Choosing Primary Key Type in Postgres – <a href="https://shekhargulati.com/2022/06/23/choosing-a-primary-key-type-in-postgres/">Link</a></li><li>Github’s Path to 128M public repositories – <a href="https://towardsdatascience.com/githubs-path-to-128m-public-repositories-f6f656ab56b1#:~:text=There%20are%20over%20128%20million%20public%20repositories%20on%20GitHub.">Link</a></li><li>Postgres Character Types Documentation – <a href="https://www.postgresql.org/docs/current/datatype-character.html">Link</a></li><li>Difference between text and varchar (character varying) – <a href="https://stackoverflow.com/questions/4848964/difference-between-text-and-varchar-character-varying">Link</a></li><li>CHAR(x) vs. VARCHAR(x) vs. VARCHAR vs. TEXT – <a href="https://www.depesz.com/2010/03/02/charx-vs-varcharx-vs-varchar-vs-text/">Link</a></li></ol>
+	</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+</article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Releasing my tools under the MIT License was probably a mistake (2023) (105 pts)]]></title>
+            <link>https://donatstudios.com/License-Grumbles</link>
+            <guid>39413562</guid>
+            <pubDate>Sat, 17 Feb 2024 21:06:37 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://donatstudios.com/License-Grumbles">https://donatstudios.com/License-Grumbles</a>, See on <a href="https://news.ycombinator.com/item?id=39413562">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>	
+	<p>For basically as long as I can remember, I have been a staunch defender of permissive licenses over the more copyleft variety. I <em>want</em> you to use things I've written. On top of that I don't believe it's my place to force you to then open source things you have written that expand upon my source code. Hence my extensive use of the MIT License.</p>
+<p>The MIT License is very simple. It basically says you can do whatever you want with the code, but you have to include the license and copyright when redistributing the code itself. It does not however require you to open source any modifications you make to the code, nor provide attribution to the non-code products of the work.</p>
+<p>With my libraries, this has served me very well. It's great, people use and contribute fixes back, and often donate back to me. I love it. I want you to use my code in your proprietary software. I open sourced it so you could do that. I specifically build open source libraries because I solved a problem I thought other people might face and wanted to save them time. Lifting the sea for all boats and all that. I have zero problem continuing to use the MIT License on my libraries.</p>
+<p>I also open sourced the tools I host on my website, including but not limited to <a href="https://donatstudios.com/PixelCircleGenerator">Pixel Circle / Oval Generator</a> and <a href="https://donatstudios.com/RewriteRule_Generator">Batch RewriteRule Generator</a>. The MIT License seemed like the natural choice because I've been using it for everything I've released since the early 2000's.</p>
+<p>I'd considered these as just <em>part of my website</em> far more so than something I thought people would reuse. My intentions open sourcing these tools, unlike my libraries, was to promote the community helping me to improve them - and they certainly have done so. I have gotten so much great feedback and contributions to these tools, and I am very happy with that. Massive shout out to <a href="https://github.com/Tyson453">Tyson453</a> for his insanely awesome work improving the speed of the Pixel Circle / Oval Generator.</p>
+<p>Against my well meaning intentions however, websites re-hosting my tools have been popping up like weeds. In some cases, they are even beating me in search results for my own tools. With noted exception, they don't credit me as the author or provide any sort of link back. Many of them have made minor or major modifications to the tools, and next to none provide the source to those modifications. A number of them even have the gall to post links advertising them in the comments of my own tools.</p>
+<p>Most irksome of all, in a fair number of cases they sit centrally on pages covered in ads and SEO keywords. My tools are being associated with a genuinely bad user experience.</p>
+<p>This is all perfectly legal and allowed under the MIT License. That's on me. It just is not in the spirit of what I intended. I didn't have the foresight to see this coming. I didn't think people so lacked in the spirit of open source. I wanted to promote community contributions, not to have them monetized by other people who <strong>don't even provide the source to their modifications</strong>. I wanted to grow the tools as a community, not have closed source forks of them overtake my own open source versions.</p>
+<p>There's not a lot I can do. I could try to contact the owners of these sites and ask them to provide attribution, but there's no obligation for them to do so. I could try to contact the owners of these sites and ask them to provide the source to their modifications, but again there is no obligation for them to do so. I really wish to see the changes shared alike, and the vain part of me would like attribution as the original author. At the end of the day though I chose the MIT License and it is what it is. It simply does not require any of that.</p>
+<hr>
+<p>On top of everything else, until very recently and for completely unclear reasons, my website Donat Studios was completely blocked from Bing search results. This in turn meant I didn't show up in DuckDuckGo or Yahoo results either. This meant that for a time the only results when searching these sites for my tools were these re-hosted versions.</p>
+<p>I actually managed to reach a human at Bing and get this resolved, but it took a lot of work and I'm still not sure why it happened in the first place.</p>
+<hr>
+<p>I am considering relicensing my tools under some sort of Attribution-ShareAlike license similar to the <a href="https://creativecommons.org/licenses/by-sa/3.0/">BY-SA</a> the content on this site is licensed under. It would not apply to current and past versions of the tools as that code is licensed MIT and you can't un-ring that bell. It would however apply to future versions. This would still promote community contributions, but would also require that any modifications be shared alike meaning that the modified source would have to be provided and I would have to be credited as the original author.</p>
+<p>At the very least I will definitely think twice about the license I choose for future tools. I don't want to be a jerk about it, but I also don't want to see them monetized by others without even a link back to my website.</p><hr>
+	
+	
+	</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Headphone and Amp Impedance (2011) (152 pts)]]></title>
             <link>http://nwavguy.blogspot.com/2011/02/headphone-amp-impedance.html</link>
             <guid>39412198</guid>
             <pubDate>Sat, 17 Feb 2024 18:49:07 GMT</pubDate>
@@ -20,7 +958,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I worry our Copilot is leaving some passengers behind (186 pts)]]></title>
+            <title><![CDATA[I worry our Copilot is leaving some passengers behind (193 pts)]]></title>
             <link>https://joshcollinsworth.com/blog/copilot</link>
             <guid>39411912</guid>
             <pubDate>Sat, 17 Feb 2024 18:21:42 GMT</pubDate>
@@ -290,7 +1228,7 @@
 Couldn't get https://www.washingtonpost.com/world/2024/02/16/russian-disinformation-zelensky-zaluzhny/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[The epidemic of fraudulent DMCA takedowns (131 pts)]]></title>
+            <title><![CDATA[The epidemic of fraudulent DMCA takedowns (141 pts)]]></title>
             <link>https://taxpolicy.org.uk/2024/02/17/the-invisible-campaign-to-censor-the-internet/</link>
             <guid>39411570</guid>
             <pubDate>Sat, 17 Feb 2024 17:45:26 GMT</pubDate>
@@ -319,7 +1257,7 @@ It turns out that in a VC-funded startup, it’s very easy to lose all almost yo
   </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: macOS-cross-compiler – Compile binaries for macOS on Linux (150 pts)]]></title>
+            <title><![CDATA[Show HN: macOS-cross-compiler – Compile binaries for macOS on Linux (161 pts)]]></title>
             <link>https://github.com/shepherdjerred/macos-cross-compiler</link>
             <guid>39409816</guid>
             <pubDate>Sat, 17 Feb 2024 14:41:56 GMT</pubDate>
@@ -663,7 +1601,7 @@ earthly +validate</pre></div>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Ute Tribe will construct one of the largest solar farms in the US for $1B+ (314 pts)]]></title>
+            <title><![CDATA[The Ute Tribe will construct one of the largest solar farms in the US for $1B+ (318 pts)]]></title>
             <link>https://www.ksut.org/news/2024-02-15/ute-mountain-ute-tribe-will-construct-one-of-the-largest-solar-farms-in-the-u-s</link>
             <guid>39409653</guid>
             <pubDate>Sat, 17 Feb 2024 14:24:14 GMT</pubDate>
@@ -821,7 +1759,7 @@ earthly +validate</pre></div>
                                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ollama is now available on Windows in preview (216 pts)]]></title>
+            <title><![CDATA[Ollama is now available on Windows in preview (230 pts)]]></title>
             <link>https://ollama.com/blog/windows-preview</link>
             <guid>39409650</guid>
             <pubDate>Sat, 17 Feb 2024 14:23:47 GMT</pubDate>
@@ -875,7 +1813,7 @@ earthly +validate</pre></div>
       </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[So Long, and Thanks for All the Bytes (273 pts)]]></title>
+            <title><![CDATA[So Long, and Thanks for All the Bytes (284 pts)]]></title>
             <link>https://chethaase.medium.com/so-long-and-thanks-for-all-the-bytes-02a4ef972f65</link>
             <guid>39409535</guid>
             <pubDate>Sat, 17 Feb 2024 14:09:37 GMT</pubDate>
@@ -883,7 +1821,7 @@ earthly +validate</pre></div>
 <div id="readability-page-1" class="page"><div><figure><figcaption>My office nameplate, freshly annotated for correctness</figcaption></figure><div><h2 id="6e35">Goodbye Tech, Hello Future</h2><div><a rel="noopener follow" href="https://chethaase.medium.com/?source=post_page-----02a4ef972f65--------------------------------"><div aria-hidden="false"><p><img alt="Chet Haase" src="https://miro.medium.com/v2/resize:fill:88:88/1*5pR0GFT8Cosn_zGIdRfc0Q.jpeg" width="44" height="44" loading="lazy" data-testid="authorPhoto"></p></div></a></div></div><p id="2e06"><span>It</span> is with very mixed feelings that I am leaving Google (as in, <em>leaving right now</em> — today is my last day). Or perhaps I should say instead “leaving Android” since I have always felt very much part of the Android team and very much ignorant of the rest of the company.</p><p id="2ea0">Unlike many of my excellent and unfortunate colleagues in the last couple of rough years of tech layoffs, my departure is self-inflicted: I quit. It is time for me to do something else — something very <em>very </em>else. It’s not so much that I’m leaving Google (Android), but that I’m leaving tech for, as Monty Python would say, something completely different.</p><p id="9879">I have been at Google for (checks calendar) nearly 14 years, since joining the Android team in May of 2010. I wrote code, delivered presentations, videos and articles, and I managed people, all of which were thoroughly enjoyable teams, roles, and projects.</p><p id="fb2c">But this wasn’t my first job. Or my second. Or my… (you get the idea). I’ve been doing this kind of work at many, various companies since leaving graduate school in 1992. So after (checks calendar again, realizes it’s more of a calculator problem, gives up, does the math) <em>more than 31 years</em>, it’s time for something new. Or, rather, something old: school.</p><p id="3982">In the last few years I’ve been gradually rewinding my career. After leading/managing the Toolkit team for a few years, I moved to Developer Relations, where I managed a smaller team. I missed coding, so I rewound and came back, as an engineer on the graphics team. I then returned to the Toolkit team as an engineer, rewinding my career more. Now it’s time to rewind it all the way to where it began: I’m going back to grad school.</p><p id="8b8b">Last Fall, I started an MFA in comedy screenwriting in Chicago. It’s a full-time 2-year program at DePaul, with comedy classes at Second City. Full time work plus school has been working out great, except for the part where I also need sleep.</p><p id="59af">Leaving my job and career is by far the worst financial decision I ever hope to make. It turns out that tech has better pay, benefits, prospects, perks, and stability (yes, even in this rotten tech cycle we’re in). But comedy writing is something I <em>want</em> to do. I feel very strongly that everyone should try, to the extent that it makes some kind of sense if you squint hard enough, to do what they want in work and life. I’ve been writing and doing comedy— sometimes at the same time — for many years on the side. So I’m promoting my hobby to be my day job.</p><p id="7b06">And maybe (probably) I will miss the code and will figure out ways to do that again someday. Maybe coding will become my hobby. You can take the engineer out of the bytes, but you can’t take bites out of the engineer. Or something like that. But for now, it’s nice to just soak in the comedy, and the writing, and the student life. (My lunch often consists of PB&amp;J and a pack of instant ramen. Sometimes both, when I feel really wild and spendy). As for what the future holds, I’ll figure that out when I get there. That’s the great thing about the future; it’s always there waiting for you. In the meantime, I have writing homework to do.</p><blockquote><p id="1c3a">You can take the engineer out of the bytes, but you can’t take bites out of the engineer.</p></blockquote><p id="b592">To everyone in the Android community: thanks for being a part of my journey. I’ve had a [very] long career in software development and I’ve enjoyed all^H^H^H most of it immensely. But my time on, with, and for Android far surpassed everything else for the sheer excitement of being a part of the wild ride as Android became what it is today. When I joined Google, Android was in a solid 4th or 5th place behind, well, everyone else. By the end of that first year, the situation had changed drastically, and everything has only gotten bigger and better in the many years since.</p><p id="1fcb">Along the way, I got to create fundamental technology and APIs that the platform needed (hello, <a href="https://developer.android.com/reference/android/animation/package-summary" rel="noopener ugc nofollow" target="_blank">Animator</a>!), work on critical and interesting projects on the platform and AndroidX (hello, graphics, UI, and performance!), and work with a great team of clever, interesting, and passionate people for many years.</p><figure><figcaption>My hobby project included speaking into foam balls dangling awkwardly near my mouth in front of sometimes many, many people.</figcaption></figure><p id="5192">Through my side project of writing and speaking about Android development,* I got to meet and be a part of a vibrant developer community for many years, including hosting a fun <a href="http://adbackstage.libsyn.com/" rel="noopener ugc nofollow" target="_blank">podcast</a> since 2014. I hope to continue with the podcast from outside of Android. I always enjoyed my “color commentary” role, so maybe ignorance of what’s happening internally won’t be a drastic change.</p><figure><figcaption>All of my badges and lanyards from the many events I spoke at. I have no idea why I kept them. Maybe just for posting a picture of them when I was done. Achievement unlocked. Badge earned.</figcaption></figure><p id="47fe">Along the way, because nobody else was doing it, I got to learn about and tell <a href="https://www.chethaase.com/androids" rel="noopener ugc nofollow" target="_blank">the story of how Android came into existence</a> in the very early years. I had <a href="https://chetchat.blogspot.com/" rel="noopener ugc nofollow" target="_blank">written</a> <a href="https://graphics-geek.blogspot.com/" rel="noopener ugc nofollow" target="_blank">many</a> <a href="http://medium.com/@chethaase" rel="noopener">things</a> before that book, and had even written <a href="https://www.chethaase.com/books" rel="noopener ugc nofollow" target="_blank">several books</a> before that book. But that 4+ year project of interviewing and compiling first-hand tales of how it all came together is the highlight of my writing life (so far!).</p><figure><figcaption>There’s nothing like a &gt;4 year book project to learn how short life is.</figcaption></figure><p id="f10e">For those brave souls who read this far looking for inside dirt on why I’m <em>really</em> leaving… I’m sorry to leave you so very unsatisfied. The company, the job, the people, and the work were great. But just in case there are any news site bots searching for possible clickbait stories, here’s a headline just for you:</p><blockquote><p id="a259">“Googler Quits to Do Something Very Different!”</p></blockquote><p id="b571">Good luck to all of the Android developers and users reading this. And, heck, to everyone else as well. I’m a writer now — I’m happy for any readers I can get! I hope to see you someday on the big screen. Or the little one. Or through the pages of books. Or in person would be fine, too.</p><p id="4b4a">Chet.</p><p id="8803"><em>* p.s. I will miss many things about my job on Android, but one of the unique opportunities I enjoyed was giving tech and comedy talks at developer events. There is nothing like being on stage in front of a large audience and pretending to know what you’re talking about. I’m game for more of that if I can figure out logistics that make sense in my new student/writing life. </em><a href="https://www.chethaase.com/contact" rel="noopener ugc nofollow" target="_blank"><em>Let me know</em></a><em> if you think you have an opportunity (conference talks, podcasts — anything with a mic) that might work.</em></p><figure><figcaption>My original badge photo taken on my first day in 2010. The security guard assumed I wanted a retake.</figcaption></figure><figure><figcaption>Do not ask for whom he smirks. He smirks for me.</figcaption></figure></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The game theory of seduction and marriage with Jane Austen (132 pts)]]></title>
+            <title><![CDATA[The game theory of seduction and marriage with Jane Austen (133 pts)]]></title>
             <link>https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and</link>
             <guid>39409445</guid>
             <pubDate>Sat, 17 Feb 2024 13:58:19 GMT</pubDate>
@@ -891,7 +1829,7 @@ earthly +validate</pre></div>
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><p><em>A key theme of this Substack is that seemingly irrational behaviour makes a lot of sense when we appreciate the right degree of complexity that people face when making decisions. In this post, I look at a domain where rationality is often deemed to be absent: love and seduction. I discuss this theme through the contribution of one of the most insightful writers on this topic: Jane Austen. </em></p><p>Finding a romantic partner is one of the things that can motivate us to spend tremendous time, effort, and thought. We can feel that the stakes are very high. What is said, what is suggested, and what is possibly thought by the other person acquires high importance. Talented writers capture the tension of these moments, the careful way people navigate these situations potentially fraught with missteps, missed opportunities or overly candid overtures. The persistent fame of Jane Austen, who wrote about such situations in the early 19th century, is a reflection of her talent to understand the rich layers of these situations.</p><p><span>This post is more than slightly inspired by the book by UCLA political scientist Michael Chwe, </span><em>Jane Austen Game Theorist </em><span>(2013). Chwe methodically unpacks Jane Austen’s six novels showing how her insights about human psychology in romantic situations can be related to many concepts from game theory.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-1-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-1-137505917" target="_self" rel="">1</a></span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png" width="788" height="570" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/f6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:570,&quot;width&quot;:788,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:999382,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff6e55e5e-8e13-453a-b918-c25fd26d9954_788x570.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p><span>The economic considerations of Austen’s heroines are easily overlooked nowadays. The economist Thomas Piketty provided some background to the magnitude of the stakes they faced. The most striking change in fate is in </span><em>Pride and Prejudice</em><span>, Austen's most famous novel: without marriage, Elizabeth would face social demotion. Being unable to inherit her father’s estate with her sisters, she would inherit from her mother 1,000 pounds, which would provide her with an income of around 40 pounds per year, just around the average income of the day.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-2-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-2-137505917" target="_self" rel="">2</a></span><span> In contrast, Mr. Darcy, who proposes to her, has an income of 10,000 pounds per year, representing 300 times the average income of the day! For comparison, the average annual income is around $30,000 in the US. The modern equivalent of Darcy would be earning 9 million dollars a year.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg" width="592" height="270.7912087912088" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:666,&quot;width&quot;:1456,&quot;resizeWidth&quot;:592,&quot;bytes&quot;:1067516,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/jpeg&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F043af9e3-2944-4f55-9197-8565364f1c50_1557x712.jpeg 1456w" sizes="100vw"></picture></div></a><figcaption><span>Extract from Thomas Piketty’s </span><em>Capital and Ideology </em><span>(2020)</span><em>, </em><span>discussing the meaning of the income differences in Austen’s novels.</span></figcaption></figure></div><p>Austen’s clear-minded heroines are mindful of these stakes. When Elizabeth’s sister asks her, “Will you tell me how long you have loved him?” Elizabeth playfully answers: “It has been coming on so gradually, that I hardly know when it began. But I believe I must date it from my first seeing of his beautiful grounds at Pemberley.”</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg" width="492" height="339.84" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/b351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:708,&quot;width&quot;:1025,&quot;resizeWidth&quot;:492,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Jane Austen Film Adaptation Locations: Pemberley from Pride and Prejudice  (1995) – Austenprose&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="Jane Austen Film Adaptation Locations: Pemberley from Pride and Prejudice  (1995) – Austenprose" title="Jane Austen Film Adaptation Locations: Pemberley from Pride and Prejudice  (1995) – Austenprose" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb351b6e1-a995-4bce-8bd1-c708b771e5c7_1025x708.jpeg 1456w" sizes="100vw"></picture></div></a><figcaption><span>Pemberley, Darcy’s estate in the 1995 BBC adaptation of </span><em>Pride and Prejudice</em></figcaption></figure></div><p>In addition to their pursuers’ wealth, Austen’s heroines also need to be very mindful of their characters. It is a truth (almost) universally acknowledged that single men tend to be more eager to secure a new partner than single women do. In short, women face a larger number of possible pursuers and should choose carefully among them if they are looking for a long-term partner. </p><p><span>In 1972, the biologist Robert Trivers explained this pattern with his critical contribution to our understanding of behaviours between men and women: </span><em>parental investment theory. </em><span>In short, making offspring is a long process requiring parental investment. However, the investments are not identical. Women, who carry a child for nine months, have to make a large physiological investment to start with. As a consequence, they are at risk of being taken advantage of by opportunistic men interested in a short-term relationship, but uncommitted to the long-term prospect of investing in building a family and raising children later on.</span></p><p>It is therefore perfectly rational for women to be extremely careful in their choice of partner and not to be too quick to accept the advances of a given pursuer. This issue is at the heart of Austen’s novels where heroines often have to avoid the deceiving appeal of men who seem charming but who are actually not of good character and not committed to a long-term relationship.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png" width="603" height="586" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:586,&quot;width&quot;:603,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:604367,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7b903cb3-e8ba-4599-80a1-9b932de59c7f_603x586.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption><span>The treacherous decisions many of Austen's heroines face, at some point enticed by a seductive man who hides a terrible character. Elizabeth in </span><em>Pride and Prejudice</em><span>, Marianne in </span><em>Sense and Sensibility</em><span>, and Emma in </span><em>Emma</em><span>.</span></figcaption></figure></div><p>In that context, one has to appreciate the consequential decisions women have to make in Jane Austen’s novels. Unlike in the modern dating process, they cannot get to know a potential partner intimately before deciding whether or not to commit to a relationship. They have to appraise the traits of potential pursuers carefully from the limited interactions and exchanges they have with them. Jane Austen’s stories recount women who use their wit and determination to navigate these high-stakes situations, avoid the dangerous matches and manage to attract the right ones.</p><p>In many ways, Austen’s world is vastly different from ours. It would be easy to dismiss these novels as irrelevant to understanding seduction and romantic situations in our times. However, despite these differences, these novels still resonate with us today because they exposed, in a magnified way, an underlying logic of interaction between men and women that still exists. </p><p><span>Even if times have changed, Trivers’ insights remain valid. The data now available from online dating platforms is unequivocal. Tinder </span><a href="https://mazeoflove.com/tinder/" rel="">data</a><span> shows that men like 10 times more profiles than women do and that 1 in 50 of their likes leads to a match versus 2 out of 5 for women.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-3-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-3-137505917" target="_self" rel="">3</a></span><span> Faced with many men happy to date them, women have to identify the ones who may be willing to invest in a long-term relationship. The costs of making wrong decisions are not negligible. Women looking for a long-term partner can lose precious years of their lives with men who are not truly interested in committing to a long-term relationship. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg" width="526" height="526" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:900,&quot;width&quot;:900,&quot;resizeWidth&quot;:526,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Image&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="Image" title="Image" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F405bdaa0-9dda-4e9a-99df-2e28501b97d2_900x900.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p><span>In the game of dating, this logic leads to an </span><a href="https://lionelpage.substack.com/p/time-for-some-game-theory" rel="">equilibrium</a><span> where men must signal their genuine interest in a long-term relationship by investing time and resources in the dating process (Sozou and Seymour, 2005). This </span><em>courtship</em><span> behaviour makes it harder for men to pursue several women simultaneously. A man who chooses to court you, therefore reveals that you were high in his preferences.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-4-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-4-137505917" target="_self" rel="">4</a></span></p><p>While a long phase of courtship before marriage has mostly disappeared in Western countries, asymmetric norms in the dating process nonetheless persist. In a survey conducted in 2015 in North America, 69% of the respondents stated that the man should pay for the first date, 87% stated that he should bring flowers then, and 66% stated that he should also pay for the second date (Cameron and Curry 2020). If these rules persist despite much greater equality between men and women, it is because they are the solution to the asymmetry in eagerness for short-term relationships between men and women. </p><p><span>In her writing, Austen offers clear insight into the stressful process of interacting with a potential partner to progressively reach a common understanding and eventually form a match. To be successful, one needs to be particularly adept at understanding others’ intentions and beliefs, a quality that Austen describes as </span><em>penetration</em><span>, which she states women are particularly gifted at.</span></p><p><span>One way to conceptualise penetration using game theory is as the ability to form accurate </span><em>higher-order beliefs</em><span>, beliefs about others’ beliefs. While a first-order belief might be “Ann thinks that Bob is charming,” a second-order belief could be “Bob believes Ann thinks he is charming.” A third-order belief might be “Ann thinks Bob believes that she thinks he is charming,” and so on.</span></p><p><span>Forming higher-order beliefs is challenging. Psychologists refer to the ability to put oneself in another's shoes as </span><em>theory of mind</em><span>. Getting an idea about the beliefs of another person—a second-order belief—requires us to simulate in our minds what beliefs would reasonably be formed from another person's perspective. Understanding other people’s beliefs about our beliefs—a third-order belief—requires simulating the perspective of somebody simulating our perspective. Climbing higher-order beliefs necessitates engaging recursively in this perspective-taking.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-5-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-5-137505917" target="_self" rel="">5</a></span><span> </span></p><p><span>The literature in behavioural economics indicates that most often, people do not go much beyond third-order beliefs, as it becomes increasingly difficult to think clearly about higher levels. However, the situations in which we are considering finding a partner are among the most significant we face in our lives, and we can invest a considerable amount of cognitive effort and time to make sense of higher-order beliefs. In his book, Chwe presents an exemplary case where two characters—Catherine Morland and Henry Tilney in </span><em>Northanger Abbey</em><span>—are in a situation in which their understanding involves many more higher-order beliefs. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png" width="614" height="386.7019230769231" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:917,&quot;width&quot;:1456,&quot;resizeWidth&quot;:614,&quot;bytes&quot;:1564446,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F2d2ce6af-1b78-4cf5-bb77-2252759cb1c9_1598x1006.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Chwe’s description of the interaction between Catherine and Henry </figcaption></figure></div><p>The situation is subtle but we fairly easily understand it. The figure below decomposes the layers of higher-order beliefs, it shows that there are up to 8 of them!</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png" width="952" height="529" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/d686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:529,&quot;width&quot;:952,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:98517,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd686bbb6-3fbb-4af0-8e50-e40e53e0ff45_952x529.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption><span>Mind reading situation in </span><em>Northanger Abbey</em></figcaption></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg" width="500" height="292" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/d4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:292,&quot;width&quot;:500,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;Jane Austen Explains Mansplaining | Better Living through Beowulf&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="Jane Austen Explains Mansplaining | Better Living through Beowulf" title="Jane Austen Explains Mansplaining | Better Living through Beowulf" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd4c30317-13ae-4e2d-ab3e-570d1685ac13_500x292.jpeg 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>Henry and Catherine (2007 adaptation)</figcaption></figure></div><p>One of Jane Austen’s talents lies in her ability to guide the reader through the considerations of higher-order beliefs that lay in the background of spoken interactions. Although the scenes described by Austen and the rules of interaction her characters follow differ significantly from our modern context, the underlying concerns they have for each other's intentions and beliefs remain relevant in today's interactions. Austen's novels continue to resonate because they allow readers to appreciate the anxieties and hopes associated with the uncertainty of these beliefs—emotions that are universally experienced by individuals with a romantic interest in someone else, even in contemporary times.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png" width="366" height="366" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1024,&quot;width&quot;:1024,&quot;resizeWidth&quot;:366,&quot;bytes&quot;:1816151,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F7899d875-c998-4f8f-985b-848868e7abe0_1024x1024.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>The significant amount of time teenagers with romantic interests spend pondering the thoughts, intentions, and perceptions of the person they are interested in reflects the inherent complexity of forming higher-order beliefs through recursive perspective-taking: it requires substantial time and effort to calibrate these beliefs accurately. This willingness to invest such cognitive resources is greater when the perceived stakes are high, as it is for teenagers’ first romantic interests.</figcaption></figure></div><p>These higher-order beliefs matter greatly when individuals who meet in a non-romantic capacity explore the possibility of a romantic interest. In such situations, guarded overtures are cautiously made, trying to maintain a balance between suggesting a possible interest and retaining plausible deniability. Overtures are needed to gauge whether the interest could be reciprocal. Keeping an overture somewhat ambiguous allows for the pretence that nothing was intended beyond the facade of the interaction if it is not met positively. If an overture is met positively, another can be made. </p><p>As such overtures are exchanged, both individuals may progressively reach a shared understanding that the civil facade of the interaction may conceal a romantic interest on both parts. This process continues until the point where the remaining uncertainty is light enough for the facade to be lifted and one of the individuals to make an explicit overture. In the time of Jane Austen, this was suitably resolved by an engagement whereby the man proposes. </p><p><span>Proceeding carefully through a series of guarded overtures allows the progressive lifting of uncertainty. A key aspect to consider is how quickly to make overtures and whether to be more or less clear about one's eagerness. The courtship equilibrium described above requires the man to show the most eagerness as a signal of his romantic interest. However, there is a risk of women being too aloof and ending up unmatched later in their lives (with potentially dire economic consequences at the time). In </span><em>Pride and Prejudice</em><span>, Elizabeth and her friend Charlotte discuss this important point in the game of seduction:</span></p><blockquote><p><strong>Charlotte</strong><span>: It is sometimes a disadvantage to be so very guarded. If a woman conceals her affection with the same skill from the object of it, she may lose the opportunity of fixing him … In nine cases out of ten a women had better show more affection than she feels.</span></p><p><strong>Elizabeth</strong><span>: … If a woman is partial to a man, and does not endeavour to conceal it, he must find it out.</span></p></blockquote><p><span>Here again, modern dating may seem very far removed from these considerations, yet this underlying logic still influences contemporary romantic interactions. Signalling too little interest might result in missed opportunities, but excessive eagerness could prematurely resolve uncertainty in situations where expectations about the prospect of a relationship are actually not aligned. When one’s feelings are not definitely set, suggesting eagerness might unduly heighten the other person’s expectations, necessitating a tedious toning down of these expectations later on. Conversely, if the other person happens not to be that inclined, revealing too much eagerness may lead to a painful explicit rejection. Both situations would lead to </span><em>awkwardness</em><span> because once uncertainty has been lifted and explicit statements have been made, they cannot be put back in the bottle. </span></p><p><span>The psychologist Steven Pinker (2007) describes such a situation occurring in the classic rom-com movie </span><em>When Harry Met Sally</em><span> (1989). Pinker points out that the effect of a too-explicit statement by Harry is to resolve the uncertainty about all the higher-order beliefs. The romantic interest of Harry is now </span><em>common knowledge</em><span>, that is Sally knows about it, Harry knows that Sally knows, Sally knows that Harry knows that Sally knows, and so on.</span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png" width="1011" height="262" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:262,&quot;width&quot;:1011,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:95020,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F142cefbe-9fee-43ef-95cb-e59584a507e0_1011x262.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png" width="528" height="285.032967032967" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:786,&quot;width&quot;:1456,&quot;resizeWidth&quot;:528,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;When Harry Met Sally&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="When Harry Met Sally" title="When Harry Met Sally" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4775cd7a-f984-4439-9948-8cf005dd639a_1500x810.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption><em>When Harry Met Sally</em><span> (1989)</span></figcaption></figure></div><p><span>An important advantage of ambiguous overtures is that they maintain uncertainty about these higher-order beliefs and can help retain </span><em>plausible deniability</em><span>. When an ambiguous overture is made and rejected, both persons can pretend that nothing happened. They can continue with the facade of non-romantic interactions, even though they may have a good understanding of what happened. However, when a too-explicit overture makes the intention of one person common knowledge, there is no walking back. It is “out there”. </span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png" width="689" height="435.943661971831" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/aefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:584,&quot;width&quot;:923,&quot;resizeWidth&quot;:689,&quot;bytes&quot;:112390,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Faefdace7-f8dd-4786-a3c7-aada5f7975b7_923x584.png 1456w" sizes="100vw" loading="lazy"></picture></div></a><figcaption>How ambiguous overtures can help maintain the non-romantic facade of the interaction by allowing individuals involved to maintain plausible deniability about their beliefs (illustration taken from Page, 2022)</figcaption></figure></div><p><span>Jane Austen’s novels describe many situations where the facade of interaction is formally maintained by avoiding explicit statements, while those involved wittily retort to each other in ways that leave little actual ambiguity regarding their respective views (amicable or unamicable) of each other. Today, as then, this management of ambiguity and the progressive resolution of uncertainty is a key aspect of interactions fraught with possible romantic interests.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-6-137505917" href="https://www.optimallyirrational.com/p/the-game-theory-of-seduction-and#footnote-6-137505917" target="_self" rel="">6</a></span></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png" width="57" height="74.13986013986013" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/fb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:186,&quot;width&quot;:143,&quot;resizeWidth&quot;:57,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb15cf31-bf51-4a29-ae3e-472d37819f56_143x186.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>The rules of courtship have noticeably changed in 200 years, but the underlying logic of strategic interaction in that process still follows many of the same principles. Jane Austen was a master at understanding the strategic layers of romantic situations and the psychology of protagonists involved in these interactions. It is because of the persistent commonality between the situations she describes and those we face today that Jane Austen still captivates modern audiences. Game theory helps us see her astute understanding of the layers of complexity in human interactions when a woman and a man have potentially romantic interests in each other.</p><h6>References</h6><h6><span>Cameron, J.J. and Curry, E., 2020. Gender roles and date context in hypothetical scripts for a woman and a man on a first date in the twenty-first century. </span><em>Sex Roles</em><span>, </span><em>82</em><span>(5-6), pp.345-362.</span></h6><h6><span>Chwe, M.S.Y., 2014. </span><em>Jane Austen, game theorist</em><span>. Princeton University Press.</span></h6><h6><span>Dekel, E. and Siniscalchi, M., 2015. Epistemic game theory. In </span><em>Handbook of Game Theory with Economic Applications</em><span> (Vol. 4, pp. 619-702). Elsevier.</span></h6><h6><span>Page, L., 2022. </span><em>Optimally irrational: The good reasons we behave the way we do</em><span>. Cambridge University Press.</span></h6><h6><span>Piketty, T., 2020. </span><em>Capital and ideology</em><span>. Harvard University Press.</span></h6><h6><span>Pinker, S., 2007. </span><em>The stuff of thought: Language as a window into human nature</em><span>. Penguin.</span></h6><h6><span>Sozou, P.D. and Seymour, R.M., 2005. Costly but worthless gifts facilitate courtship. </span><em>Proceedings of the Royal Society B: Biological Sciences</em><span>, </span><em>272</em><span>(1575), pp.1877-1884. </span></h6><h6><span>Tomasello, M., 2019. </span><em>Becoming human: A theory of ontogeny</em><span>. Harvard University Press.</span></h6><h6><span>Trivers, R.L., 1972. Parental investment and sexual selection. In </span><em>Sexual selection and the descent of man</em><span> (pp. 136-179). Routledge.</span></h6></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We Have to Start Over: From Atom to Zed (267 pts)]]></title>
+            <title><![CDATA[We Have to Start Over: From Atom to Zed (272 pts)]]></title>
             <link>https://zed.dev/blog/we-have-to-start-over</link>
             <guid>39408288</guid>
             <pubDate>Sat, 17 Feb 2024 10:45:22 GMT</pubDate>
@@ -1059,7 +1997,7 @@ EU users will be able to continue accessing websites directly from their Home Sc
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA["Stolen" radio tower missing for at least a year (178 pts)]]></title>
+            <title><![CDATA["Stolen" radio tower missing for at least a year (186 pts)]]></title>
             <link>https://www.radiodiscussions.com/threads/wjlx-wjbe-and-werh-oh-my.769948/#post-6697751</link>
             <guid>39408171</guid>
             <pubDate>Sat, 17 Feb 2024 10:24:00 GMT</pubDate>
@@ -1067,7 +2005,7 @@ EU users will be able to continue accessing websites directly from their Home Sc
 Couldn't get https://www.radiodiscussions.com/threads/wjlx-wjbe-and-werh-oh-my.769948/#post-6697751: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft bets on Germany in 3.2B euro AI push (125 pts)]]></title>
+            <title><![CDATA[Microsoft bets on Germany in 3.2B euro AI push (127 pts)]]></title>
             <link>https://www.reuters.com/technology/microsoft-invest-32-bln-eur-germany-ai-push-2024-02-15/</link>
             <guid>39408155</guid>
             <pubDate>Sat, 17 Feb 2024 10:19:49 GMT</pubDate>
@@ -1075,7 +2013,7 @@ Couldn't get https://www.radiodiscussions.com/threads/wjlx-wjbe-and-werh-oh-my.7
 Couldn't get https://www.reuters.com/technology/microsoft-invest-32-bln-eur-germany-ai-push-2024-02-15/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[Considerations for a long-running Raspberry Pi (426 pts)]]></title>
+            <title><![CDATA[Considerations for a long-running Raspberry Pi (433 pts)]]></title>
             <link>https://www.dzombak.com/blog/2023/12/Considerations-for-a-long-running-Raspberry-Pi.html</link>
             <guid>39407631</guid>
             <pubDate>Sat, 17 Feb 2024 08:42:37 GMT</pubDate>
@@ -1083,7 +2021,46 @@ Couldn't get https://www.reuters.com/technology/microsoft-invest-32-bln-eur-germ
 <div id="readability-page-1" class="page"><article><header><span> <time pubdate="" datetime="2023-12-29T14:43:07-05:00"> <span>December</span> <span>29,</span> <span>2023</span> </time> • <span>Tagged:</span> <a href="https://www.dzombak.com/blog/tag/series%3Api-reliability/">series:pi-reliability</a> <a href="https://www.dzombak.com/blog/tag/raspberry-pi/">raspberry-pi</a> </span></header><p>Part of the <a href="https://www.dzombak.com/blog/series/pi-reliability.html">Raspberry Pi Reliability</a> series.</p><p>I use Raspberry Pis around my home as everything from <a href="https://github.com/cdzombak/pi-fm-player">low-power FM transmitters</a> to <a href="https://github.com/cdzombak/nut_influx_connector">UPS energy monitors</a>.</p><p>Keeping a Raspberry Pi online and working with zero intervention for weeks, months, or years is somewhat of an art form. Several classes of things can go wrong, and you need to consider how your Pi will recover from each of them — and <a href="https://www.dzombak.com/blog/2023/12/Consider-the-risks-before-making-any-dramatic-changes-to-your-Raspberry-Pi-setup.html">weigh the risks of each solution against its benefits</a>.</p><p>This new set of posts in <a href="https://www.dzombak.com/blog/series/pi-reliability.html">my Raspberry Pi Reliability series</a> covers each class of issues I’ve run into, and what I’ve done to solve them. As a bonus, these posts also include some tips on monitoring, mainly using <a href="https://github.com/louislam/uptime-kuma">Uptime Kuma</a>.</p><p>This aims to be a more comprehensive guide than <a href="https://www.dzombak.com/blog/2021/11/Reducing-SD-Card-Wear-on-a-Raspberry-Pi-or-Armbian-Device.html">my previous post on reducing SD card wear</a>, and the posts linked here should be considered an updated replacement for that post.</p><p><em>Without further ado:</em></p><h2 id="what-can-go-wrong-and-how-do-i-prevent-it"> What can go wrong, and how do I prevent it? <a href="#what-can-go-wrong-and-how-do-i-prevent-it"></a></h2><ul><li><a href="https://www.dzombak.com/blog/2023/12/Maintaining-a-solid-WiFi-connection-on-Raspberry-Pi.html">The WiFi connection can fail</a></li><li><a href="https://www.dzombak.com/blog/2023/12/Keep-your-software-up-and-running-on-the-Raspberry-Pi.html">Your software service can stop working</a></li><li><a href="https://www.dzombak.com/blog/2023/12/Mitigating-hardware-firmware-driver-instability-on-the-Raspberry-Pi.html">Hardware/firmware/driver instability can cause a crash</a></li><li>Your SD card can wear out or completely fill up<ul><li><a href="https://www.dzombak.com/blog/2023/12/Choosing-the-right-SD-card-for-your-Pi.html">Start by choosing the right microSD card</a></li><li><a href="https://www.dzombak.com/blog/2023/12/Stop-using-the-Raspberry-Pi-s-SD-card-for-swap.html">Don’t use the SD card for swap!</a></li><li><em>Choose one of…</em><ul><li>Aggressively manage things that write to the SD card (especially logs)</li><li>Make the Pi’s root filesystem read-only</li><li><em>In the interest of getting this series of posts finished in fewer than 2 months,</em> for now I’ll point you to my 2021 post on reducing SD card wear, particularly the <a href="https://www.dzombak.com/blog/2021/11/Reducing-SD-Card-Wear-on-a-Raspberry-Pi-or-Armbian-Device.html#if-the-system-can-use-a-read-only-filesystem">read-only root filesystem section</a> or the <a href="https://www.dzombak.com/blog/2021/11/Reducing-SD-Card-Wear-on-a-Raspberry-Pi-or-Armbian-Device.html#if-the-system-cant-use-a-read-only-filesystem">non-read-only root filesystem section</a>. <em>I plan to produce two updated, easier-to-read guides here in the near future, for my own reference as much as yours; <a href="https://www.dzombak.com/blog/series/pi-reliability.atom.xml">watch this space</a>!</em></li></ul></li><li><a href="https://www.dzombak.com/blog/2023/12/Raspberry-Pi-SD-cards-fsck-them-often.html">Check the filesystem often</a> if you’re not using a read-only root filesystem</li></ul></li><li><a href="https://www.dzombak.com/blog/2023/12/Disable-or-remove-unneeded-services-and-software-to-help-keep-your-Raspberry-Pi-online.html">Disabling unneeded services helps with both software stability <em>and</em> SD card wear</a></li></ul><p><strong>Also, do these:</strong></p><ul><li><a href="https://www.dzombak.com/blog/2023/12/Consider-the-risks-before-making-any-dramatic-changes-to-your-Raspberry-Pi-setup.html">Consider risks and benefits before applying any invasive intervention</a></li><li><a href="https://www.dzombak.com/blog/2023/12/Remote-logging-for-easier-Raspberry-Pi-debugging.html">Remote logging can help you figure out what went wrong, when something <em>does</em> go wrong</a></li></ul><h2 id="caution-advice-to-avoid"> Caution: Advice to avoid <a href="#caution-advice-to-avoid"></a></h2><p><a href="https://raspberrypi.stackexchange.com/a/186">This Stack Exchange post</a> suggests disabling journaling for the Pi’s filesystem. <strong>Don’t do this.</strong> While this change might reduce SD card wear, it makes your Pi more likely to face filesystem corruption in the event of a crash or power outage. My goal is to make my Pis <em>more</em> reliable, and disabling journaling works against that goal.</p><h2 id="pi-reliability-series-updates"> Pi Reliability Series Updates <a href="#pi-reliability-series-updates"></a></h2><p>Inevitably I’ll come back to the posts linked above with corrections and additions. For the foreseeable future, when this happens, I will:</p><ul><li>Edit the post</li><li>Add a callout in the post noting the date the change was made</li><li>Write a brief post in the Pi Reliability blog series announcing the change, with a link to the edited post</li></ul></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[From engineer to manager: what I love, what I hate (270 pts)]]></title>
+            <title><![CDATA[Mushroom Sprouting Out of a Living Frog (101 pts)]]></title>
+            <link>https://journals.ku.edu/reptilesandamphibians/article/view/20966/19496</link>
+            <guid>39407081</guid>
+            <pubDate>Sat, 17 Feb 2024 06:59:22 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://journals.ku.edu/reptilesandamphibians/article/view/20966/19496">https://journals.ku.edu/reptilesandamphibians/article/view/20966/19496</a>, See on <a href="https://news.ycombinator.com/item?id=39407081">Hacker News</a></p>
+<div id="readability-page-1" class="page">
+
+		<header>
+
+		<a href="https://journals.ku.edu/reptilesandamphibians/article/view/20966">
+			<span>
+									Return to Article Details
+							</span>
+		</a>
+
+		<a href="https://journals.ku.edu/reptilesandamphibians/article/view/20966">
+			Mushroom sprouting out of a living frog
+		</a>
+
+		<a href="https://journals.ku.edu/reptilesandamphibians/article/download/20966/19496/64783" download="">
+			<span>
+				Download
+			</span>
+			<span>
+				Download PDF
+			</span>
+		</a>
+
+	</header>
+
+	
+
+	
+	
+
+
+</div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[From engineer to manager: what I love, what I hate (272 pts)]]></title>
             <link>https://thoughtspile.github.io/2024/02/16/eng-to-em/</link>
             <guid>39406804</guid>
             <pubDate>Sat, 17 Feb 2024 05:52:01 GMT</pubDate>
