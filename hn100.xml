@@ -4,12 +4,274 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 02 Mar 2024 18:00:05 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 02 Mar 2024 19:00:06 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Mathematicians prove Pólya's conjecture for the eigenvalues of a disk (131 pts)]]></title>
+            <title><![CDATA[Writing a Minecraft server from scratch in Bash (2022) (104 pts)]]></title>
+            <link>https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/</link>
+            <guid>39572858</guid>
+            <pubDate>Sat, 02 Mar 2024 14:42:43 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/">https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/</a>, See on <a href="https://news.ycombinator.com/item?id=39572858">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content">
+<div><h3>My thoughts on writing a Minecraft server from scratch (in Bash)</h3>
+<p>For the past year or so, I've been thinking about writing a Minecraft server in Bash as a thought excercise. I once tried that before with the Classic protocol (the one from 2009), but I quickly realized there wasn't really a way to properly parse binary data in bash. Take the following code sample:</p>
+
+<p><code>function a() {
+	read -n 2 uwu
+	echo "$uwu" | xxd
+}
+</code></p><p>This would read two bytes into a variable, and then pass them to `xxd`, which should show the hexdump of the data.</p>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/1.png">
+<small>Picture 1 - bash's lack of support for nullbytes</small></p><p>Everything's great, until we pass a nullbyte (0x00). Not only does Bash ignore nullbytes in strings, it also doesn't present any way to detect that a nullbyte has occured. Considering that the protocol I'm trying to implement is strictly binary, this can severely mangle the data.</p>
+
+<br><hr>
+
+<p>One rainy evening in late January, I've had a revelation. What if I reversed the order of that function? If the binary data never reaches a variable (or, more precisely, a substitution), and just stays inside a pipe, can it pass nullbytes around?</p>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/2.png">
+<small>Picture 2 - reading nullbytes with xxd</small></p><p>The answer is yes! After some iterations, I decided to use `dd` passed to `xxd` instead of just `xxd`, because this way I can finetune how many bytes to read.</p>
+
+<p><code># the $len variable is assigned earlier, basing on a similar read function
+a=$(dd count=$len bs=1 status=none | xxd -p)
+</code></p><p>This gave me a hex string, on which I could do pattern matching, pattern replace, data extraction... and more. Sending out responses could be done analogically, using xxd's Reverse switch.</p>
+
+<p>`ncat` is used for listening on Minecraft's default TCP port. It launches the main shell script (`mc.sh`) after it receives an incoming connection.</p>
+
+<h3>The Protocol Is Not Really Good, Actually</h3>
+
+<p><i>Note: the following section contains mostly my ramblings about implementing number conversion routines in Bash; If this does not interest you, feel free to <a href="#skip">skip</a> it.</i></p>
+
+<p>The first thing one should implement for a Minecraft server to function would be the <a href="https://wiki.vg/Server_List_Ping">Server List Ping</a> packet - not because it's required (heck, your server can just not reply to it properly, and you'd still be able to join the game), but because it's the easiest to tackle first. It helps to familiarize yourself with core protocol concepts, such as <a href="https://wiki.vg/Data_types">data types</a> types:</p>
+
+<h4>VarInts and VarLongs</h4>
+
+<p>Most data types were trivial to implement, but some gave me more of a fight than others - notably the IEEE754 floating point numbers (more on them later), and so-called VarInt/VarLong numbers. Those may be familar to those acquainted with the MQTT protocol, as they're just a modified version of the <a href="https://en.wikipedia.org/wiki/LEB128">LEB128</a> encoding.</p>
+
+<p>LEB128 is a compression scheme for integers. By splitting a byte into 1 signalling bit and 7 data bits, the scheme stores the number length. If the 1st bit is 0, then this byte is the last one; else, then there's another byte after this one. Great scheme if most of your numbers are either between 0 and 127 or 256 and 16383, otherwise it's `buy one byte, get one free` situation, because numbers that would otherwise fit in a byte get pushed out to the next one by a single bit.</p>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/3.png">
+<small>Picture 3 - explanation of basic LEB128 in a drawing form; red bits are signalling bits, green bits are data bits. Input value is 0xFF (256), output value is 0xFF01</small>
+
+
+
+
+<code># from <a href="https://git.sakamoto.pl/domi/Witchcraft/-/blob/meow/src/int.sh">src/int.sh</a>
+# int2varint(int)
+function int2varint() {
+	local a
+	local b
+	local c
+	local out
+	out=$(printf '%02x' "$1")
+	if [[ $1 -lt 128 ]]; then
+		:
+	elif [[ $1 -lt 16384 ]]; then
+		a=$(($1%128))
+		b=$(($1/128))
+		out=$(printf "%02x" $((a+128)))$(printf "%02x" $b)
+	elif [[ $1 -lt $((128*128*128)) ]]; then
+		a=$(($1%128))
+		c=$((($1/128)%128))
+		b=$(($1/16384))
+		out=$(printf "%02x" $((a+128)))$(printf "%02x" $((c+128)))$(printf "%02x" $b)
+	fi
+	echo -n "$out"
+}
+</code></p><p>I've had problems translating the reference implementation to Bash, so instead I played with the protocol enough to write my own from scratch. I figured out that it was basically a modulo and a division in a trenchcoat, which I used to my advantage in the code snippet above.</p>
+
+<p>I took a more contemporary approach on <a href="https://git.sakamoto.pl/domi/Witchcraft/-/blob/meow/src/int.sh#L28">the decoder</a>, using an AND, and then multiplying the result - similarly to how the reference did it.</p>
+
+<p>LEB128 definitely wasn't the hardest or the most annoying to implement (that one goes to IEEE754 floating point); I still don't like how it is sprinkled in random places inside the protocol, interleaved with regular ints (and longs), and in some cases even signed shorts.</p>
+
+<h4>IEEE 754 Floating Point numbers</h4>
+
+<p>I'm not a math person. When I see the exponential notation spewed out by Python, I scream and run. This may be the main cause of why I hated implementing these floating point converters. I won't be going too deep into specifics of how this format works - instead, I recommend you check out <a href="https://en.wikipedia.org/wiki/Double-precision_floating-point_format">this wikipedia page</a>.</p>
+
+<p>The basic implementation requires a loop, inside of which there's a negative power applied to the result; Bash doesn't natively support negative powers, which sent me on a trip to find a utility that does.</p>
+
+<p>A suggestion I found while duckduckgoing was to use perl, but I consider that cheating. Alternatively, tried using `bc`, but it seems that either it doesn't support powers at all, or the busybox version does not. Bummer.</p>
+
+<p>When I was about to give up, I got reminded that <a href="https://twitter.com/thingskatedid">Kate</a> once made a <a href="https://gist.github.com/katef/fb4cb6d47decd8052bd0e8d88c03a102">plot program</a> in awk. Surely, awk has powers? ~~Maybe even super cow powers?~~ It turns out that it does!</p>
+
+
+
+<p><code>$ echo '' | awk '{print (2**-1)}'
+0.5
+</code></p><p>With this knowledge, I scribbled a working implementation and attached it to data decoded from the Player Move packet. In a trial run, the client sent around 50-100 packets like that, each one with three doubles (X, Y, Z). It turned out that the conversion function was so slow, that the server wasn't done with that workload after multiple minutes - something rather unacceptable for a real-time game.</p>
+
+<p>The easiest solution to lowering the response time would be lowering the amount of calls to external binaries, such as awk. As most of my workload was already inside a bash `for` loop, I just <a href="https://git.sakamoto.pl/domi/Witchcraft/-/blob/meow/src/int.sh#L114">moved the loop</a> inside `awk`, which has saved me literally tens of calls to awk.</p>
+
+
+
+<p><code># (...)
+asdf=$(cut -c 13- &lt;&lt;&lt; $val | sed -E 's/./,&amp;/g;s/,//' | tr -d 'n' | awk -F ,     '{
+power_count=-1
+x=0;
+for(i=1; i&lt;=NF; i++) {
+x=(x + ($i * (2 ** power_count)))
+power_count=power_count-1;
+}
+print(x+1)
+}')
+# (...)
+</code></p><p>The conversion is still quite slow (it takes ~10ms on my Xeon E5-2680v2), but this is to be expected with bash scripts. For a cheap comparsion, the old version took around 350ms, but I don't have solid measurements to prove that. ~~still, 35x faster, woo!~~</p>
+
+<h4>"Position" data type</h4>
+
+<p>Finally, something made up by Mojang themselves! <a href="https://wiki.vg/Data_types#Position">Position</a> is a 64-bit Long value, where three coordinates are stored alongside each other: X gets 26 most significant bits, Z gets 26 middle bits, Y gets 12 least significant bits. I'm not the biggest fan of weird data types like this one, but it was <a href="https://git.sakamoto.pl/domi/Witchcraft/-/blob/meow/src/int.sh#L48">crazy easy to implement</a> in Bash, because it has all the needed bitshift operators.</p>
+<p>The worst part about this data type is that it doesn't actually get used much. Around half of the packets store X, Y and Z coordinates as separate Double vaules. This means that:</p>
+<ul>
+	<li>the location data suddenly grew from 64 bits to 192 bits per packet</li>
+	<li>we get 9 digits of floating point accuracy, if we assume that we're only ever going to need numbers up to 30 000 000 (where the world border is at by default)</li>
+	<li>the protocol gets messy, with ~~two~~ three (or more) different number formats</li>
+</ul>
+
+<p>I kinda see the reasoning as to why it's like that, but I still don't like the current state. Normal server communication uses zlib anyways, and you realistically won't ever need more than two (or maybe three max) digits of decimal precision to describe a position within a block.</p>
+
+<h4>Named Binary Tag</h4>
+<p>Lastly, there's the <a href="https://wiki.vg/NBT">NBT</a> format, also an internal thing made by <strike>Mojang</strike> <a href="https://twitter.com/ihaveamac/status/1207812790771015680">Hatsune Miku</a> herself. NBT is like JSON, but for binary data. Not unlike JSON, it gets abused to store arbitrary data beyond spec - for example, Mojang stores bitstreams of variable length as an array of Longs; if such array isn't long-aligned, or even byte-aligned, the last Long is padded with zeroes.</p>
+<p>At one point I've had a NBT parser implementation implemented almost fully, but I decided it was not worth the hassle to finish it. The code is currently lost, due to my extensive use of tmpfs as a project directory, and a system crash.</p>
+
+<h3 id="skip">Writing the actual server</h3>
+<p>With all the math out of the way, here comes the *actually fun* part. I documented some of my adventures <a href="https://twitter.com/_sdomi/status/1489066397137354753">on Twitter</a>, but that thread was merely a glimpse on the actual development process. Also, let's assume that we already have the Server Ping packet out of our way, and it's a matter of actually making the game joinable now.</p>
+<p>To allow a client to join your server, it has to complete the handshake process and send a few extra packets (chunks, player position, inventory, join game). Two biggest obstacles on that course were the Join Game packet, and the data structure within the Chunk packets.</p>
+
+
+<h4><a href="https://wiki.vg/Protocol#Join_Game">Join game</a></h4>
+<p>The join game sends some initial metadata: player's entity ID, gamemode, some information about the world and, since ~1.16, a "Dimension codec". This is a NBT Compound, containing the following fields:</p>
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/4.png">
+<small>Picture 4 - What if a client gets an empty NBT Compound? It helpfully dumps out all the required values</small></p><p>The Dimension codec part was a major pain to implement. For my purposes, I decided to retrieve that NBT field from a vanilla server. It's the only binary blob in this implementation, and while it could be reimplemented, I don't see any reason to reimplement something that I don't necessarily need (or want) to customize.</p>
+
+<h4><a href="https://wiki.vg/Protocol#Chunk_Data_And_Update_Light">Chunk Data And Update Light</a></h4>
+
+<p>At first glance, this packet looks huge and scary! If you have the table from the link above open side by side with this article, I invite you to imagine that every one of those huge BitSet fields is actually just `0x00`, and that you don't need to send the Block Entity field at all. This leaves us with X, Y, heightmaps (which are fancily encoded repetitions of `b000000010`, and could be virtually anything), and the ominous Data field. Less scary, right?</p>
+
+<h4>What's the Data?</h4>
+
+<p>The Data field is actually an array of Chunk Section. A Chunk Section is 16 by 16 by 16 blocks, and multiple sections can be stacked together to create a Chunk. For our purposes, this array only has a single element, just to simplify the code a bit.</p>
+
+<p>A Chunk Section contains a block count, a block states container, and a biome container. Both of these containers use palette structure to encode possible block values - this means that before the real block data, server has to define a mapping from the "local" block IDs, to "global" block IDs. This aims to squish as much data as possible inside a small space - a block definition can be as small as 4 bits.</p>
+
+<p>As in my opinion the wiki page doesn't explain it well enough to quickly comprehend, here's another drawing:</p>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/5.png">
+<small>Picture 5 - left, a visualized palette to global ID mapping; right, a simplified example of how the displayed blocks correspond to the encoded data at 4-bit per block.</small></p><p>For me, the easiest way I found to send those fields data management-wise was to use an 8 bit (instead of a minimal 4 bit) block definition length. This would give me a whopping 256 possible palette entries, out of all available blocks to choose from. Then, writing actual chunk data would be as easy as sending hex numbers referencing those palette entries. A 4-bit palette would be equally easy (a byte represented as a hex string is two characters, representing 4 bits each, so `0x01` would represent two blocks - one with id 0, and another with id 1), but it would limit me to 16 blocks per chunk.</p>
+
+<p>The standard actually allows for anything from 4 bits per block to 9bpb, otherwise it assumes a direct palette mapping with 15bpb  - I too have no idea why it isn't byte-aligned.</p>
+
+<p>The biome palette works a bit differently in my implementation - it just sends an empty palette, and then maps biome ID 0x01 (minecraft:plains) directly to all regions inside the chunk. This was based on my reverse engineering of how vanilla works - I suspect that the existing documentation of this part of the packet is incorrect, as I'm either getting too much data, or missing a few bytes every time.</p>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/6.png">
+<small>Picture 6 - after fully implementing everything from that list and sending a few chunk packets, we have chunks showing up!</small></p><h4>"Plugin" system</h4>
+
+<p>By now, we only have a plain chunk, not anything special by any means. I definitely wanted to make a few demos to show that the server can do *more* than just load and show a chunk, but I didn't want to create a separate source tree for every demo I spewed out. My solution is a series of overridable functions I called `hooks`, and an option for the server to load your own code. This allows for anything from changing how the world looks, to hooking up a pkt_effect so your player makes ticking noises while you move the mouse. Below I attach a simple (unoptimized) "plugin" that generates a chunk with random blocks from the default palette, which makes for an oddity that's kinda interesting visually.</p>
+
+
+
+<p><code>#!/usr/bin/env bash
+# map.sh - simple map modification showcase
+
+function hook_chunks() {
+chunk_header
+for (( i=0; i&lt;4096; i++ )); do
+chunk+="$(printf '%02x' $((RANDOM%30)))"
+done
+chunk_footer
+echo "$chunk" &gt; $TEMP/world/0000000000000000
+
+pkt_chunk FFFFFFFF FFFFFFFF 00
+pkt_chunk FFFFFFFF 00000000 00
+pkt_chunk FFFFFFFF 00000001 00
+
+pkt_chunk 00000000 FFFFFFFF 00
+pkt_chunk 00000000 00000000
+pkt_chunk 00000000 00000001 00
+
+pkt_chunk 00000001 FFFFFFFF 00
+pkt_chunk 00000001 00000000 00
+pkt_chunk 00000001 00000001 00
+}
+</code>
+
+
+
+<img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/7.png">
+<small>Picture 7 - output of the code displayed above</small></p><p>Another demo worth taking a look at is digmeout - it's a simple highscore based game, which throws you onto a chunk with randomly placed stone and ores. Dig out the most valuable ores until the timer runs out!</p>
+
+<video controls="">
+	<source src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/vid.webm" type="video/webm">
+</video>
+
+<p><img src="https://sdomi.pl/weblog/15-witchcraft-minecraft-server-in-bash/img/8.png">
+<small>Picture 8 - you know the game and, you're gonna play it</small></p><h4>Witchcraft's (that's the project name!) Quirks</h4>
+
+<ul>
+<li>Bash is notoriously bad at handling decimal numbers. It's *ok* with Integers (as long as you don't do too advanced maths on them), but the only way to handle a decimal number is by multiplying it on input, and somehow placing a dot in the correct place for output. Because of this, most (if not all?) numbers handled by Witchcraft are ints.</li>
+<li>The multiplayer doesn't really work? I mean, it kinda does, but I never really took time to finish it and polish it up.</li>
+<li>Witchcraft is technically a multi-threaded server!</li>
+<li>... which means that it has to use terrible hacks to communicate between threads. Currently, most global data is stored under `/dev/shm/witchcraft`, internally referenced to as `$TEMP`.</li>
+<li>Witchcraft is slow, especially in terms of data exchange between multiple threads. Don't expect to be able to send massive amounts of data, generating and sending 16 solid chunks can take as long as a second.</li>
+<li>Witchcraft currently runs *only* if you have the latest BusyBox (1.35.0) installed. I haven't tested it with GNU coreutils, but I expect it won't work.</li>
+</ul>
+<h3>FAQ</h3>
+
+<p>Q: Why?</p>
+<p>A: Because I could. And it was fun!</p>
+
+<p>Q: Where do the block IDs come from?</p>
+<p>A: Witchcraft-internal IDs are defined in <a href="https://git.sakamoto.pl/domi/Witchcraft/-/blob/meow/src/palette.sh">src/palette.sh</a>, and can be redefined in "plugins". The external IDs to which the internal ones are mapped can be acquired from the vanilla server. Check out this reference page on <a href="https://wiki.vg/Data_Generators">Data Generators</a>.</p>
+
+<p>Q: Why "WitchCraft"?</p>
+<p>A: selfisekai came up with that name, possibly because I'm a (bash) witch, and I thought it was *great*</p>
+
+<h3>Resources</h3>
+
+<ul>
+	<li><a href="https://git.sakamoto.pl/domi/Witchcraft/">Witchcraft repository</a></li>
+	<li><a href="https://wiki.vg/Protocol">wiki.vg Protocol docs</a></li>
+</ul>
+
+<hr>
+<p>
+Big thanks to <a href="https://selfisekai.rocks/">Lauren</a>, <a href="https://badat.dev/">Mae</a> and <a href="https://cadence.moe/">cadence</a> for proofreading this post! :3
+
+</p><hr><p><a href="https://ko-fi.com/sdomi/"><img alt="Support me on ko-fi!" src="https://sdomi.pl/img/ko-fi.png"></a></p><hr><h3>Comments:</h3></div><p><span>Everyone</span> at 15.02.2022, 16:40:40</p><p>Liked that</p><p><span>helpful person</span> at 15.02.2022, 16:59:22</p><p>This project is wicked cool but your font choices make it super hard to read.  And this black-on-dark-gray comment box is insane! :D</p><p><span><a href="https://saphi.re/">Saphire</a></span> at 15.02.2022, 17:10:48</p><p>Oh dear, that is cursed. Much more so than the HTTP(s) server in bash that I have seen around... I love it~!
+
+...wait is the font for this the minecraft font. And agree with previous comment, the black-on-gray is hard to read q-q</p><p><span>new reader</span> at 15.02.2022, 17:48:56</p><p>as someone that knows very little bash, this was extremely fun to read. love the website too! :)</p><p><span>awesome stuff</span> at 15.02.2022, 17:49:01</p><p>awesome stuff</p><p><span>josé</span> at 15.02.2022, 18:06:37</p><p>I've had this idea a few months ago and I didn't think it was possible. This is awesome! good work.</p><p><span><a href="https://artur.co/">Artur</a></span> at 15.02.2022, 18:15:27</p><p>Awesome stuff</p><p><span><a href="http://lilybee.club/">lily</a></span> at 15.02.2022, 18:17:05</p><p>i hate it here</p><p><span><a href="https://nanoshinono.me/">prefetcher</a></span> at 15.02.2022, 18:22:08</p><p>This is absolutely awesome! Great work!!</p><p><span>Rafael</span> at 15.02.2022, 18:49:27</p><p>Amazing work!</p><p><span><a href="https://daniel.harka.com/">Daniel</a></span> at 15.02.2022, 18:49:40</p><p>That's amazing! Good job!</p><p><span>keldu</span> at 15.02.2022, 19:20:46</p><p>That's crazy. I wrote a small MC network implementation in C++ and gave up after I started to see how they randomly change packets in different versions.
+
+I didn't want to keep up with that. But do this in bash for MC is crazy.
+I went back and wrote a small reverse proxy server for MC though.</p><p><span><a href="https://ted.ge/">Theo</a></span> at 15.02.2022, 19:36:33</p><p>Your website is great. Your posts are great. Your everything is great. Keep up the work, It's definitely worth it...</p><p><span>bigking</span> at 15.02.2022, 19:39:06</p><p>ilove this. gonna play with it, if i manage to make something worthwhile i let you know. thanks for this interesting unconventional project.</p><p><span>Mikael</span> at 15.02.2022, 20:03:07</p><p>Cool project! May I ask how much time went into it? I don't really know how complex the protocol is or how long time each test takes, like if you need to restart the client and stuff.</p><p><span>anon</span> at 15.02.2022, 20:53:12</p><p>nice</p><p><span>Triggernometry</span> at 15.02.2022, 21:16:27</p><p>this is a glorious write-up of the process tho.
+one of the best ways to learn coding is to do or see "what if i did this stupid pointless thing" then seeing aaaaaall the pitfalls</p><p><span>eggmtf</span> at 15.02.2022, 21:19:43</p><p>this is insane but really cool, nice work!</p><p><span><a href="https://edwinkofler.com/">hyperupcall</a></span> at 15.02.2022, 21:25:36</p><p>I do a lot of Bash and lemmie tell you, this is pretty badass! Some people would say it's cursed, but I think its just cool - Thanks for sharing ^w^</p><p><span>egg</span> at 15.02.2022, 22:03:16</p><p>Wow for the hackery of the "in Bash", and nice font reminds me of some VGA stuff.</p><p><span>anon</span> at 15.02.2022, 22:17:18</p><p>neato</p><p><span><a href="https://j3s.sh/">j3s</a></span> at 16.02.2022, 01:34:09</p><p>dope af</p><p><span>a nat you don't know</span> at 16.02.2022, 02:19:17</p><p>delightfully cursed, i love it</p><p><span><a href="https://sucipto.id/">chip</a></span> at 16.02.2022, 02:49:23</p><p>Hardcore :D</p><p><span>ayo</span> at 16.02.2022, 06:12:39</p><p>noice</p><p><span>trekkie1701c</span> at 16.02.2022, 06:16:55</p><p>You can hackily handle floating point numbers in a bash script by piping the equation through BCMath.
+
+In the case that I've had to do it, it's pretty much:
+
+var=$(echo "scale=9;$num1/$num2" | bc)
+
+Where the 9 is the number of decimal places and / is the operand and can be replaced by whatever.
+
+This is probably highly inefficient but hey it works.</p><p><span>punk xfce</span> at 16.02.2022, 08:19:20</p><p>I didn't read that</p><p><span>annow</span> at 16.02.2022, 11:11:57</p><p>i've never think about it, congrats</p><p><span>M</span> at 16.02.2022, 11:21:37</p><p>This is exactly the kind of insane (in a good way) stuff I love to read about! Looking forward to more of this! :3</p><p><span>Charles Duffy</span> at 16.02.2022, 13:13:19</p><p>You can absolutely read and write streams containing NULs in bash -- the trick is to store them as arrays (with the terminal element containing everything after the last NUL) instead of as strings. Also, echo is an abomination in general, and even the POSIX spec describing it says that printf should be used instead -- search for the excellent answer by Stéphane Chazelas to "Why is printf better than echo?" on unix.stackexchange.com</p><p><span>RJM</span> at 16.02.2022, 19:12:40</p><p>I respect your work so much! Awesome job!</p><p><span>RSEA</span> at 16.02.2022, 20:00:24</p><p>Great piece. Terminus font in the screenshots also, the best terminal font by far.</p><p><span><a href="https://leigergaming.com/">LeigerGaming</a></span> at 16.02.2022, 22:23:12</p><p>Interesting!</p><p><span>Wensz</span> at 16.02.2022, 22:42:09</p><p>I got rickrolled at the ending.</p><p><span>Francois Scheurer</span> at 17.02.2022, 10:43:56</p><p>nice work!
+I was puzzled with the line:
+a=$(dd count=2 bs=$len status=none | xxd -p)
+
+as dd cannot will hangs here on an empty stdin.
+or maybe it's lacking context and your script stdin is filled already with data...?
+
+or are you using some function like this?
+function a() { dd count=$len bs=1 status=none | xxd -p; }
+
+anyway it is a clever idea to use dd to deal with null chars!
+
+Another way would be to use tempfiles (in ram) instead of strings variables, but that would probably perform slower.</p><p><span>Drygord</span> at 19.02.2022, 18:40:39</p><p>Cool project - what is the font and color scheme of this webpage?</p><p><span>A</span> at 03.03.2022, 01:10:46</p><p>SO</p><p><span>mine</span> at 04.03.2022, 21:41:59</p><p>craft</p><p><span><a href="https://chfour.github.io/">chfour</a></span> at 10.03.2022, 19:11:45</p><p>that is, quite literally, witchcraft. I'm amazed. I mean I made an HTTP server in browser Javascript, and that's NOTHING compared to this. this is a fully functional, real time minecraft server. a full-on online 3D game. Wow.
+also, lovely font choice ;)</p><p><span><a href="http://quadsplace.neocities.org/">me</a></span> at 10.03.2022, 19:17:31</p><p>My BRAIN IS BOGELED</p><p><span><a href="https://notnite.com/">NotNite</a></span> at 04.05.2022, 23:21:31</p><p>wow this is horrifying</p><p><span>some guy on the interweb of tubes</span> at 25.12.2022, 23:42:35</p><p>This is sooo cool! I once tried to write an http server in bash and gave up on it after writing file serving code became too hard for me</p><p><span>test</span> at 29.12.2022, 16:01:13</p><p>test</p><p><span><a href="http://juh.gay/">juh</a></span> at 06.02.2023, 17:36:51</p><p>inspires fear in friends and enemies alike :D</p><p><span>nigga</span> at 02.03.2024, 17:13:16</p><p>nig</p><p><span>Bot</span> at 02.03.2024, 17:27:23</p><p>Ah yes, a comment section with no captcha. I hope bots don't evade it.</p>        <p>
+        By commenting, you agree for the session cookie to be stored on your device ;p</p><hr>
+    
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Mathematicians prove Pólya's conjecture for the eigenvalues of a disk (144 pts)]]></title>
             <link>https://phys.org/news/2024-03-mathematicians-plya-conjecture-eigenvalues-disk.html</link>
             <guid>39572106</guid>
             <pubDate>Sat, 02 Mar 2024 12:27:22 GMT</pubDate>
@@ -60,7 +322,7 @@
 									</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[R: Introduction to Data Science (117 pts)]]></title>
+            <title><![CDATA[R: Introduction to Data Science (128 pts)]]></title>
             <link>http://rafalab.dfci.harvard.edu/dsbook-part-1/</link>
             <guid>39571439</guid>
             <pubDate>Sat, 02 Mar 2024 10:03:01 GMT</pubDate>
@@ -108,7 +370,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Weather.gov 2.0 (164 pts)]]></title>
+            <title><![CDATA[Weather.gov 2.0 (194 pts)]]></title>
             <link>https://github.com/weather-gov/weather.gov</link>
             <guid>39571308</guid>
             <pubDate>Sat, 02 Mar 2024 09:30:29 GMT</pubDate>
@@ -268,7 +530,7 @@ drush cache:rebuild
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ente: Open-Source, E2E Encrypted, Google Photos Alternative (520 pts)]]></title>
+            <title><![CDATA[Ente: Open-Source, E2E Encrypted, Google Photos Alternative (548 pts)]]></title>
             <link>https://ente.io/</link>
             <guid>39570692</guid>
             <pubDate>Sat, 02 Mar 2024 07:31:09 GMT</pubDate>
@@ -324,7 +586,7 @@ https://ente.io/static/f6d51305482c376bce59e7c033163155/ed53e/feature-4.webp 160
 https://ente.io/static/f6d51305482c376bce59e7c033163155/f604c/feature-4.webp 2092w" loading="lazy" alt="Together with family"></picture></div></div></section><section id="pricing"><svg xmlns="http://www.w3.org/2000/svg" width="112" height="78" viewBox="0 0 112 78" fill="none" data-sal="dash"><path d="M85.0002 72H21.0604L6.00018 24.6L33.1086 42.3L53.8918 6L79.4942 37.5L106 13.5L102.085 56.1" stroke="#FFCD3F" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"></path></svg><h2>Pricing <span>Plans</span></h2><p>Free trial of 1 GB for a year.<br>Every plan can be shared with your family.</p></section><div><svg width="192px" height="277" viewBox="0 0 290 277" fill="none" xmlns="http://www.w3.org/2000/svg"><g filter="url(#filter0_d_734_1751)"><rect x="49" y="30.959" width="192" height="178" rx="35" fill="url(#paint0_linear_734_1751)"></rect></g><path d="M104.637 135.959C101.712 135.959 99.1379 135.4 96.913 134.281C94.7199 133.162 93.0195 131.639 91.8117 129.712C90.6039 127.754 90 125.532 90 123.046C90 120.529 90.588 118.307 91.764 116.38C92.9718 114.422 94.6087 112.899 96.6747 111.812C98.7406 110.693 101.077 110.133 103.683 110.133C106.194 110.133 108.451 110.662 110.453 111.718C112.487 112.744 114.092 114.236 115.268 116.194C116.444 118.12 117.032 120.436 117.032 123.139C117.032 123.419 117.016 123.745 116.985 124.118C116.953 124.46 116.921 124.787 116.889 125.097H96.0549V120.855H112.98L110.119 122.114C110.119 120.809 109.849 119.674 109.309 118.711C108.769 117.747 108.022 117.002 107.068 116.473C106.115 115.914 105.002 115.634 103.731 115.634C102.459 115.634 101.331 115.914 100.346 116.473C99.3922 117.002 98.6453 117.763 98.1049 118.757C97.5646 119.721 97.2944 120.871 97.2944 122.207V123.326C97.2944 124.693 97.5964 125.905 98.2003 126.962C98.836 127.988 99.71 128.78 100.822 129.339C101.967 129.868 103.302 130.132 104.827 130.132C106.194 130.132 107.386 129.93 108.403 129.526C109.452 129.122 110.405 128.516 111.264 127.708L115.221 131.903C114.045 133.209 112.567 134.219 110.787 134.933C109.007 135.617 106.957 135.959 104.637 135.959Z" fill="white"></path><path d="M137.574 110.133C139.608 110.133 141.42 110.537 143.009 111.345C144.63 112.122 145.902 113.334 146.823 114.982C147.745 116.598 148.206 118.68 148.206 121.228V135.586H140.768V122.347C140.768 120.327 140.307 118.835 139.386 117.872C138.496 116.908 137.224 116.427 135.572 116.427C134.396 116.427 133.331 116.675 132.377 117.173C131.456 117.639 130.725 118.369 130.184 119.363C129.676 120.358 129.421 121.632 129.421 123.186V135.586H121.984V110.506H129.088V117.452L127.753 115.354C128.675 113.676 129.994 112.387 131.71 111.485C133.426 110.584 135.381 110.133 137.574 110.133Z" fill="white"></path><path d="M165.436 135.959C162.417 135.959 160.065 135.213 158.38 133.721C156.696 132.199 155.853 129.945 155.853 126.962V104.959H163.291V126.869C163.291 127.925 163.577 128.749 164.149 129.339C164.721 129.899 165.5 130.179 166.485 130.179C167.661 130.179 168.662 129.868 169.489 129.246L171.491 134.374C170.728 134.902 169.807 135.306 168.726 135.586C167.677 135.835 166.581 135.959 165.436 135.959ZM151.896 116.66V111.066H169.679V116.66H151.896Z" fill="white"></path><path d="M187.604 135.959C184.68 135.959 182.106 135.4 179.881 134.281C177.688 133.162 175.987 131.639 174.779 129.712C173.572 127.754 172.968 125.532 172.968 123.046C172.968 120.529 173.556 118.307 174.732 116.38C175.939 114.422 177.576 112.899 179.642 111.812C181.708 110.693 184.044 110.133 186.651 110.133C189.162 110.133 191.418 110.662 193.421 111.718C195.455 112.744 197.06 114.236 198.236 116.194C199.412 118.12 200 120.436 200 123.139C200 123.419 199.984 123.745 199.952 124.118C199.921 124.46 199.889 124.787 199.857 125.097H179.022V120.855H195.948L193.087 122.114C193.087 120.809 192.817 119.674 192.276 118.711C191.736 117.747 190.989 117.002 190.036 116.473C189.082 115.914 187.97 115.634 186.698 115.634C185.427 115.634 184.299 115.914 183.313 116.473C182.36 117.002 181.613 117.763 181.073 118.757C180.532 119.721 180.262 120.871 180.262 122.207V123.326C180.262 124.693 180.564 125.905 181.168 126.962C181.804 127.988 182.678 128.78 183.79 129.339C184.934 129.868 186.269 130.132 187.795 130.132C189.162 130.132 190.354 129.93 191.371 129.526C192.419 129.122 193.373 128.516 194.231 127.708L198.188 131.903C197.012 133.209 195.534 134.219 193.754 134.933C191.975 135.617 189.924 135.959 187.604 135.959Z" fill="white"></path><defs><filter id="filter0_d_734_1751" x="0" y="0.958984" width="290" height="276" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB"><feFlood flood-opacity="0" result="BackgroundImageFix"></feFlood><feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"></feColorMatrix><feOffset dy="19"></feOffset><feGaussianBlur stdDeviation="24.5"></feGaussianBlur><feComposite in2="hardAlpha" operator="out"></feComposite><feColorMatrix type="matrix" values="0 0 0 0 0.359395 0 0 0 0 0.708333 0 0 0 0 0.288253 0 0 0 1 0"></feColorMatrix><feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_734_1751"></feBlend><feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_734_1751" result="shape"></feBlend></filter><linearGradient id="paint0_linear_734_1751" x1="145" y1="101.459" x2="145" y2="255.459" gradientUnits="userSpaceOnUse"><stop stop-color="#494949"></stop><stop offset="1" stop-color="#161616"></stop></linearGradient></defs></svg><div><div><h2>Experience Ente Photos</h2><p>Scan the QR code to download the app</p></div><div><div data-gatsby-image-wrapper=""><picture><source type="image/webp" data-srcset="/static/6b37a10e00615335d2d4fe04be3e6d05/3a6ff/play-store-qr.webp 40w,/static/6b37a10e00615335d2d4fe04be3e6d05/1deab/play-store-qr.webp 80w,/static/6b37a10e00615335d2d4fe04be3e6d05/c6aca/play-store-qr.webp 160w,/static/6b37a10e00615335d2d4fe04be3e6d05/0a0af/play-store-qr.webp 320w" sizes="(min-width: 160px) 160px, 100vw"><img data-gatsby-image-ssr="" data-main-image="" sizes="(min-width: 160px) 160px, 100vw" decoding="async" loading="lazy" data-src="/static/6b37a10e00615335d2d4fe04be3e6d05/40dd2/play-store-qr.png" data-srcset="/static/6b37a10e00615335d2d4fe04be3e6d05/996dd/play-store-qr.png 40w,/static/6b37a10e00615335d2d4fe04be3e6d05/4ed6d/play-store-qr.png 80w,/static/6b37a10e00615335d2d4fe04be3e6d05/40dd2/play-store-qr.png 160w,/static/6b37a10e00615335d2d4fe04be3e6d05/7e354/play-store-qr.png 320w" alt="Download Ente on the Google Play Store" src="https://ente.io/static/6b37a10e00615335d2d4fe04be3e6d05/40dd2/play-store-qr.png" srcset="https://ente.io/static/6b37a10e00615335d2d4fe04be3e6d05/996dd/play-store-qr.png 40w,https://ente.io/static/6b37a10e00615335d2d4fe04be3e6d05/4ed6d/play-store-qr.png 80w,https://ente.io/static/6b37a10e00615335d2d4fe04be3e6d05/40dd2/play-store-qr.png 160w,https://ente.io/static/6b37a10e00615335d2d4fe04be3e6d05/7e354/play-store-qr.png 320w"></picture></div><div><a target="_blank" rel="noopener" href="https://play.google.com/store/apps/details?id=io.ente.photos"><div data-gatsby-image-wrapper=""><picture><source type="image/webp" data-srcset="/static/ed265c3abdcd3efa5e29f64b927bcb44/8f4fe/play-store-badge.webp 49w,/static/ed265c3abdcd3efa5e29f64b927bcb44/7279c/play-store-badge.webp 99w,/static/ed265c3abdcd3efa5e29f64b927bcb44/729c5/play-store-badge.webp 197w,/static/ed265c3abdcd3efa5e29f64b927bcb44/e230a/play-store-badge.webp 394w" sizes="(min-width: 197px) 197px, 100vw"><img data-gatsby-image-ssr="" data-main-image="" sizes="(min-width: 197px) 197px, 100vw" decoding="async" loading="lazy" data-src="/static/ed265c3abdcd3efa5e29f64b927bcb44/b5c1a/play-store-badge.png" data-srcset="/static/ed265c3abdcd3efa5e29f64b927bcb44/3b381/play-store-badge.png 49w,/static/ed265c3abdcd3efa5e29f64b927bcb44/4dcc6/play-store-badge.png 99w,/static/ed265c3abdcd3efa5e29f64b927bcb44/b5c1a/play-store-badge.png 197w,/static/ed265c3abdcd3efa5e29f64b927bcb44/d9dd2/play-store-badge.png 394w" alt="Download Ente on the Google Play Store" src="https://ente.io/static/ed265c3abdcd3efa5e29f64b927bcb44/b5c1a/play-store-badge.png" srcset="https://ente.io/static/ed265c3abdcd3efa5e29f64b927bcb44/3b381/play-store-badge.png 49w,https://ente.io/static/ed265c3abdcd3efa5e29f64b927bcb44/4dcc6/play-store-badge.png 99w,https://ente.io/static/ed265c3abdcd3efa5e29f64b927bcb44/b5c1a/play-store-badge.png 197w,https://ente.io/static/ed265c3abdcd3efa5e29f64b927bcb44/d9dd2/play-store-badge.png 394w"></picture></div></a></div></div><div><div data-gatsby-image-wrapper=""><picture><source type="image/webp" data-srcset="/static/160b560656ce589adae75f6cf0da868e/3a6ff/app-store-qr.webp 40w,/static/160b560656ce589adae75f6cf0da868e/1deab/app-store-qr.webp 80w,/static/160b560656ce589adae75f6cf0da868e/c6aca/app-store-qr.webp 160w,/static/160b560656ce589adae75f6cf0da868e/0a0af/app-store-qr.webp 320w" sizes="(min-width: 160px) 160px, 100vw"><img data-gatsby-image-ssr="" data-main-image="" sizes="(min-width: 160px) 160px, 100vw" decoding="async" loading="lazy" data-src="/static/160b560656ce589adae75f6cf0da868e/40dd2/app-store-qr.png" data-srcset="/static/160b560656ce589adae75f6cf0da868e/996dd/app-store-qr.png 40w,/static/160b560656ce589adae75f6cf0da868e/4ed6d/app-store-qr.png 80w,/static/160b560656ce589adae75f6cf0da868e/40dd2/app-store-qr.png 160w,/static/160b560656ce589adae75f6cf0da868e/7e354/app-store-qr.png 320w" alt="Download Ente on the Google Play Store" src="https://ente.io/static/160b560656ce589adae75f6cf0da868e/40dd2/app-store-qr.png" srcset="https://ente.io/static/160b560656ce589adae75f6cf0da868e/996dd/app-store-qr.png 40w,https://ente.io/static/160b560656ce589adae75f6cf0da868e/4ed6d/app-store-qr.png 80w,https://ente.io/static/160b560656ce589adae75f6cf0da868e/40dd2/app-store-qr.png 160w,https://ente.io/static/160b560656ce589adae75f6cf0da868e/7e354/app-store-qr.png 320w"></picture></div><p><a target="_blank" rel="noopener" href="https://apps.apple.com/app/id1542026904"><img src="https://ente.io/static/app-store-badge-8c4986ee4828b47d16f5cd694ef065f2.svg" width="197" height="66" alt="Download Ente on the iOS App Store" loading="lazy"></a></p></div></div></div><section><svg width="283" height="291" viewBox="0 0 283 291" fill="none" xmlns="http://www.w3.org/2000/svg"><g><path d="M175.205 32.317C116.282 14.5086 53.7687 48.0048 35.9319 107.022C27.7956 133.942 29.932 162.221 41.9364 187.421L23.493 220.574C19.3554 228.129 26.0656 236.593 34.1349 234.987L73.2855 226.788C84.2019 235.532 96.7059 242.085 110.542 246.267C169.465 264.075 231.95 230.673 249.787 171.656C267.624 112.639 234.128 50.1256 175.205 32.317ZM132.635 196.959C127.715 199.596 121.831 197.553 119.364 192.948C116.775 187.786 118.538 182.268 123.375 179.676C127.991 177.203 133.917 178.592 136.647 183.687C138.882 187.858 138.044 194.061 132.635 196.959ZM154.453 148.904C152.343 149.088 149.882 150.09 149.143 152.538L147.407 158.279C145.843 163.456 140.327 166.412 135.15 164.847C129.879 163.254 127.017 157.767 128.582 152.59L130.317 146.848C133.276 137.059 142.134 130.183 152.873 129.32C161.718 128.603 168.683 121.874 169.832 112.975C170.807 105.669 166.764 97.975 160.196 94.5518C149.51 88.9321 137.092 94.5229 133.783 105.47C132.219 110.647 126.703 113.603 121.526 112.038C116.349 110.474 113.393 104.958 114.958 99.7808C121.917 76.756 148.09 65.9385 169.377 77.0902C183.114 84.3235 191.369 100.173 189.407 115.502C186.996 133.675 172.671 147.425 154.453 148.904Z" fill="var(--color-secondary-highlight)"></path></g></svg><h2>FAQs</h2></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google lays off entire team while they are testifying to the city council (132 pts)]]></title>
+            <title><![CDATA[Google lays off entire team while they are testifying to the city council (133 pts)]]></title>
             <link>https://mas.to/@yogthos/112020432735682211</link>
             <guid>39570657</guid>
             <pubDate>Sat, 02 Mar 2024 07:25:29 GMT</pubDate>
@@ -332,7 +594,7 @@ https://ente.io/static/f6d51305482c376bce59e7c033163155/f604c/feature-4.webp 209
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Don't Use Discord for FOSS (2021) (242 pts)]]></title>
+            <title><![CDATA[Don't Use Discord for FOSS (2021) (244 pts)]]></title>
             <link>https://drewdevault.com/2021/12/28/Dont-use-Discord-for-FOSS.html</link>
             <guid>39569843</guid>
             <pubDate>Sat, 02 Mar 2024 04:36:37 GMT</pubDate>
@@ -462,7 +724,7 @@ edition I’ve been invol…</p>
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[K8s Service Meshes: The Bill Comes Due (198 pts)]]></title>
+            <title><![CDATA[K8s Service Meshes: The Bill Comes Due (200 pts)]]></title>
             <link>https://matduggan.com/k8s-service-meshes/</link>
             <guid>39569671</guid>
             <pubDate>Sat, 02 Mar 2024 03:57:54 GMT</pubDate>
@@ -472,7 +734,7 @@ edition I’ve been invol…</p>
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A 45 year engineer clears up electric sauna ventilation (149 pts)]]></title>
+            <title><![CDATA[A 45 year engineer clears up electric sauna ventilation (157 pts)]]></title>
             <link>https://www.saunatimes.com/sauna-information/a-45-year-engineer-clears-up-electric-sauna-ventilation/</link>
             <guid>39569077</guid>
             <pubDate>Sat, 02 Mar 2024 01:52:07 GMT</pubDate>
@@ -480,7 +742,7 @@ edition I’ve been invol…</p>
 <div id="readability-page-1" class="page"><div data-id="3736a4c9" data-element_type="widget" data-widget_type="theme-post-content.default"><p><em>Guest post series continues with Malcolm, a 45 year engineer, who clears up electric sauna ventilation. He has been using his electric heated sauna almost every day for over a year. He is enjoying his sauna 4-6 times a week. Instead of watching the “idiot TV”, Malcolm has spent his evening watching his thermal meters in his hot room. </em></p><p><em>Further, he has been able to enjoy nature between sauna rounds. Whether looking up at the stars or feeling a soft breeze as it blows through the nearby trees, sauna has become a game changer for his physical and mental wellbeing. As example, his blood flow has improved. His heat rate used to be in the mid 70s.. now it is mid 60s. Beats per minute.</em></p><p><em>Malcolm used to go to the sauna at the gym. When Covid hit, he in vested in his own backyard sauna. ‘”This thing has really made a difference.”  The flow pattern is the same. Malcolm has been talking with others. And those that have adopted his venting system have had great success with Malcolm’s profile. </em></p><p><em>Malcolm has analyzed the Finnish 1992 sauna ventilation study profile, applied his knowledge and experience as a 45 year engineer to test and better understand sauna ventilation in his own backyard sauna.</em></p><p><em>Welcome Malcolm:</em></p><p>Hi Glenn, here is a draft of the commentary on the 1992 Finnish Electric Heated Sauna Study.</p><p>I have basically taken a 34 page research paper and condensed it into 9 pages. This helped to shorten the commentary. One of the areas that most of our fellow Sauna Dwellers don’t understand is the air flow that each particular inlet opening around the stove and exhaust opening at the back of the sauna creates. I concentrated on the results that the Study found on the various inlet air openings flow characteristics to educate our folks on how they function in an Electric heated sauna.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/IMG_4132-496x1024.jpg" alt="" src="https://www.saunatimes.com/wp-content/uploads/IMG_4132-496x1024.jpg"></figure><p>I’ve done some further temperature profiling of my sauna and the profile around and in front of my stove has some quite&nbsp;interesting temperature changes. I found several typos and misinformation in the original translation and corrected them for this article. I think the translator had English as a second language. Some of their statements were lacking the details that the Study actually provided so I expanded those so that people would have a better understanding what is actually going on there.&nbsp;</p><p>There is a good amount of vagueness in the original translated study that I addressed. I’ve got a much better understanding of the processes going on in the electric heated sauna. Some of the temperature studies I have been doing have produced some quite&nbsp;interesting results. The old engineer’s brain is finally waking up (at least to a degree).</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/IMG_4289-560x747.jpg" alt="" src="https://www.saunatimes.com/wp-content/uploads/IMG_4289-560x747.jpg"><figcaption>A few of Malcom’s temperature reading sensors</figcaption></figure><p>Over the past several months you have probably read or contributed an opinion on what the proper ventilation setup should be for an Electric Heated Finnish Sauna. You have probably also seen the image below in several different advertising brochures used by various Sauna kit and Electric heater manufacturers plus in comments or articles by others.&nbsp;</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-40-560x668.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-40-560x668.png"></figure><p>Some folks have actually created their own version of this image, modified (can we say distorted?) in order to present their particular position on this somewhat controversial topic. In November of this past year “Sauna Times” presented a “POST “to look at some of those ventilation opinions since “just about everyone had one” and there did not seem to be an easy answer to this question. One of the areas of confusion for the Ventilation of the electric heated sauna is that it’s ventilation air flow dynamics are very different from that seen in the “Traditional Wood Stove (loaded inside the sauna)” Finnish Sauna world that nearly everyone has seen or experienced. One thing I found through one of Facebook’s “Sauna Groups” was a link to a copy of an English translation of a 1992 Finnish Research study on the “Ventilation Requirements for an Electric Heated Finnish Sauna”. &nbsp;</p><p>What is being done here is to summarize the actual “Science” of that Ventilation process from the Electric Heated Sauna prospective based upon the 1992 Finnish Study of the Ventilation characteristics of an Electric Heated Finnish Sauna. The image above is from the cover of that Research Study from which the Figures and the translated and paraphrased Texts are incorporated into this discussion. A link to the actual English translation of the Study will be provided at the end of this Post.</p><p>Most North American Electric Heated Sauna Users did not know about this Study and the other resources they were dependent upon (Heater and Sauna Kit manufacturers) had other agendas, including the UL 90-degree Celius Over Temp / Heat issue, that they were more interested in addressing and not necessarily the proper Ventilation requirements of an Electric Heated Sauna. This Post will not address the UL controversy but will stick to providing the useful information on Ventilation contained within the 1992 Finnish Ventilation Study at this point.</p><h3>So, let’s get to it</h3><p>In my simple mind, the Finnish Sauna is just a type of Heat Treat Furnace or Oven that you load humans into and try to provide them with three characteristics. (1) not oversaturate their lungs with their own Carbon Dioxide waste products from being enclosed in a sauna with poor ventilation and limited fresh air volume changes (called Air Mixing in the study), (2) create an enjoyable Temperature distribution within the sauna environment (called Temperatures in the study) and lastly (3) provide a well distributed Ladled Steam Humidity cloud throughout the Sauna (called Air Condition in the study). Basically, everything you would expect for a good Finnish Sauna experience.</p><p>Here are some particulars about the Study’s Setup. The inlet Air Flow within the Test Sauna was maintained at 48 Kg/h (24 CFM). The inlet air temperature was 19 to 21 degrees C for most of the experiments. The internal chamber of the sauna was tightly sealed against air leaks since air leaks cause a disruption of the Sauna Ventilation flow pattern and in turn the characteristics being evaluated. The volume of the Test Sauna they used was 8 Cubic Meters heating it with a 8Kw electric, wall mounted, solid sided, stove. This stove held 25 Kg of stones as it’s Thermal mass. Other details or experimental changes are included in the Text of this Post.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-42.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-42.png"></figure><p><strong><u>Figure 1</u></strong></p><p>The two drawings above show the location of the inlet air ventilation openings, labeled T1- T4 and the exhaust air (Fan assisted) ventilation openings, labeled P1 – P3 used in the Study. The thermocouple temperature measurement points were labeled as 1-15 for the Study and are also shown in the Figure 1 above. The measurements are in Millimeters with inches being hand printed next to them. We have attempted to copy and paraphrase the Data, Figures and Text from the Translation of the Study in a way that simulates the order that the Researchers followed in the Study in this Post.</p><p>The Researchers were focused on three ventilation areas of the Electric Heated Sauna environment. They were called AIR MIXING, TEMPERATURES, and AIR CONDITION. They studied the AIR MIXING (Ventilation air flow system) dynamics by looking at the flow patterns of four Inlet Air vent openings (T 1 – 4) commonly used in Saunas. Three (Fan assisted) Exhaust vent openings (P1– 3) were strategically placed in the back wall of the Test Sauna also. They are all shown in Figure 1 above. Previous studies of Gravity Convection Ventilation showed it to be inconsistent and undependability for the Electric Heated Sauna Ventilation needs. Hence each exhaust opening was equipped with an variable speed in-line fan assistance.</p><p>The TEMPERATURES properties (Temperature Distribution) in the Test Sauna were measured by 15 different Thermocouples mentioned earlier (numbered 1 – 15 above). The AIR CONDITION properties (Absolute Humidity measurements) were related to water being flashed to steam on the stones on top of the stove by a Brackish Water Diffuser system and the Absolute Humidity of the resulting steam / sauna air mixture and it’s distribution was measured using a psychrometer with thermocouples mounted on a device with a mercury meter that measured both dry and wet bulb temperatures. The Absolute Humidity was mainly measured next to Thermocouple point 7 and in some of the experiments, next to Thermocouple point 4 and at a location 150 mm above the floor.</p><p><strong><u>Air Mixing Experiments</u></strong></p><p>In the <a href="https://www.saunatimes.com/types-of-saunas/electric-saunas/the-a-b-c-ds-of-venting-an-electric-heated-sauna/" target="_blank" rel="noreferrer noopener">November post on SaunaTimes</a>, several locations of the Inlet air vent placement were discussed. Under the stove, midway behind the stove, and a couple of different locations opposite from the stove.</p><p>The Researchers started the study by observing the flow pattern of each of the 4 Inlet Air vent openings (T1 – 4) by videotaping the smoke pattern (they used smoke bombs) coming through each individual Air inlet opening and seeing how that air flow pattern reacted to the hot air stream coming up from the stove and the existing sauna air flow field moving back towards the stove along the floor. The Researchers found that the normal hot air flow field coming up from the stove causes a very strong circulation of air in the sauna space above the stone level of the stove and continues up to the ceiling. In the sauna space below the stone level, the air movement around the stove is quite calm, unless it is disturbed by the incoming cold air flow from the inlet opening.&nbsp; The four Figures below, show the flow patterns of inlet air coming into the test sauna with the different placements of the incoming air openings (T1-4). The Flow pattern Observations below were the results of the experiments conducted for the “Air Mixture” segment of the study. The Researchers found that varying the locations of the exhaust vents (P1- 3) did not affect how the air, coming in from the various inlet vent openings, would react with the existing the sauna air flow.&nbsp; For this reason, the Figures below from the study, were not shown with any exhaust air vents. The inlet air opening findings were combined with the exhaust of ventilation openings (P1-3) and were then used in the Temperature and Air Condition (Humidity) research segments conducted later in the study.&nbsp;</p><p>The Figures below show how the inlet supply air flow patterns stream into the sauna room when the Inlet air opening is at different heights (TI – T4). The temperature of the incoming air for each trial was approx. 20°C and the air flow was kept at 48 kg/h (24 CFM) as constants for most of the experiments.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-43.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-43.png"></figure><p><strong><u>Figure 2</u></strong> Supply air opening close to the floor (T1)</p><p>The Researchers found when the inlet air opening is below the stove (T1), the inlet air, which is colder than the existing sauna air, spreads to the floor and forms a layer of cool air in the lower part of the sauna. If the exhaust air opening is also at the bottom of the floor (P1) away from the inlet vent (T1), it was found that a short-circuit flow pattern occurs, whereby the air exchange in the sauna space above the stove deteriorates and does not reach the average air exchange rate needed for the constant exhaust air flow (48 Kg/H or 24 CFM). When the exhaust air opening is near the roof (P3), air rises in a piston like flow fashion, from the lower part of the sauna floor upwards. The air around the stones on top of the stove, mixes in a very gradual way with the sauna air flow pattern in the upper part of the sauna.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-44.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-44.png"></figure><p><strong><u>Figure 3</u></strong> Supply air opening behind the stove (T2)</p><p>When the intake air opening was placed behind the stove (T2), in this case too, most of the cold inlet air flow landed on the floor and did not differ substantially from the T1 case, where the intake air was brought in under the stove.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-45.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-45.png"></figure><p><strong><u>Figure 4</u></strong> Supply air opening just above the stove (T3)</p><p>If the intake air opening used is just above the stove (T3), the air flow movements depend primarily on the speed and temperature of the inlet air flow (in this study 48Kg/H &amp; 19 – 21 °C). When the air flow rate is high, some of the air stream moves over the stove and some flows under the benches and since this air is colder than the surrounding sauna air, much of it lands onto the floor. When the flow rate of the incoming air is low enough, the incoming air has time enough to mix with the hot air flow rising up from the stove and from there, flows up into the existing sauna air flow pattern in the upper part (ceiling) of the sauna where it gradually moves to the lower part of the sauna as well. In some measurements, the distribution of the incoming air flow was observed such that some went up and some went down (under the benches and on to the floor).</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-46.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-46.png"></figure><p><strong><u>Figure 5</u></strong> Supply air opening midway between the top of the stove and the ceiling (T4)</p><p>When the inlet air opening is located above the stove (T4), the upward air flow generated by the hot air from the stove, is so strong that the inlet air immediately mixes with the hot air flow rising up from the stove and moves rapidly up to the ceiling. The Researchers found that the T4 Inlet Air vent location (halfway between the Top of the Stove and the ceiling) provided the best flow pattern for mixing inlet Cold air with the existing Cool Sauna air from the floor and the Hot air coming up from the stove. This experiment also showed that the T4 Inlet location should be used to keep the Carbon Dioxide levels low in the sauna and will provide good mixing to meet the 3 to 8 volume changes per hour required by the Finnish Sauna regulations. The T4 location in the Study is near where the “B” Vent location was shown in the Sauna Times November “Post” drawing.</p><p><strong><u>Temperatures Experiments</u></strong></p><p>After determining the normal air flow path for each of the inlet air openings the Researchers examined the influences of the various Fan assisted exhaust openings (P1 – 3) on the Sauna temperature distribution created using various Air Inlet and Exhaust air opening (T1 – 4) to (P1-3) combinations. The three Figures below show their findings (Temperature Distribution) for those combinations. The inlet air temperature was around 20°C, with a constant air flow rate of 48Kg/H or 24 CFM, and the sauna floor was uninsulated concrete. Only the combination of the inlet and exhaust air openings were varied. &nbsp;The vertical temperature distribution of the sauna was measured from in front of the seat board (top Bench), using Thermocouple locations 2 – 9 shown in Figure 1. The temperature of the exhaust air was found to be approximately the same as the temperature of the inside sauna air at that height of the exhaust air opening being studied.\</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-47.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-47.png"></figure><p><strong><u>Figure 6.</u></strong></p><p>The Figure above shows the vertical distribution of sauna air temperatures when the supply air was led into the sauna from different Inlet Air vent heights (T1 – T4) and the Fan assisted exhaust air opening was at the floor border (P1). The temperature of the incoming air was 19 – 21°C.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-48.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-48.png"></figure><p><strong><u>Figure 7. </u></strong>The Figure above shows the vertical distribution of sauna air temperatures when the supply air was led into the sauna from different heights (T1 – T 4) and the exhaust air opening was below the seat board (P2), where the “D” Vent location was shown in the Sauna Times November “Post” drawing. &nbsp;The temperature of the incoming air was 18 – 20°C.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-49.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-49.png"></figure><p><strong><u>Figure 8</u></strong></p><p>The Figure above shows the vertical distribution of sauna air temperatures, when the supply air was led into the sauna from different heights (Tl – T4) and the exhaust air opening was near the ceiling (P3). The temperature of the incoming air was 18 – 20°C.</p><p>The Researchers found that the best Temperature distribution was produced when the T4 inlet and P2 exhaust (Fan Assisted) opening locations were used.</p><p>During this segment of the study, side experiments were conducted and Temperature distributions were measured for the case where the concrete floor of the sauna was thermally insulated with 50 mm thick Styrofoam. The floor temperature was found to increase because of the presence of the insulation. The Study’s temperature distributions, when the temperature of the incoming air is around 20 °C. and the concrete floor of the sauna is thermally insulated with 50 mm thick Styrofoam, clearly showed an increase in the temperature of the lower parts of the sauna. When the floor in the sauna is thermally insulated and the supply air is led into the Sauna above the stove (T3 or T4) and the exhaust air opening is under the bench of the sauna (P2), the floor also stayed warmer than in the case with an uninsulated floor. In the tests where the inlet air temperature was 7 – 9 °C, there were no noticeable differences in the floor temperature distributions when using the T1 or T2 inlet air locations with the insulated floor. The inlet air coming in from T1 and T2 goes directly to the floor so they were unaffected by the existing Sauna air moving back on the floor towards the heater as a result of the insulation. The flow patterns of the T3 and T4 Inlet openings showed that insulation on the floor definitely increased their related floor temperatures due to their flow patterns discussed in the Air Mixing segment of the study. The Figures provided for the insulated floor experiments are not shown in this Post but may be viewed by going to the link for the Study for more detail.</p><p><strong><u>Air Condition</u></strong></p><p>&nbsp;The purpose of the Air Condition (Humidity) sauna tests was to clarify the effect of the location of the ventilation openings on the Humidity distribution within the sauna air flow pattern in connection with the throwing of water onto the stones of the stove to create the steam cloud. In the first measurements, Humidity was monitored at the height of the Bathers’ head (70 cm above the seat board). Water was thrown at a rate of 125 g every five minutes using a repeatable procedure. This amount of water was chosen so that the Absolute Humidity at the height of the Bather’s head would mainly be in the range of 40 – 50 g/Kg of air with normal ventilation (48Kg/H). The results of the Air Condition (Humidity) sauna experiments showed that, similar to the results of the Air Mixing experiments, that both the inlet and exhaust air openings located close to the floor (T1 and P1), followed the same the short-circuit flow that causes the dispersion of steam in the sauna to be very poor and does not provide the needed steam dispersion expected by the existing Sauna air flow rate (48Kg/H). This was also the case in the steam tests, where the Humidity of the sauna air rises continuously when the exhaust air opening is near the floor (P1) and the intake air opening is either close to the floor (T1) or behind the stove (T2). As the sauna air stream continues to move, the humidity rises continuously both in the upper part of the sauna and at the footboard. The Figures and additional data describing this situation is not addressed in this Post. Go to the link for additional details. When the supply air was led into the sauna from different heights (T1 – T4) and the exhaust air opening was near the ceiling (P3), the different placements of the inlet air openings did not really cause differences in the humidity distribution at the Bather’s head. The Figure’s columns showed about the same humidity distributions regardless of the placement of the exhaust air openings, even in the case where the intake air opening is above the stove and the exhaust vent is near the ceiling (T4 &amp; P3). Check the link for those results.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-50.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-50.png"></figure><p><strong><u>Figure 9.</u></strong></p><p>When the exhaust air opening is placed under the seat board (P2) the results are shown above. This placement improves the ventilation efficiency and dispersion of the Humidity in the upper part of the sauna for all heights of the inlet opening, even when the intake air openings are still under the stove (T1) or behind it (T2) with their active short circuit effect. The vent combination of (T4 / P2) provided the best and most uniform Humidity (steam) distribution across the sauna of any of the other opening combinations.</p><p>With a separate steam test series, the Researchers wanted to find out how much the exhaust air flow of the sauna must be increased so that the Humidity steam cloud, rising in the upper part of the sauna, would have to be increased to roughly match the T4 case shown in the Humidity Figure 9 above, where the air circulation in the upper part of the sauna can be considered good. Figure 10 below shows that results.</p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/image-51.png" alt="" src="https://www.saunatimes.com/wp-content/uploads/image-51.png"></figure><p><strong><u>Figure 10</u></strong>.</p><p>The Figure above shows the measured results of the sauna air Humidity variations using different exhaust air flows (0 – 196 kg/h) at the 70 cm seat bench height and using the worst-case scenario being at air inlet opening location T1 and exhaust opening location P1. When the ventilation was completely closed (first column air flow 0), the Humidity rose considerably. Air leaks introduced into the test sauna led to condensation of moisture on to the surfaces and absorption into the surfaces that reduced the steepness of the absolute humidity curve’s ascent. When the ventilation rate was increased (next three columns) the fluctuation in levels of Humidity decreased. When the exhaust air flow was set at 196 kg/h, (four times the so-called normal amount 48 kg/h and last column) it reached the humidity variation level that approximated the results of what Inlet Air opening T4 provided in Figure 9 using either exhaust vents P1 or P3 (worst exhaust openings). This experiment showed that the ventilation efficiency above the seat board is quite poor if the intake and exhaust air openings are close to the floor (T1 and P1) or close to the ceiling P3 even with High Air Flows. Use of very high air flow rates will seriously disrupt the needed ventilation flow pattern for an Electric Heated Sauna. Use of High air flow rates proved not to be a solution for distributing Humidity.</p><p><strong><u>CONCLUSIONS</u></strong></p><p>1.FRESH AIR MIXING</p><p><strong>We like to keep the CO2 down. We want 6-8 volume changes per hour in the hot room.</strong></p><p>An even vertical temperature distribution in the sauna requires an effective mixing of the existing sauna air and the cold air coming in from the Inlet opening. Figures 2, 3 ,4 and 5 shows the incoming air flow patterns of the four Inlet openings used in this Study. In practice, however, incoming air that is colder than the surrounding temperature always tends to “flow” downwards. In the sauna, the room air is already at normal temperature and is classified as “cold air” which flows down to the sauna floor unless it can be mixed with the hot air mass circulating inside the sauna.</p><p>In order to prevent a cold air zone from forming in the lower part of the sauna, the incoming air must be led in from above the stove, where it immediately must mix with the existing circulating air of the sauna and the hot air coming up from the stove. In this case, the effects on the sauna air also extends to the lower parts of the sauna.</p><p>The mixing of the air from the upper part of the sauna with the air from the lower part of the sauna is promoted by placing the exhaust air opening in the lower part of the sauna. This condition was found when the Inlet air opening was placed at the T4 location and the exhaust opening was placed at the P2 location under the bench. &nbsp;</p><p>The Study’s experiments showed this particular combination provided the necessary mixing of the cold inlet air with the hot air stream coming up from the stove and provided the necessary dynamics to move the “cold” sauna air along the floor and into the air flow loop surrounding the stove.</p><p>2. TEMPERATURE RANGE</p><p><strong>We like to have the temperature at our ears not hugely different than at our feet.</strong></p><p>From the temperature measurements, it was found that there is a large variation in the temperature of the sauna air in the vertical direction. As typical values, it can be stated that the temperature at the height of the head of a person sitting on the bench is 90<a>°</a>C, at the height of the seat board (bench) 80 – 85 °C and at the height of the foot board approx. 60 – 65 °C.</p><p>The temperature difference between the foot board and the Bather’s head was therefore approx. 25 – 30 °C. The temperature of the air at the height of the seat board (bench) and at the border of the floor is significantly affected by the location of the inlet air opening, along with the temperature of the inlet air and the amount of ventilation the exhaust Opening provides.</p><p>Due to these aforementioned factors, the temperature at the footboard could vary from 50 to 80 °C. The highest temperature was reached when the inlet air opening was above the stove (T4) and the exhaust opening was under the bench at P2 and the floor was also thermally insulated. This last combination opening arrangement (T4 /P2) provided the most uniform vertical temperature distribution of the Study.</p><p>3. AIR MIX WITH STEAM</p><p><strong>Fresh air mixing with steam makes better steam.</strong></p><p>By placing the inlet air opening above the stove (T4) and the exhaust air opening between the seat board and the floor (P2), the effects of the steam distribution extended down to the lower parts of the sauna. In addition, this particular ventilation combination showed that the incoming air mixed directly with the steam and the hot air coming up from the stove and the upper part of the sauna (the breathing air of the bathers).</p><p>If both the inlet and outlet air openings (T1and P1) are located in the lower part of the sauna, a short-circuit flow occurs in the lower part, and the fresh air does not mix with the breathing air of the bathers. The Researchers also found that Carbon Dioxide buildup moves in a sauna nearly identically as to how the Humidity distributes itself in the sauna. When the supply air is led to the border of the floor (T1 opening), the temperatures of the border of the floor and the footboard remains low, even too cool in the cold season. This also has an effect on the drying of the lower parts of the sauna.</p><p>The temperature and humidity measurements performed in connection with this study, as well as the visual smoke trail observations made, support the T4 and P2 ventilation opening arrangement, where the incoming air is led into the sauna above the stove (T4) and the air is exhausted from the opening located below seat board (Bench) at (P2). The Study also confirmed that the Sauna has to have mechanical exhaust involved in it’s ventilation system.</p><p><strong><u>Other Considerations</u></strong></p><p>The above results are based on measurements performed in a test sauna, and Bathers’ personal observations of the issues presented in the Study have not been investigated. In practice, the tightness of saunas differs substantially from the tightness of the test sauna. As many air leaks in the normal sauna as possible should be sealed to keep from disrupting the Ventilation flow pattern of the T4 and P2 combination.</p><p><em>If you’re still with us and breathing fresh air, you can check this article, that adapts a 4 vent system for electric heated saunas <a href="https://www.saunatimes.com/types-of-saunas/electric-saunas/the-a-b-c-ds-of-venting-an-electric-heated-sauna/" target="_blank" rel="noreferrer noopener">here.</a> In the drawing below:</em></p><ul><li>T4 = B</li><li>P2 = D</li></ul><p>A <em>“A” and “C” are common with wood fired setups. When each of these 4 vents can be controlled by “chutes” or “sliders”, we allow ourselves, like the Clash song goes, “Complete Control… C-O-N… Control!” </em></p><figure><img decoding="async" data-src="https://www.saunatimes.com/wp-content/uploads/IMG_6556-1-560x640.jpeg" alt="" src="https://www.saunatimes.com/wp-content/uploads/IMG_6556-1-560x640.jpeg"><figcaption>venting an electric heated sauna</figcaption></figure><p>Link to the original 1992 study is <a href="https://www.saunatimes.com/wp-content/uploads/Sauna-Ventilation-VTT-INFORMATION-1431.pdf" target="_blank" rel="noreferrer noopener">here</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bash Debugging (292 pts)]]></title>
+            <title><![CDATA[Bash Debugging (308 pts)]]></title>
             <link>https://wizardzines.com/comics/bash-debugging/</link>
             <guid>39568728</guid>
             <pubDate>Sat, 02 Mar 2024 00:48:51 GMT</pubDate>
@@ -497,7 +759,7 @@ edition I’ve been invol…</p>
         </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[ArtPrompt: ASCII Art-Based Jailbreak Attacks Against Aligned LLMs (122 pts)]]></title>
+            <title><![CDATA[ArtPrompt: ASCII Art-Based Jailbreak Attacks Against Aligned LLMs (123 pts)]]></title>
             <link>https://arxiv.org/abs/2402.11753</link>
             <guid>39568622</guid>
             <pubDate>Sat, 02 Mar 2024 00:30:06 GMT</pubDate>
@@ -521,7 +783,7 @@ edition I’ve been invol…</p>
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ada 95: The Craft of Object-Oriented Programming (105 pts)]]></title>
+            <title><![CDATA[Ada 95: The Craft of Object-Oriented Programming (110 pts)]]></title>
             <link>https://adaic.org/resources/add_content/docs/craft/html/contents.htm</link>
             <guid>39567780</guid>
             <pubDate>Fri, 01 Mar 2024 22:52:57 GMT</pubDate>
@@ -844,7 +1106,7 @@ and for Unix (<a href="http://www.it.bton.ac.uk/staff/je/adacraft/adacraft.tar.g
 Couldn't get https://www.cpuc.ca.gov/-/media/cpuc-website/divisions/consumer-protection-and-enforcement-division/documents/tlab/av-programs/waymo-al-2-disposition-letter-20240301_signed.pdf: Error: getaddrinfo ENOTFOUND www.cpuc.ca.gov]]></description>
         </item>
         <item>
-            <title><![CDATA[WhatsApp forces Pegasus spyware maker to share its secret code (407 pts)]]></title>
+            <title><![CDATA[WhatsApp forces Pegasus spyware maker to share its secret code (411 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2024/03/whatsapp-finally-forces-pegasus-spyware-maker-to-share-its-secret-code/</link>
             <guid>39566766</guid>
             <pubDate>Fri, 01 Mar 2024 21:02:59 GMT</pubDate>
@@ -887,7 +1149,7 @@ Couldn't get https://www.cpuc.ca.gov/-/media/cpuc-website/divisions/consumer-pro
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FastUI: Build Better UIs Faster (307 pts)]]></title>
+            <title><![CDATA[FastUI: Build Better UIs Faster (311 pts)]]></title>
             <link>https://github.com/pydantic/FastUI</link>
             <guid>39566732</guid>
             <pubDate>Fri, 01 Mar 2024 20:59:18 GMT</pubDate>
@@ -1096,434 +1358,6 @@ async def html_landing() -> HTMLResponse:
 <li>Implementing the component models in another language like Rust or Go — since there's actually not that much code in the backend, so this would be a relatively small and mechanical task</li>
 </ul>
 </article></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Go Enums Suck (127 pts)]]></title>
-            <link>https://www.zarl.dev/articles/enums</link>
-            <guid>39564737</guid>
-            <pubDate>Fri, 01 Mar 2024 18:09:20 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.zarl.dev/articles/enums">https://www.zarl.dev/articles/enums</a>, See on <a href="https://news.ycombinator.com/item?id=39564737">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><h2 id="go-enums-suck">Go Enums Suck</h2>
-
-<p>Go doesn’t technially have Enums and it is a missing feature in my book but there is a Go idiomatic way to achieve roughly the same thing.  Go does have however the <code>iota</code> keyword. This is basically a self incrementing integer - so you end up writing Enums something like this:</p>
-
-<pre><code>type Operation int
-
-const (
-	Escalated Operation = iota
-	Archived
-	Deleted
-	Completed
-)
-</code></pre>
-
-<p>This is fine however it is nothing but an integer under the covers this means what we actually have is:</p>
-
-<pre><code>const (
-	Escalated Operation = 0
-	Archived  Operation = 1
-	Deleted   Operation = 2
-	Completed Operation = 3
-)
-</code></pre>
-
-<p>This also means any function that uses these or a struct that contains these can also just take an <code>int</code> value.  For this reason its best to make sure our default case is correctly handled. So for this we either decide which will be the default case or what I usually do is specify an <code>Unknown</code> case and use this as a validation check.  So now we have :</p>
-
-<pre><code>type Operation int
-
-const (
-	Unknown Operation = iota
-	Escalated 
-	Archived
-	Deleted
-	Completed
-)
-
-func (o Operation) IsValid() bool {
-	if o == Unknown {
-		return false
-	}
-	return true
-}
-</code></pre>
-
-<p>But what you notice here is we have no string representation of these Enums so we have to build that out next, for this I just use a <code>map[Operation]string</code> and instantiate this with the defined string constants.  We also now need to handle in inverse scenario of a <code>string</code> to an <code>Operation</code> for example if we are reading the value off the wire via JSON for example.  Adding the string maps:</p>
-
-<pre><code>
-const (
-	unknownStr = "Unknown"
-	escalatedStr = "Escalated"
-	archivedStr = "Archived"
-	deletedStr = "Deleted"
-	completedStr = "Completed"
-)
-
-var (
-&nbsp; &nbsp; opsToStrings = map[Operation]string{
-&nbsp; &nbsp; &nbsp; &nbsp; Escalated: escalatedStr,
-&nbsp; &nbsp; &nbsp; &nbsp; Archived: &nbsp;archivedStr,
-&nbsp; &nbsp; &nbsp; &nbsp; Deleted: &nbsp; deletedStr,
-&nbsp; &nbsp; &nbsp; &nbsp; Completed: completedStr,
-&nbsp; &nbsp; }
-&nbsp; &nbsp; stringsToOps = map[string]Operation{
-&nbsp; &nbsp; &nbsp; &nbsp; escalatedStr: Escalated,
-&nbsp; &nbsp; &nbsp; &nbsp; archivedStr: &nbsp;Archived,
-&nbsp; &nbsp; &nbsp; &nbsp; deletedStr: &nbsp; Deleted,
-&nbsp; &nbsp; &nbsp; &nbsp; completedStr: Completed,
-&nbsp; &nbsp; }
-)
-</code></pre>
-
-<p>Now that we have these maps set up we should really put them to use, for this I usually make 1  method and 1 function, the <code>String()</code> method on the Enum type and a package level function Parse which takes the <code>any</code> type and can return an Operation type.  This looks like:</p>
-
-<pre><code>func (o Operation) String() string {
-&nbsp; &nbsp; if s, ok := opsToStrings[o]; ok {
-&nbsp; &nbsp; &nbsp; &nbsp; return s
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return unknownStr
-}
-
-func ParseOperation(o any) Operation {
-&nbsp; &nbsp; switch o := o.(type) {
-&nbsp; &nbsp; case Operation:
-&nbsp; &nbsp; &nbsp; &nbsp; return o
-&nbsp; &nbsp; case int:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation(o)
-&nbsp; &nbsp; case string:
-&nbsp; &nbsp; &nbsp; &nbsp; return stringToOp(o)
-&nbsp; &nbsp; case fmt.Stringer:
-&nbsp; &nbsp; &nbsp; &nbsp; return stringToOp(o.String())
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return Unknown
-}
-
-  func (o Operation) IsValid() bool {
-&nbsp; &nbsp; _, ok := opsToStrings[o]
-	return ok
-}
-
-  func stringToOp(o string) Operation {
-&nbsp; &nbsp; if op, ok := stringsToOps[o]; ok {
-&nbsp; &nbsp; &nbsp; &nbsp; return op
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return Unknown
-}
-</code></pre>
-
-<p>This lets us use the Enum in JSON for example, it can be represented as an <code>int</code> or a <code>string</code> it’s up to you, but I almost always go for the <code>string</code> representation in JSON.  And of course it’s the 2 most used interfaces in the world.  The JSON Marshall and Unmarshall interfaces.</p>
-
-<pre><code>func (o Operation) MarshalJSON() ([]byte, error) {
-&nbsp; &nbsp; return []byte(`"` + t.String() + `"`), nil
-}
-
-func (t *Operation) UnmarshalJSON(b []byte) error {
-&nbsp; &nbsp; *t = Parse(string(b))
-&nbsp; &nbsp; return nil
-}
-</code></pre>
-
-<p>OK so now that we have all the individual Enums defined I like to group them up in a struct and give it the feel of an Enum more akin to a Java/Kotlin Enum when referencing it.  Start with making a container wrapper with a <code>Operation</code> for each case then define a public variable of the container type with all the correct mappings.  This ends up looking like:</p>
-
-<pre><code>type operationContainer struct {
-	UNKNOWN:   Operation
-	ESCALATED: Operation
-	ARCHIVED:  Operation
-	DELETED:   Operation
-	COMPLETED: Operation
-&nbsp;}
-
-var Operations = operationContainer {
-	UNKNOWN: Unknown,
-	ESCALATED: Escalated,
-	ARCHIVED: Archived,
-	DELETED: Deleted,
-	COMPLETED: Completed,
-}
-</code></pre>
-
-<p>This allows us to use these Enums like below if for example we are importing from the <code>cmd</code> pkg.</p>
-
-<pre><code>cmdOp := cmd.Operations.COMPLETED
-</code></pre>
-
-<p>With this container we can also extend the functionality to return all Enums as a slice for iteration over all the values if required excluding the <code>Unknown</code> value.</p>
-
-<pre><code>func (c operationsContainer) All() []Operation {
-&nbsp; &nbsp; return []Operation{
-&nbsp; &nbsp; &nbsp; &nbsp; c.ESCALATED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.ARCHIVED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.DELETED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.COMPLETED,
-&nbsp; &nbsp; }
-}
-</code></pre>
-
-<h2 id="job-done-or-is-it">Job Done. Or is it….</h2>
-
-<p>After all this we now have a much nicer more fully featured Enum but the biggest problem remains;  Anywhere that accepts an <code>Operation</code>  Enum type will just as happily accept an <code>int</code>. This is a real pain as it almost completely negates the work we have done here.  There is also the fact that we have our container but the original definitions are also public and can be accessed from outside the package so we have two things that are functionally the same.</p>
-
-<pre><code>opCompleted := cmd.Completed
-enumCompleted := cmd.Operations.COMPLETED
-</code></pre>
-
-<p>To limit this the first thing I did was to make the operation Enum type private so <code>Operation</code> became <code>operation</code> and made all instances of the operation type private also.  I then defined a new public struct called <code>Operation</code> which contains this private <code>operation</code> Enum.</p>
-
-<pre><code>type Operation struct {
-&nbsp; &nbsp; operation
-}
-
-type operation int
-
-const (
-&nbsp; &nbsp; unknown operation = iota
-&nbsp; &nbsp; escalated
-&nbsp; &nbsp; archived
-&nbsp; &nbsp; deleted
-&nbsp; &nbsp; completed
-)
-</code></pre>
-
-<p>This now makes it impossible to just pass an <code>int</code> to any function or struct that uses the <code>Operation</code> type as they cannot instantiate a new one with a valid private <code>operation</code> as it cannot be used outside the package.  This also means even if someone for example uses this as an empty struct <code>empty := cmd.Operation{}</code> it will be Invalid and will report as <code>Unknown</code>.  So now that this has been done we need to change our public container to accommodate our new <code>Operation</code> struct but as you can see the container does not need to change but the assignment does.</p>
-
-<pre><code>type operationsContainer struct {
-&nbsp; &nbsp; UNKNOWN &nbsp; Operation
-&nbsp; &nbsp; ESCALATED Operation
-&nbsp; &nbsp; ARCHIVED &nbsp;Operation
-&nbsp; &nbsp; DELETED &nbsp; Operation
-&nbsp; &nbsp; COMPLETED Operation
-}
-
- 
-var Operations = operationsContainer{
-&nbsp; &nbsp; UNKNOWN: &nbsp; Operation{unknown},
-&nbsp; &nbsp; ESCALATED: Operation{escalated},
-&nbsp; &nbsp; ARCHIVED: &nbsp;Operation{archived},
-&nbsp; &nbsp; DELETED: &nbsp; Operation{deleted},
-&nbsp; &nbsp; COMPLETED: Operation{completed},
-}
-</code></pre>
-
-<p>We also now need to change our Parse function to handle the wrapped <code>operation</code></p>
-
-<pre><code>func Parse(a any) Operation {
-&nbsp; &nbsp; switch v := a.(type) {
-&nbsp; &nbsp; case Operation:
-&nbsp; &nbsp; &nbsp; &nbsp; return v
-&nbsp; &nbsp; case string:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{stringToOperation(v)}
-&nbsp; &nbsp; case fmt.Stringer:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{stringToOperation(v.String())}
-&nbsp; &nbsp; case int:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(v)}
-&nbsp; &nbsp; case int64:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(int(v))}
-&nbsp; &nbsp; case int32:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(int(v))}
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return Operation{unknown}
-}
-</code></pre>
-
-<p>With this new structure we still have the same nice syntax for accessing the Enum outside the package but the individual Enums are not public so this encourages the use of the singleton Enum container for getting the appropriate value and it also makes Intellisense in the IDE better as there is less public variables exposed meaning the drop down is cleaner.</p>
-
-<p>Now I know - this is a metric ton of work just to get nice Enums, but to be honest I think it really makes a nicer developer experience when using them and is better than the <code>iota</code> approach from a type safety perspective.  However I too agree that this is way to much work and it’s repetitive work at that, which can easily require rework with the adding of Enums or the changing of Enums means making sure everything has been done correctly for all the string maps etc.</p>
-
-<p>So ………..</p>
-
-<h2 id="goenums">goenums</h2>
-
-<p>This is a a little tool I wrote to accompany this post - its an Enum generator that generates Enums in the same style as I have laid out above.  It’s a simple <code>text/template</code> based tool that can turn some simple JSON configuration into a formatted go file.</p>
-
-<p>It turns this:</p>
-
-<pre><code>{
-&nbsp; "enums": [
-&nbsp; &nbsp; &nbsp;{
-&nbsp; &nbsp; &nbsp; "package": "cmd",
-&nbsp; &nbsp; &nbsp; "type": "operation",
-&nbsp; &nbsp; &nbsp; "values": [
-&nbsp; &nbsp; &nbsp; &nbsp; "Escalated",
-&nbsp; &nbsp; &nbsp; &nbsp; "Archived",
-&nbsp; &nbsp; &nbsp; &nbsp; "Deleted",
-&nbsp; &nbsp; &nbsp; &nbsp; "Completed"
-&nbsp; &nbsp; &nbsp; ]
-&nbsp; &nbsp; }
-&nbsp; ]
-}
-</code></pre>
-
-<p>Into this:</p>
-
-<pre><code>package cmd
-
-import "fmt"
-
-type Operation struct {
-&nbsp; &nbsp; operation
-}
-
-type operation int
-
-const (
-&nbsp; &nbsp; unknown operation = iota
-&nbsp; &nbsp; escalated
-&nbsp; &nbsp; archived
-&nbsp; &nbsp; deleted
-&nbsp; &nbsp; completed
-)
-
-var (
-&nbsp; &nbsp; strOperationMap = map[operation]string{
-&nbsp; &nbsp; &nbsp; &nbsp; escalated: "ESCALATED",
-&nbsp; &nbsp; &nbsp; &nbsp; archived: &nbsp;"ARCHIVED",
-&nbsp; &nbsp; &nbsp; &nbsp; deleted: &nbsp; "DELETED",
-&nbsp; &nbsp; &nbsp; &nbsp; completed: "COMPLETED",
-&nbsp; &nbsp; }
-
-&nbsp; &nbsp; typeOperationMap = map[string]operation{
-&nbsp; &nbsp; &nbsp; &nbsp; "ESCALATED": escalated,
-&nbsp; &nbsp; &nbsp; &nbsp; "ARCHIVED": &nbsp;archived,
-&nbsp; &nbsp; &nbsp; &nbsp; "DELETED": &nbsp; deleted,
-&nbsp; &nbsp; &nbsp; &nbsp; "COMPLETED": completed,
-&nbsp; &nbsp; }
-)
-
-func (t operation) String() string {
-&nbsp; &nbsp; return strOperationMap[t]
-}
-  
-func Parse(a any) Operation {
-&nbsp; &nbsp; switch v := a.(type) {
-&nbsp; &nbsp; case Operation:
-&nbsp; &nbsp; &nbsp; &nbsp; return v
-&nbsp; &nbsp; case string:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{stringToOperation(v)}
-&nbsp; &nbsp; case fmt.Stringer:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{stringToOperation(v.String())}
-&nbsp; &nbsp; case int:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(v)}
-&nbsp; &nbsp; case int64:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(int(v))}
-&nbsp; &nbsp; case int32:
-&nbsp; &nbsp; &nbsp; &nbsp; return Operation{operation(int(v))}
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return Operation{unknown}
-}
-  
-func stringToOperation(s string) operation {
-&nbsp; &nbsp; if v, ok := typeOperationMap[s]; ok {
-&nbsp; &nbsp; &nbsp; &nbsp; return v
-&nbsp; &nbsp; }
-&nbsp; &nbsp; return unknown
-}
-  
-func (t operation) IsValid() bool {
-&nbsp; &nbsp; _, ok := strOperationMap[s]
-    return ok
-}
-  
-type operationsContainer struct {
-&nbsp; &nbsp; UNKNOWN &nbsp; Operation
-&nbsp; &nbsp; ESCALATED Operation
-&nbsp; &nbsp; ARCHIVED &nbsp;Operation
-&nbsp; &nbsp; DELETED &nbsp; Operation
-&nbsp; &nbsp; COMPLETED Operation
-}
-  
-var Operations = operationsContainer{
-&nbsp; &nbsp; UNKNOWN: &nbsp; Operation{unknown},
-&nbsp; &nbsp; ESCALATED: Operation{escalated},
-&nbsp; &nbsp; ARCHIVED: &nbsp;Operation{archived},
-&nbsp; &nbsp; DELETED: &nbsp; Operation{deleted},
-&nbsp; &nbsp; COMPLETED: Operation{completed},
-}
-  
-func (c operationsContainer) All() []Operation {
-&nbsp; &nbsp; return []Operation{
-&nbsp; &nbsp; &nbsp; &nbsp; c.ESCALATED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.ARCHIVED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.DELETED,
-&nbsp; &nbsp; &nbsp; &nbsp; c.COMPLETED,
-&nbsp; &nbsp; }
-}
-  
-func (t Operation) MarshalJSON() ([]byte, error) {
-&nbsp; &nbsp; return []byte(`"` + t.String() + `"`), nil
-}
-  
-func (t *Operation) UnmarshalJSON(b []byte) error {
-&nbsp; &nbsp; *t = Parse(string(b))
-&nbsp; &nbsp; return nil
-}
-</code></pre>
-
-<p>Note that the config is a JSON array this allows specifying many different Enums and have them all get generated in one shot.  More about goenums can be found on the github at <a href="https://www.github.com/zarldev/goenums" target="_blank">https://www.github.com/zarldev/goenums</a></p>
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[I accidentally made my link shortener into a malware honeypot (183 pts)]]></title>
-            <link>https://app.y.gy/blog/honeypot</link>
-            <guid>39564678</guid>
-            <pubDate>Fri, 01 Mar 2024 18:05:17 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://app.y.gy/blog/honeypot">https://app.y.gy/blog/honeypot</a>, See on <a href="https://news.ycombinator.com/item?id=39564678">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Colecovision BASIC compiler: CVBasic v0.1.0 (104 pts)]]></title>
-            <link>https://forums.atariage.com/topic/362182-colecovision-basic-compiler-cvbasic-v010/</link>
-            <guid>39564674</guid>
-            <pubDate>Fri, 01 Mar 2024 18:04:48 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://forums.atariage.com/topic/362182-colecovision-basic-compiler-cvbasic-v010/">https://forums.atariage.com/topic/362182-colecovision-basic-compiler-cvbasic-v010/</a>, See on <a href="https://news.ycombinator.com/item?id=39564674">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-role="commentContent" data-controller="core.front.core.lightboxedImages">
-			<p>
-	This is excellent news! I do have a few questions though:
-</p>
-
-
-
-<p>
-	1) I know this new compiler is very early in its development, but do you have plans to offer a tile/sprite editor, or a sound/music editor? If it's not something you've thought a lot about so far, perhaps you could collaborate with people on AtariAge who have already made such editors (mostly for data import/export functionalities)?
-</p>
-
-
-
-<p>
-	2) While the programming language is a central part of the project, another very important part is the debugger. Do you plan to add a proper debugger (with breakpoints, RAM usage monitor, interrupt monitor and time-to-next-VBLANK monitor) into CoolCV? One thing that is difficult with programming for the ColecoVision is that you don't have any real control over when the VBLANK NMI happens, and if your code tries to do too many operations between VBLANKs, this results in graphic corruption, and perhaps even complete runtime crashes.
-</p>
-
-
-
-<p>
-	3) Your sample Basic code doesn't seem to have any provisions for specifying the compiling setup (i.e. does the game use bankswitching (32K, MegaCart, Activision PCB), does it require the Super Game Module, is it supposed to support (or ignore) interrupts from the Roller Controller, that kind of thing).
-</p>
-
-
-
-<p>
-	4) Will you be offering built-in functions with the language? For example, a standard function to detect the SGM, or a function to clear VRAM at boot/reset, or a function to initialize the sound chip into "silent" mode, so programmers won't need to code their own routines?
-</p>
-
-
-
-
-
-<p>
-	Those are just questions off the top of my head, I'm sure I could come up with more.&nbsp; <span><img alt=":P" data-emoticon="" src="https://content.invisioncic.com/r322239/emoticons/atariage_icon_razz.gif" title=":P"></span>
-</p>
-
-
-
-
-			
-				
-
-<p><span data-excludequote="">
-	<strong>Edited <time datetime="2024-02-28T13:32:21Z" title="02/28/2024 01:32  PM" data-short="3 dy">Wednesday at 01:32  PM</time> by Pixelboy</strong>
-	
-	
-</span>
-			
-		</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
