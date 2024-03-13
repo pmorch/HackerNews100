@@ -4,12 +4,160 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 13 Mar 2024 08:00:05 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 13 Mar 2024 09:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Nvtop: Linux Task Monitor for Nvidia, AMD and Intel GPUs (223 pts)]]></title>
+            <title><![CDATA[JIT WireGuard (133 pts)]]></title>
+            <link>https://fly.io/blog/jit-wireguard-peers/</link>
+            <guid>39688545</guid>
+            <pubDate>Wed, 13 Mar 2024 06:13:09 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://fly.io/blog/jit-wireguard-peers/">https://fly.io/blog/jit-wireguard-peers/</a>, See on <a href="https://news.ycombinator.com/item?id=39688545">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+         <dl>
+             <dt>Author</dt>
+             <dd>
+                 <img alt="Lillian Berry" src="https://fly.io/static/images/fly-social-square.webp">
+               <dl>
+                 <dt>Name</dt>
+                 <dd>
+                   Lillian Berry
+                 </dd>
+                  <dt>star-ark.net</dt>
+                  <dd>
+                    <a href="https://star-ark.net/" target="_blank">
+                      star-ark.net
+                    </a>
+                  </dd>
+               </dl>
+             </dd>
+         </dl>
+
+        <section>
+            <figure>
+                <img src="https://fly.io/blog/jit-wireguard-peers/assets/network-cover.webp" alt="A cartoon of devices floating around and networked together with lines and nodes">
+                <figcaption>
+                  <span>Image by</span>
+                  
+<svg role="img" style="pointer-events: none; width: 17px; height: 17px;" viewBox="0 0 20 20" fill="currentColor" fill-rule="evenodd">
+  <g buffered-rendering="static">
+    <path fill-rule="evenodd" d="M1 8a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 018.07 3h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0016.07 6H17a2 2 0 012 2v7a2 2 0 01-2 2H3a2 2 0 01-2-2V8zm13.5 3a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM10 14a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"></path>
+  </g>
+</svg>
+
+                    <a href="https://annieruygtillustration.com/" target="_blank">
+                      Annie Ruygt
+                    </a>
+                </figcaption>
+            </figure>
+          <p>We’re Fly.io and we transmute containers into VMs, running them on our hardware around the world with the power of Firecracker alchemy. We do a lot of stuff with WireGuard, which has become a part of our customer API. This is a quick story about some tricks we played to make WireGuard faster and more scalable for the hundreds of thousands of people who now use it here.</p>
+<p>One of many odd decisions we’ve made at Fly.io is how we use WireGuard. It’s not just that we use it in many places where other shops would use HTTPS and REST APIs. We’ve gone a step beyond that: every time you run <code>flyctl</code>, our lovable, sprawling CLI, it conjures a TCP/IP stack out of thin air, with its own IPv6 address, and speaks directly to Fly Machines running on our networks.</p>
+
+<p>There are plusses and minuses to this approach, which we talked about <a href="https://fly.io/blog/our-user-mode-wireguard-year/" title="">in a blog post a couple years back</a>. Some things, like remote-operated Docker builders, get easier to express (a Fly Machine, as far as <code>flyctl</code> is concerned, might as well be on the same LAN). But everything generally gets trickier to keep running reliably.</p>
+
+<p>It was a decision. We own it.</p>
+
+<p>Anyways, we’ve made some improvements recently, and I’d like to talk about them.</p>
+<h2 id="where-we-left-off"><a href="#where-we-left-off" aria-label="Anchor"></a>Where we left off</h2>
+<p>Until a few weeks ago, our gateways ran on a pretty simple system.</p>
+
+<ol>
+<li>We operate dozens of “gateway” servers around the world, whose sole purpose is to accept incoming WireGuard connections and connect them to the appropriate private networks.
+</li><li>Any time you run <code>flyctl</code> and it needs to talk to a Fly Machine (to build a container, pop an SSH console, copy files, or proxy to a service you’re running), it spawns or connects to a background agent process.
+</li><li>The first time it runs, the agent generates a new WireGuard peer configuration from our GraphQL API. WireGuard peer configurations are very simple: just a public key and an address to connect to.
+</li><li>Our API in turn takes that peer configuration and sends it to the appropriate gateway (say, <code>ord</code>, if you’re near Chicago) via an RPC we send over the NATS messaging system.
+</li><li>On the gateway, a service called <code>wggwd</code> accepts that configuration, saves it to a SQLite database, and adds it to the kernel using WireGuard’s Golang libraries. <code>wggwd</code> acknowledges the installation of the peer to the API.
+</li><li>The API replies to your GraphQL request, with the configuration.
+</li><li>Your <code>flyctl</code> connects to the WireGuard peer, which works, because you receiving the configuration means it’s installed on the gateway.
+</li></ol>
+
+<p>I copy-pasted those last two bullet points from <a href="https://fly.io/blog/our-user-mode-wireguard-year/" title="">that two-year-old post</a>, because when it works, it does <em>just work</em> reasonably well. (We ultimately did end up defaulting everybody to WireGuard-over-WebSockets, though.)</p>
+
+<p>But if it always worked, we wouldn’t be here, would we?</p>
+
+<p>We ran into two annoying problems:</p>
+
+<p>One: NATS is fast, but doesn’t guarantee delivery. Back in 2022, Fly.io was pretty big on NATS internally. We’ve moved away from it. For instance, our <a href="https://fly.io/blog/carving-the-scheduler-out-of-our-orchestrator/" title="">internal <code>flyd</code> API</a> used to be driven by NATS; today, it’s HTTP.  Our NATS cluster was losing too many messages to host a reliable API on it. Scaling back our use of NATS made WireGuard gateways better, but still not great.</p>
+
+<p>Two: When <code>flyctl</code> exits, the WireGuard peer it created sticks around on the gateway. Nothing cleans up old peers. After all, you’re likely going to come back tomorrow and deploy a new version of your app, or <code>fly ssh console</code> into it to debug something. Why remove a peer just to re-add it the next day? </p>
+
+<p>Unfortunately, the vast majority of peers are created by <code>flyctl</code> in CI jobs, which don’t have persistent storage and can’t reconnect to the same peer the next run; they generate new peers every time, no matter what.</p>
+
+<p>So, we ended up with a not-reliable-enough provisioning system, and gateways with hundreds of thousands of peers that will never be used again. The high stale peer count made kernel WireGuard operations very slow - especially loading all the peers back into the kernel after a gateway server reboot - as well as some kernel panics.</p>
+
+<p>There had to be</p>
+<h2 id="a-better-way"><a href="#a-better-way" aria-label="Anchor"></a>A better way.</h2>
+<p>Storing bajillions of WireGuard peers is no big challenge for any serious n-tier RDBMS. This isn’t “big data”. The problem we have at Fly.io is that our gateways don’t have serious n-tier RDBMSs. They’re small. Scrappy. They live off the land.</p>
+
+<p>Seriously, though: you could store every WireGuard peer everybody has ever used at Fly.io in a single SQLite database, easily.  What you can’t do is store them all in the Linux kernel.</p>
+
+<p>So, at some point, as you push more and more peer configurations to a gateway, you have to start making decisions about which peers you’ll enable in the kernel, and which you won’t.</p>
+
+<p>Wouldn’t it be nice if we just didn’t have this problem? What if, instead of pushing configs to gateways, we had the gateways pull them from our API on demand?</p>
+
+<p>If you did that, peers would only have to be added to the kernel when the client wanted to connect. You could yeet them out of the kernel any time you wanted; the next time the client connected, they’d just get pulled again, and everything would work fine.</p>
+
+<p>The problem you quickly run into to build this design is that Linux kernel WireGuard doesn’t have a feature for installing peers on demand. However:</p>
+<h2 id="it-is-possible-to-jit-wireguard-peers"><a href="#it-is-possible-to-jit-wireguard-peers" aria-label="Anchor"></a>It is possible to JIT WireGuard peers</h2>
+<p>The Linux kernel’s <a href="https://github.com/WireGuard/wgctrl-go" title="">interface for configuring WireGuard</a> is <a href="https://docs.kernel.org/userspace-api/netlink/intro.html" title="">Netlink</a> (which is basically a way to create a userland socket to talk to a kernel service). Here’s a <a href="https://github.com/WireGuard/wg-dynamic/blob/master/netlink.h" title="">summary of it as a C API</a>. Note that there’s no API call to subscribe for “incoming connection attempt” events.</p>
+
+<p>That’s OK! We can just make our own events. WireGuard connection requests are packets, and they’re easily identifiable, so we can efficiently snatch them with a BPF filter and a <a href="https://github.com/google/gopacket" title="">packet socket</a>.</p>
+<p>Most of the time, it’s even easier for us to get the raw WireGuard packets, because our users now default to WebSockets WireGuard (which is just an unauthenticated WebSockets connect that shuttles framed UDP packets to and from an interface on the gateway), so that people who have trouble talking end-to-end in UDP can bring connections up.</p>
+<p>We own the daemon code for that, and can just hook the packet receive function to snarf WireGuard packets.</p>
+
+<p>It’s not obvious, but WireGuard doesn’t have notions of “client” or “server”. It’s a pure point-to-point protocol; peers connect to each other when they have traffic to send. The first peer to connect is called the <strong>initiator</strong>, and the peer it connects to is the <strong>responder</strong>.</p>
+
+<p>For Fly.io, <code>flyctl</code> is typically our initiator,  sending a single UDP packet to the gateway, which is the responder. According <a href="https://www.wireguard.com/papers/wireguard.pdf" title="">to the WireGuard paper</a>, this first packet is a <code>handshake initiation</code>.  It gets better: the packet type is recorded in a single plaintext byte. So this simple BPF filter catches all the incoming connections: <code>udp and dst port 51820 and udp[8] = 1</code>.</p>
+
+<p>In most other protocols, we’d be done at this point; we’d just scrape the username or whatnot out of the packet, go fetch the matching configuration, and install it in the kernel. With WireGuard, not so fast. WireGuard is based on Trevor Perrin’s <a href="http://www.noiseprotocol.org/" title="">Noise Protocol Framework</a>, and Noise goes way out of its way to <a href="http://www.noiseprotocol.org/noise.html#identity-hiding" title="">hide identities</a> during handshakes. To identify incoming requests, we’ll need to run enough Noise cryptography to decrypt the identity.</p>
+
+<p>The code to do this is fussy, but it’s relatively short (about 200 lines). Helpfully, the kernel Netlink interface will give a privileged process the private key for an interface, so the secrets we need to unwrap WireGuard are easy to get. Then it’s just a matter of running the first bit of the Noise handshake. If you’re that kind of nerdy, <a href="https://gist.github.com/tqbf/9f2c2852e976e6566f962d9bca83062b" title="">here’s the code.</a></p>
+
+<p>At this point, we have the event feed we wanted: the public keys of every user trying to making a WireGuard connection to our gateways. We keep a rate-limited cache in SQLite, and when we see new peers, we’ll make an internal HTTP API request to fetch the matching peer information and install it. This fits nicely into the little daemon that already runs on our gateways to manage WireGuard, and allows us to ruthlessly and recklessly remove stale peers with a <code>cron</code> job.</p>
+
+<p>But wait! There’s more! We bounced this plan off Jason Donenfeld, and he tipped us off on a sneaky feature of the Linux WireGuard Netlink interface.</p>
+<p>Jason is the hardest working person in show business.</p>
+<p>Our API fetch for new peers is generally not going to be fast enough to respond to the first handshake initiation message a new client sends us. That’s OK; WireGuard is pretty fast about retrying. But we can do better.</p>
+
+<p>When we get an incoming initiation message, we have the 4-tuple address of the desired connection, including the ephemeral source port <code>flyctl</code> is using. We can install the peer as if we’re the initiator, and <code>flyctl</code> is the responder. The Linux kernel will initiate a WireGuard connection back to <code>flyctl</code>. This works; the protocol doesn’t care a whole lot who’s the server and who’s the client. We get new connections established about as fast as they can possibly be installed.</p>
+<figure>
+  <figcaption>
+    <h2>Launch an app in minutes</h2>
+    <p>Speedrun an app onto Fly.io and get your own JIT WireGuard peer&nbsp;✨</p>
+      <a href="https://fly.io/docs/speedrun/">
+        Speedrun &nbsp;<span>→</span>
+      </a>
+  </figcaption>
+  <p><img src="https://fly.io/static/images/cta-dog.webp" srcset="https://fly.io/static/images/cta-dog@2x.webp 2x" alt="">
+  </p>
+</figure>
+
+<h2 id="look-at-this-graph"><a href="#look-at-this-graph" aria-label="Anchor"></a>Look at this graph</h2>
+<p>We’ve been running this in production for a few weeks and we’re feeling pretty happy about it. We went from thousands, or hundreds of thousands, of stale WireGuard peers on a gateway to what rounds to none. Gateways now hold a lot less state, are faster at setting up peers, and can be rebooted without having to wait for many unused peers to be loaded back into the kernel.</p>
+
+<p>I’ll leave you with this happy Grafana chart from the day of the switchover.</p>
+
+<p><img alt="a Grafana chart of 'kernel_stale_wg_peer_count' vs. time. For the first few hours, all traces are flat. Most are at values between 0 and 50,000 and the top-most is just under 550,000. Towards the end of the graph, each line in turn jumps sharply down to the bottom, and at the end of the chart all datapoints are indistinguishable from 0." src="https://fly.io/blog/jit-wireguard-peers/assets/wireguard-peers-graph.webp"></p>
+
+<p><strong>Editor’s note:</strong> Despite our tearful protests, Lillian has decided to move on from Fly.io to explore new pursuits. We wish her much success and happiness!&nbsp;✨</p>
+
+          
+        </section>
+        <dl>
+            <dt>
+              Previous post  ↓
+            </dt>
+            <dd>
+              <a href="https://fly.io/blog/fks-beta-live/">
+                Fly Kubernetes does more now
+              </a>
+            </dd>
+        </dl>
+      </article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Nvtop: Linux Task Monitor for Nvidia, AMD and Intel GPUs (240 pts)]]></title>
             <link>https://github.com/Syllo/nvtop</link>
             <guid>39687132</guid>
             <pubDate>Wed, 13 Mar 2024 01:36:14 GMT</pubDate>
@@ -379,7 +527,7 @@ at the GNU website &lt;<a href="http://www.gnu.org/licenses/" rel="nofollow">www
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Features lost across versions of macOS (114 pts)]]></title>
+            <title><![CDATA[Features lost across versions of macOS (118 pts)]]></title>
             <link>https://talk.tidbits.com/t/features-lost-across-versions-of-macos/27037</link>
             <guid>39687037</guid>
             <pubDate>Wed, 13 Mar 2024 01:23:12 GMT</pubDate>
@@ -996,7 +1144,7 @@ at the GNU website &lt;<a href="http://www.gnu.org/licenses/" rel="nofollow">www
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Direct File officially opens in 12 pilot states (145 pts)]]></title>
+            <title><![CDATA[Direct File officially opens in 12 pilot states (149 pts)]]></title>
             <link>https://www.irs.gov/newsroom/direct-file-officially-opens-in-12-pilot-states-following-positive-early-reviews-eligible-taxpayers-can-file-online-directly-with-the-irs-for-free</link>
             <guid>39686585</guid>
             <pubDate>Wed, 13 Mar 2024 00:26:45 GMT</pubDate>
@@ -1078,7 +1226,7 @@ at the GNU website &lt;<a href="http://www.gnu.org/licenses/" rel="nofollow">www
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A ragtag band of internet friends became the best at forecasting world events (137 pts)]]></title>
+            <title><![CDATA[A ragtag band of internet friends became the best at forecasting world events (146 pts)]]></title>
             <link>https://www.vox.com/future-perfect/2024/2/13/24070864/samotsvety-forecasting-superforecasters-tetlock</link>
             <guid>39685894</guid>
             <pubDate>Tue, 12 Mar 2024 22:52:40 GMT</pubDate>
@@ -1201,7 +1349,7 @@ at the GNU website &lt;<a href="http://www.gnu.org/licenses/" rel="nofollow">www
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Scammed by the top result for 'Bitcoin wallet' in Apple App Store (197 pts)]]></title>
+            <title><![CDATA[HNInternal: Scammed by the top result for 'Bitcoin wallet' in Apple App Store (201 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=39685272</link>
             <guid>39685272</guid>
             <pubDate>Tue, 12 Mar 2024 21:36:53 GMT</pubDate>
@@ -1404,7 +1552,7 @@ EDIT: added the word 'top' at the end</span></p></div></td></tr>
                               </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[40 Years of Programming (163 pts)]]></title>
+            <title><![CDATA[40 Years of Programming (174 pts)]]></title>
             <link>https://liw.fi/40/</link>
             <guid>39685046</guid>
             <pubDate>Tue, 12 Mar 2024 21:15:23 GMT</pubDate>
@@ -2014,6 +2162,111 @@ are mine.</p>
   </article></div>]]></description>
         </item>
         <item>
+            <title><![CDATA[Chyrp Lite – An Ultra-Lightweight Tumblelogging Engine Using PHP and SQLite (101 pts)]]></title>
+            <link>https://chyrplite.net/</link>
+            <guid>39684618</guid>
+            <pubDate>Tue, 12 Mar 2024 20:36:36 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://chyrplite.net/">https://chyrplite.net/</a>, See on <a href="https://news.ycombinator.com/item?id=39684618">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+    <header>
+      
+      <h2>An ultra-lightweight blogging engine, written in PHP.</h2>
+      <p><img width="24" src="https://chyrplite.net/favicon.svg" alt=""></p>
+    </header>
+    <section aria-label="Download">
+      <p>
+        <a href="https://github.com/xenocrat/chyrp-lite/releases/latest">Download from GitHub!</a>
+      </p>
+    </section>
+    <section aria-label="Overview">
+      <h3 id="offering">What can Chyrp Lite do for me?</h3>
+      <p>
+        Chyrp Lite makes it possible to host a blog on your own web server with minimal fuss. You can have a traditional blog, a tumbleblog, or you can add oodles of customisation and build a general-purpose web publishing platform with blogging features on the side. You get four beautiful blog themes and a friendly administration console, all fully navigable on a broad range of devices, thanks to the power of responsive HTML5. Semantic markup and comprehensive ARIA labelling ensure your blog will be accessible to visitors who use assistive technologies.
+      </p>
+      <p>
+        With a flexible system of Feathers and Pages, you can make your website whatever you want it to be. Feathers enable different types of blog content – you can restrict yourself to absolute textual purity, or you can create a multimedia rainbow. Pages let you publish articles separate from your blog content – be it a simple colophon or a hierarchy of multiple pages.
+      </p>
+      <h3 id="screenshots">Screenshots</h3>
+      <p><a href="#screenshot_blossom_large" title="A screenshot of the Blossom theme">
+          <img alt="A screenshot of the Blossom theme" src="https://chyrplite.net/images/screenshot_blossom_small.webp">
+        </a>
+        <a href="#screenshot_sparrow_large" title="A screenshot of the Sparrow theme">
+          <img alt="A screenshot of the Sparrow theme" src="https://chyrplite.net/images/screenshot_sparrow_small.webp">
+        </a>
+        <a href="#screenshot_topaz_large" title="A screenshot of the Topaz theme">
+          <img alt="A screenshot of the Topaz theme" src="https://chyrplite.net/images/screenshot_topaz_small.webp">
+        </a>
+        <a href="#screenshot_umbra_large" title="A screenshot of the Umbra theme">
+          <img alt="A screenshot of the Umbra theme" src="https://chyrplite.net/images/screenshot_umbra_small.webp">
+        </a>
+        <a href="#screenshot_virgula_large" title="A screenshot of the Virgula theme">
+          <img alt="A screenshot of the Virgula theme" src="https://chyrplite.net/images/screenshot_virgula_small.webp">
+        </a>
+        <a href="#screenshot_install" title="A screenshot of Chyrp Lite's super simple installer">
+          <img alt="A screenshot of Chyrp Lite's super simple installer" src="https://chyrplite.net/images/install_small.webp">
+        </a>
+        <a href="#screenshot_write_desktop" title="A screenshot of the Write page">
+          <img alt="A screenshot of the Write page" src="https://chyrplite.net/images/write_desktop_small.webp">
+        </a>
+        <a href="#screenshot_modules_desktop" title="A screenshot of the Modules page">
+          <img alt="A screenshot of the Modules page" src="https://chyrplite.net/images/modules_desktop_small.webp">
+        </a>
+      </p>
+      <p><a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_blossom_large">
+          <img loading="lazy" alt="" src="https://chyrplite.net/images/screenshot_blossom_large.webp">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_sparrow_large">
+          <img loading="lazy" alt="" src="https://chyrplite.net/images/screenshot_sparrow_large.webp">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_topaz_large">
+          <img loading="lazy" alt="" src="https://chyrplite.net/images/screenshot_topaz_large.webp">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_umbra_large">
+          <img loading="lazy" alt="" src="https://chyrplite.net/images/screenshot_umbra_large.webp">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_virgula_large">
+          <img loading="lazy" alt="" src="https://chyrplite.net/images/screenshot_virgula_large.webp">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_install">
+          <img loading="lazy" alt="" src="https://chyrplite.net/wiki/images/install.png">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_write_desktop">
+          <img loading="lazy" alt="" src="https://chyrplite.net/wiki/images/write_desktop.png">
+        </a>
+        <a href="#screenshots" aria-label="Stop displaying this image" id="screenshot_modules_desktop">
+          <img loading="lazy" alt="" src="https://chyrplite.net/wiki/images/modules_desktop.png">
+        </a>
+      </p>
+      <h3 id="features">What are the key features?</h3>
+      <ul>
+        <li>
+          Easy to install, simple to maintain, extensible by design.
+        </li>
+        <li>
+          Built with responsive and accessible <a rel="external" href="https://www.w3.org/">W3C</a>-validated HTML5.
+        </li>
+        <li>
+          Universal support for plain text, <a rel="external" href="https://commonmark.org/">Markdown</a>, or raw markup.
+        </li>
+        <li>
+          Personalise your blog using powerful extensions.
+        </li>
+        <li>
+          Theme development is easy with the <a rel="external" href="https://twig.symfony.com/">Twig template engine</a>.
+        </li>
+        <li>
+          Manage users and visitors with a comprehensive rights model.
+        </li>
+      </ul>
+    </section>
+    <section aria-label="Wiki">
+      <p>
+        <a href="https://chyrplite.net/wiki/">Find out more on the wiki</a>
+      </p>
+    </section>
+  </article></div>]]></description>
+        </item>
+        <item>
             <title><![CDATA[On the new Dutch intelligence and security law (185 pts)]]></title>
             <link>https://berthub.eu/articles/posts/dutch-intelligence-and-security-law/</link>
             <guid>39684472</guid>
@@ -2114,7 +2367,7 @@ are mine.</p>
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bluesky's stackable approach to moderation (152 pts)]]></title>
+            <title><![CDATA[Bluesky's stackable approach to moderation (164 pts)]]></title>
             <link>https://bsky.social/about/blog/03-12-2024-stackable-moderation</link>
             <guid>39684027</guid>
             <pubDate>Tue, 12 Mar 2024 19:43:18 GMT</pubDate>
@@ -2226,7 +2479,7 @@ have made such an impact and we are beyond excited to continue working with you
 all while we continue to ship!</p><p>Brendan, Matt, and the Amazon CodeWhisperer for command line team.</p></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How Mandelbrot set images are affected by floating point precision (186 pts)]]></title>
+            <title><![CDATA[How Mandelbrot set images are affected by floating point precision (197 pts)]]></title>
             <link>https://github.com/ProfJski/FloatCompMandelbrot</link>
             <guid>39683455</guid>
             <pubDate>Tue, 12 Mar 2024 19:01:53 GMT</pubDate>
@@ -2316,7 +2569,7 @@ unsigned int batchSize_third_float=512;
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Vehicle brakes produce charged particles that may harm public health: study (157 pts)]]></title>
+            <title><![CDATA[Vehicle brakes produce charged particles that may harm public health: study (166 pts)]]></title>
             <link>https://news.uci.edu/2024/03/12/uc-irvine-study-vehicle-brakes-produce-charged-particles-that-may-harm-public-health/</link>
             <guid>39683351</guid>
             <pubDate>Tue, 12 Mar 2024 18:53:28 GMT</pubDate>
@@ -2487,7 +2740,7 @@ https://media.npr.org/assets/img/2024/03/12/gettyimages-1258352775-22dd4b0612dd7
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Astro DB (161 pts)]]></title>
+            <title><![CDATA[Astro DB (162 pts)]]></title>
             <link>https://astro.build/db/</link>
             <guid>39682366</guid>
             <pubDate>Tue, 12 Mar 2024 17:34:41 GMT</pubDate>
@@ -2530,7 +2783,7 @@ Get started for free,<br>then pay as you grow.
  </h3>  </p>  </section>  </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Launch HN: Glide (YC W24) – AI-assisted technical design docs (134 pts)]]></title>
+            <title><![CDATA[HNInternal: Launch HN: Glide (YC W24) – AI-assisted technical design docs (136 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=39682183</link>
             <guid>39682183</guid>
             <pubDate>Tue, 12 Mar 2024 17:21:06 GMT</pubDate>
@@ -2544,7 +2797,7 @@ Get started for free,<br>then pay as you grow.
   </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Byte-Sized Swift: Building Tiny Games for the Playdate (179 pts)]]></title>
+            <title><![CDATA[Byte-Sized Swift: Building Tiny Games for the Playdate (182 pts)]]></title>
             <link>https://www.swift.org/blog/byte-sized-swift-tiny-games-playdate/</link>
             <guid>39682143</guid>
             <pubDate>Tue, 12 Mar 2024 17:18:09 GMT</pubDate>
@@ -3010,7 +3263,7 @@ test.o: ELF 32-bit LSB relocatable, ARM, EABI5 version 1 <span>(</span>SYSV<span
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The NYPD sent a warrantless subpoena for a copwatcher's Twitter account (434 pts)]]></title>
+            <title><![CDATA[The NYPD sent a warrantless subpoena for a copwatcher's Twitter account (443 pts)]]></title>
             <link>https://hellgatenyc.com/nypd-warrantless-subpoena-copwatcher-social-media</link>
             <guid>39681920</guid>
             <pubDate>Tue, 12 Mar 2024 17:00:27 GMT</pubDate>
@@ -3018,7 +3271,7 @@ test.o: ELF 32-bit LSB relocatable, ARM, EABI5 version 1 <span>(</span>SYSV<span
 <div id="readability-page-1" class="page"><div><p>The NYPD sent a sweeping subpoena seeking information from the social media account of the president of a New York City police accountability organization in February, records reviewed by Hell Gate show, only to withdraw its subpoena when told they would need to justify the subpoena in court.</p><p>Michael Clancy, better known to friends on and off social media as <a href="https://twitter.com/minkoff_steven/" target="_blank" rel="noreferrer noopener">Rabbi</a>, received a notice last month from X, formerly known as Twitter, alerting him to the fact that the NYPD had sent X a subpoena requesting "all records consisting but not limited to all subscriber name(s), Email address(s), Phone number(s), account creation date, IP logs with timestamps (IP address of account logins and logouts), all logs of previous messages sent and received." The subpoena also requested "all videos sent and received, including but not limited to meta-data. exit data about the messages and videos” for the account.</p><p>The notification included a copy of the subpoena, which warned X not to tell Clancy of its existence. "You are not to disclose or notify any customer or third party of the existence of this subpoena or that records were provided pursuant to this subpoena," the document read.</p><p>But X, following its own corporate policy, told Clancy anyway, and suggested he might want to get some legal representation to fight the subpoena, recommending the American Civil Liberties Union. Clancy did just that, and Kathryn Sachs of the New York Civil Liberties Union took up his case. Last Wednesday, Sachs wrote to the NYPD to challenge the administrative subpoena, which the NYPD had sent on its own authority, without any warrant or judicial approval. If the NYPD did not withdraw the subpoena, Sachs told the NYPD, Clancy would go to court with a motion to quash it. Rather than go to court to explain to a judge why the subpoena was necessary, the NYPD wrote back the same afternoon to say that it was withdrawing the subpoena altogether.</p><p>The NYPD subpoena letter cited as its empowering authority <a href="https://codelibrary.amlegal.com/codes/newyorkcity/latest/NYCadmin/0-0-0-25019" target="_blank" rel="noreferrer noopener">Section 14-137 of the New York City Administrative Code</a>, which gives the NYPD commissioner the power to issue subpoenas. But as Sachs argued in her letter to the NYPD, that doesn't mean the police department can issue warrantless subpoenas for anything they feel like. Sachs cited case law suggesting that the subpoena power is actually restricted to investigations involving current or former officers.</p><p>Under the federal <a href="https://www.law.cornell.edu/uscode/text/18/2703" target="_blank" rel="noreferrer noopener">Stored Communications Act</a>, authorities who want to subpoena electronic records from a provider either need a court-issued warrant, or, if they're using an administrative subpoena, "prior notice from the governmental entity to the subscriber or customer."</p><p>"This kind of administrative subpoena is not overseen by any court, and is not meant to target people like our client," Sachs told Hell Gate. "If it's left unchecked, it would chill speech from potentially anyone that the NYPD decided to subpoena information about."</p><p>"We don't give that kind of power to police departments without judicial review," said Marty Stolar, a lawyer who has worked on similar cases in the past. "It's got to be a process that's connected to a court if you're going to apply it to the general population. Here, the NYPD is misusing the power of subpoena to compel the production of documents as if they had the right to demand that information from any citizen. And they don't have that right. We have never given it to them."&nbsp;</p><figure><img alt="" src="https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=710" srcset="https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=425&amp;quality=75 425w, https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=850&amp;quality=75 850w, https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=585&amp;quality=75 585w, https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=1170&amp;quality=75 1170w, https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=710&amp;quality=75 710w, https://lede-admin.hellgatenyc.com/wp-content/uploads/sites/43/2024/03/Twitter_Subpoena.jpg?w=1420&amp;quality=75 1420w" sizes="(max-width: 30rem) 425px, (min-width: 30rem) and (max-width: 40rem) 585px, (min-width: 40rem) 710px" loading="lazy"><figcaption>A copy of the NYPD subpoena supplied by X.</figcaption></figure><p>The legal status of the NYPD's use of warrantless subpoenas for social media information isn't as clear as it might be, in part because when the NYPD's use of such subpoenas is challenged, it tends to withdraw the subpoenas rather than engage in a court process that might definitively establish the legality or illegality of its practice.</p><p>In 2020, the department <a href="https://www.nytimes.com/2020/02/14/nyregion/patriot-act-subpoena-nypd.html" target="_blank" rel="noreferrer noopener">sent a nearly identical subpoena</a> to Twitter, seeking a broad swath of records for Tina Moore, a New York Post reporter covering the NYPD. When lawyers for the Post threatened to challenge the subpoena in court, the NYPD hastily withdrew it. The incident provoked significant backlash, with free speech advocates, the Post, and groups like the Media Law Resource Center decrying the chilling effect of the subpoena.</p><p>Clancy isn't working as a conventional journalist, but he is involved in the collection and dissemination of information about the NYPD. As president of the Brooklyn chapter of Copwatch Patrol Unit, Clancy receives tips about police conduct, and films police conduct himself. While the withdrawal of the subpoena makes it all but impossible to know what the NYPD's goal was in issuing it, he has his theories. Maybe the police are just trying to rattle him with a shot across the bow. Or maybe the NYPD is trying to find out whether NYPD officers themselves are feeding his organization information about misconduct. "That happens," Clancy told Hell Gate. "For a junior officer who sees misconduct by his superiors, if you take that to Internal Affairs, maybe your boss has a connection there and it winds up being you who gets in trouble. So some cops prefer to take it to Copwatch."</p><p>As a further wrinkle, the NYPD's subpoena letter to X was sent by Michael Yanni, a member of the office of the department's deputy commissioner for legal matters, but used the email address <a href="mailto:intelsubpoenas@nynjhidta.org" target="_blank" rel="noreferrer noopener">intelsubpoenas@nynjhidta.org</a>, a domain affiliated with the <a href="https://www.hidtaprogram.org/ny_nj.php" target="_blank" rel="noreferrer noopener">New York and New Jersey High Intensity Drug Trafficking Area</a> office, a regional and federal joint drug task force. Similarly, the letter from the NYPD notifying NYCLU of the withdrawal of the subpoena was sent from Mallory McGee, an attorney with the NYPD Legal Bureau, using another email attached to the drug task force.</p><p>Why are NYPD lawyers sending out subpoenas for a critic's private information without a warrant? Why are they using federal task force email domains to do it? Why did they withdraw the subpoena rather than defend its legitimacy in court? How many of these warrantless subpoenas have they sent out in the last year? We asked the NYPD these questions, but did not receive a response.</p><p>Clancy, for his part,<strong> </strong>said that he's undaunted, and that the NYPD has no business rummaging through his social media content and metadata.&nbsp;</p><p>"Why would you use a shower curtain and close the bathroom door when you take a shower, if you have nothing to hide?" he asked. "Because it's none of your business, that's why. What the police might want to know and what they have a legal right to know are two different things."</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Vulkan Foliage rendering using GPU Instancing (145 pts)]]></title>
+            <title><![CDATA[Vulkan Foliage rendering using GPU Instancing (147 pts)]]></title>
             <link>https://www.thegeeko.me/blog/foliage-rendering</link>
             <guid>39681812</guid>
             <pubDate>Tue, 12 Mar 2024 16:54:10 GMT</pubDate>
@@ -3185,7 +3438,7 @@ pos<span>.</span>z <span>+=</span> bend <span>*</span> pos<span>.</span>y<span>;
     </span></h4><p><strong>Note:</strong> <em>note I got the numbers using <a href="https://registry.khronos.org/vulkan/specs/1.3-extensions/html/vkspec.html#queries">Vulkan's timestamp queries</a></em></p><p>On my RX5600XT using the <a href="https://docs.mesa3d.org/drivers/radv.html">open source drivers(RADV)</a> on Linux in 1080p resleoution my GPU can process about 6'770'688 grass blade with all of them visible the compute shader takes about <code>4.7ms</code> and drawing it takes around <code>8ms</code> that's about it more than that it drop blew 60fps. Increasing the area covered by the grass to 1000 by 1000 we can consider up to 19'066'880 grass blade with compute shader taking about <code>2.5ms</code> and drawing them takes about <code>6ms</code>. <img src="https://www.thegeeko.me/images/folliage-stats.png" alt="performance data"></p></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pilot of Boeing flight says he lost control after instrument failure (231 pts)]]></title>
+            <title><![CDATA[Pilot of Boeing flight says he lost control after instrument failure (233 pts)]]></title>
             <link>https://www.cnn.com/2024/03/12/australia/latam-airlines-flight-injuries-new-zealand-tuesday-intl-hnk/index.html</link>
             <guid>39681102</guid>
             <pubDate>Tue, 12 Mar 2024 16:01:42 GMT</pubDate>
