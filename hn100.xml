@@ -4,12 +4,293 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 27 Apr 2024 14:00:06 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 27 Apr 2024 15:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Janky Apple ID Security (102 pts)]]></title>
+            <title><![CDATA[The server chose violence (104 pts)]]></title>
+            <link>https://cliffle.com/blog/hubris-reply-fault/</link>
+            <guid>40178652</guid>
+            <pubDate>Sat, 27 Apr 2024 09:37:28 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://cliffle.com/blog/hubris-reply-fault/">https://cliffle.com/blog/hubris-reply-fault/</a>, See on <a href="https://news.ycombinator.com/item?id=40178652">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+  <header>
+    
+    <p>Hubris's oddest syscall</p>
+  </header>
+  
+  <p><span>2024-04-08</span></p><ul>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#a-brief-overview-of-hubris-ipc">A brief overview of Hubris IPC</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#new-and-exciting-failure-modes">New and exciting failure modes</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#none-of-this-happens-in-normal-correct-programs">None of this happens in normal, correct programs</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-kernel-is-not-having-any-of-your-nonsense">The kernel is not having any of your nonsense.</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-server-isn-t-having-any-of-your-nonsense-either">The server isn’t having any of your nonsense, either.</a>
+        
+        </li>
+    
+      <li><a href="https://cliffle.com/blog/hubris-reply-fault/#the-joy-of-panicking-other-programs">The joy of panicking other programs</a>
+        
+        </li>
+    
+  </ul>
+  
+  <p>I’m continuing to reflect on the past four years with <a href="https://hubris.oxide.computer/">Hubris</a> — April Fool’s
+Day was, appropriately enough, the fourth anniversary of the first Hubris user
+program, and today is the fourth anniversary of the first kernel code. (I wrote
+the user program first to help me understand what the kernel’s API wanted to
+look like.)</p>
+<p>Of all of Hubris’s design decisions, there’s one that gets a “wait what”
+response more often than any other. It’s also proving to be a critical part of
+the system’s overall robustness. In this post, I’ll take a look at our 13th and
+oddest syscall, <code>REPLY_FAULT</code>.</p>
+<h2 id="a-brief-overview-of-hubris-ipc">A brief overview of Hubris IPC</h2>
+<p>Hubris uses a small, application-independent kernel, and puts most of the code
+— drivers, application logic, network stack, etc. — in separately compiled
+isolated tasks. These tasks can communicate with each other using a cross-task
+messaging system (inter-process communication, or IPC). (This section will do a
+sort of “Hubris in a nutshell” — if you’d like to learn more I recommend the
+<a href="https://hubris.oxide.computer/reference/">Reference Manual</a>.)</p>
+<p>IPC in Hubris consists of three core operations, implemented in the kernel,
+which tasks can request using syscalls:</p>
+<ul>
+<li><code>RECV</code> collects the highest priority incoming message, or blocks until one
+arrives.</li>
+<li><code>SEND</code> stops the caller and transfers a message — and control! — to the
+receiving task. The caller is parked until it gets a response.</li>
+<li><code>REPLY</code> delivers a response to a task that had previously used <code>SEND</code>,
+allowing it to continue.</li>
+</ul>
+<p>The Hubris IPC scheme is deliberately designed to work a lot like a function
+call, at least from the perspective of the client.</p>
+<p>We often talk about “clients” and “servers” in Hubris, and it’s worth noting
+that these are <em>roles tasks play.</em> A client is just a task using <code>SEND</code>, and a
+server is a task using <code>RECV</code> and <code>REPLY</code> – but they’re not mutually exclusive.
+A task may be a server to some other tasks, and simultaneously a client to
+different tasks. For instance, an “LED Blinker” task may call (client) into a
+“GPIO driver” task (server), which itself may call (client) into a supervisory
+task (server).</p>
+<p>To underscore this point, here’s a graph of the IPC flow (green arrows) between
+tasks (rectangles) in Oxide’s production server firmware. Notice that almost all
+tasks have arrows both coming out (client) and coming in (server).</p>
+<p><img src="https://cliffle.com/blog/hubris-reply-fault/gimlet-graph.svg" alt="A directed graph showing layers of tasks in our firmware with edges drawn between them, which is unfortunately difficult to explain entirely in text."></p>
+<h2 id="new-and-exciting-failure-modes">New and exciting failure modes</h2>
+<p>When writing a function or procedure in almost any programming language, you
+make some assumptions about your callers’ behavior. This creates <em>preconditions</em>
+for calling the function. Depending on the language, some are explicit, and some
+are implicit. In Rust, for instance, if your function takes an argument of
+type <code>String</code>, it’s reasonable to assume your caller passes in a <code>String</code> and
+not a <code>bool</code>.</p>
+<p>Your function has the backing of the compiler here: the caller has to pass a
+compatible type for all arguments, or the compiler won’t let them attempt to
+call the function. It’s possible to subvert this if you work at it, of course,
+but it’s hard to subvert it by accident.</p>
+<p>The compiler and linker conspire behind the scenes to make sure that your
+program calls the function you intended. This ensures that you won’t be
+surprised by code that attempts to call <code>pet_cat</code> and winds up calling
+<code>fire_missiles</code> instead, except in very rare circumstances.</p>
+<p>Because IPC crosses task boundaries, and tasks in Hubris are separately compiled
+programs, you have to be careful making these same assumptions with IPC. If a
+client is compiled against the wrong interface, or confuses one task for
+another, the compiler won’t have any idea, since it sees only a single program
+at a time. In this respect, IPC acts more like communication over a network.</p>
+<p>Every task on Hubris that acts as an IPC server has to deal with the following
+<em>potential</em> errors:</p>
+<ul>
+<li>Getting a message with an operation code that isn’t even appropriate for your
+interface, like “operation number 48” in a two-operation interface.</li>
+<li>Receiving an uninterpretable bag of bytes instead of the message type you were
+expecting — or a message that is much too short or long.</li>
+<li>Not getting the sort of loaned memory you require (e.g. you need it writable
+but you receive it read-only, or don’t receive it at all).</li>
+</ul>
+<p>But I describe those as <em>potential</em> errors because, in practice…</p>
+<h2 id="none-of-this-happens-in-normal-correct-programs">None of this happens in normal, correct programs</h2>
+<p>In a normal Hubris program, none of these things happen.</p>
+<p>Tasks are connected to each other by configuration in the build system, so it’s
+hard to confuse one for the other. Clients use generated Rust code to construct
+and send IPCs to servers, which use different generated Rust code to handle the
+result. This lets us squint and pretend that the type system works across task
+boundaries — it doesn’t, really, but our tools produce a pretty good illusion.</p>
+<p>I always hate to penalize the “good” programs for error cases that they can’t
+actually hit. All of the obvious ways of handling the <em>potential but unlikely</em>
+errors (described above) hurt good programs.</p>
+<p>For example: making all IPC operations return a <code>Result&lt;T, IpcError&gt;</code> where the
+good programs can’t actually hit any case in <code>IpcError</code> means that, in practice,
+they’ll just <code>unwrap()</code> it. That’s a fairly large operation in terms of code
+size — especially when we know the code will never be used! — and costs time
+at runtime to check for errors that won’t happen.</p>
+<p>To keep every client from needing to <code>unwrap()</code> a bazillion errors, we could put
+the <code>unwrap()</code> (or more generally a <code>panic!</code>) into the generated code. This
+might reduce the code size impact (by centralizing the <code>panic!</code> in one location)
+but won’t reduce the cost at runtime.</p>
+<p>There’s also a different kind of cost: a <em>design cost.</em> To be able to return a
+universal error from any operation, and have it be understood by a caller
+attempting any <em>other</em> operation, we have to make rules about the message
+encoding. Every operation must be capable of returning an error, every operation
+must have a way of encoding <em>this particular</em> error, and the encoding of this
+error by all operations must be <em>identical.</em> </p>
+<p>This means you can’t express an operation that <em>can’t</em> fail, which is
+particularly annoying: as we’ve built our firmware infrastructure on Hubris, we
+keep finding operations that really can’t fail. Setting a GPIO pin, for example.</p>
+<p>So we dearly needed an alternative to this “universal error code” approach. I
+drew inspiration from a weird design decision I made in the Hubris kernel API:
+the Hubris kernel is <em>unusually aggressive.</em></p>
+<h2 id="the-kernel-is-not-having-any-of-your-nonsense">The kernel is not having any of your nonsense.</h2>
+<p>In most operating systems, if you violate the preconditions for a system call,
+you get a polite error code back from the kernel — or, at worst, an exception
+handler or signal handler gets triggered. You have an opportunity to recover.</p>
+<p>Take Unix for example. If you call <code>close</code> on a file descriptor you never
+opened, you get an error code back. If you call <code>open</code> and hand it a null
+pointer instead of a pathname? You get an error code back. Both of these are
+violations of a system call’s preconditions, and both are handled through the
+same error mechanism that handles “file not found” and other cases that <em>can</em>
+happen in a correct program.</p>
+<p>On Hubris, if you break a system call’s preconditions, your task is immediately
+destroyed with no opportunity to do anything else.<sup><a href="#sup">1</a></sup></p>
+
+<p>More specifically, the kernel delivers a <em>synthetic fault.</em> This is very similar
+to the hardware faults that a task receives if it, say, dereferences a null
+pointer, or divides by zero. Those are produced by the CPU for breaking the
+processor architecture’s rules. Synthetic faults, on the other hand, are
+produced by the kernel for breaking the kernel’s rules.</p>
+<p>For example, when a task calls <code>SEND</code>, it passes the kernel the index of the
+intended recipient task, and a pointer to some memory containing the message. If
+the recipient task index is out of range for the application? Synthetic fault.
+If the message pointer points to memory the task doesn’t actually have access
+to? Synthetic fault.</p>
+<p>Early in the system’s design, I decided not to permit recoverable/resumable
+faults. That is, when a program takes a fault — whether it’s hardware or
+synthetic — the task is dead. It can run no further instructions. There is no
+way to “fix” the problem and resume the task. This was a conscious choice to
+avoid some subtle failure modes and simplify reasoning about the system.<sup><a href="#sup2">2</a></sup></p>
+
+<p>But combined with the kernel’s habit of faulting any task that looks at it
+funny, this makes the system’s behavior very unusual compared to most operating
+systems.</p>
+<p>And it’s been <em>great.</em></p>
+<p>Initially I was concerned that I’d made the kernel <em>too</em> aggressive, but in
+practice, this has meant that errors are caught very early in development. A
+fault is hard to miss, and literally cannot be ignored the way an error code
+might be. Humility (our debugger) happily prints a detailed description of any
+fault it finds; in fact, one made an appearance in my <a href="https://cliffle.com/blog/who-killed-the-network-switch/">last Hubris-related
+post</a>, although in that case it was being reported in error:</p>
+<pre><code><span>mem fault (precise: 0x801bffd) in syscall (was: wait: reply from i2c_driver/gen0)
+</span></code></pre>
+<p>This is a synthetic fault that a task receives for handing the kernel a pointer
+to some memory (at address <code>0x801bffd</code> in this case) that the task can’t
+actually access.</p>
+<p>This behavior was <em>so</em> nice to use in practice, in fact, that it suggested a way
+to fix our IPC error reporting woes: generalize the same mechanism.</p>
+<h2 id="the-server-isn-t-having-any-of-your-nonsense-either">The server isn’t having any of your nonsense, either.</h2>
+<p>Once I realized that our unusually strict kernel was actually <em>helping</em>
+developers instead of hindering them, I was inspired to implement Hubris’s 13th
+and oddest syscall: <code>REPLY_FAULT</code>.</p>
+<p>I mentioned <code>REPLY</code> earlier, the mechanism servers use to respond to their
+clients. More specifically,</p>
+<ul>
+<li>
+<p>When a client uses <code>SEND</code> the kernel marks the client’s task as “waiting to
+send” to the recipient task.</p>
+</li>
+<li>
+<p>When the recipient uses <code>RECV</code>, one client task “waiting to send” to it is
+updated to “waiting for reply.” The client task will remain in that state
+until something changes — usually, the server using <code>REPLY</code>.</p>
+</li>
+<li>
+<p><code>REPLY</code> only works on a task marked as “waiting for reply” from the specific
+server task that is attempting to reply. It switches the client task back into
+a “runnable” state.</p>
+</li>
+</ul>
+<p><code>REPLY_FAULT</code> is basically the same thing, except instead of delivering a
+message and making the task runnable, it delivers a fault and makes the task
+dead. With <code>REPLY_FAULT</code>, we can avoid having unnecessary error handling on IPC
+operations, because correct programs will just go on as if the problem can’t
+occur — and incorrect programs won’t get to <em>handle</em> the error at all!</p>
+<p>Like <code>REPLY</code>, a server can only <code>REPLY_FAULT</code> a task that is waiting for its
+reply. You can’t use <code>REPLY_FAULT</code> to kill random tasks, only the set of tasks
+from which you have <code>RECV</code>’d a message and not yet <code>REPLY</code>’d.</p>
+<p>Our system now uses <code>REPLY_FAULT</code> to handle the three cases I mentioned earlier:
+a bogus operation code; or a corrupt, truncated, or otherwise nonsensical
+message; or if the client doesn’t send the right kind of loaned memory.</p>
+<p>But <code>REPLY_FAULT</code> also provides a way to define and implement <em>new</em> kinds of
+errors — application-specific errors — such as access control rules. For
+instance, the Hubris IP stack assigns IP ports to tasks statically. If a task
+tries to mess with another task’s IP port, the IP stack faults them. This gets
+us the same sort of “fail fast” developer experience, with the smaller and
+simpler code that results from not handling “theoretical” errors that can’t
+occur in practice.</p>
+<p>Like the kernel’s aggressive handling of errors in system calls, I was initially
+concerned that <code>REPLY_FAULT</code> would be too extreme. After I had the idea, I
+delayed several months before starting implementation, basically trying to talk
+myself out of it.</p>
+<p>I was being too careful. <code>REPLY_FAULT</code> has been great. A new developer on the
+system recently cited it as one of the more surprising and pleasant parts of
+developing on Hubris, which is what inspired me to write this post.</p>
+<h2 id="the-joy-of-panicking-other-programs">The joy of panicking other programs</h2>
+<p>I mentioned earlier that Hubris IPC was explicitly designed to behave like a
+Rust function call from the perspective of the client.</p>
+<p>Well, if you violate the preconditions on a Rust function call, the function
+will normally respond with a <code>panic!</code>.</p>
+<p><code>REPLY_FAULT</code> essentially provides a way for servers to generate cross-process
+<code>panic!</code> in their clients, without requiring clients to contain code to do it
+— or, perhaps more importantly, without requiring clients to cooperate in the
+process at all.</p>
+<p>Overall, this combines with some other system features to make Hubris
+“aggressively hostile to malicious programs,” as <a href="https://eliza.me/">Eliza Weissman</a> recently
+described it. Since attempts at exploitation often manifest first as errors or
+misuse of APIs, a system that responds to any misbehavior by wiping the state of
+the misbehaving component ought to be harder to exploit. (This hypothesis has
+yet to be tested! Please reach out to me if you’re interested in trying to
+exploit Hubris. I will help!)</p>
+<p>In practice, the only downside I’ve observed from these decisions is that the
+system is <em>really difficult to fuzz test.</em> Because I like <a href="https://en.wikipedia.org/wiki/Chaos_engineering">chaos
+engineering</a>, I’ve implemented a small “chaos” task that generates random
+IPCs and system calls to test other components for bugs, and almost anything it
+does causes it to get immediately reset. To be useful, it has to base all of its
+decisions off the one piece of state that is observably different each time it
+starts: the system uptime counter. (However, <code>REPLY_FAULT</code> <em>does</em> provide a way
+for servers to force chaos upon their clients by randomly killing them, an
+option I haven’t fully evaluated.)</p>
+<p>But normal Hubris tasks don’t dynamically generate IPC messages, particularly
+ones that are deliberately bogus. In practice, they can carry on without
+realizing <code>REPLY_FAULT</code> even exists — because unless they do something <em>really
+unusual,</em> they will never see the business end of it anyway.</p>
+
+  
+    <p><span>
+      
+        <a href="https://cliffle.com/tags/api-design/">#api-design</a>
+      
+        <a href="https://cliffle.com/tags/dayjob/">#dayjob</a>
+      
+        <a href="https://cliffle.com/tags/embedded/">#embedded</a>
+      
+        <a href="https://cliffle.com/tags/rust/">#rust</a>
+      
+        <a href="https://cliffle.com/tags/security/">#security</a>
+      
+    </span>
+  
+</p></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Janky Apple ID Security (111 pts)]]></title>
             <link>https://mjtsai.com/blog/2024/04/26/janky-apple-id-security/</link>
             <guid>40178629</guid>
             <pubDate>Sat, 27 Apr 2024 09:33:08 GMT</pubDate>
@@ -146,7 +427,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[World Wide Web (1991) (148 pts)]]></title>
+            <title><![CDATA[World Wide Web (1991) (160 pts)]]></title>
             <link>https://info.cern.ch/hypertext/WWW/TheProject.html</link>
             <guid>40177906</guid>
             <pubDate>Sat, 27 Apr 2024 07:01:15 GMT</pubDate>
@@ -202,7 +483,7 @@ anonymous FTP</a> , etc.
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple users are being locked out of their Apple IDs with no explanation (443 pts)]]></title>
+            <title><![CDATA[Apple users are being locked out of their Apple IDs with no explanation (467 pts)]]></title>
             <link>https://9to5mac.com/2024/04/26/signed-out-of-apple-id-account-problem-password/</link>
             <guid>40177617</guid>
             <pubDate>Sat, 27 Apr 2024 05:50:57 GMT</pubDate>
@@ -343,7 +624,7 @@ anonymous FTP</a> , etc.
 	<div><p><em>FTC: We use income earning auto affiliate links.</em> <a href="https://9to5mac.com/about/#affiliate">More.</a></p><p><a href="https://bit.ly/49Cuzm7"><img src="https://9to5mac.com/wp-content/uploads/sites/6/2024/04/Roborock-April-22.jpg?quality=82&amp;strip=all" alt="" width="750" height="150"></a></p></div>				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What contributing to Open-source is, and what it isn't (106 pts)]]></title>
+            <title><![CDATA[What contributing to Open-source is, and what it isn't (121 pts)]]></title>
             <link>https://suchdevblog.com/opinions/WhatOpenSourceIs.html</link>
             <guid>40177171</guid>
             <pubDate>Sat, 27 Apr 2024 04:16:58 GMT</pubDate>
@@ -351,7 +632,7 @@ anonymous FTP</a> , etc.
 <div id="readability-page-1" class="page"><div><p><em>This article was initially published on <a href="https://dev.to/samuelfaure/what-contributing-to-open-source-is-and-what-it-isnt-148g" target="_blank" rel="noopener noreferrer">Dev.to<span><span>open in new window</span></span></a></em></p><p>I've been a senior developer for quite some time now, yet I've just recently understood some advice I've been given at the very beginning of my career:</p><p><em><strong>Participate in Open Source!</strong> It will be great for your career!</em></p><p>Well, as such, this is extremely bad advice.</p><hr><h2 id="how-to-contribute-to-open-source-the-wrong-way" tabindex="-1"><a href="#how-to-contribute-to-open-source-the-wrong-way"><span>How to contribute to open-source the WRONG way</span></a></h2><p>I get it. You're a student or a junior developer. It's hard out there and you want to boost your career. You don't know what to do. Or maybe you're just enthusiastic about open-source and want to contribute.</p><p>Well, you probably shouldn't.</p><h3 id="let-s-build-a-school-together" tabindex="-1"><a href="#let-s-build-a-school-together"><span>Let's build a school together!</span></a></h3><p>In French, we have an idiom for contributing: "To bring your stone (brick) to the building".</p><p>Imagine if people in your city decided to gather together and build a school for the community. What an inspiring collaborative effort!</p><p>So you're arriving on the building site with your brick and enthusiasm in your eyes. And very little knowledge of how building actually works, and even less knowledge on how this particular building is being built.</p><p>Well, let's be honest, despite your great intentions you're probably going to be more of a nuisance than anything else here.</p><p>Now imagine if, not only you do this, but two thousands other people are coming with you. Not only does this lower the odds of the school ever being built, the end result would probably be a school where no child should ever set foot.</p><h3 id="hacktoberfest-and-its-consequences-have-been-a-disaster-for-the-human-race" tabindex="-1"><a href="#hacktoberfest-and-its-consequences-have-been-a-disaster-for-the-human-race"><span>Hacktoberfest and its consequences have been a disaster for the human race</span></a></h3><p>I did Hacktoberfest three times, so I own three of their t-shirts (I'm wearing one right now. Very cozy.)</p><p>As you can see on <a href="https://github.com/Samuelfaure" target="_blank" rel="noopener noreferrer">my Github profile<span><span>open in new window</span></span></a> (go like and subscribe©) I am a huge open-source contributor. Well, not really. I'm a freelancer and most of my clients open-source their products. That's how I make my living. So that doesn't count, right? (More on that later).</p><p>Hacktoberfest is a great, deeply flawed initiative. Trying to make people contribute to open-source is very commendable. It's also something you should absolutely not do. You don't tell people to take their bricks and find a random school to help. You're just going to make everything worse for everyone.</p><p>Experienced builders will lose time and patience because of the spam, and young builders will leave bitter, believing open-source is not welcoming and/or not for them.</p><p>Hacktoberfest is trying to do good, but it is promoting the very wrong idea that juniors should just go and find a place where to put a brick.</p><h3 id="so-who-should-build-the-school" tabindex="-1"><a href="#so-who-should-build-the-school"><span>So who should build the school?</span></a></h3><p>The parents whose kids will be at the school, that's who. And the teachers as well. They're the ones who are going to use that school, after all.</p><p>Heck, with proper supervision the kids themselves can help too. You can do open source as a beginner, you don't need to be a senior for that.</p><p>But you need to be involved in the project and act accordingly, you don't just go and throw bricks around.</p><h3 id="open-source-is-not-about-coding" tabindex="-1"><a href="#open-source-is-not-about-coding"><span>Open-source is not about coding</span></a></h3><p>It's hard to get hired as a junior developer. You want to both get more skilled, and show that you're more skilled. Open-source contributions are seen as a potential career-boost, and that's because they are (more on that later). But just because they are, doesn't mean that this is a good reason to contribute.</p><p>Why do you build a school? Because you want a school to be built. Because you need a school. Because you believe free, communal schools are important, in a world where education gets more and more expensive.</p><p>You build it to enjoy the final product, you don't build it for the sake of building it, or (mostly) to train your building skills. You can enjoy building, that's fine, but that's not the point. Your love for building won't make for a good product in the end.</p><p><img src="https://suchdevblog.com/images/opensource_oglaf.webp" alt="oglaf comic illustrating the point"> <em>Comic source: Oglaf</em></p><hr><h2 id="how-to-contribute-to-open-source-the-right-way" tabindex="-1"><a href="#how-to-contribute-to-open-source-the-right-way"><span>How to contribute to open-source the RIGHT way</span></a></h2><p>The following point is by far the most important part of this article.</p><h3 id="if-you-don-t-use-it-you-lose-it" tabindex="-1"><a href="#if-you-don-t-use-it-you-lose-it"><span>If you don't use it, you lose it</span></a></h3><p>The best thing you can do to contribute to open-source is to <strong>actually use</strong> open-source products.</p><p>By being an open-source user, you open yourself to being an open-source contributor. An annoying bug? Report it, so it can get fixed, so both you and other users can enjoy a better product.</p><p>There's a feature you wish the product had? Ask for it!</p><p>No one is fixing that bug, no one is adding your feature? Well, guess it's time to get your own hands dirty then.</p><p>This is how you do open-source. You follow the purpose of open-source, not just your love for building.</p><p>And of course, always ask the other contributors before doing anything (usually via opening an issue). Remember that this is a team effort.</p><h3 id="contributing-to-open-source-means-taking-responsibility" tabindex="-1"><a href="#contributing-to-open-source-means-taking-responsibility"><span>Contributing to open-source means taking responsibility</span></a></h3><p>I'm an Arch Linux user btw, and I only recently started maintaining a package on the AUR (a community-managed collection of packages).</p><p>I've been needing this package, but no one was maintaining it. Infuriating! I can't use an unmaintained package! If only there was a solution!</p><p>Oh, right, almost forgot. I can do that myself.</p><p>You know it's good, useful open-source when it feels like a chore. You do the job because, well, you kinda have to. The fact that it's open source just means other people will enjoy your work for free, and in turn you will enjoy their work for free.</p><p><em>Sidenote: Did you know squirrels can't remember where they store acorns for the winter? They solve this via communal efforts. If all squirrels fill the forest with acorn reserves, then they will easily stumble upon acorns when the winter comes.</em></p><h3 id="to-hell-with-contributing-just-make-your-own-thing" tabindex="-1"><a href="#to-hell-with-contributing-just-make-your-own-thing"><span>To hell with contributing, just make your own thing.</span></a></h3><p>When aspiring junior devs ask me what they should build, I always reply: "Well, what do you need?".</p><p>Think hard. You probably need a tool that either:</p><ul><li>do not exist</li><li>or it exists as a paid service</li><li>or it is free but is spying on your data</li><li>or the most common situation, it already exists but got <a href="https://en.wikipedia.org/wiki/Enshittification" target="_blank" rel="noopener noreferrer">enshittified<span><span>open in new window</span></span></a>.</li></ul><p>Well, just go and make it, and open your code while you're at it. Congratulation, you're doing open source, and doing it right!</p><h3 id="or-just-get-paid-for-it" tabindex="-1"><a href="#or-just-get-paid-for-it"><span>Or just get paid for it</span></a></h3><p>I've been building stuff for the French government for many years now. One of the reasons why I keep working with this client is that all the code we produce is open-sourced by default.</p><p>One of the first projects I built was a public API for querying public data. This open-source project has been used by thousands of private companies, one of them even ended up hiring me.</p><p>So yeah, open source can indeed help your career. For me, working in open source was both an ideological and career-savvy move. I helped myself while also helping the common good. Just because you get paid for it doesn't mean you aren't doing open source and doing it right.</p><p>So I'm keeping those Hacktoberfest t-shirts.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Vision Pro is a flop (138 pts)]]></title>
+            <title><![CDATA[The Vision Pro is a flop (148 pts)]]></title>
             <link>https://disconnect.blog/the-vision-pro-is-a-big-flop/</link>
             <guid>40176739</guid>
             <pubDate>Sat, 27 Apr 2024 02:56:20 GMT</pubDate>
@@ -361,7 +642,7 @@ anonymous FTP</a> , etc.
         </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[iPhone 15 Pro Storage Expansion – 128GB to 512GB [video] (112 pts)]]></title>
+            <title><![CDATA[iPhone 15 Pro Storage Expansion – 128GB to 512GB [video] (113 pts)]]></title>
             <link>https://www.youtube.com/watch?v=JbSDdU8bJI0</link>
             <guid>40176637</guid>
             <pubDate>Sat, 27 Apr 2024 02:34:11 GMT</pubDate>
@@ -369,7 +650,7 @@ anonymous FTP</a> , etc.
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[How to prevent Lyme disease this summer (126 pts)]]></title>
+            <title><![CDATA[How to prevent Lyme disease this summer (137 pts)]]></title>
             <link>https://news.harvard.edu/gazette/story/2023/06/how-to-prevent-lyme-disease-this-summer/</link>
             <guid>40176441</guid>
             <pubDate>Sat, 27 Apr 2024 02:00:35 GMT</pubDate>
@@ -478,7 +759,7 @@ anonymous FTP</a> , etc.
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: React for Circuits (125 pts)]]></title>
+            <title><![CDATA[Show HN: React for Circuits (132 pts)]]></title>
             <link>https://github.com/tscircuit/tscircuit/blob/main/README.md</link>
             <guid>40175087</guid>
             <pubDate>Fri, 26 Apr 2024 22:39:22 GMT</pubDate>
@@ -692,7 +973,7 @@ anonymous FTP</a> , etc.
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[British Columbia to recriminalize use of drugs in public spaces (203 pts)]]></title>
+            <title><![CDATA[British Columbia to recriminalize use of drugs in public spaces (210 pts)]]></title>
             <link>https://www.cbc.ca/news/canada/british-columbia/david-eby-public-drug-use-1.7186245</link>
             <guid>40175039</guid>
             <pubDate>Fri, 26 Apr 2024 22:32:16 GMT</pubDate>
@@ -700,7 +981,7 @@ anonymous FTP</a> , etc.
 <div id="readability-page-1" class="page"><div><p dir="ltr">After weeks of troubling stories about problematic street drug use in hospitals, parks and at bus stops, the province of British Columbia announced plans to recriminalize the use of drugs in public places Friday — radically altering a pilot program aimed at addressing the toxic drug crisis.</p><p dir="ltr">In a statement, Premier David Eby insisted that his government is "caring and compassionate for those struggling with addiction," but that patience for disorder only goes so far.</p><p dir="ltr">"Keeping people safe is our highest priority,"&nbsp;said Eby.</p><p dir="ltr">"We're taking action to make sure police have the tools they need to ensure safe and comfortable communities for everyone as we expand treatment options so people can stay alive and get better," he said.</p><p>With an election looming, Eby's NDP government has been bombarded with a string of headlines about concerns with decriminalization — a pilot program introduced in January 2023 allowed adult drug users in B.C. to carry up to 2.5 grams of drugs for personal use without facing criminal charges.</p><p>The program was possible through an exemption granted by Health Canada under the Controlled Drugs and Substances Act which allowed for open drug use in some public spaces.</p><div><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/st-pauls-hospital-drug-use-1.7168786" text="Opposition alleges open drug use, dealing at Vancouver hospital" flag="" data-contentid=""><span>Opposition alleges open drug use, dealing at Vancouver hospital</span></a></li></ul><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/bc-drug-decriminalization-pilot-scrutiny-1.7177661" text="Scrutiny of B.C. drug decrim pilot program intensifies" flag="" data-contentid=""><span>Scrutiny of B.C. drug decrim pilot program intensifies</span></a></li></ul></div><p>Eby's political opponents have seized on concerns from hospital workers and patients about <a href="https://www.cbc.ca/news/canada/british-columbia/st-pauls-hospital-drug-use-1.7168786">illegal drug use and trafficking in the hallways of hospitals</a>.</p><p>And last week, Vancouver Police Deputy Chief Fiona Wilson <a href="https://www.cbc.ca/news/canada/british-columbia/bc-drug-decriminalization-pilot-scrutiny-1.7177661">testified at a House of Commons health committee hearing</a> about the struggles police are having responding to public complaints involving disturbances related to public drug consumption.</p><p><strong><em>WATCH</em> | <em>B.C. government backtracks on drug use in public spaces over safety concerns:</em></strong><span><span><div title="B.C. recriminalizes drug use in public spaces" role="button" tabindex="0"><div><p><img src="https://thumbnails.cbc.ca/maven_legacy/thumbnails/211/455/ST_FLETCHER_BC_DECRIMINALIZATION_UPDATE_MPX.jpg" srcset="" alt="" loading="lazy"></p></div><div><h3>B.C. recriminalizes drug use in public spaces</h3></div></div><span>British Columbia Premier David Eby has announced that drug use in public spaces will be recriminalized over public safety concerns following a wave of troubling accounts of street drugs being taken in hospitals, parks and transit stops.</span></span></span></p><p>In a release, the province says it is "working with Health Canada to urgently change the decriminalization policy to stop drug use in public and has requested an amendment to its … exemption to exclude all public places."</p><p>"When police are called to a scene where illegal and dangerous drug use is taking place, they will have the ability to compel the person to leave the area, seize the drugs when necessary or arrest the person, if required," the province said in a statement.</p><p>"This change would not recriminalize drug possession in a private residence or place where someone is legally sheltering or at overdose prevention sites and drug checking locations."</p><p>B.C. Health Minister Adrian Dix said the province is also introducing specific measures aimed at curbing illicit drug use in health care facilities — including the prohibition of street drug possession or use.</p><p>"We are taking immediate action to make hospitals safer and ensuring policies are consistent and strictly enforced through additional security, public communication and staff supports," Dix said in a statement.</p><div><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/eight-years-bc-toxic-drug-crisis-1.7173592" text="8 years and 14,000 deaths later, B.C.'s drug emergency rages on" flag="" data-contentid=""><span>8 years and 14,000 deaths later, B.C.'s drug emergency rages on</span></a></li></ul></div><p>"The action plan launching today will improve how patients with addictions are supported while they need hospital care, while preventing others from being exposed to the secondhand effects of illicit drug use."</p><p>The province said it is working with police to come up with guidance to ensure that people who merely possess drugs are not arrested unless they're threatening public safety or causing a disturbance.</p><div><figure><p><img loading="lazy" alt="A white woman wearing a police uniform looks at the camera." srcset="https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_300/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg 300w,https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_460/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg 460w,https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_620/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg 620w,https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg 780w,https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg 1180w" sizes="(max-width: 300px) 300px,(max-width: 460px) 460px,(max-width: 620px) 620px,(max-width: 780px) 780px,(max-width: 1180px) 1180px" src="https://i.cbc.ca/1.6952381.1693435453!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/vancouver-police-department-deputy-chief-const-fiona-wilson.jpg" data-cy="image-img"></p><figcaption>VPD Deputy Chief Constable Fiona Wilson told a parliamentary committee on health the limit on police powers to address the public consumption of illicit drugs is affecting public safety.<!-- --> <!-- -->(Ben Nelms/CBC)</figcaption></figure></div><p>Vancouver Police Deputy Chief Fiona Wilson said at the announcement that decriminalization has to be part of a broader strategy to address the province's drug crisis.</p><p>"We've heard loud and clear from the front-line police officers who continue to see the unintended ramifications that unchecked public drug use has on the safety and well-being of neighbourhoods," she said.</p><p>"And the feedback has been unequivocal — public consumption is a significant issue that needs to be addressed&nbsp;and major changes are required."</p><p><strong><em>LISTEN | Political panel discusses the pushback against safe supply pilot:&nbsp;</em></strong><span><span><div role="button" tabindex="0" title="On The Island Political Panel for April 26 2024"><p><img src="https://thumbnails.cbc.ca/maven_legacy/thumbnails/47/891/ontheisland-640x360.jpg" alt="" loading="lazy"></p><p><span>On The Island</span><span>17:28</span><span>On The Island Political Panel for April 26 2024</span></p></div><span>&lt;p&gt;Gregor Craigie convened the political panel.&lt;/p&gt;</span></span></span></p><h2>14,000 lives lost</h2><p>The decriminalization pilot was introduced in January 2023 and allows adult drug users in B.C. to carry up to 2.5 grams of opioids, cocaine, methamphetamine and ecstasy for personal use without facing criminal charges.</p><p>Relying&nbsp;on an exemption granted by Health Canada under the Controlled Drugs and Substances Act, it also allows for open drug use in some public spaces.</p><div><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/safe-supply-backlash-chief-coroner-1.7101210" text="Backlash against drug decriminalization and safe supply 'terrifies' B.C.'s exiting chief coroner" flag="" data-contentid=""><span>Backlash against drug decriminalization and safe supply 'terrifies' B.C.'s exiting chief coroner</span></a></li></ul><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/bc-public-drug-consumption-law-injunction-pause-appeal-rejected-1.7124864" text="B.C. top court upholds pause on law restricting public drug use" flag="" data-contentid=""><span>B.C. top court upholds pause on law restricting public drug use</span></a></li></ul></div><p>The pilot is part of a government response to the public health emergency declared eight years ago due to a rise in deaths from toxic, illicit drugs.&nbsp;</p><p>More than 14,000 people have died since the emergency was declared in 2016, largely due to the opioid fentanyl.</p><div><figure><p><img loading="lazy" alt="A white sign at a New West Naloxone training event that says &quot;I love someone who uses drugs&quot; but the love is represented by a purple heart. " srcset="https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_300/i-love-someone-who-uses-drugs-sign.jpg 300w,https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_460/i-love-someone-who-uses-drugs-sign.jpg 460w,https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_620/i-love-someone-who-uses-drugs-sign.jpg 620w,https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/i-love-someone-who-uses-drugs-sign.jpg 780w,https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/i-love-someone-who-uses-drugs-sign.jpg 1180w" sizes="(max-width: 300px) 300px,(max-width: 460px) 460px,(max-width: 620px) 620px,(max-width: 780px) 780px,(max-width: 1180px) 1180px" src="https://i.cbc.ca/1.6953755.1693520440!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/i-love-someone-who-uses-drugs-sign.jpg" data-cy="image-img"></p><figcaption>More than 14,000 people have died of toxic, illicit drugs in B.C. since a public health emergency was declared in 2016.<!-- --> <!-- -->(Jean-Marc Poirier/Radio-Canada)</figcaption></figure></div><p>By reducing stigma associated with drug use, officials say they hope to provide better access to lifesaving care along with a less deadly safe supply.</p><p>But it has come with criticism about a lack of guardrails.&nbsp;</p><p>On April 15, Vancouver Police Deputy Chief Fiona Wilson testified&nbsp;at a House of Commons health committee hearing about how the pilot&nbsp;is limiting police response&nbsp;to problematic public drug use, including inside hospitals and at bus stops.</p><p><em><strong>WATCH |&nbsp;B.C.&nbsp;Premier says compassion for drug users must be balanced against public safety</strong></em> <span><span><div title="'We still have expectations around safety': B.C. bans drug use in public spaces" role="button" tabindex="0"><div><p><img src="https://thumbnails.cbc.ca/maven_legacy/thumbnails/131/874/eby-clip-for-web_frame_1029.png" srcset="" alt="" loading="lazy"></p></div><div><h3>'We still have expectations around safety': B.C. bans drug use in public spaces</h3></div></div><span>B.C. Premier David Eby announced Friday plans to recriminalize drug use in public spaces. He says while it is still important to help drug users, open drug use around kids and other people is not acceptable.</span></span></span></p><p>"In the wake of decriminalization, there are many of those locations where we have absolutely no authority to address that problematic drug use, because the person appears to be in possession of less than 2.5 grams," Wilson said.&nbsp;</p><p dir="ltr">"So, if you have someone who is with their family at the beach, and there's a person next to them smoking crack cocaine, it's not a police matter."</p><h2 dir="ltr">Courts previously stopped legislation</h2><p>Friday's announcement is the government's latest attempt at curbing public drug use.</p><p>Last October, it tabled&nbsp;<a href="https://www.cbc.ca/news/canada/british-columbia/bc-drug-use-changes-1.6987330" target="_blank">new legislation in an attempt to ban illegal drug use in many public places</a>.</p><p dir="ltr">The bill would have banned the use of illicit drugs within six metres of all building entrances and bus stops;&nbsp;within 15 metres of playgrounds, spray and wading pools, and skate parks; and in parks, beaches and sports fields.</p><p>But in December, B.C. Supreme Court&nbsp;Chief Justice&nbsp;Christopher Hinkson&nbsp;<a href="https://www.cbc.ca/news/canada/british-columbia/bc-supreme-court-pauses-province-s-public-drug-consumption-law-1.7071225">ordered the law paused until March 31,&nbsp;ruling it would likely result in more deaths</a>, displacement&nbsp;and criminalization of people who use drugs.</p><div><ul><li><a href="https://www.cbc.ca/news/canada/british-columbia/bc-drug-use-changes-1.6987330" text="B.C. introduces bill to ban illicit drug use in many public spaces" flag="" data-contentid=""><span>B.C. introduces bill to ban illicit drug use in many public spaces</span></a></li></ul></div><p>"Irreparable harm will be caused if the act comes into force," Hinkson wrote in his ruling.</p><p>The provincial government appealed the ruling, but it was <a href="https://www.cbc.ca/news/canada/british-columbia/bc-public-drug-consumption-law-injunction-pause-appeal-rejected-1.7124864">upheld by the B.C. Court of Appeal</a>.</p><p><em><strong>WATCH | The debate over decriminalization in B.C.:</strong>&nbsp;</em><span><span><div title="B.C.'s debate over drug decriminalization | Canada Tonight" role="button" tabindex="0"><div><p><img src="https://i.cbc.ca/ais/021f570c-a0fa-45c3-a779-938b0e6b911c,1713964898418/full/max/0/default.jpg?im=Crop%2Crect%3D%280%2C0%2C1919%2C1079%29%3BResize%3D%28620%29" srcset="" alt="" loading="lazy"></p></div><div><h3>B.C.'s debate over drug decriminalization | Canada Tonight</h3></div></div><span>One year into a three-year drug decriminalization pilot, B.C. Premier David Eby says he shares public safety concerns that have been raised by police and city councillors from multiple municipalities. Jess Lamb, co-founder of the East Kootenay Network of People Who Use Drugs, and Alexa Loo, a city councillor in Richmond, B.C., give their thoughts on whether the pilot should continue.</span></span></span></p><p>Eby says he expects the changes to go through this time because he is asking them to come from Health Canada.</p><p>"The resolution of that court issue is potentially more than a year down the road and we cannot afford to wait. We need to act now," Eby said.&nbsp;</p><p>"I have talked to the prime minister about this. He assures me that the federal government will provide full support to ensure that police have the tools that they need."</p><p>Eby said it's possible the government could face another legal challenge in response to these changes, but he thinks the risk is low.</p><p>"In order for it to be successful, the court would have to find that the entire Controlled Drugs and Substances Act at the federal level was unconstitutional," he said.</p><p>Eby said criminalizing drug use costs lives and taxpayer money while not making the public safer, but "police do need the tools to address extraordinary circumstances where people are compromising public safety through their drug use."</p><h2>Election looms</h2><p>Vancouver Mayor Ken Sim said in a statement that he welcomed the change.&nbsp;</p><p>"Today's changes will make public drug use effectively illegal and provide the VPD with actual tools to maintain public safety. This change aligns with the critical work we have already undertaken with the federal and provincial governments to address open drug use in public areas, especially around playgrounds, splash pads, beaches, and sports fields."</p><p>The premier said the issue has been intensely politicized as the province heads into an election.</p><p>British Columbians go to the polls on Oct. 19.&nbsp;</p><p>Opposition B.C. United Leader Kevin Falcon and his critic for mental health and addiction&nbsp;Elenore Sturko issued a joint statement calling the government's move a "desperate attempt to salvage a failing policy."</p><p>"Instead of upholding their commitments to scrap the decriminalization pilot when it clearly wasn't meeting its goals, David Eby and the NDP have stubbornly persisted with this dangerous policy," the statement says.</p><p>"From its inception, the decriminalization experiment has failed to connect drug users with any necessary treatment or recovery services."</p><p>B.C. Conservative Leader John Rustad said in an interview that "decriminalization has been an utter failure in this province."</p><p>"This should have never happened in the province of British Columbia," he said.</p><p>In a statement posted online, B.C. Green Party Leader Sonia Furstenau&nbsp;expressed concerns about the increase in arrests that could be associated with the policy, writing, "Police discretion is especially likely to stigmatize Indigenous and racialized British Columbians."</p><p>"This issue is intrinsically linked to the housing and affordability crisis. Rolling back decriminalization isn't going to fix that. No jurisdiction in the world has arrested their way out of this problem, and we won't either."</p><p><strong><em>WATCH | Full press conference on drug recriminalization:&nbsp;</em></strong><span><span><div title="B.C. to recriminalize drug use in public spaces" role="button" tabindex="0"><div><p><img src="https://thumbnails.cbc.ca/maven_legacy/thumbnails/148/967/raw-eby-presser-full_frame_43433.png" srcset="" alt="" loading="lazy"></p></div><div><h3>B.C. to recriminalize drug use in public spaces</h3></div></div><span>B.C. Premier David Eby, Vancouver Police Department Deputy Chief Constable Fiona Wilson and B.C. Health Minister Adrian Dix  announce and answer questions about plans to recriminalize drug use in public spaces.</span></span></span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Searchformer: Beyond A* – Better planning with transformers via search dynamics (140 pts)]]></title>
+            <title><![CDATA[Searchformer: Beyond A* – Better planning with transformers via search dynamics (149 pts)]]></title>
             <link>https://github.com/facebookresearch/searchformer</link>
             <guid>40174912</guid>
             <pubDate>Fri, 26 Apr 2024 22:15:51 GMT</pubDate>
@@ -816,7 +1097,7 @@ The following notebooks are included:</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Court upholds New York law that says ISPs must offer $15 broadband (232 pts)]]></title>
+            <title><![CDATA[Court upholds New York law that says ISPs must offer $15 broadband (235 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2024/04/court-upholds-new-york-law-that-says-isps-must-offer-15-broadband/</link>
             <guid>40174424</guid>
             <pubDate>Fri, 26 Apr 2024 21:18:37 GMT</pubDate>
@@ -852,7 +1133,7 @@ The following notebooks are included:</p>
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Factorio – Statistics improvements, Linux adventures (129 pts)]]></title>
+            <title><![CDATA[Factorio – Statistics improvements, Linux adventures (131 pts)]]></title>
             <link>https://factorio.com/blog/post/fff-408</link>
             <guid>40174316</guid>
             <pubDate>Fri, 26 Apr 2024 21:09:14 GMT</pubDate>
@@ -1196,7 +1477,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: I made a spaced repetition tool to master coding problems (168 pts)]]></title>
+            <title><![CDATA[Show HN: I made a spaced repetition tool to master coding problems (173 pts)]]></title>
             <link>https://www.lanki.xyz/</link>
             <guid>40173237</guid>
             <pubDate>Fri, 26 Apr 2024 19:38:45 GMT</pubDate>
@@ -1204,7 +1485,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
 <div id="readability-page-1" class="page"><div><p>Try Lanki for Free</p><h2><span>Spaced Repetition</span> for Leetcode.</h2><p>Lanki helps you practice coding problems you have seen before...but haven't quite yet mastered.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[3 years of fulltime Rust game development, and why we're leaving Rust behind (1308 pts)]]></title>
+            <title><![CDATA[3 years of fulltime Rust game development, and why we're leaving Rust behind (1333 pts)]]></title>
             <link>https://loglog.games/blog/leaving-rust-gamedev/</link>
             <guid>40172033</guid>
             <pubDate>Fri, 26 Apr 2024 17:33:56 GMT</pubDate>
@@ -1643,7 +1924,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Data breach at Kaiser Permanente affects 13.4M people (115 pts)]]></title>
+            <title><![CDATA[Data breach at Kaiser Permanente affects 13.4M people (116 pts)]]></title>
             <link>https://restoreprivacy.com/data-breach-at-kaiser-permanente-affects-13-4-million-people/</link>
             <guid>40171909</guid>
             <pubDate>Fri, 26 Apr 2024 17:15:35 GMT</pubDate>
@@ -1719,7 +2000,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The brutal business practices of Amazon (132 pts)]]></title>
+            <title><![CDATA[The brutal business practices of Amazon (133 pts)]]></title>
             <link>https://www.vanityfair.com/news/story/inside-amazon-business-practices</link>
             <guid>40171551</guid>
             <pubDate>Fri, 26 Apr 2024 16:49:09 GMT</pubDate>
@@ -1727,7 +2008,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
 <div id="readability-page-1" class="page"><div data-journey-hook="client-content" data-testid="BodyWrapper"><p>In May of 2020, seven members of the House Judiciary Antitrust Subcommittee penned a letter to then CEO of Amazon <strong>Jeff Bezos.</strong> “On April 23,” their message began, <em>The Wall Street Journal</em> “reported that Amazon employees used sensitive business information from third-party sellers on its platform to develop competing products.” The article contradicted previous sworn testimony from the company’s general counsel, possibly rendering the testimony “false or perjurious,” the seven congressional leaders wrote.</p><p>The <em>Journal</em>’s exposé, which ultimately spurred Bezos’s first-ever congressional testimony, was written by <strong>Dana Mattioli</strong> as part of the paper’s wide-ranging investigation into Amazon’s business practices. At the time, Mattioli, a longtime business reporter, had recently moved into the Amazon beat, her interest piqued by the corporation’s tentacular infiltration of nearly every aspect of American economic life. Now, four years later, she’s out with <em><a data-offer-url="https://www.amazon.com/Everything-War-Dana-Mattioli/dp/0316269778" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.amazon.com/Everything-War-Dana-Mattioli/dp/0316269778&quot;}" href="https://www.amazon.com/Everything-War-Dana-Mattioli/dp/0316269778" rel="noopener" target="_blank">The Everything War</a>,</em> a new book-length examination of Amazon that explores everything from its rise to power to its lobbying efforts and the brewing backlash against it.</p><p>In this interview with <em>Vanity Fair,</em> edited for length and clarity, Mattioli and I spoke about the challenges of reporting on an infamously secretive and combative company, Amazon’s forays into political-influence peddling, its new foe in the Biden administration, and which candidate she thinks Amazon execs want to see back in the White House come January 2025.</p><p><strong><em>Vanity Fair:</em> What first got you interested in covering Amazon?</strong></p><p><em>Dana Mattioli:</em> I was <em>The</em> <em>Wall Street Journal</em>’s mergers-and-acquisitions reporter for six years, and in that role, my job was to cover which companies are buying other companies across industries globally. Something fascinating happened during my tenure in that role. It wasn’t just retail companies that were nervous about Amazon. I’d speak to the bankers, the lawyers, the CEOs, the board members at different companies, and they started talking about how they were worried about Amazon invading their industry. Over the course of those six years, those questions got louder. It started bleeding into other sectors where you wouldn’t even really think about Amazon at the time. The company seemed to stretch into every vertical and its tentacles kept spreading. It occurred to me that this was the most interesting company, but also one of the most secretive companies in business history. That to me seemed like such a fun challenge to dig in and see what was going on behind the scenes.</p><p><strong>What are the sorts of challenges reporters covering the company face?</strong></p><p>I would say that, as it relates to me, they didn’t provide access, but that doesn't mean I didn’t get access. I spoke to 17 S-team members—the most senior people at the company—for this book, without the company knowing. I spoke to hundreds of people in and around the company. I had hundreds of pages of internal documents. They didn’t really cooperate for the book in setting up interviews, and I understand why. Some of my investigations at the <em>Journal</em> had been very hard-hitting. One of them was the basis for Jeff Bezos’s being called to testify to Congress for the first time in his career. So they didn't participate on an official basis, but I of course did a full fact-check. Out of fairness, I incorporate their PR statements and rebuttals very generously throughout. But it is an interesting company from a PR standpoint. There was an <a href="https://www.motherjones.com/politics/2021/06/amazon-journalists-pr-tactics/" target="_blank">investigation from <em>Mother Jones</em></a> about the company bullying reporters, how they have lied to reporters in the past, and how that makes things difficult for reporters trying to cover the company. And that investigation questions whether that’s a tactic to get people to back off and not even want to cover them in the first place.</p><p><strong>What do you think it is about Amazon’s internal culture that made so many employees willing to talk to you?</strong></p><p>Amazon is the most interesting company culture and the most aggressive one I’ve ever covered. It’s a giant company. More than a million people work there. The turnover and the burnout is much higher than at most other companies. People tend not to last, because it’s very aggressive and it can be bruising. As a result of that, a lot of people have come to me—both people still there and people that have left—to tell me their experiences.</p><p>When I delve into what goes on behind the scenes and the anticompetitive business behaviors that make Amazon win so often, a lot of it is the product of this culture. A lot of the shocking behaviors are because of this company’s culture. If you’re auditioning for your job every day, and you’re auditioning against every other brilliant employee there, and you know that at the end of the year, 6% of you are going to get cut no matter what, and at the same time, you have access to unrivaled data on partners, sellers, and competitors, you might be tempted to look at that data to get an edge and keep your job and get to your restricted stock units. If you’re at [Amazon] and you’re meeting with [outside companies] on the dealmaking side or the Alexa venture capital side, you might be tempted to not forget what you learned in those meetings and use it on a product to have a home run.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Univer: Open-Source Alternative for Google Sheets, Slides, Docs (110 pts)]]></title>
+            <title><![CDATA[Univer: Open-Source Alternative for Google Sheets, Slides, Docs (121 pts)]]></title>
             <link>https://github.com/dream-num/univer/</link>
             <guid>40171216</guid>
             <pubDate>Fri, 26 Apr 2024 16:23:04 GMT</pubDate>
@@ -2043,7 +2324,7 @@ $ ldd bin/FinalReleasex64Clang/factorio
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bun's New Crash Reporter (326 pts)]]></title>
+            <title><![CDATA[Bun's New Crash Reporter (332 pts)]]></title>
             <link>https://bun.sh/blog/bun-report-is-buns-new-crash-reporter</link>
             <guid>40171183</guid>
             <pubDate>Fri, 26 Apr 2024 16:20:30 GMT</pubDate>
@@ -2152,102 +2433,6 @@ $ ldd bin/FinalReleasex64Clang/factorio
             <pubDate>Fri, 26 Apr 2024 15:49:54 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.washingtonpost.com/climate-solutions/interactive/2024/amazon-solar-panels-ecuador/">https://www.washingtonpost.com/climate-solutions/interactive/2024/amazon-solar-panels-ecuador/</a>, See on <a href="https://news.ycombinator.com/item?id=40170955">Hacker News</a></p>
 Couldn't get https://www.washingtonpost.com/climate-solutions/interactive/2024/amazon-solar-panels-ecuador/: Error: timeout of 10000ms exceeded]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Jon Pretty wins in court against sexual harassment claims by Scala community (138 pts)]]></title>
-            <link>https://pretty.direct/statement.html</link>
-            <guid>40169578</guid>
-            <pubDate>Fri, 26 Apr 2024 14:05:16 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://pretty.direct/statement.html">https://pretty.direct/statement.html</a>, See on <a href="https://news.ycombinator.com/item?id=40169578">Hacker News</a></p>
-<div id="readability-page-1" class="page">
-  
-  <h2>Jon Pretty, 26 April 2024</h2>
-  <p>
-   I am a Scala developer and speaker who was cancelled three years ago.
-   Yesterday I attended the High Court in London to hear an apology from several
-   prominent members of the Scala community for making untrue claims about me on
-   27 April 2021. I sued them for libel, and they admitted fault and settled,
-   paying me costs and damages.
-  </p>
-  <p>
-   Their allegations were sensational and squalid, but unfounded. Their source was
-   the resentment of one woman following a relationship in 2018, which I ended
-   against her wishes. She fabricated or was offered an alternative narrative, which developed
-   into claims of a pattern of behaviour, and culminated in the defendants’
-   publication of an open letter, which they now agree is defamatory.
-  </p>
-  <p>
-   In two years of legal action, the defendants never presented any evidence to
-   support their allegations, and admitted in court that they had no proper reason
-   to make them. They have given undertakings to the court not to publish further
-   or similar defamatory statements, or have anyone else do so on their behalf.
-  </p>
-  <p>
-   No signatory contacted me about the allegations before publication. I received
-   no warning, and had no knowledge of the claims’ substance. I only discovered
-   what I was accused of at the same time as I learned of my indefinite exclusion
-   from the community; at the same time everyone else found out. I had no
-   opportunity to defend myself. It is no coincidence that the absence of due
-   process led to an abject injustice.
-  </p>
-  <p>
-   The experience of cancellation and enduring the online hysteria was traumatic.
-   I responded by withdrawing from the life I knew. Its consequences hurt me and
-   people close to me, and have been immiserating.
-  </p>
-  <p>
-   My employment opportunities were obliterated. My charitable and educational
-   projects, and my small business, could not continue. Despite my transferable
-   skills, the allegations were a transferrable red flag recognised across
-   programming communities and industries, and I have barely earned a living
-   since. It has taken two years of legal action to receive fair scrutiny in a
-   forum reliant on facts. This outcome finally vindicates me.
-  </p>
-  <p>
-   Many familiar with the open letter will be surprised by this outcome, given the
-   certainty expressed by some of the letter’s supporters. But they should
-   question why no defence of my libel claim was ever offered. They should seek
-   answers for how so many people became so convinced without evidence. And the
-   defendants’ co-signatories should reassess the credibility of everything that
-   compelled them to support the open letter.
-  </p>
-  <p>
-   Nonetheless, I believe the open letter’s authors were convinced it was the
-   right thing to do. I believe that they wished to show their kindness in
-   response to a story which shocked them. Many of them I have known for years,
-   and know to be good, moral people who were mistaken, and would not wish to be
-   mistaken.
-  </p>
-  <p>
-   Good people can make mistakes, without becoming bad people. So, I offer them
-   the respect and compassion I believe they deserve. I recognise their good
-   intent, and I interpret its consequences charitably. We owe each other civility
-   in ceding the time and space necessary to reflect upon this in open enquiry,
-   without coercion or urgency, so everyone can reach a better understanding of
-   this outcome, and of one another.
-  </p>
-  <p>
-   I have avoided naming any third parties here, and I urge others to do the same.
-   I know too well how it feels to be the subject of online harassment, and I do
-   not wish it upon anyone. I reject the culture of blame and escalation.
-  </p>
-  <p>
-   I have not been idle since 2021. I’ve spent much of my time writing Scala 3,
-   which I believe is an exceptional platform for software development, and
-   deserves far greater success. I am motivated to be part of that success, and I
-   will start sharing my work again soon.
-  </p>
-  <p>
-   █
-  </p>
-  <p>
-   <a href="https://pretty.direct/consentorder.pdf"><b>Consent Order and Statement in Open Court</b> (The Honourable Mrs Justice Steyn DBE)</a>
-  </p>
-  
- 
-
-
-</div>]]></description>
         </item>
     </channel>
 </rss>
