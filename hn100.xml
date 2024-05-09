@@ -4,12 +4,120 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 09 May 2024 19:00:07 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 09 May 2024 20:00:07 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Leaked FBI Email Reportedly Shows Desperation to Justify Warrantless Wiretaps (134 pts)]]></title>
+            <title><![CDATA[It's always TCP_NODELAY (146 pts)]]></title>
+            <link>https://brooker.co.za/blog/2024/05/09/nagle.html</link>
+            <guid>40310896</guid>
+            <pubDate>Thu, 09 May 2024 17:54:49 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://brooker.co.za/blog/2024/05/09/nagle.html">https://brooker.co.za/blog/2024/05/09/nagle.html</a>, See on <a href="https://news.ycombinator.com/item?id=40310896">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="post">
+
+
+<p>It's not the 1980s anymore, thankfully.</p>
+
+<p>The first thing I check when debugging latency issues in distributed systems is whether <a href="https://linux.die.net/man/7/tcp">TCP_NODELAY</a> is enabled. And it’s not just me. Every distributed system builder I know has lost hours to latency issues quickly fixed by enabling this simple socket option, suggesting that the default behavior is wrong, and perhaps that the whole concept is outmoded.</p>
+
+<p>First, let’s be clear about what we’re talking about. There’s no better source than John Nagle’s <a href="https://datatracker.ietf.org/doc/html/rfc896">RFC896</a> from 1984<sup><a href="#foot1">1</a></sup>. First, the problem statement:</p>
+
+<blockquote>
+  <p>There is a special problem associated with small  packets.   When TCP  is  used  for  the transmission of single-character messages originating at a keyboard, the typical result  is  that  41  byte packets (one  byte  of data, 40 bytes of header) are transmitted for each byte of useful data.  This 4000%  overhead  is  annoying but tolerable on lightly loaded networks.</p>
+</blockquote>
+
+<p>In short, Nagle was interested in better amortizing the cost of TCP headers, to get better throughput out of the network. Up to 40x better throughput! These tiny packets had two main causes: human-interactive applications like shells, where folks were typing a byte at a time, and poorly implemented programs that dribbled messages out to the kernel through many <code>write</code> calls. Nagle’s proposal for fixing this was simple and smart:</p>
+
+<blockquote>
+  <p>A  simple and elegant solution has been discovered.</p>
+</blockquote>
+
+<blockquote>
+  <p>The solution is to inhibit the sending of new TCP  segments  when new  outgoing  data  arrives  from  the  user  if  any previously transmitted data on the connection remains unacknowledged.</p>
+</blockquote>
+
+<p>When many people talk about Nagle’s algorithm, they talk about timers, but RFC896 doesn’t use any kind of timer other than the round-trip time on the network.</p>
+
+<p><em>Nagle’s Algorithm and Delayed Acks</em></p>
+
+<p>Nagle’s nice, clean, proposal interacted poorly with another TCP feature: delayed <code>ACK</code>. The idea behind delayed <code>ACK</code> is to delay sending the acknowledgement of a packet at least until there’s some data to send back (e.g. a <code>telnet</code> session echoing back the user’s typing), or until a timer expires. <a href="https://datatracker.ietf.org/doc/html/rfc813">RFC813</a> from 1982 is that first that seems to propose delaying <code>ACKs</code>:</p>
+
+<blockquote>
+  <p>The receiver of data will   refrain   from   sending   an   acknowledgement   under   certain circumstances, in which case it must set a timer which  will  cause  the acknowledgement  to be sent later.  However, the receiver should do this only where it is a reasonable guess that some other event will intervene and prevent the necessity of the timer  interrupt.</p>
+</blockquote>
+
+<p>which is then formalized further in <a href="https://datatracker.ietf.org/doc/html/rfc1122">RFC1122</a> from 1989. The interaction between these two features causes a problem: Nagle’s algorithm is blocking sending more data until an <code>ACK</code> is received, but delayed ack is delaying that <code>ack</code> until a response is ready. Great for keeping packets full, not so great for latency-sensitive pipelined applications.</p>
+
+<p>This is a point Nagle has made himself several times. For example in this <a href="https://news.ycombinator.com/item?id=10608356">Hacker News comment</a>:</p>
+
+<blockquote>
+  <p>That still irks me. The real problem is not tinygram prevention. It’s ACK delays, and that stupid fixed timer. They both went into TCP around the same time, but independently. I did tinygram prevention (the Nagle algorithm) and Berkeley did delayed ACKs, both in the early 1980s. The combination of the two is awful.</p>
+</blockquote>
+
+<p>As systems builders this is should be a familiar situation: two reasonable features of the system that interact to create an undesirable behavior. This kind of interaction is one of the things that makes protocol design so hard.</p>
+
+<p><em>Is Nagle blameless?</em></p>
+
+<p>Unfortunately, it’s not just delayed ACK. Even without delayed ack and that <em>stupid fixed timer</em>, the behavior of Nagle’s algorithm probably isn’t what we want in distributed systems. A single in-datacenter RTT is typically around 500μs, then a couple of milliseconds between datacenters in the same region, and up to hundreds of milliseconds going around the globe. Given the vast amount of work a modern server can do in even a few hundred microseconds, delaying sending data for even one RTT isn’t clearly a win.</p>
+
+<p>To make a clearer case, let’s turn back to the justification behind Nagle’s algorithm: amortizing the cost of headers and avoiding that 40x overhead on single-byte packets. But does anybody send single byte packets anymore? Most distributed databases and systems don’t. Partially that’s because they simply have more to say, partially its because of additional overhead of protocols like TLS, and partially its because of encoding and serialization overhead. But mostly, they have more to say.</p>
+
+<p>The core concern of not sending tiny messages is still a very real one, but we’ve very effectively pushed that into the application layer. Sending a byte at a time wrapped in JSON isn’t going to be very efficient, no matter what Nagle’s algorithm does.</p>
+
+<p><em>Is Nagle needed?</em></p>
+
+<p>First, the uncontroversial take: if you’re building a latency-sensitive distributed system running on modern datacenter-class hardware, enable <code>TCP_NODELAY</code> (disable Nagle’s algorithm) without worries. You don’t need to feel bad. It’s not a sin. It’s OK. Just go ahead.</p>
+
+<p>More controversially, I suspect that Nagle’s algorithm just isn’t needed on modern systems, given the traffic and application mix, and the capabilities of the hardware we have today. In other words, <code>TCP_NODELAY</code> should be the default. That’s going to make some “<code>write</code> every byte” code slower than it would otherwise be, but those applications should be fixed anyway if we care about efficiency.</p>
+
+<p><em>Footnotes</em></p>
+
+<ol>
+  <li><a name="foot1"></a> I won’t got into it here, but RFC896 is also one of the earliest statements I can find of metastable behavior in computer networks. In it, Nagle says: “This condition is stable. Once the  saturation point has been reached, if the algorithm for selecting packets to be dropped is fair, the network will continue to operate in a degraded condition.”</li>
+</ol>
+
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Leaked deck reveals how OpenAI is pitching publisher partnerships (196 pts)]]></title>
+            <link>https://www.adweek.com/media/openai-preferred-publisher-program-deck/</link>
+            <guid>40310228</guid>
+            <pubDate>Thu, 09 May 2024 16:56:55 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.adweek.com/media/openai-preferred-publisher-program-deck/">https://www.adweek.com/media/openai-preferred-publisher-program-deck/</a>, See on <a href="https://news.ycombinator.com/item?id=40310228">Hacker News</a></p>
+<div id="readability-page-1" class="page"><section data-continue-reading-wrapper="">
+                                    
+
+
+
+<div>
+		
+		<p>Mark your calendar for Mediaweek, October 29-30 in New York City. We’ll unpack the biggest shifts shaping the future of media—from tv to retail media to tech—and how marketers can prep to stay ahead. <a href="https://event.adweek.com/mediaweek-2024/4442894?ref=nativep1&amp;itm_source=ROS&amp;itm_medium=display&amp;itm_campaign=nativeMediaweek24&amp;itm_content=p1"><strong>Register</strong></a> with early-bird rates before sale ends!</p>
+	</div>
+
+
+<div><p>The generative artificial intelligence firm OpenAI has been pitching partnership opportunities to news publishers through an initiative called the Preferred Publishers Program, according to a deck obtained by ADWEEK and interviews with four industry executives.</p><p>OpenAI has been courting premium publishers dating back to July 2023, when it struck a licensing agreement with the Associated Press. It has since inked public partnerships with Axel Springer, The Financial Times, <a href="https://www.adweek.com/media/le-monde-english-subscribers-olympics/" target="_blank" rel="noreferrer noopener">Le Monde</a>, Prisa and Dotdash Meredith, although it has declined to share the specifics of any of its deals.</p><p>A representative for OpenAI disputed the accuracy of the information in the deck, which is more than three months old. The <a href="https://www.adweek.com/category/artificial-intelligence/" target="_blank">gen AI</a> firm also negotiates deals on a per-publisher basis, rather than structuring all of its deals uniformly, the representative said.</p><p>“We are engaging in productive conversations and partnerships with many news publishers around the world,” said a representative for OpenAI. “Our confidential documents are for discussion purposes only and ADWEEK’s reporting contains a number of mischaracterizations and outdated information.”</p><p>Nonetheless, the leaked deck reveals the basic structure of the partnerships OpenAI is proposing to media companies, as well as the incentives it is offering for their collaboration.</p><section> <p><a href="https://www.adweek.com/media/publishers-ai-licensing-negotiations-mark-an-inflection-point/" target="_blank"><img decoding="async" src="https://static-prod.adweek.com/wp-content/uploads/2023/11/publisher-ai-licensing-2023-640x360.jpg" alt="Copyright law favors creators, but commercial compromise offers a hedge against uncertainty."></a></p>  </section><h4><strong>Details from the pitch deck</strong></h4><p>The Preferred Publisher Program has five primary components, according to the deck.</p><p>First, it is available only to “select, high-quality editorial partners,” and its purpose is to help ChatGPT users more easily discover and engage with publishers’ brands and content.</p><p>Additionally, members of the program receive priority placement and “richer brand expression” in chat conversations, and their content benefits from more prominent link treatments. Finally, through PPP, OpenAI also offers licensed financial terms to publishers.</p><p>The financial incentives participating publishers can expect to receive are grouped into two buckets: guaranteed value and variable value.</p><p>Guaranteed value is a licensing payment that compensates the publisher for allowing OpenAI to access its backlog of data, while variable value is contingent on display success, a metric based on the number of users engaging with linked or displayed content.</p><p>The resulting financial offer would combine the guaranteed and variable values into one payment, which would be structured on an annual basis.&nbsp;</p><p>“The PPP program is more about scraping than training,” said one executive. “OpenAI has presumably already ingested and trained on these publishers’ archival data, but it needs access to contemporary content to answer contemporary queries.”</p><!--nextpage--><p>In return for these payments, OpenAI would gain two benefits. </p><p>It would have the ability to train on a publisher’s content and the license to display that information in ChatGPT products, complete with attribution and links. It would also get to announce the publisher as a preferred partner and work with them to build out these experiences.</p><h4><strong>Participation boosts publisher payouts</strong></h4><p>According to the deck, publisher participation in PPP creates a better experience for OpenAI users, which will help shift engagement toward browsing, i.e. queries that result in responses with links.</p><p>Roughly 25% of ChatGPT users already use the browse function, but the company expects that a majority of users will do so once the feature is broadly rolled out. If more users engage with publishers’ links, the <a href="https://www.adweek.com/category/media-news/" target="_blank" rel="noreferrer noopener">media companies</a> could earn larger payments for their variable value.&nbsp;</p><p>PPP members will see their content receive its “richer brand expression” through a series of content display products: the branded hover link, the anchored link and the in-line treatment.</p><p>In the hover treatment, which is available today, OpenAI will hyperlink keywords in its responses to search queries. The links appear as blue text and reveal a clickable tab when moused over. </p><p>In the anchor treatment, branded, clickable buttons appear below ChatGPT’s response to a user query. And the in-line product inserts a pullquote into the text of ChatGPT’s response, whose font is larger and includes a clickable, branded link.&nbsp;</p><p>All three content display products seek to cite the publishers whose writing is being used to answer the search query, although the setup will likely lead fewer users to visit publishers’ websites.&nbsp;</p><p>A recent model from The Atlantic found that if a search engine like Google were to integrate AI into search, it would answer a user’s query 75% of the time without requiring a clickthrough to its website.</p><h4><strong>Where publishers go from here</strong></h4><p>The details of the program add further color to the complicated relationship between digital publishers and OpenAI. The uncertain legal standing of the data-scraping methodology that OpenAI uses to power its large-language models has made licensing negotiations between the two parties complex.</p><p>While some publishers have opted to partner with OpenAI, others, <a href="https://www.adweek.com/media/open-ai-response-new-york-times-lawsuit/" target="_blank">including recent NewFronts participant The New York Times</a> and eight Alden Global Capital titles, have sued the tech firm on the grounds that it has used copyrighted articles without permission.</p><p>The vast majority of news publishers, as well as independent websites, have neither partnered with OpenAI nor taken legal action. According to one media executive, through programs such as Preferred Publisher, OpenAI is looking to change that.</p><p>“At the recent Aspen Conference in New York on AI and the news,” the person said, “OpenAI was very open about their need to attract publishers into their partnership program.”&nbsp;</p><!--nextpage--><p><em>This story has updated to include a response from OpenAI.</em></p></div>
+<div id="meter-count">
+  
+  
+    
+    
+  
+  <a href="#" onclick="ShowAndHide()">
+    
+  </a>
+  
+  
+  <div>
+        <p>
+          <h3>Enjoying Adweek's Content? Register for More Access!</h3>
+        </p>
+      </div>
+</div>                                                                    </section></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Leaked FBI Email Reportedly Shows Desperation to Justify Warrantless Wiretaps (142 pts)]]></title>
             <link>https://gizmodo.com/leaked-fbi-email-warrantless-wiretaps-section-702-1851464520</link>
             <guid>40309957</guid>
             <pubDate>Thu, 09 May 2024 16:34:17 GMT</pubDate>
@@ -17,7 +125,15 @@
 <div id="readability-page-1" class="page"><div><p>Congress reauthorized America’s warrantless wiretapping program last month after some <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/national-security-threat-likely-nukes-in-space-1851257693&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/national-security-threat-likely-nukes-in-space-1851257693">successful fearmongering</a></span> by national security hawks on Capitol Hill. But an internal FBI email, leaked to <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.wired.com/story/fbi-section-702-us-person-queries-email/&quot;,{&quot;metric25&quot;:1}]]" href="https://www.wired.com/story/fbi-section-702-us-person-queries-email/" target="_blank" rel="noopener noreferrer">Wired</a></span> on Wednesday, may accidentally reveal how the federal law enforcement agency plans to overstep the spirit of the law, while technically maintaining the letter of the law.<br></p><div data-video-id="196937" data-monetizable="false" data-position="sidebar" data-video-title="Approaching Queerness in Doctor Who" data-video-blog-id="4" data-video-network="gizmodo" data-video-duration="72" data-playlist="196937,196931,196911" data-current="196937"><div><p>Approaching Queerness in Doctor Who</p></div><video disablepictureinpicture="" muted="" playsinline="" width="100%" height="100%" crossorigin="anonymous" preload="none"><source data-src="https://vid.kinja.com/prod/196937/196937_240p.mp4" label="240p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/196937/196937_480p.mp4" label="480p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/196937/196937_720p.mp4" label="720p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/196937/196937_1080p.mp4" label="1080p" type="video/mp4"><track kind="captions" label="English" src="https://kinja.com/api/videoupload/caption/22499.vtt" srclang="en"></video><div><ul><li data-label="">Off</li><li data-label="English">English</li></ul></div></div><p>The controversial spying program is Section 702 in the Foreign Intelligence Surveillance Act (FISA) and allows the interception of foreign communications that sometimes include American citizens. The program ostensibly includes safeguards to ensure the law isn’t being used to unnecessarily spy on Americans, but it’s pretty clear from this new email that the FBI likes being able to get communications from Americans.<br></p><p>The email obtained by <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.wired.com/story/fbi-section-702-us-person-queries-email/&quot;,{&quot;metric25&quot;:1}]]" href="https://www.wired.com/story/fbi-section-702-us-person-queries-email/" target="_blank" rel="noopener noreferrer">Wired</a></span> dated April 20 was written by FBI Deputy Director Paul Abbate and sent out to employees internally.<br></p><p>“To continue to demonstrate why tools like this are essential to our mission, we need to <em>use</em> them, while also holding ourselves accountable for doing so properly and in compliance with legal requirements,” the email reads, according to Wired, which notes that the italicization on the word “use” was in the original email.</p><p>The FBI email made things even more explicit by encouraging searches for Americans when looking through intercepted communications.<br></p><p>“I urge everyone to continue to look for ways to appropriately use US  person queries to advance the mission, with the added confidence that  this new pre-approval requirement will help ensure that those queries  are fully compliant with the law,” the email reads.</p><p>The FBI’s response to Wired is particularly interesting, making it worth quoting at length. From Wired:<br></p><blockquote data-type="BlockQuote"><p>Following publication, FBI spokesperson Susan McKee provided a statement  from the bureau that mischaracterized WIRED’s reporting, inaccurately  claiming it “alleged that that the FBI instructed its employees to  violate the law or FBI policies.” The statement added that Abbate’s  email “emphasized Congress’ recognition of the vital importance of FISA  Section 702 to protect the American people and was sent to ensure that  FBI personnel were immediately aware of, and in compliance with, the  privacy enhancing changes the law has put in place.”</p></blockquote><p>Obviously, the FBI is going to say everyone at the agency follows the law since they quite literally are the law. But Wired spoke with Rep. Zoe Lofgren, a Democrat from California who notes this newly leaked email “directly contradicts earlier assertions” by the FBI when the agency was trying to get the law reauthorized.</p><p>It’s all a mess. The FBI got exactly what it wanted with the reauthorization of Section 702, something that was never really in doubt, even with pressure from a handful of politicians who opposed it. To paraphrase former president Richard Nixon, it’s <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.nixonlibrary.gov/media/video/excerpt-frost-interview-final&quot;,{&quot;metric25&quot;:1}]]" href="https://www.nixonlibrary.gov/media/video/excerpt-frost-interview-final" target="_blank" rel="noopener noreferrer">not illegal</a></span> when the FBI does it. But what are you going to do in such a <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.vox.com/2014/4/18/5624310/martin-gilens-testing-theories-of-american-politics-explained&quot;,{&quot;metric25&quot;:1}]]" href="https://www.vox.com/2014/4/18/5624310/martin-gilens-testing-theories-of-american-politics-explained" target="_blank" rel="noopener noreferrer">ridiculously rigged system</a></span>? </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Launch HN: Muddy (YC S19) – Multiplayer browser for getting work done (103 pts)]]></title>
+            <title><![CDATA[Familial Transmission of Personality Is Higher Than Shown in Typical Studies (103 pts)]]></title>
+            <link>https://osf.io/preprints/psyarxiv/7ygp6</link>
+            <guid>40309840</guid>
+            <pubDate>Thu, 09 May 2024 16:24:38 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://osf.io/preprints/psyarxiv/7ygp6">https://osf.io/preprints/psyarxiv/7ygp6</a>, See on <a href="https://news.ycombinator.com/item?id=40309840">Hacker News</a></p>
+&lt;Unparsable&gt;]]></description>
+        </item>
+        <item>
+            <title><![CDATA[HNInternal: Launch HN: Muddy (YC S19) – Multiplayer browser for getting work done (117 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=40309342</link>
             <guid>40309342</guid>
             <pubDate>Thu, 09 May 2024 15:38:48 GMT</pubDate>
@@ -25,7 +141,7 @@
 <div id="readability-page-1" class="page"><div><td colspan="2"></td><td><div><p>Hey HN! This is Jimmy, Ron and Austa from Muddy (<a href="https://feelmuddy.com/">https://feelmuddy.com/</a>). Muddy is a browser for work that automatically keeps project files organized in the same place where you use and share them. Here’s a demo: <a href="https://www.youtube.com/watch?v=tZr49aN3sjQ" rel="nofollow">https://www.youtube.com/watch?v=tZr49aN3sjQ</a>. Download and try it out here: <a href="https://feelmuddy.com/">https://feelmuddy.com/</a>.</p><p>Building together in the past, we were incredibly frustrated with how much friction there is to get anything done on our computers. I was losing time everyday digging through chat logs looking for that one important link or breaking others out of flow by asking where something is.</p><p>Web apps promised to help us get more done—and they do, but each in its own silo, so there’s still a ton of redundancy to deal with. Every app has its own way of organizing files, its own notification inbox, its own search system. Conversations live everywhere and there isn’t a single view to see everything about a project. Remember when files simply lived in folders rather than the “cloud”?</p><p>We started dedicating time to organizing our files in shared docs and limiting new apps we used. This helped – but the second we didn’t stay on top of organization, links became stale and things got messy again.</p><p>Muddy started as a hack week project we built for ourselves—a single place to use web apps with others, but personalized for each user automatically. Everyone gets their own view for every project, designed around how they work.</p><p>Muddy users work on projects in spaces, which are like automatic tab groups. Users share apps (any site works—a Github PR, Figma file, Trello board—whatever you want) into the project’s shared timeline and Muddy automatically opens relevant tabs for you. It’s a single click to open up all the apps you need for the project.</p><p>Under the hood, Muddy works in the background to keep track of the timeline and uses a LLM to continuously organize apps and keep everything on to date. It considers signals like the popularity of a file, naming conventions, and conversations to figure out what’s relevant. So everyone is presented with an updated list of important tabs, without anyone lifting a finger. Our actual browser is based on Chromium.</p><p>When you need to revisit something from weeks ago, you can rewind the project timeline to that point in a single click. Apps open up in the timeline so you’ll see your files right away. For sites that don’t have built in collaboration features (like documentation), Muddy lets you do annotations directly on the website.</p><p>Projects sometimes get big and need to be broken up. Across all your spaces, Muddy can answer questions like ChatGPT, cite your files as sources, and return apps directly. This is possible since Muddy’s AI shares your browser and can use your authenticated apps locally (with privacy in mind).</p><p>Other browsers like Chrome and Arc focus on solo productivity with sharing as a bolt-on. We think productivity depends on how well you can work with others, and should be the first class consideration. And doing organizational work manually is unsustainable.</p><p>Muddy will have paid subscriptions for teams with additional features like shared passwords, team organization, custom shortcuts, and SSO management. Those aren’t built out yet and the base product will be free. No part of our revenue will come from data monetization.</p><p>We’d love for you to give Muddy a spin! You can download Muddy for Mac or Windows on our website and add others once inside: <a href="https://feelmuddy.com/">https://feelmuddy.com/</a>. We’ll be around to answer questions and look forward to any and all feedback!</p></div></td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft PlayReady – Complete Client Identity Compromise (164 pts)]]></title>
+            <title><![CDATA[Microsoft PlayReady – Complete Client Identity Compromise (169 pts)]]></title>
             <link>https://seclists.org/fulldisclosure/2024/May/5</link>
             <guid>40308261</guid>
             <pubDate>Thu, 09 May 2024 13:53:06 GMT</pubDate>
@@ -135,7 +251,7 @@ Web Archives &amp; RSS: <a rel="nofollow" href="https://seclists.org/fulldisclos
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[No "Zero-Shot" Without Exponential Data (127 pts)]]></title>
+            <title><![CDATA[No "Zero-Shot" Without Exponential Data (133 pts)]]></title>
             <link>https://arxiv.org/abs/2404.04125</link>
             <guid>40307832</guid>
             <pubDate>Thu, 09 May 2024 13:08:05 GMT</pubDate>
@@ -159,7 +275,7 @@ Web Archives &amp; RSS: <a rel="nofollow" href="https://seclists.org/fulldisclos
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Exploring HN by mapping and analyzing 40M posts and comments for fun (200 pts)]]></title>
+            <title><![CDATA[Exploring HN by mapping and analyzing 40M posts and comments for fun (224 pts)]]></title>
             <link>https://blog.wilsonl.in/hackerverse/</link>
             <guid>40307519</guid>
             <pubDate>Thu, 09 May 2024 12:31:04 GMT</pubDate>
@@ -570,7 +686,7 @@ df_scores = df_comments_relevant.groupby(<span>"author"</span>).agg({<span>"sim"
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: An SQS Alternative on Postgres (123 pts)]]></title>
+            <title><![CDATA[Show HN: An SQS Alternative on Postgres (139 pts)]]></title>
             <link>https://github.com/tembo-io/pgmq</link>
             <guid>40307454</guid>
             <pubDate>Thu, 09 May 2024 12:21:53 GMT</pubDate>
@@ -804,7 +920,7 @@ pg_partman_bgw.dbname = 'postgres'
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Deaf girl is cured in world first gene therapy trial (217 pts)]]></title>
+            <title><![CDATA[Deaf girl is cured in world first gene therapy trial (266 pts)]]></title>
             <link>https://www.independent.co.uk/news/health/deaf-cure-girl-gene-therapy-b2541735.html</link>
             <guid>40307138</guid>
             <pubDate>Thu, 09 May 2024 11:38:14 GMT</pubDate>
@@ -812,7 +928,7 @@ pg_partman_bgw.dbname = 'postgres'
 <div id="readability-page-1" class="page"><div id="main"><div data-newsletter-key="receiveIndyHealthNews"><p><img src="https://static.independent.co.uk/static-assets/images/newsletter/health/health.jpg" loading="lazy" alt="Health Check"></p><div><p><h3 data-nosnippet="">Sign up for our free Health Check email to receive exclusive analysis on the week in health</h3><h3 data-nosnippet="">Get our free Health Check email</h3></p></div></div><p>A <a href="https://www.independent.co.uk/topic/british">British</a> girl has had her hearing restored after becoming the first in the world to take part in a groundbreaking new <a href="https://www.independent.co.uk/topic/gene-therapy">gene therapy</a> trial.</p><p>Opal Sandy, aged 18 months, was born completely deaf due to the condition auditory neuropathy, which is caused by the disruption of nerve impulses travelling from the inner <a href="https://www.independent.co.uk/topic/ear">ear</a> to the <a href="https://www.independent.co.uk/topic/brain">brain</a>.</p><p>Now, thanks to a “one and done” gene therapy being trialled in the UK and worldwide, Opal’s hearing is almost normal – and could even improve further.</p><p>The little girl from Oxfordshire, who has a genetic form of auditory neuropathy, was treated at Addenbrooke’s Hospital, which is part of Cambridge University Hospitals NHS Foundation Trust.</p><p>Professor Manohar Bance, an ear surgeon at the trust and chief investigator for the trial, told the PA news agency the results were “better than I hoped or expected” and may point to a cure for patients with this type of deafness.</p><p>He said: “We have results from [Opal] which are very spectacular – so close to normal hearing restoration. So we do hope it could be a potential cure.”</p><div><figure><figcaption>Opal (centre) with her mother Jo, father James and sister Nora (left) at their home in Eynsham, Oxfordshire<span> <!-- -->(<!-- -->Andrew Matthews/PA Wire<!-- -->)</span></figcaption></figure></div><p>Auditory neuropathy can be caused by a fault in the OTOF gene, which is responsible for making a protein called otoferlin. This enables cells in the ear to communicate with the hearing nerve.</p><p>To overcome the fault, the “new era” gene therapy – from biotech firm Regeneron – delivers a working copy of the gene to the ear.</p><p>In Opal’s case, she received an infusion containing the working gene in her right ear during surgery last September.</p><p>Her parents Jo and James, both 33, noticed improvements to her hearing within four weeks when Opal turned her head to loud clapping.</p><p>“When she first turned, I couldn’t believe it,” Mrs Sandy told PA.</p><p>“I thought it was a fluke or like a change in light or something that had caught her eye, but I repeated it a few times.</p><p>“I picked my phone up and texted James, and said, ‘I think it’s working’. I was absolutely gobsmacked. I thought it was a fluke.”</p><p>But even more impressive results were on the horizon.</p><p>Some 24 weeks after surgery, in February this year, tests in Cambridge showed Opal could also hear soft sounds such as a whisper.</p><p>“The audiologist played back some of the sounds that she was responding to and they were ridiculously quiet sort of sounds that in the real world wouldn’t catch your attention during a conversation,” Mrs Sandy said.</p><p>“Certainly since February, we’ve noticed her sister [Nora] waking her up in the morning because she’s running around on the landing, or someone rings on the door so her nap’s cut short.</p><p>“She’s definitely responding more to sort of what we would call functional sounds rather than just sounds that we use to test her.</p><p>“We were told she had near-normal hearing last time – I think they got responses at sort of 25 to 30 decibels.</p><p>“I think normal hearing is classed at 20 decibels, so she’s not far off. Before, she had no hearing whatsoever.”</p><p>Prof Bance said Opal’s hearing is now “close to normal”, adding: “We hope she’ll get back to normal by the next testing.”</p><p>He added that the treatment is “a one-and-done therapy, so hopefully you have your treatment and then you go back to your life”.</p><p>A second child has also received the gene therapy treatment at Cambridge University Hospitals, with positive results seen recently, six weeks after surgery.</p><p>The overall phase 1/2 Chord trial consists of three parts, with three deaf children, including Opal, receiving a low dose of gene therapy in one ear only.</p><p>A different set of three children will get a high dose on one side. Then, if that is shown to be safe, more children will receive a dose in both ears at the same time.</p><p>Up to 18 youngsters from the UK, Spain and the US are being recruited to the trial and will be followed up for five years.</p><p>Prof Bance said: “My entire life, gene therapy has been ‘five years away’, and I’ve been in practice about 30 years.</p><p>“So, for me, it was almost unreal that this moment had arrived.</p><p>“It was just the fact that we’ve been hearing about this for so long, and there’s been so much work, decades of work … to finally see something that actually worked in humans … It was quite spectacular and a bit awe-inspiring really.</p><p>“It felt very special.”</p><p>At the moment, the gold standard treatment for auditory neuropathy is cochlear implants.</p><p>Opal had one fitted to her left ear at the same time as she underwent gene therapy in her right ear, to ensure she got hearing as soon as possible.</p><p>The youngster is the first patient globally to receive the Regeneron therapy and “she’s the youngest globally that’s been done to date as far as we know,” Prof Bance said.</p><p>China has also been working on targeting the same gene, with positive results, though Prof Bance said theirs uses a different technology and slightly different mode of delivery.</p><p>Medics in Philadelphia have also reported a good outcome with a type of gene therapy on an 11-year-old boy, who was operated on after Opal.</p><p>Prof Bance said he believes the trial is “just the beginning of gene therapies”, adding: “It marks a new era in the treatment for deafness.</p><p>“It also supports the development of other gene therapies that may prove to make a difference in other genetic-related hearing conditions, many of which are more common than auditory neuropathy.”</p><p>He said it could take a while for more children to benefit from gene therapy. The treatment was currently not available on the NHS.</p><p>“What’s really helped though is that the NHS does pay for genetic testing now for hearing loss,” he said.</p><div><figure><figcaption>Opal Sandy can now hear unaided for the first time<span> <!-- -->(<!-- -->Andrew Matthews/PA Wire<!-- -->)</span></figcaption></figure></div><p>Opal’s surgery, which was carried out under general anaesthetic, was very similar to fitting a cochlear implant, Prof Bance continued.</p><p>“So basically, we find the inner ear and we open the inner ear and infuse the treatment, in this particular case using a catheter, over 16 minutes,” he said.</p><p>“We have to make a release hole in another part of the ear to let the treatment out because it has to go all the way through the ear.</p><p>“And then we just repair and close up, so it’s actually a very similar approach to a cochlear implant, except we don’t put the implant in.”</p><p>Martin McLean, senior policy adviser at the National Deaf Children’s Society, welcomed the study, saying it would lead to learning regarding gene therapies for deafness with a specific genetic cause.</p><p>“We would like to emphasise that, with the right support from the start, deafness should never be a barrier to happiness or fulfilment,” he said.</p><p>“As a charity, we support families to make informed choices about medical technologies, so that they can give their deaf child the best possible start in life.”</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What I mean when I say that machine learning in Elixir is production-ready (122 pts)]]></title>
+            <title><![CDATA[What I mean when I say that machine learning in Elixir is production-ready (123 pts)]]></title>
             <link>https://cigrainger.com/elixirconf-eu-2024-keynote/</link>
             <guid>40307108</guid>
             <pubDate>Thu, 09 May 2024 11:33:49 GMT</pubDate>
@@ -880,7 +996,7 @@ pg_partman_bgw.dbname = 'postgres'
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Algebraic Data Types for C99 (239 pts)]]></title>
+            <title><![CDATA[Algebraic Data Types for C99 (251 pts)]]></title>
             <link>https://github.com/Hirrolot/datatype99</link>
             <guid>40307098</guid>
             <pubDate>Thu, 09 May 2024 11:31:27 GMT</pubDate>
@@ -1714,7 +1830,7 @@ test.c:10:1: warning: control reaches end of non-void function [-Wreturn-type]
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Boeing 737 crashes during take-off in Senegal (103 pts)]]></title>
+            <title><![CDATA[Boeing 737 crashes during take-off in Senegal (104 pts)]]></title>
             <link>https://www.bbc.co.uk/news/articles/ce5ljpnggp4o</link>
             <guid>40307084</guid>
             <pubDate>Thu, 09 May 2024 11:28:53 GMT</pubDate>
@@ -1769,7 +1885,162 @@ test.c:10:1: warning: control reaches end of non-void function [-Wreturn-type]
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tracking Illicit Brazilian Beef from the Amazon to Your Burger (226 pts)]]></title>
+            <title><![CDATA[UTC, Tai, and Unix Time (2001) (103 pts)]]></title>
+            <link>https://cr.yp.to/proto/utctai.html</link>
+            <guid>40306352</guid>
+            <pubDate>Thu, 09 May 2024 08:40:27 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://cr.yp.to/proto/utctai.html">https://cr.yp.to/proto/utctai.html</a>, See on <a href="https://news.ycombinator.com/item?id=40306352">Hacker News</a></p>
+<div id="readability-page-1" class="page">
+<a href="https://cr.yp.to/djb.html">D. J. Bernstein</a>
+<br><a href="https://cr.yp.to/time.html">Time</a>
+
+<h2>What is TAI?</h2>
+TAI, Temps Atomique International (French for International Atomic Time),
+measures real time.
+One second of TAI time is a constant duration defined by cesium radiation.
+TAI has been measured continuously since 1955
+and is the foundation of all civil time standards.
+<p>
+TAI times are identified by year, month, day, hour, minute, and second.
+There are exactly 86400 TAI seconds in every TAI day.
+TAI days are labelled by the Gregorian calendar.
+</p><h2>What is UTC?</h2>
+One day of Earth's rotation isn't exactly 86400 seconds.
+It's closer to 86400.002 seconds,
+wobbling slightly from day to day.
+<p>
+UTC, Coordinated Universal Time, is based on TAI, and very similar to it,
+except that UTC has <b>leap seconds</b> every year or two.
+For example, here's how UTC and TAI handled the end of June 1997:
+</p><p>
+1997-06-30 23:59:59 UTC = 1997-07-01 00:00:29 TAI<br>
+1997-06-30 23:59:60 UTC = 1997-07-01 00:00:30 TAI<br>
+1997-07-01 00:00:00 UTC = 1997-07-01 00:00:31 TAI<br>
+</p><p>
+Notice the 23:59:60 in UTC.
+That's a leap second.
+It extended 1997-06-30 UTC to 86401 seconds.
+Before the leap second, the TAI-UTC difference was 30 seconds;
+after the leap second, the TAI-UTC difference was 31 seconds.
+</p><p>
+By inserting occasional leap seconds into UTC,
+astronomers slow down UTC's progression to match Earth's rotation.
+That way the Sun will always be overhead at 12:00:00 UTC in England.
+(It's conceivable, but unlikely,
+that someday Earth's rotation will speed up past 1/86400 Hz.
+In that case astronomers will create negative leap seconds:
+UTC will skip from 23:59:58 to 00:00:00.)
+</p><p>
+Other time zones are based on UTC---e.g.,
+UTC minus 5 hours---so noon has a predictable relationship to the Sun
+in every time zone.
+</p><p>
+The leap-second system was introduced at the beginning of 1972.
+At that point UTC was TAI minus 10 seconds.
+</p><h2>What is UNIX time?</h2>
+UNIX time counts the number of seconds since an ``epoch.''
+This is very convenient for programs that work with time intervals:
+the difference between two UNIX time values is a
+real-time difference measured in seconds,
+within the accuracy of the local clock.
+Thousands of programmers rely on this fact.
+<p>
+What is the epoch?
+Originally it was defined as
+the beginning of 1970 GMT.
+GMT, Greenwich Mean Time,
+is a traditional term for the time zone in England.
+Unfortunately, it is ambiguous;
+it can refer to a variety of astronomical time scales.
+</p><p>
+Arthur David Olson's popular time library
+uses an epoch of 1970-01-01 00:00:10 TAI.
+</p><h2>What's the problem?</h2>
+For many years,
+the UNIX localtime() time-display routine didn't support leap seconds.
+In effect it treated TAI as UTC.
+Its displays slipped 1 second away from the correct local time
+as each leap second passed.
+Nobody cared;
+clocks weren't set that accurately anyway.
+<p>
+Unfortunately,
+xntpd, a program that synchronizes clocks using the Network Time Protocol,
+pandered to those broken localtime() libraries,
+at the expense of reliability.
+Watch how the xntpd time scale increases as a leap second occurs:
+</p><p>
+1997-06-30 23:59:59.7 UTC -&gt; 867715199.7 xntpd<br>
+1997-06-30 23:59:59.8 UTC -&gt; 867715199.8 xntpd<br>
+1997-06-30 23:59:59.9 UTC -&gt; 867715199.9 xntpd<br>
+1997-06-30 23:59:60.0 UTC -&gt; 867715200.0 xntpd<br>
+1997-06-30 23:59:60.1 UTC -&gt; 867715200.1 xntpd<br>
+1997-06-30 23:59:60.2 UTC -&gt; 867715200.2 xntpd<br>
+1997-06-30 23:59:60.3 UTC -&gt; 867715200.3 xntpd<br>
+1997-06-30 23:59:60.4 UTC -&gt; 867715200.4 xntpd<br>
+1997-06-30 23:59:60.5 UTC -&gt; 867715200.5 xntpd<br>
+1997-06-30 23:59:60.6 UTC -&gt; 867715200.6 xntpd<br>
+1997-06-30 23:59:60.7 UTC -&gt; 867715200.7 xntpd<br>
+1997-06-30 23:59:60.8 UTC -&gt; 867715200.8 xntpd<br>
+1997-06-30 23:59:60.9 UTC -&gt; 867715200.9 xntpd<br>
+1997-07-01 00:00:00.0 UTC -&gt; 867715200.0 xntpd<br>
+1997-07-01 00:00:00.1 UTC -&gt; 867715200.1 xntpd<br>
+1997-07-01 00:00:00.2 UTC -&gt; 867715200.2 xntpd<br>
+</p><p>
+The xntpd time scale repeats itself!
+It cannot be reliably converted to UTC.
+</p><p>
+By resetting the clock at each leap second,
+xntpd extracts a correct UTC display
+(except, of course, during leap seconds)
+from the broken localtime() libraries.
+Meanwhile,
+it produces incorrect results
+for applications that add and subtract real times.
+</p><h2>Why not fix it?</h2>
+It's easy enough to fix xntpd.
+It's also easy to fix localtime() to handle leap seconds.
+In fact, some vendors have already adopted Olson's time library.
+<p>
+The main obstacle is POSIX.
+POSIX is a ``standard'' designed
+by a vendor consortium several years ago
+to eliminate progress and protect the installed base.
+The behavior of the broken localtime() libraries
+was documented and turned into a POSIX requirement.
+</p><p>
+Fortunately, the POSIX rules are so outrageously dumb---for
+example, they require that 2100 be a leap year,
+contradicting the Gregorian calendar---that no
+self-respecting engineer would obey them.
+</p><h2>References</h2>
+The 
+<a href="http://www.boulder.nist.gov/timefreq/">NIST
+Time and Frequency Division Home Page</a>
+is a good starting point for programmers who want to learn about
+time measurement.
+<p>
+The Olson library is available from
+<a href="ftp://elsie.nci.nih.gov/pub/">ftp://elsie.nci.nih.gov/pub/</a>.
+The above argument against the xntpd time scale
+is shamelessly stolen from one of Olson's manual pages.
+</p><p>
+In preparation for the Y2036 and Y2038 disasters,
+I've put together some
+<a href="https://cr.yp.to/libtai.html">64-bit time manipulation code</a>,
+including very fast UTC-to-TAI conversion.
+My library supports the same TAI epoch as the Olson library.
+</p><p>
+I've also put together a
+<a href="https://cr.yp.to/clockspeed.html">very simple clock-synchronization package</a>,
+including a Network Time Protocol client
+that handles leap seconds correctly.
+
+
+</p></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Tracking Illicit Brazilian Beef from the Amazon to Your Burger (228 pts)]]></title>
             <link>https://e360.yale.edu/features/marcel-gomes-interview</link>
             <guid>40306249</guid>
             <pubDate>Thu, 09 May 2024 08:09:54 GMT</pubDate>
@@ -2079,7 +2350,7 @@ test.c:10:1: warning: control reaches end of non-void function [-Wreturn-type]
 <div id="readability-page-1" class="page"><div id="detailContent"><p><span><a href="https://www.cbc.ca/news/climate"><span>News</span></a></span></p><p>Shell sold millions of carbon credits for reductions in greenhouse gas emissions that never happened, allowing the company to turn a profit on its fledgling carbon capture and storage project, according to a new report by Greenpeace Canada.</p><h2 lang="en">Greenpeace describes deal with Alberta as 'hidden subsidy' that awarded money for 'phantom' credits</h2><div data-cy="storyWrapper"><figure><p><img alt="An employee looks at the facility" src="https://i.cbc.ca/1.7041427.1715214044!/fileImage/httpImage/image.jpg_gen/derivatives/16x9_780/carbon-capture.jpg" data-cy="leadmedia-story-img" fetchpriority="high"></p><figcaption>Shell's Quest facility near Edmonton has stored nine million tonnes of carbon dioxide since 2015.<!-- --> <!-- -->(Jason Franson/Bloomberg)</figcaption></figure><div><p dir="ltr">Shell sold millions of carbon credits for reductions in greenhouse gas emissions that never happened, allowing the company to turn a profit on its fledgling carbon capture and storage project, according to a <a href="https://www.greenpeace.org/static/planet4-canada-stateless/2024/02/4b010c8b-en-selling-hot-air-report.pdf"><u>new report</u></a> by Greenpeace Canada.</p><p dir="ltr">Under an agreement with the Alberta government, Shell was awarded two tonnes' worth of emissions reduction credits for each tonne of carbon it actually captured and stored underground at its Quest plant, near Edmonton.</p><p dir="ltr">This took place between 2015 and 2021 through a subsidy program for <a href="https://www.cbc.ca/news/climate/carbon-capture-canada-iea-1.7041175"><u>carbon, capture, utilisation and storage projects</u></a> (CCUS), which are championed by the oil and gas sector as a way to cut its greenhouse gas emissions.</p><p dir="ltr">At the time, Quest was the only operational CCUS facility in Alberta. The subsidy program ended in 2022.&nbsp;</p><p dir="ltr">During this period, Shell was able to sell 5.7 million tonnes of what Greenpeace describes as "phantom" credits, making more than $200 million for the company. These credits were sold to other oilsands companies on the Alberta carbon market, Greenpeace alleged.</p><p dir="ltr">Such sales would not have been illegal, but amounted to a "hidden subsidy" within the program&nbsp;which&nbsp;undercut the effectiveness of industrial carbon pricing, says Keith Stewart, senior energy strategist at Greenpeace and the author of the report.</p><p dir="ltr">"Carbon capture projects that have been advertised as a solution to pollution in the oilsands have been almost entirely paid for by the public," he said.</p><p dir="ltr">Shell has received $777 million from the federal and provincial governments&nbsp;and $406 million in revenue from carbon offsets, according to company records cited by Greenpeace.</p><p dir="ltr">In all, taxpayer funding has covered 93 per cent of the costs of Shell's Quest project to date, Greenpeace said.</p><p dir="ltr">Since 2015, the Quest project has stored nine million tonnes of CO2. (By comparison, emissions from the oil and gas sector totalled just over <a href="http://www.cbc.ca/news/canada/calgary/alberta-2024-national-inventory-report-2022-greenhouse-gas-emissions-1.7192042#:~:text=Alberta's%20emissions%20totalled%20270%20megatonnes,province's%20271%20megatonnes%20in%202021.">158 million tonnes</a> in 2022, the most recent federal data available.)</p><h2>'Smear job'&nbsp;</h2><p dir="ltr">Carbon offsets are bought and sold under a trading system, with governments putting a price on carbon dioxide emissions to compel companies to fight climate change.</p><p dir="ltr">Since 2007, Alberta has run a mandatory carbon offset system for large emitters, such as oil and gas companies. If they produce more than their allotted levels of carbon dioxide, they must purchase credits to offset those emissions.</p><div dir="ltr"><figure><p><img loading="lazy" alt="Equipment and buildings at an oilsands mine" srcset="https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_300/fort-hills-suncor.jpg 300w,https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_460/fort-hills-suncor.jpg 460w,https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_620/fort-hills-suncor.jpg 620w,https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/fort-hills-suncor.jpg 780w,https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_1180/fort-hills-suncor.jpg 1180w" sizes="(max-width: 300px) 300px,(max-width: 460px) 460px,(max-width: 620px) 620px,(max-width: 780px) 780px,(max-width: 1180px) 1180px" src="https://i.cbc.ca/1.5474405.1700862621!/fileImage/httpImage/image.jpg_gen/derivatives/original_780/fort-hills-suncor.jpg" data-cy="image-img"></p><figcaption>An oilsands mine in northern Alberta. A proposed carbon capture and storage facility to be built in northeastern Alberta is designed to cut emissions from the oilsands industry.<!-- --> <!-- -->(Kyle Bakx/CBC)</figcaption></figure></div><p dir="ltr">Ryan Fournier, a spokesperson for Alberta's Environment Minister Rebecca Schulz, said the report is a "smear job by Greenpeace."</p><p dir="ltr">Fournier acknowledged in an email that the Alberta government previously offered "important credits to help accelerate CCUS development."</p><p dir="ltr">But he described the program as a "targeted incentive to help drive CCUS investments at a time when this was still an unproven technology."&nbsp;</p><p dir="ltr">The <a href="https://www.shell.ca/en_ca/about-us/projects-and-sites/quest-carbon-capture-and-storage-project.html">Quest facility</a> is operated by Shell Canada and owned by Canadian Natural Resources, Chevron and Shell Canada.</p><p dir="ltr">In response to the report, Shell Canada spokesperson Stephen Doolan said carbon capture technology is critical to achieving international climate targets.</p><p dir="ltr">He said that as "a result of innovative fiscal and regulatory frameworks, nine million tonnes of CO2 have been captured at Shell's Quest facility that would have otherwise been released into the atmosphere."</p><p dir="ltr">Neither the province nor Shell denied the sale of the extra credits.</p><p dir="ltr">Doolan later followed up to add that the incentive had previously been publicly announced by the Alberta&nbsp;government and&nbsp;that it was in place "only until project costs broke even."</p><p><em><strong>WATCH&nbsp;|&nbsp;CO2 site worries Albertans: </strong></em><span><span><div title="Massive carbon capture facility worries Alberta residents" role="button" tabindex="0"><div><p><img src="https://thumbnails.cbc.ca/maven_legacy/thumbnails/671/607/carbon_mpx.jpg" srcset="" alt="" loading="lazy"></p></div><div><h3>Massive carbon capture facility worries Alberta residents</h3></div></div><span>Canadian oilsands companies want to build a $16.5-billion carbon capture project near Cold Lake, Alta. Residents fear that pumping millions of tonnes of CO2 underground will endanger their communities.</span></span></span></p><h2 dir="ltr">Heavily reliant on subsidies</h2><p dir="ltr">Pierre-Olivier Pineau, a professor and researcher in energy policy at HEC Montreal, said the Greenpeace report illustrates "a key underlying problem" for carbon capture and storage, that "the economic environment isn't yet there to make them sound business."&nbsp;</p><p dir="ltr">"It has to rely on subsidies, which become problematic because the government ends up subsidizing polluters," he said, adding that it also shows the need for a higher price on carbon.</p><p>"CCUS can only be correctly incentivized through a [higher] penalty on carbon emission," he said.&nbsp;</p><p>Without a sufficiently high price,&nbsp;Pineau&nbsp;says CCUS&nbsp;projects will be cancelled because "they are not as profitable as dumping CO2 straight in the atmosphere" — unless, as in the case of Shell, they are heavily subsidized, he said.</p><p dir="ltr">Last week, Edmonton-based Capital Power Corp. announced it was abandoning plans to build a $2.4-billion carbon capture and storage project at its Genesee natural gas-fired power plant southwest of Edmonton.</p><p dir="ltr">Up to three million tonnes of carbon dioxide per year would have been captured at the facility.</p><p dir="ltr">The Pathways Alliance, a consortium of Canada's largest oilsands companies, is still trying to move ahead with a $16.5-billion carbon capture pipeline project, but is seeking about two-thirds of that amount to be covered by subsidies.</p><h2 dir="ltr">Watching for loopholes</h2><p dir="ltr">Federal data released last week found <a href="https://www.cbc.ca/news/canada/calgary/alberta-2024-national-inventory-report-2022-greenhouse-gas-emissions-1.7192042#:~:text=Alberta's%20emissions%20totalled%20270%20megatonnes,province's%20271%20megatonnes%20in%202021."><u>Alberta was lagging</u></a> behind other provinces in terms of emissions reductions, with the oil and gas sector still the largest contributor to greenhouse gas emissions.</p><p dir="ltr">A spokesperson for Natural Resources Minister Jonathan Wilkinson said "the oil and gas sector needs to move forward on achieving reductions in absolute emissions."</p><p dir="ltr">"It is time for the sector to be spending money and putting into place solutions that will reduce carbon pollution and will ultimately strengthen the sector's long-term competitiveness," said Carolyn Svonkin.</p><div dir="ltr"><ul><li><a href="https://www.cbc.ca/news/canada/calgary/alberta-2024-national-inventory-report-2022-greenhouse-gas-emissions-1.7192042" text="Alberta's emissions down slightly but still make up lion's share of Canada's greenhouse gas" flag="" data-contentid=""><span>Alberta's emissions down slightly but still make up lion's share of Canada's greenhouse gas</span></a></li></ul><ul><li><a href="https://www.cbc.ca/news/canada/edmonton/capital-power-ccs-1.7192920" text="Financial risks of novel technology likely derailed Alberta carbon capture project, analysts say" flag="" data-contentid=""><span>Financial risks of novel technology likely derailed Alberta carbon capture project, analysts say</span></a></li></ul></div><p dir="ltr">In reference to the Greenpeace report, Svonkin noted that the federal government updated its national carbon pricing benchmark in 2021 "to ensure all provincial and territorial pricing systems are comparable in terms of stringency and effectiveness."&nbsp;</p><p dir="ltr">"This put an end to processes that could have rewarded industry for emissions reductions that are not real," the statement said.</p><p dir="ltr">The federal government is expected to announce details for its emissions cap on the oil and gas sector in the coming months. Stewart said he wants to make sure there aren't similar "loopholes built into it in obscure ways that undercut the effectiveness of the policy."</p><div dir="ltr"><ul><li><a href="https://www.cbc.ca/news/canada/saskatoon/boundary-dam-carbon-capture-missing-emmision-goals-1.7191867" text="Missed emissions goals at Sask. carbon capture project raising questions" flag="" data-contentid=""><span>Missed emissions goals at Sask. carbon capture project raising questions</span></a></li></ul></div></div></div><div><h2>ABOUT THE AUTHOR</h2><div><figure><p><img loading="lazy" alt="" srcset="https://i.cbc.ca/1.3502943.1669653259!/fileImage/httpImage/image.jpg_gen/derivatives/square_300/benjamin-shingler.jpg 300w,https://i.cbc.ca/1.3502943.1669653259!/fileImage/httpImage/image.jpg_gen/derivatives/square_460/benjamin-shingler.jpg 460w,https://i.cbc.ca/1.3502943.1669653259!/fileImage/httpImage/image.jpg_gen/derivatives/square_620/benjamin-shingler.jpg 620w" sizes="(max-width: 258pxpx) 258pxpx" src="https://i.cbc.ca/1.3502943.1669653259!/fileImage/httpImage/image.jpg_gen/derivatives/square_620/benjamin-shingler.jpg" data-cy="author-image-img"></p></figure></div><p>Benjamin Shingler is a senior writer based in Montreal, covering climate policy, health and social issues. He previously worked at The Canadian Press and the New Brunswick Telegraph-Journal. </p><ul></ul></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Time I Lied to the CTO and Saved the Day (443 pts)]]></title>
+            <title><![CDATA[The Time I Lied to the CTO and Saved the Day (447 pts)]]></title>
             <link>https://GrumpyOldDev.com/post/the-one-where-i-lie-to-the-cto/</link>
             <guid>40304453</guid>
             <pubDate>Thu, 09 May 2024 01:39:27 GMT</pubDate>
@@ -2198,7 +2469,7 @@ were rock stars for a bit.  Maybe more like <a href="https://en.wikipedia.org/wi
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Opening Windows in Linux with sockets, bare hands and 200 lines of C (206 pts)]]></title>
+            <title><![CDATA[Opening Windows in Linux with sockets, bare hands and 200 lines of C (211 pts)]]></title>
             <link>https://hereket.com/posts/from-scratch-x11-windowing/</link>
             <guid>40303661</guid>
             <pubDate>Wed, 08 May 2024 23:14:28 GMT</pubDate>
@@ -3996,62 +4267,6 @@ How much of a productivity increase is that? Well jeepers, if you’re only doin
                   <p><span>For context, ChatGPT doesn't seem to be very good at less popular languages. In my experience, it's able to generate good C# code, but it is very poor at generating Autohotkey code. So it's a similiar situation here with LISP.</span></p></div></td></tr>
         </tbody></table></td></tr>
             </tbody></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Consistency LLM: converting LLMs to parallel decoders accelerates inference 3.5x (425 pts)]]></title>
-            <link>https://hao-ai-lab.github.io/blogs/cllm/</link>
-            <guid>40302201</guid>
-            <pubDate>Wed, 08 May 2024 19:55:07 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://hao-ai-lab.github.io/blogs/cllm/">https://hao-ai-lab.github.io/blogs/cllm/</a>, See on <a href="https://news.ycombinator.com/item?id=40302201">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p><a href="https://arxiv.org/abs/2403.00835" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/arXiv-2403.00835-white.svg?style=social">
-</a><a href="https://github.com/hao-ai-lab/Consistency_LLM" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/github/stars/hao-ai-lab/Consistency_LLM?style=social"></a></p><p><strong>TL;DR:</strong> LLMs have been traditionally regarded as sequential decoders, decoding one token after another. In this blog, we show pretrained LLMs can be easily taught to operate as efficient parallel decoders. We introduce <strong>Consistency Large Language Models (CLLMs)</strong>, a new family of parallel decoders capable of reducing inference latency by efficiently decoding an $n$-token sequence per inference step. Our research shows this process – mimicking human cognitive process of forming complete sentences in mind before articulating word by word – can be effectively learned by simply finetuning pretrained LLMs. Specifically, CLLMs are trained to perform parallel decoding by mapping any randomly initialized $n$-token sequence to the same result yielded by autoregressive (AR) decoding in as few steps as possible. Experiment results show CLLMs obtained using our proposed method are highly effective, showing $2.4\times$ to $3.4\times$ improvements in generation speed, in par with or even beter than other fast inference techniques like Medusa2 and Eagle, yet require no additional memory cost to accomodate auxiliary model components at inference time.</p><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/baseline_vs_cllm_gsm8k_best_acc_demo.gif" alt="cllm-gsm8k-acc-demo"></p><figcaption>Figure 1: Demo of $\sim 3 \times$ speedup by CLLM-ABEL-7B-001 in comparison with baseline <a href="https://github.com/GAIR-NLP/abel">ABEL-7B-001</a> using Jacobi decoding on GSM8K.</figcaption></div></figure><h2 id="background-jacobi-decoding">Background: Jacobi Decoding</h2><p>Large language models (LLMs) are transforming the landscape of human lives, from programming to offering legal and health advice. However, during inference, LLMs generate responses token by token using AR decoding as shown in Figure 1, leading to high latency for longer responses. Using AR decoding, it often necessitates architectural modifications, auxiliary components, or draft models, to speed up inference by generating more than one token at a time.</p><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/clm_objective.png" alt="autoregressive"></p><figcaption>Figure 2: illustration of conventional AR decoding: one token is generated at a time.</figcaption></div></figure><p><a href="https://arxiv.org/abs/2305.10427">Jacobi decoding</a> originates from the Jacobi and Gauss-Seidel fixed-point iteration for solving nonlinear equations, and <a href="https://proceedings.mlr.press/v139/song21a.html">is proven identical to AR generation using greedy decoding</a>. Jacobi decoding reformulates the sequential generation process into a system of $n$ non-linear equations with $n$ variables solvable in parallel based on Jacobi iteration. Each iteration step might predict more than one correct token (By “correct”, we mean alignment with the AR decoding
-result under a greedy sampling strategy), thereby accelerating AR decoding potentially.</p><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/jacobi_objective.png" alt="jacobi"></p><figcaption>Figure 3: illustration of Jacobi decoding: $n$-token sequence is fed into the LLM and iterates until convergence.</figcaption></div></figure><p>To be specific, Jacobi decoding method first randomly guesses the next $n$ tokens in a sequence (referred to as $n$-token sequence hereinafter unless specified otherwise) from an input prompt. The $n$-token sequence, along with the prompt, is then fed to the LLM to iteratively update itself. This process continues until the $n$-token sequence stabilizes and no further changes occur, reaching a fixed point. Notably, Jacobi decoding requires no more queries to the LLM than auto-regressive (AR) decoding. Eventually, the $n$-token sequence converges to the output that would be generated by AR decoding under a greedy strategy. This progression from an initial random guess to the final AR generation outcome traces what is known as a Jacobi trajectory. An instance of Jacobi decoding iteration process and <strong>Jacobi trajectory</strong> is illustrated in Figure 2.</p><h3 id="limitations-of-jacobi-decoding">Limitations of Jacobi Decoding</h3><div><p>However, vanilla Jacobi decoding for LLMs shows only marginal speedup over AR decoding in practice, e.g., <a href="https://arxiv.org/abs/2305.10427">an average of $1.05\times$ speedup</a>. This is because an AR-trained LLM can rarely yield a correct token when there are incorrections in its preceding tokens. Thereby, most Jacobi iterations gain only one correction for the $n$-token sequence, resulting in a longer trajectory as illustrated on the left side of Figure 3.</p><p><a href="https://lmsys.org/blog/2023-11-21-lookahead-decoding/">Lookahead decoding</a> and speculative decoding methods try to mitigate inefficiency in Jacobi decoding and conventional AR decoding, but incurs extra memory cost during inference time. While CLLMs require none.</p></div><h2 id="consistency-llms-cllms">Consistency LLMs (CLLMs)</h2><h3 id="jacobi-decoding-preliminary">Jacobi Decoding Preliminary</h3><p>Given a prompt $\mathbf x$ and a pre-trained LLM $p(\cdot| \mathbf x)$, LLM typically generates with the standard AR decoding method under the greedy strategy, i.e.</p><p>$$
-\begin{align}
-y_i = \underset{y}{\text{arg max }} p(y | \mathbf {y}_{:i}, \mathbf x) \ \ \text{for}\,\, i = 1,\dots,n
-\end{align}
-$$</p><p>Jacobi decoding re-frames the LLM inference process as solving a system of nonlinear equations to transform the decoding process into a parallelizable computation. Consider, $f(y_i, \mathbf y_{:i}, \mathbf x):= y_i- \underset{y}{\text{arg max }} p(y | \mathbf y_{:i}, \mathbf x)$, we can rewrite the above equation as a system of nonlinear equations:</p><p>$$
-\begin{align}
-f(y_i, \mathbf y_{:i}, \mathbf x) = 0 \ \ \text{for} \quad i = 1,\dots,n
-\Longrightarrow
-\begin{cases}
-y_{1}^{(j+1)} &amp;= \underset{y}{\text{arg max}} \ \ p(y | \mathbf x) \\
-y_{2}^{(j+1)} &amp;= \underset{y}{\text{arg max}} \ \ p(y | \mathbf y_{1}^{(j)}, \mathbf x) \\
-&amp; \vdots \\
-y_{n}^{(j+1)} &amp;= \underset{y}{\text{arg max}} \ \ p(y | \mathbf y_{:n}^{(j)}, \mathbf x)
-\end{cases}
-\end{align}
-$$</p><p>Note that the process exits at some k such that $\mathbf y^{(k)} = \mathbf y^{(k−1)}$ and we define $\mathbf y^{∗} := \mathbf y^{(k)}$ as the <strong>fixed point</strong>, and $\mathcal J := \set{ \mathbf y^{(1)}, \dots, \mathbf y^{(k)} }$ as the <strong>Jacobi trajectory</strong>.</p><h3 id="training-with-jacobi-trajectories">Training with Jacobi Trajectories</h3><p>To address this, we propose adapting pre-trained LLMs so that they can consistently map any point $\mathbf y$ on the Jacobi trajectory $\mathcal{J}$ to the fixed point $\mathbf y^*$. Surprisingly, we find such an objective is analogous to that of <a href="https://arxiv.org/abs/2303.01469">consistency models</a>, a leading acceleration approach for diffusion models. In our proposed method, we use Jacobi trajectories collected from a target model to train the model with a loss that encourages single-step convergence during Jacobi iterations. For each target model $p$ to be adapted as a CLLM, the training consists of two parts:</p><div><ul><li><strong>Jacobi trajectory preparation:</strong> for each prompt, we sequentially perform Jacobi decoding for every truncation of $n$ tokens until the entire response sequence $\mathbf l$ has been generated, which amounts to a concatenation of all consecutive fixed points. Each sequence generated along a trajectory counts as one data entry. Note that for a lengthy response $\mathbf l$ of $N$ ($N ≫ n$) tokens, such truncation avoids slow model evaluation on lengthy input.</li></ul></div><div><ul><li><strong>Training with consistency and AR loss:</strong> we jointly optimize two losses for tuning CLLMs, the consistency loss guarantees the prediction of multiple tokens at once and the AR loss prevents the CLLM from deviating from the target LLM so as to maintain generation quality.</li></ul></div><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/cllm_objective.png" alt="training_objective"></p><figcaption>Figure 4: an illustration of consistency training for one-step convergence: refining the target LLM to consistently predict the fixed point given any state along Jacobi trajectory as input.</figcaption></div></figure><h3 id="consistency-and-ar-loss">Consistency and AR Loss</h3><h4 id="consistency-loss">Consistency Loss</h4><div><p>Let $p$ denote the target LLM. Let $q_\theta(\cdot| \mathbf x)$ denote the CLLM with parameters $\theta$ initialized with those of $p$. For a prompt $\mathbf x$ and the corresponding Jacobi trajectory $\mathcal{J}$, let $\mathbf y$ and $\mathbf y^*$ denote a random state and the fixed point on the trajectory, respectively.</p><p>We can encourage CLLM to output $\mathbf y^*$ with $\mathbf y$ as the input by minimizing the following loss, termed as the <strong>global consistency (GC) loss</strong>:</p></div><p>$$
-\begin{align}
-\mathcal L_{\text{GC}} =\underset{(\mathbf x, \mathcal{J}) \sim \mathcal{D}, \mathbf y \sim \mathcal{J}}{\mathbb E} \Big[ \sum_{i=1}^n D( q_{\theta^{-}}(\cdot|\mathbf y_{:i}^{*}, \mathbf x)) || q_{\theta}(\cdot|\mathbf y_{:i}, \mathbf x)\Big]
-\end{align}
-$$</p><div><p>where $\theta^{-} = \text{stopgrad}(\theta)$ and we abuse notations to represent uniform sampling from the dataset, and we abuse notations to represent uniform sampling from the dataset. $D(\cdot||\cdot)$ denotes the distance between two distributions, choices are discussed in <a href="https://arxiv.org/abs/2306.13649">the GKD method</a> and in this paper we primarily experiment with the forward KL.</p><p>Alternatively, local consistency (LC) loss following the formulation in consistency models, where the adjacent states $(\mathbf y^{(j)}, \mathbf y^{(j+1)})$ in a Jacobi trajectory $\mathcal{J}$ are driven to yield the same outputs:</p></div><p>$$
-\begin{align}
-\mathcal L_{\text{LC}} =\underset{(\mathbf x, \mathcal{J}) \sim \mathcal{D}, (\mathbf y^{(j)}, \mathbf y^{(j+1)} )\sim \mathcal{J}}{\mathbb E} \Big[ \sum_{i=1}^n D( q_{\theta^{-}}(\cdot|\mathbf y_{:i}^{(j+1)}, \mathbf x)) || q_{\theta}(\cdot|\mathbf y_{:i}^{(j)}, \mathbf x) \Big]
-\end{align}
-$$</p><h4 id="ar-loss">AR Loss</h4><p>To avoid deviating from the distribution of the target LLM, we incorporate the traditional AR loss based on the generation $\mathbf l$ of the target LLM $p$:</p><p>$$
-\begin{align}
-\mathcal L_{\text{AR}} = \underset{ (\mathbf x, \mathbf l) \sim \mathcal D }{\mathbb E} \Big[ - \sum_{i=1}^N \log q_{\theta}(l_i | \mathbf l_{:i}, \mathbf x) \Big]
-\end{align}
-$$</p><p>Putting the two loss together, with some weight $w$, the total loss for training a CLLM is:</p><p>$$
-\mathcal{L}(\theta) = \mathcal L_{\text{consistency}} + w\mathcal{L}_{\text{AR}}
-$$</p><h2 id="experiments">Experiments</h2><h3 id="results">Results</h3><p>Our experiments contain three domain-specific tasks, including Spider (text-to-SQL), Human-Eval (Python code completion), and GSM8k (math), and the broader open-domain conversational challenge, MT-bench. Reported experiments were conducted using either fine-tuned coder LLM, Deepseek-coder-7B-instruct, LLaMA-2-7B or ABEL-7B-001 as the target model depending on the task. Both training and evaluation are carried out on NVIDIA A100 40GB servers.</p><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/cllm_speedup.png" alt="speedup"></p><figcaption>Figure 5: CLLM speedup on different downstream tasks. CLLMs are significantly faster than pre-trained models and achieve comparable speedups in comparison with Medusa, yet with no extra cost at inference time.</figcaption></div></figure><figure><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/mt-bench.png" alt="specialized">
-<img src="https://hao-ai-lab.github.io/blogs/cllm/img/specialized_domains.png" alt="mt_bench"></p><p><figcaption>Figure 6: illustration of CLLM vs. other baselines on domain-specific tasks (Spider, CSN-Python, GSM8k), as well as on MT-bench. CLLMs achieve similar or even better speedup in comoparison with Medusa2 while introducing no extra inference cost (in terms FLOPS and memory consumption).</figcaption></p></figure><div><p><strong>Specialized domains:</strong> From Figure 5, we can see that in comparison with other baselines including the original target model, Medusa2, and speculative decoding, CLLMs achieve the most significant speedup.</p><p><strong>Open-domain conversational Challenge (MT-bench):</strong> CLLM trained from LLaMA2-7B using ShareGPT dataset can achieve roughly the same speedup as Medusa2 when combined with lookahead decoding, with comparable scores on MT-bench. However, CLLM offers higher adaptability and memory efficiency as it requires no modifications to the target model’s original architecture and no auxiliary components.</p></div><h3 id="training-cost">Training Cost</h3><div><p>The fine-tuning cost of CLLMs is moderate, e.g., passing only around 1M tokens for LLaMA-7B to achieve a $3.4\times$ speedup on the Spider dataset. In the cases where the dataset size is large, for example, for CodeSearchNet-Python, only 10% of the dataset is required to generate Jacobi trajectories in training CLLMs to obtain around $2.5\times$ speedup. The total number of tokens can be estimated by taking:</p><p>$N = $ avg # of trajectories per prompt $ \times $ avg trajectory length $ \times $ # of prompts.</p></div><div><table><thead><tr><th>dataset</th><th>estimated training cost (tokens)</th><th>$\%$ of pre-training cost</th></tr></thead><tbody><tr><td>Spider</td><td>2M</td><td>$&lt; 0.01\%$</td></tr><tr><td>CodeSearchNet-Python</td><td>100M</td><td>$\sim 0.1\%$</td></tr><tr><td>GSM8K</td><td>10M</td><td>$\sim 0.01\%$</td></tr><tr><td>ShareGPT</td><td>200M</td><td>$\sim 0.2\%$</td></tr></tbody></table></div><h3 id="fast-forwarding-and-stationary-tokens">Fast Forwarding and Stationary Tokens</h3><figure><div><p><img src="https://hao-ai-lab.github.io/blogs/cllm/img/trajectory_compare_aligned.png" alt="trajectory_compare"></p><figcaption>Figure 7: Comparison of Jacobi trajectory between a target LLM and CLLMs on Spider. Each point along the Jacobi trajectory is a color-coded sequence: blue for correct tokens matching with AR results, and red for inaccurate ones. CLLM demonstrates enhanced efficiency, converging to the fixed point $2\times$ faster the Target LLM. This increased efficiency in the CLLM can be attributed to the consistency loss which facilitates the learning of the structure of each $n$-token sequence given a prefix.</figcaption></div></figure><div><p>The left side of Figure 6 shows target LLMs typically generate only one correct token in one iteration. In contrast, in CLLMs, we identify <strong>fast forwarding phenomenon</strong> where multiple consecutive tokens are correctly predicted in a single Jacobi iteration.</p><p>Moreover, tokens correctly generated in advance (e.g. “country” and “H” at index 6 and 7 on the left side of Figure 6), are often replaced inaccurately in subsequent iterations in target LLMs. On the other hand, CLLMs exhibit the capability of predicting correct tokens preemptively, even with preceding incorrect tokens, while ensuring the tokens remain unchanged. We term such tokens as <strong>stationary tokens</strong>. Both phenomena contribute to the fast convergence in Jacobi decoding of CLLMs, thereby leading to a considerable generation speedup.</p><p>We observe that CLLMs acquire a crucial linguistic concept through training – <strong>collocations</strong>: a series of words or terms that <a href="https://aclanthology.org/P91-1036.pdf">co-occur more frequently than one would expect by random chance</a>. Language is not solely composed of isolated words but also relies heavily on specific word pairings. Examples of collocations are abundant in both natural and coding languages. They include verb + preposition combinations (e.g., ‘’talk to’’, ‘‘remind … of …’’), verb + noun structures (e.g., ‘‘make a decision’’, ‘‘catch a cold’’), and many more domain-specific syntactical structures (e.g., ‘‘SELECT … FROM …’’, ‘‘if … else’’ for programming). The consistency generation objective allows CLLMs to infer such structures from any point in the Jacobi trajectory, encouraging CLLMs to acquire proficiency in numerous collocations and thereby predict multiple words simultaneously to minimize iteration steps.</p></div><h2 id="get-started">Get started</h2><h2 id="acknowledgement">Acknowledgement</h2><p>We would like to thank Yang Song, Canwen Xu, Yonghao Zhuang, Dacheng Li and Yichao Fu for providing insightful feedback.</p><h2 id="citation">Citation</h2><pre tabindex="0"><code>@misc{kou2024cllms,
-      title={CLLMs: Consistency Large Language Models}, 
-      author={Siqi Kou and Lanxiang Hu and Zhezhi He and Zhijie Deng and Hao Zhang},
-      year={2024},
-      eprint={2403.00835},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL}
-}
-</code></pre></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Breathwork supports emergence of altered states of consciousness (202 pts)]]></title>
-            <link>https://www.researchsquare.com/article/rs-3976380/v1</link>
-            <guid>40302200</guid>
-            <pubDate>Wed, 08 May 2024 19:54:58 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.researchsquare.com/article/rs-3976380/v1">https://www.researchsquare.com/article/rs-3976380/v1</a>, See on <a href="https://news.ycombinator.com/item?id=40302200">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p><span><p>Altered states of consciousness (ASCs), induced e.g. by psychedelics, show great potential to treat widespread mental health disorders like depression and PTSD. However, access to such treatments is restricted by legal, medical, and financial barriers. Here, we explore the potential of circular breathwork to serve as an accessible, non-pharmacological alternative to engage similar therapeutic processes. Scientific studies investigating the mental health effects of breathwork are only just emerging and the underlying physiological and psychological mechanisms are largely unknown. In this study, we address these questions by tracking physiological and experiential dynamics throughout a breathwork session, comparing two popular forms of breathwork: Holotropic Breathwork<sup>®</sup> and Consciously-Connected breathwork. We show that a reduction in end-tidal CO2 pressure due to deliberate hyperventilation is instrumental in catalyzing ASCs during breathwork. ASCs evoked by breathwork were comparable to those produced by psychedelics, and their depth predicted psychological and physiological follow-on effects, including improved well-being and a reduction of depressive symptoms. Moreover, different breathwork formats produced highly similar physiological, experiential and psychological outcomes. These results outline physiological boundary conditions for ASCs to arise in a non-pharmacological context, shedding light on the functional mechanisms of breathwork as well as its potential as a psychotherapeutic tool.</p></span></p></div></div>]]></description>
         </item>
     </channel>
 </rss>
