@@ -4,12 +4,82 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 10 May 2024 07:00:05 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 10 May 2024 08:00:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The world has probably passed peak pollution (147 pts)]]></title>
+            <title><![CDATA[The most backdoor-looking bug I've ever seen (2021) (109 pts)]]></title>
+            <link>https://words.filippo.io/dispatches/telegram-ecdh/</link>
+            <guid>40315274</guid>
+            <pubDate>Fri, 10 May 2024 03:33:11 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://words.filippo.io/dispatches/telegram-ecdh/">https://words.filippo.io/dispatches/telegram-ecdh/</a>, See on <a href="https://news.ycombinator.com/item?id=40315274">Hacker News</a></p>
+<div id="readability-page-1" class="page"><section>
+            <!--kg-card-begin: markdown--><p>This is the story of a bug that was discovered and fixed in Telegram's self-rolled cryptographic protocol about seven years ago. The bug didn't get any press, and no one seems to know about it, probably because it was only published in Russian.</p>
+<p>To this day, it's the most backdoor-looking bug I've ever seen.</p>
+<p>Google Translate does a good enough job on the <a href="https://habrahabr.ru/post/206900/?ref=words.filippo.io">original article</a>, which is still available on Habr, but I'm going to walk you through it along with some context.</p>
+<p>Telegram is a popular chat app that uses its own... bizarre protocol to encrypt chats, called MTProto. The protocol is used both to encrypt all messages to the Telegram server, and to encrypt opt-in 1:1 end-to-end "Secret Chats".<sup><a href="#fn1" id="fnref1">[1]</a></sup> In text I can't do justice to the facial expressions of cryptographers when you mention Telegram's protocol, so just believe me that it's <em>weird</em>.</p>
+<p>The current consensus seems to be that the latest version is not broken in known ways that are severe or relevant enough to affect end users, assuming the implementation is correct. That is about as safe as leaving exposed wires around your house because they are either not live or placed high enough that no one should touch them.</p>
+<p>The original version was, however, completely broken, in the most puzzling of ways.</p>
+<p>End-to-end Telegram chat sessions use <a href="https://en.wikipedia.org/wiki/Diffie%E2%80%93Hellman_key_exchange?ref=words.filippo.io">finite-field Diffie-Hellman</a><sup><a href="#fn2" id="fnref2">[2]</a></sup> to establish a shared key between the two participants. The negotiation happens through messages relayed by the Telegram server. Diffie-Hellman is a fundamental building block of many cryptosystems, and it allows two parties to establish a shared secret that any eavesdroppers can't derive. It is however only one part of a secure key exchange, because an attacker capable of intercepting the messages could simply establish two separate sessions with the two parties, carrying out a <a href="https://en.wikipedia.org/wiki/Person-in-the-middle_attack?ref=words.filippo.io">Person-in-the-Middle</a> attack. The parties need some way to verify they derived the same secret. In TLS, they use a signature from a certificate. In most secure chat apps, there is a fingerprint ("Safety Numbers" in Signal) that the two parties can compare out-of-band.<sup><a href="#fn3" id="fnref3">[3]</a></sup> What's important is that if the two sides derived the same secret, they can be sure no one else has access to it.</p>
+<p>The Telegram key exchange is described in <a href="https://web.archive.org/web/20131220000537/https://core.telegram.org/api/end-to-end#key-generation">the "Key Generation" section of Telegram's end-to-end API docs</a>. Concretely, Alice requests the DH parameters <code>(p, g)</code> from Telegram, painstakingly verifies them, computes a random <code>a</code> value, and sends <code>g^a mod p</code> to Telegram. Bob receives <code>(p, g, g^a mod p)</code>, similarly computes <code>b</code> and <code>g^b mod p</code>, and sends the latter back (along with a truncated hash of the derived key, for some reason).</p>
+<p>Now, normally the two sides would compute the shared key as <code>(g^a)^b mod p</code> and <code>(g^b)^a mod p</code>. Instead, the original version of MTProto computed it as</p>
+<pre><code>(g^a)^b mod p XOR nonce
+</code></pre>
+<p>where <code>nonce</code> was an arbitrary, supposedly random value sent by the server along with the peer's public contribution.</p>
+<p>This was a completely non-standard and useless addition, and all it did was let the server perform an undetected Person-in-the-Middle attack. Let's see how.</p>
+<p>In a normal PitM, the server negotiates two separate Diffie-Hellman sessions with Alice and Bob, who end up with different shared keys, which they could detect by comparing fingerprints.</p>
+<pre><code>Alice                     Telegram              Bob
+
+a = random()       
+A = g^a mod p       -&gt;
+                        t = random()
+                        T = g^t mod p -&gt;
+                                          b = random()
+                                      &lt;-  B = g^b mod p
+                                          key = T^b mod p
+                    &lt;-  T
+key = T^a mod p
+
+                    T^a mod p != T^b mod p
+</code></pre>
+<p>With the nonce addition, however, the server could "fix" Alice's key to match Bob's by manipulating Alice's nonce. The two parties would end up with the same fingerprint, and couldn't tell that an attack happened, but the server (and no one else) would know the shared key, allowing it to decrypt all messages.</p>
+<pre><code>nonce_bob = random()
+key_bob = T^b mod p  XOR  nonce_bob
+
+nonce_alice = A^t mod p  XOR  B^t mod p  XOR  nonce_bob
+key_alice = T^a mod p  XOR  nonce_alice =
+  T^a mod p  XOR  (A^t mod p  XOR  B^t mod p  XOR  nonce_bob) =
+  B^t mod p  XOR  nonce_bob = key_bob
+</code></pre>
+<p>Why do I say this addition was useless? Because it literally had no purpose! Indeed, the vulnerability was <a href="https://web.archive.org/web/diff/20131220000537/20131225140924/http://core.telegram.org/api/end-to-end">fixed by silently removing the nonce step from the docs</a>.<sup><a href="#fn4" id="fnref4">[4]</a></sup> <a href="https://core.telegram.org/constructor/encryptedChatRequested?layer=11&amp;ref=words.filippo.io">A later API revision</a> removed the nonce parameter with the caption "Improve secret chats". All <a href="https://web.archive.org/web/20131028041748/http://core.telegram.org/constructor/encryptedChatRequested">the original API reference</a> said about the nonce is "Random server sequence for calculation of key".</p>
+<p>I never heard a plausible explanation for why the designers of MTProto went out of their way to add useless complexity to their protocol, with the only outcome of making undetectable interception possible.</p>
+<p><strong>Edit (2021-01-11)</strong>: <a href="https://twitter.com/asdofindia/status/1348491279798128641?ref=words.filippo.io">@asdofindia linked me on Twitter</a> to <a href="https://telegram.org/blog/crowdsourcing-a-more-secure-future?ref=words.filippo.io">an official statement by Telegram about this</a> that I couldn't find anymore. It claims the nonce was there to protect clients with weak random number generators. Here's what I had buried into a footnote when I couldn't find a citation to attribute that explanation to Telegram:</p>
+<blockquote>
+<p>This doesn't make sense for a number of reasons: 1) clients with weak randomness are likely to be toast anyway, because Telegram's bizarro not-a-MAC relies on randomness in the payload to avoid an offline decryption oracle (there is a plaintext hash of the payload on the wire, I told you this was weird!); 2) the API also allows clients to request random bytes from the server to XOR with their secret share; and 3) defending against weak randomness by relying on a server contribution defends against everything but the server, which is the relevant attacker in the end-to-end setting. (Said another way, anyone that can intercept client-server messages can see the extra randomness, making it moot.) Non-practitioners might think this is a reasonable defense in depth, belts and suspenders kind of thing, but in cryptography engineering adding complexity to defend against scenarios that lead to compromise anyway is simply pointless.</p>
+</blockquote>
+<p>Anyway, it's been a while, the world is a different place now, and maybe <a href="https://en.wikipedia.org/wiki/Hanlon%27s_razor?ref=words.filippo.io">Hanlon's razor</a> cuts deeper than I thought. I think there are better reasons not to use Telegram today than this old bug<sup><a href="#fn1" id="fnref1:1">[1:1]</a></sup>, but it's still what I think about every time people talk about far-fetched "bugdoors". The bar is high!</p>
+<h2 id="the-picture">The picture</h2>
+<p>In other news, this newsletter is going to pivot into Rome photoblogging. (Not really, if you made it this far and like cryptography engineering, you should <a href="https://buttondown.email/cryptography-dispatches?tag=header&amp;ref=words.filippo.io">subscribe</a> or <a href="https://twitter.com/FiloSottile?ref=words.filippo.io">follow me on Twitter</a>.)</p>
+<p><img src="https://words.filippo.io/content/images/2022/01/ee618b89-a8fa-45a2-af01-6f9955d2c99a.jpeg" alt="St. Peter's reflecting in the Tevere" loading="lazy"></p>
+<hr>
+<section>
+<ol>
+<li id="fn1"><p>By the way, aside from all the cryptographic weirdness and the unexplained backdoor-looking bug, the real reason you should not trust Telegram's encryption is that it's off by default, inconvenient to use, and simply unavailable in groups, meaning most messages flow unencrypted on Telegram's servers. Nonetheless, Telegram markets itself as a secure chat app, with misleading copy along the lines of "everything is encrypted, Secret Chats are just <em>more</em> encrypted!" They explain in their FAQ that it's all about backups, and that other more secure apps "<a href="https://telegram.org/faq?ref=words.filippo.io#dev_page_content:~:text=Other%20apps%20ignore%20the%20need%20for,before%20ever%20reaching%20a%20million%20users.">never reach a million users</a>". <a href="https://twitter.com/signalapp/status/1347240006444675072?ref=words.filippo.io">In other news</a>. <a href="#fnref1">↩︎</a> <a href="#fnref1:1">↩︎</a></p>
+</li>
+<li id="fn2"><p>Diffie-Hellman over finite fields is how it was originally designed, but today we'd use Elliptic-Curve Diffie-Hellman, which is faster, has smaller outputs, and is safer. FFDH has many of <a href="https://buttondown.email/cryptography-dispatches/archive/557475c5-9781-47e0-a640-5734bc849bc7?ref=words.filippo.io">the same issues as DSA</a> (FFDH is to DSA like ECDH is to ECDSA and EdDSA.) Current-day MTProto 2.0 still uses FFDH, but that's far from the most anachronistic choice in it. <a href="#fnref2">↩︎</a></p>
+</li>
+<li id="fn3"><p>This is admittedly not a particularly strong authentication strategy, but it relies on the assumption that even if 1% of users check their fingerprints, systematic PitM is likely to be detected, and high-risk users can be extra careful and consistently check fingerprints. I hope solutions like key transparency can improve this picture in the coming years without changing the default UX. <a href="#fnref3">↩︎</a></p>
+</li>
+<li id="fn4"><p>Can we talk about how cool the Wayback Machine Compare feature is? Now is a good time to <a href="https://archive.org/donate/">donate to the Internet Archive</a>, by the way. <a href="#fnref4">↩︎</a></p>
+</li>
+</ol>
+</section>
+<!--kg-card-end: markdown-->
+        </section></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The world has probably passed peak pollution (149 pts)]]></title>
             <link>https://www.sustainabilitybynumbers.com/p/peak-pollution</link>
             <guid>40313451</guid>
             <pubDate>Thu, 09 May 2024 22:11:41 GMT</pubDate>
@@ -17,7 +87,7 @@
 <div id="readability-page-1" class="page"><div dir="auto"><p><span>The health impacts of air pollution are often underrated. There are a </span><a href="https://ourworldindata.org/data-review-air-pollution-deaths" rel="">range of estimates</a><span> for how many people die prematurely from local air pollution every year.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-1-144199988" href="https://www.sustainabilitybynumbers.com/p/peak-pollution#footnote-1-144199988" target="_self" rel="">1</a></span><span> All are in the low millions. The World Health Organization </span><a href="https://www.who.int/health-topics/air-pollution" rel="">estimates around</a><span> 7 million.</span></p><p>The good news, then, is that the world is probably passed “peak pollution”. I say “probably” because confidently declaring a peak is, apparently, the best way to make sure it doesn’t happen.</p><p><span>Here, I’m talking specifically about emissions of harmful </span><em>local</em><span> air pollutants: gases like nitrogen oxides (NOx), sulphur dioxide which causes acid rain, carbon monoxide, black carbon, organic carbon, non-methane volatile organic compounds. I’m not talking about greenhouse gases.</span></p><p><span>The </span><a href="https://github.com/JGCRI/CEDS/tree/master" rel="">Community Emissions Data System (CEDS)</a><span> recently extended its long-term dataset on emissions of air pollutants up to the end of 2022.</span></p><p><span>I updated this data in our explorer tool </span><a href="https://ourworldindata.org/explorers/air-pollution" rel="">on Our World in Data</a><span> (where you can explore the trends by country).</span></p><p>What’s striking is that emissions appear to have peaked for all of these pollutants, with the exception of ammonia, which is almost entirely produced by agriculture. Organic carbon and NMVOCs are not quite out of the clear yet, but might not reach their previous peaks again.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png" width="1456" height="1028" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1028,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8407a523-3c57-4fd2-a5a5-43c092800f6e_1600x1130.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>Of course, emissions are not falling everywhere. They’ve fallen steeply in richer countries like the US and much of Europe. And the big turning point for the global figures has been the rapid turnaround in China. Emissions have declined rapidly in the last decade, with huge gains for public health.</p><p><span>It’s in low and lower-middle income countries where emissions are still rising, and pollution levels in cities are the highest. This is not surprising: air pollution is one of the few areas where the “</span><a href="https://en.wikipedia.org/wiki/Kuznets_curve#Environmental_Kuznets_curve" rel="">Environmental Kuznets Curve</a><span>” tells a pretty accurate and consistent story.</span></p><p>Air pollution increases as countries develop, gain access to energy, and industrialise. They then fall once a country gets rich enough to impose pollution standards and limits without infringing on development and the move away from energy poverty.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png" width="1456" height="1028" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1028,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null}" alt="" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F463777f7-346d-40ca-94da-d0f2027445c0_1600x1130.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>The goal now is to see if countries can move through this curve much faster – and with lower levels of pollution – than countries like the US or the UK did. This should be doable: we’ve learned a lot over the last 50 years about how to produce energy with less pollution, what technologies work and don’t work, and have reduced the costs of solutions that were expensive in their early days.</p><p><span>Note that this is not a finger-pointing exercise where rich countries tell poorer ones not to pollute. We’re mostly talking about </span><em>local</em><span> air pollution. The negative impacts of pollution are felt by domestic populations. It’s about how we ensure that the poorest countries can gain access to energy, alleviate poverty, and develop while limiting the number of people who die prematurely from air pollution in the process.</span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Cubic millimetre of brain mapped in spectacular detail (142 pts)]]></title>
+            <title><![CDATA[Cubic millimetre of brain mapped in spectacular detail (146 pts)]]></title>
             <link>https://www.nature.com/articles/d41586-024-01387-9</link>
             <guid>40313193</guid>
             <pubDate>Thu, 09 May 2024 21:36:06 GMT</pubDate>
@@ -35,7 +105,7 @@
                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Sioyek is a PDF viewer with a focus on textbooks and research papers (193 pts)]]></title>
+            <title><![CDATA[Sioyek is a PDF viewer with a focus on textbooks and research papers (207 pts)]]></title>
             <link>https://github.com/ahrm/sioyek</link>
             <guid>40313143</guid>
             <pubDate>Thu, 09 May 2024 21:28:43 GMT</pubDate>
@@ -345,7 +415,7 @@ sudo codesign --force --sign - --deep /Applications/sioyek.app
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[It's always TCP_NODELAY (605 pts)]]></title>
+            <title><![CDATA[It's always TCP_NODELAY (631 pts)]]></title>
             <link>https://brooker.co.za/blog/2024/05/09/nagle.html</link>
             <guid>40310896</guid>
             <pubDate>Thu, 09 May 2024 17:54:49 GMT</pubDate>
@@ -417,7 +487,7 @@ sudo codesign --force --sign - --deep /Applications/sioyek.app
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Leaked deck reveals how OpenAI is pitching publisher partnerships (282 pts)]]></title>
+            <title><![CDATA[Leaked deck reveals how OpenAI is pitching publisher partnerships (283 pts)]]></title>
             <link>https://www.adweek.com/media/openai-preferred-publisher-program-deck/</link>
             <guid>40310228</guid>
             <pubDate>Thu, 09 May 2024 16:56:55 GMT</pubDate>
@@ -469,7 +539,7 @@ sudo codesign --force --sign - --deep /Applications/sioyek.app
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[ESP32 Drum Synth Machine (197 pts)]]></title>
+            <title><![CDATA[ESP32 Drum Synth Machine (201 pts)]]></title>
             <link>https://github.com/zircothc/DRUM_2004_V1</link>
             <guid>40309759</guid>
             <pubDate>Thu, 09 May 2024 16:17:14 GMT</pubDate>
@@ -899,7 +969,7 @@ Expressif Systems 2.0.14</p>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Launch HN: Muddy (YC S19) – Multiplayer browser for getting work done (198 pts)]]></title>
+            <title><![CDATA[HNInternal: Launch HN: Muddy (YC S19) – Multiplayer browser for getting work done (204 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=40309342</link>
             <guid>40309342</guid>
             <pubDate>Thu, 09 May 2024 15:38:48 GMT</pubDate>
@@ -907,7 +977,7 @@ Expressif Systems 2.0.14</p>
 <div id="readability-page-1" class="page"><div><td colspan="2"></td><td><div><p>Hey HN! This is Jimmy, Ron and Austa from Muddy (<a href="https://feelmuddy.com/">https://feelmuddy.com/</a>). Muddy is a browser for work that automatically keeps project files organized in the same place where you use and share them. Here’s a demo: <a href="https://www.youtube.com/watch?v=tZr49aN3sjQ" rel="nofollow">https://www.youtube.com/watch?v=tZr49aN3sjQ</a>. Download and try it out here: <a href="https://feelmuddy.com/">https://feelmuddy.com/</a>.</p><p>Building together in the past, we were incredibly frustrated with how much friction there is to get anything done on our computers. I was losing time everyday digging through chat logs looking for that one important link or breaking others out of flow by asking where something is.</p><p>Web apps promised to help us get more done—and they do, but each in its own silo, so there’s still a ton of redundancy to deal with. Every app has its own way of organizing files, its own notification inbox, its own search system. Conversations live everywhere and there isn’t a single view to see everything about a project. Remember when files simply lived in folders rather than the “cloud”?</p><p>We started dedicating time to organizing our files in shared docs and limiting new apps we used. This helped – but the second we didn’t stay on top of organization, links became stale and things got messy again.</p><p>Muddy started as a hack week project we built for ourselves—a single place to use web apps with others, but personalized for each user automatically. Everyone gets their own view for every project, designed around how they work.</p><p>Muddy users work on projects in spaces, which are like automatic tab groups. Users share apps (any site works—a Github PR, Figma file, Trello board—whatever you want) into the project’s shared timeline and Muddy automatically opens relevant tabs for you. It’s a single click to open up all the apps you need for the project.</p><p>Under the hood, Muddy works in the background to keep track of the timeline and uses a LLM to continuously organize apps and keep everything on to date. It considers signals like the popularity of a file, naming conventions, and conversations to figure out what’s relevant. So everyone is presented with an updated list of important tabs, without anyone lifting a finger. Our actual browser is based on Chromium.</p><p>When you need to revisit something from weeks ago, you can rewind the project timeline to that point in a single click. Apps open up in the timeline so you’ll see your files right away. For sites that don’t have built in collaboration features (like documentation), Muddy lets you do annotations directly on the website.</p><p>Projects sometimes get big and need to be broken up. Across all your spaces, Muddy can answer questions like ChatGPT, cite your files as sources, and return apps directly. This is possible since Muddy’s AI shares your browser and can use your authenticated apps locally (with privacy in mind).</p><p>Other browsers like Chrome and Arc focus on solo productivity with sharing as a bolt-on. We think productivity depends on how well you can work with others, and should be the first class consideration. And doing organizational work manually is unsustainable.</p><p>Muddy will have paid subscriptions for teams with additional features like shared passwords, team organization, custom shortcuts, and SSO management. Those aren’t built out yet and the base product will be free. No part of our revenue will come from data monetization.</p><p>We’d love for you to give Muddy a spin! You can download Muddy for Mac or Windows on our website and add others once inside: <a href="https://feelmuddy.com/">https://feelmuddy.com/</a>. We’ll be around to answer questions and look forward to any and all feedback!</p></div></td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft PlayReady – Complete Client Identity Compromise (179 pts)]]></title>
+            <title><![CDATA[Microsoft PlayReady – Complete Client Identity Compromise (181 pts)]]></title>
             <link>https://seclists.org/fulldisclosure/2024/May/5</link>
             <guid>40308261</guid>
             <pubDate>Thu, 09 May 2024 13:53:06 GMT</pubDate>
@@ -1127,7 +1197,7 @@ Web Archives &amp; RSS: <a rel="nofollow" href="https://seclists.org/fulldisclos
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[No "Zero-Shot" Without Exponential Data (166 pts)]]></title>
+            <title><![CDATA[No "Zero-Shot" Without Exponential Data (167 pts)]]></title>
             <link>https://arxiv.org/abs/2404.04125</link>
             <guid>40307832</guid>
             <pubDate>Thu, 09 May 2024 13:08:05 GMT</pubDate>
@@ -1151,7 +1221,7 @@ Web Archives &amp; RSS: <a rel="nofollow" href="https://seclists.org/fulldisclos
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Exploring HN by mapping and analyzing 40M posts and comments for fun (396 pts)]]></title>
+            <title><![CDATA[Exploring HN by mapping and analyzing 40M posts and comments for fun (410 pts)]]></title>
             <link>https://blog.wilsonl.in/hackerverse/</link>
             <guid>40307519</guid>
             <pubDate>Thu, 09 May 2024 12:31:04 GMT</pubDate>
@@ -1796,7 +1866,7 @@ pg_partman_bgw.dbname = 'postgres'
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Deaf girl is cured in world first gene therapy trial (603 pts)]]></title>
+            <title><![CDATA[Deaf girl is cured in world first gene therapy trial (610 pts)]]></title>
             <link>https://www.independent.co.uk/news/health/deaf-cure-girl-gene-therapy-b2541735.html</link>
             <guid>40307138</guid>
             <pubDate>Thu, 09 May 2024 11:38:14 GMT</pubDate>
@@ -1872,7 +1942,7 @@ pg_partman_bgw.dbname = 'postgres'
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Algebraic Data Types for C99 (337 pts)]]></title>
+            <title><![CDATA[Algebraic Data Types for C99 (339 pts)]]></title>
             <link>https://github.com/Hirrolot/datatype99</link>
             <guid>40307098</guid>
             <pubDate>Thu, 09 May 2024 11:31:27 GMT</pubDate>
@@ -2706,7 +2776,7 @@ test.c:10:1: warning: control reaches end of non-void function [-Wreturn-type]
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Browser-based knitting (pattern) software (126 pts)]]></title>
+            <title><![CDATA[Show HN: Browser-based knitting (pattern) software (127 pts)]]></title>
             <link>https://github.com/alefore/knit</link>
             <guid>40307089</guid>
             <pubDate>Thu, 09 May 2024 11:29:32 GMT</pubDate>
