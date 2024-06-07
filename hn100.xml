@@ -4,10 +4,115 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 07 Jun 2024 01:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 07 Jun 2024 02:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
+        <item>
+            <title><![CDATA[Make your program slower with threads (2014) (102 pts)]]></title>
+            <link>https://brooker.co.za/blog/2014/12/06/random.html</link>
+            <guid>40603625</guid>
+            <pubDate>Thu, 06 Jun 2024 23:28:41 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://brooker.co.za/blog/2014/12/06/random.html">https://brooker.co.za/blog/2014/12/06/random.html</a>, See on <a href="https://news.ycombinator.com/item?id=40603625">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="post">
+
+
+<p>How much do context switches matter?</p>
+
+<p>Years ago, while taking a numerical methods course, I wrote some code to calculate the expected number of shared birthdays in a group. The code is very simple: each attempt constructs a vector of N birthdays, then counts the duplicates. The outer loop runs millions of attempts, and calculates the mean number of shared birthdays across all the samples. It’s little more than a tight loop around a pseudo-random number generator.</p>
+
+<p>I was also learning about threading at the time, and decided that I could speed up my program by running it on the lab’s shiny dual-core machine. I knew that communicating between threads was expensive, so I had each of my threads calculate their attempts in parallel, and merge the results right at the end. I was expecting a great speedup. Much to my disappointment, though, the multi-threaded version was slower. Much, much, slower.</p>
+
+<p>Much like the <a href="http://en.wikipedia.org/wiki/Birthday_problem">birthday paradox</a> runs counter to our intuition about statistics, the behavior of bad multi-threaded programs runs counter to our intuition about computer performance. We’re used to computers being much faster than they used to be, and single-threaded efficiency mattering less than it used to in most cases. Counter to that intuition, the gap between <em>good</em> and <em>bad</em> multithreaded programs has gotten worse over time.</p>
+
+<p>To illustrate just how bad it can be, I replicated my program from back then. It’s not much more than a multi-threaded tight loop around <em>random(3)</em>. It’s nice and quick single-threaded: running 10 million attempts in under 7 seconds. Going up to two threads makes it a bit faster, down to less than 6 seconds. When we hit three threads (on my four core Haswell E3-1240), it all goes horribly wrong:</p>
+
+<p><img src="https://s3.amazonaws.com/mbrooker-blog-images/threads_bar.png" alt=""></p>
+
+<p>To figure out what’s wrong, we can turn to Linux’s excellent <a href="https://perf.wiki.kernel.org/index.php/Tutorial">perf</a> tool. Running the 1-thread and 4-thread versions with <em>perf stat</em> make it obvious that something’s going on. For 1 thread:</p>
+
+<div><pre><code>     3,788,352 L1-dcache-load-misses #0.03% of all L1-dcache hits
+43,399,424,441 instructions  #1.46  insns per cycle
+           734 context-switches
+</code></pre></div>
+
+<p>and for four threads:</p>
+
+<div><pre><code>  4,110,904,396 L1-dcache-load-misses #6.88% of all L1-dcache hits
+248,853,610,160 instructions # 0.51  insns per cycle
+     15,993,647 context-switches
+</code></pre></div>
+
+<p>Two things are going wrong here. One is that we’re seeing a more L1 cache misses with more threads, but the bigger issue is that we’re seeing <em>a whole lot more</em> context switches. The effect of both of these is visible in the much lower <em>instructions per cycle</em> of the second version. There’s no nice constant for the cost of a context switch, but a good modern estimate is around 3μs. Multiplying 3μs by 16 million context switches gives 48 seconds, which is a good hint that we’re headed in the right direction. So, what’s causing the context switches?</p>
+
+<p>Back to <em>perf</em>, this time running <em>perf record</em> on the processes, followed by <em>perf report</em>. First, the top few rows for the single-threaded version:</p>
+
+<div><pre><code># Overhead   Command  Shared Object    Symbol
+# ........  ........  ..............   ........................
+62.01%  birthday  libc-2.19.so         [.] msort_with_tmp.part.0
+11.40%  birthday  libc-2.19.so         [.] __memcpy_sse2        
+10.19%  birthday  birthday             [.] simulate
+</code></pre></div>
+
+<p>We’re spending 62% of the time sorting the array, which is used to find the duplicates. That’s about what I would have guessed. What about the version with four threads?</p>
+
+<div><pre><code># Overhead   Command  Shared Object  Symbol
+# ........  ........  .............  ............
+46.80%  birthday  [kernel.kallsyms]  [k] _raw_spin_lock   
+ 8.86%  birthday  libc-2.19.so       [.] __random           
+ 3.42%  birthday  libc-2.19.so       [.] __lll_lock_wait_private
+ 3.23%  birthday  [kernel.kallsyms]  [k] try_to_wake_up       
+ 2.95%  birthday  libc-2.19.so       [.] __random_r        
+ 2.79%  birthday  libc-2.19.so       [.] msort_with_tmp.part.0
+ 2.10%  birthday  [kernel.kallsyms]  [k] futex_wake 
+ 1.46%  birthday  [kernel.kallsyms]  [k] system_call  
+ 1.35%  birthday  [kernel.kallsyms]  [k] get_futex_value_locked 
+ 1.15%  birthday  [kernel.kallsyms]  [k] futex_wait_setup  
+ 1.14%  birthday  [kernel.kallsyms]  [k] futex_wait 
+</code></pre></div>
+
+<p>Well, that’s suspicious. There aren’t any locks in my code, but there are a whole lot of references to locks in the trace. <em>raw_spin_lock</em> is obviously a candidate, and it’s suspicious to see so many <a href="http://en.wikipedia.org/wiki/Futex">futex</a>-related calls. Something’s taking locks, and the fact that <em>random</em> is near the top of the list makes it a likely candidate. Before we dive in there, though, let’s confirm that we’re doing a lot of syscalls:</p>
+
+<div><pre><code>sudo perf stat -e 'syscalls:sys_e*' ./birthday
+</code></pre></div>
+
+<p>Which spits out a long list of system calls, most (like <em>mmap</em>) with just a handful of hits. There are two huge outliers:</p>
+
+<div><pre><code>46,889,267 syscalls:sys_enter_futex
+46,889,267 syscalls:sys_exit_futex
+</code></pre></div>
+
+<p>That confirms it, something’s taking a lot of futexes. Knowing whether it’s <em>random</em> or not requires a dive into the <em>glibc</em> source, which nearly instantly <a href="https://sourceware.org/git/?p=glibc.git;a=blob;f=stdlib/random.c;h=c75d1d96adecf5ac894ca752a4c54647014bd746;hb=9752c3cdbce2b3b8338abf09c8b9dd9e78908b8a#l194">reveals something suspicious</a>:</p>
+
+<div><pre><code> /* POSIX.1c requires that there is mutual exclusion for the `rand' and
+  `srand' functions to prevent concurrent calls from modifying common
+   data.  */
+</code></pre></div>
+
+<p>And, <a href="https://sourceware.org/git/?p=glibc.git;a=blob;f=stdlib/random.c;h=c75d1d96adecf5ac894ca752a4c54647014bd746;hb=9752c3cdbce2b3b8338abf09c8b9dd9e78908b8a#l292">just a little bit further down</a>:</p>
+
+<div><pre><code> __libc_lock_lock (lock);
+ (void) __random_r (&amp;unsafe_state, &amp;retval);
+ __libc_lock_unlock (lock);
+</code></pre></div>
+
+<p>Getting rid of the locks means getting rid of one of two things: shared state, or the necessity to prevent concurrent modification to that state. It seems like the former is easier: reasoning about a data-race-safe PRNG is tricky. There are a many good ways to get rid of shared state in the PRNG. Linux has one particularly convenient way: the C library exposes a reentrant random number generator called <a href="http://man7.org/linux/man-pages/man3/random_r.3.html">random_r</a> (which is used by <em>random</em>, as you can see from the snippet above). Dropping <em>random_r</em> in place of <em>random</em> has an amazing effect:</p>
+
+<p><img src="https://s3.amazonaws.com/mbrooker-blog-images/threads_bar_second.png" alt=""></p>
+
+<p>As expected, the context switches are way down and instructions per cycle is nicely improved:</p>
+
+<div><pre><code>     4,166,540 L1-dcache-load-misses  # 0.04% of all L1-dcache hits
+40,201,461,769 instructions # 1.43  insns per cycle
+           572 context-switches
+</code></pre></div>
+
+<p>I recognize that spinning on a tight loop on <em>random</em> is a contrived example, but it’s not too far away from reality. Many programs that multi-thread for performance end up with library or system calls inside relatively tight loops. Our intuition about these things tends to follow <a href="http://en.wikipedia.org/wiki/Amdahl%27s_law">Amdahl’s law</a>. At worst, it’s tempting to think, these things count as a non-parallel portion of code and lower the maximum achievable parallel speedup. In the real world, though, that’s not the case. Multi-threaded programs can, and very often do, run much more slowly than the equivalent single-threaded program.</p>
+
+<p>It’s just another thing that makes writing multi-threaded code difficult.</p>
+
+</div></div>]]></description>
+        </item>
         <item>
             <title><![CDATA[PSA: How to keep using adblockers on Chrome and Chromium (112 pts)]]></title>
             <link>https://gist.github.com/velzie/053ffedeaecea1a801a2769ab86ab376</link>
@@ -45,7 +150,15 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HP bricks customers laptops with faulty automatic BIOS upgrade (146 pts)]]></title>
+            <title><![CDATA[Boeing's starliner docks at ISS after five thrusters unexpectedly shut off (102 pts)]]></title>
+            <link>https://gizmodo.com/watch-boeing-starliner-dock-iss-astronauts-1851521917</link>
+            <guid>40601776</guid>
+            <pubDate>Thu, 06 Jun 2024 20:06:33 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://gizmodo.com/watch-boeing-starliner-dock-iss-astronauts-1851521917">https://gizmodo.com/watch-boeing-starliner-dock-iss-astronauts-1851521917</a>, See on <a href="https://news.ycombinator.com/item?id=40601776">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><p>After back-to-back failed launch attempts, a crewed Starliner capsule finally <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/boeing-first-crewed-starliner-launch-iss-nasa-tense-1851512733&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/boeing-first-crewed-starliner-launch-iss-nasa-tense-1851512733">launched on Wednesday</a></span> to deliver two NASA astronauts to low Earth orbit. Boeing is testing its capsule’s ability to transport crews to the International Space Station (ISS), with Starliner set to dock to the orbital lab on Thursday.<br></p><div data-video-id="197027" data-monetizable="true" data-position="sidebar" data-video-title="Sonos First Ever Headphones Are Too Expensive For What They Offer" data-video-blog-id="4" data-video-network="gizmodo" data-video-duration="154" data-playlist="197027,197012,196999" data-current="197027"><div><p>Sonos First Ever Headphones Are Too Expensive For What They Offer</p></div><video disablepictureinpicture="" muted="" playsinline="" width="100%" height="100%" crossorigin="anonymous" preload="none"><source data-src="https://vid.kinja.com/prod/197027/197027_240p.mp4" label="240p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/197027/197027_480p.mp4" label="480p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/197027/197027_720p.mp4" label="720p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/197027/197027_1080p.mp4" label="1080p" type="video/mp4"><track kind="captions" label="English" src="https://kinja.com/api/videoupload/caption/22588.vtt" srclang="en"></video><div><ul><li data-label="">Off</li><li data-label="English">English</li></ul></div></div><p><strong>Update: June 6, 1:45 p.m. ET: </strong>Starliner missed its first docking opportunity at 12:15 p.m. ET due to technical issues, prompting NASA to target another docking window starting at around 1:30 p.m. ET. Five of the spacecraft thrusters failed during its approach, and four were subsequently recovered. As a result, NASA astronaut Butch Wilmore had to assume manual control of the crew capsule for a while before it went back into its autonomous mode. The capsule finally docked with the ISS at 1:34 p.m. ET following a nail-biting journey.</p><p><strong>Update: June 6, 1:27 p.m. ET: </strong>Starliner’s docking has not gone smoothly, the spacecraft developed trouble with its reaction control system thrusters.</p><p><strong>Update: June 6, 12:40 p.m. ET</strong>: NASA has waved off Starliner’s first docking opportunity and is now targeting a backup at 1:33 p.m. ET.</p><p><em>Original article follows.</em></p><p>Starliner is scheduled to autonomously dock to the forward-facing port of the space station’s Harmony module at approximately 12:15 p.m. on June 6, where it will remain for about a week. The hatch is set to open at 2 p.m. ET to allow the crew to board the ISS.</p><p>The docking maneuver will be broadcast live on NASA’s <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;http://nasa.gov/nasatv&quot;,{&quot;metric25&quot;:1}]]" href="http://nasa.gov/nasatv" target="_blank" rel="noopener noreferrer">website</a></span>, as well as the space agency’s <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.youtube.com/@NASA&quot;,{&quot;metric25&quot;:1}]]" href="https://www.youtube.com/@NASA" target="_blank" rel="noopener noreferrer">YouTube channel</a></span>. The live stream is set to begin at 9:30 a.m. ET, and you can tune in  through the feed below.<br></p><p>Boeing’s Starliner capsule launched atop United Launch Alliance’s Atlas V rocket, carrying NASA astronauts Butch Wilmore and Suni Williams. “Two bold NASA astronauts are well on their way on this historic first test flight of a brand-new spacecraft,” NASA Administrator Bill Nelson said in a <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.nasa.gov/news-release/liftoff-nasa-astronauts-pilot-first-starliner-crewed-test-to-station/&quot;,{&quot;metric25&quot;:1}]]" href="https://www.nasa.gov/news-release/liftoff-nasa-astronauts-pilot-first-starliner-crewed-test-to-station/" target="_blank" rel="noopener noreferrer">statement</a></span>. “Human spaceflight is a daring task—but that’s why it’s worth doing.”</p><p>The <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/review-boeing-nasa-starliner-program-1851448548&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/review-boeing-nasa-starliner-program-1851448548">Crewed Flight Test</a></span> is part of NASA’s Commercial Crew Program and is meant to transport crew and cargo to and from the International Space Station (ISS) under a <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://oig.nasa.gov/docs/IG-20-005.pdf&quot;,{&quot;metric25&quot;:1}]]" href="https://oig.nasa.gov/docs/IG-20-005.pdf" target="_blank" rel="noopener noreferrer">$4.3 billion</a></span> contract with the space agency. NASA’s other commercial partner, SpaceX, has so far launched eight crews to the space station.</p><p>During Starliner’s first crewed flight, Boeing will monitor a series of automatic spacecraft maneuvers while NASA will monitor space station operations throughout the flight. Meanwhile, the astronaut crew on board will be testing the environmental control system, the displays and control system, and maneuvering the thrusters, as well as other features of the spacecraft. </p><p>The two astronauts will provide a virtual tour of the Starliner capsule from space, which will be broadcast live on Saturday, June 8 at 8:50 a.m. on <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;http://nasa.gov/nasatv&quot;,{&quot;metric25&quot;:1}]]" href="http://nasa.gov/nasatv" target="_blank" rel="noopener noreferrer">NASA TV</a></span>.</p><p>It’s been a struggle for Boeing to reach this stage with its Starliner program, which has been marred by technical hiccups and delays over the past few years. Throughout it all, NASA remained dedicated to seeing its crew ride on board the company’s crew capsule.</p><p>“For many of us, this is a career-defining moment bringing on a new crew transportation capability for our agency and our nation,” Steve Stich, manager, Commercial Crew Program, at NASA’s Johnson Space Center in Houston, said in a statement. “We are going to take it one step at a time, putting Starliner through its paces, and remaining vigilant until Butch and Suni safely touch down back on Earth at the conclusion of this test flight.”</p><p><em>For more spaceflight in your life, follow us on </em><span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;http://gizspaceflight/&quot;,{&quot;metric25&quot;:1}]]" href="http://gizspaceflight/" target="_blank" rel="noopener noreferrer"><em>X</em></a></span><em> and bookmark Gizmodo’s dedicated </em><span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/science/spaceflight&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/science/spaceflight"><em>Spaceflight page</em></a></span><em>.</em></p></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[HP bricks customers laptops with faulty automatic BIOS upgrade (147 pts)]]></title>
             <link>https://h30434.www3.hp.com/t5/Notebook-Operating-System-and-Recovery/HP-Probook-BIOS-Upgrade-1-17-failed/td-p/9081096/page/3</link>
             <guid>40601711</guid>
             <pubDate>Thu, 06 Jun 2024 20:01:37 GMT</pubDate>
@@ -73,7 +186,7 @@
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Extracting concepts from GPT-4 (187 pts)]]></title>
+            <title><![CDATA[Extracting concepts from GPT-4 (203 pts)]]></title>
             <link>https://openai.com/index/extracting-concepts-from-gpt-4/</link>
             <guid>40599749</guid>
             <pubDate>Thu, 06 Jun 2024 17:01:37 GMT</pubDate>
@@ -81,7 +194,7 @@
 Couldn't get https://openai.com/index/extracting-concepts-from-gpt-4/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Qwen2 LLM Released (192 pts)]]></title>
+            <title><![CDATA[Qwen2 LLM Released (197 pts)]]></title>
             <link>https://qwenlm.github.io/blog/qwen2/</link>
             <guid>40599018</guid>
             <pubDate>Thu, 06 Jun 2024 16:01:13 GMT</pubDate>
@@ -109,7 +222,7 @@ Benefiting from meticulously curated datasets and optimized training methods, Qw
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-107425233" data-test="InlineImage"><p>SpaceX's Starship launches its fourth flight test from the company's Boca Chica launchpad, designed to eventually send astronauts to the moon and beyond, near Brownsville, Texas, U.S. , in this handout picture obtained on June 6, 2024.&nbsp;</p><p>Spacex | Via Reuters</p></div><div><p>SpaceX completed a test flight of its Starship rocket for the first time on Thursday, as the company pushed development of the mammoth vehicle past new milestones.</p><p>"Our first ever ship landing burn after a launch into space ... that was incredible," SpaceX communications manager Dan Huot said on the company's broadcast.</p><p><a href="https://www.cnbc.com/elon-musk/">Elon Musk's</a> company launched Starship at about 8:50 a.m. ET from its Starbase facility near Boca Chica, Texas.</p></div><div id="ArticleBody-InlineImage-107425169" data-test="InlineImage"><p>The SpaceX Starship launches during its fourth flight test from Boca Chica beach on June 06, 2024 in Brownsville, Texas.&nbsp;</p><p>Brandon Bell | Getty Images</p></div><div><p>A few minutes after launch, the rocket's booster successfully splashed down in the Gulf of Mexico, a new milestone for its development. This was the first time SpaceX returned the booster in one piece — a controlled return of the booster is key to the company's long-term goal of being able to launch and land Starship regularly, a practice it's made routine with its Falcon 9 rockets.</p><p>About an hour after the launch, Starship visibly survived reentry through the Earth's atmosphere, and the company confirmed that the rocket splashed down in the Indian Ocean to complete the mission. Starship appeared to withstand external damage during the intense heat of reentry, with debris apparent on the broadcast.</p><p>"Splashdown confirmed!" SpaceX posted on social media after the flight.</p><p>There were no people on board the fourth Starship spaceflight. The company's leadership has previously emphasized that SpaceX expects to fly hundreds of Starship missions before the rocket launches with any crew.</p></div><div id="ArticleBody-InlineImage-107425157" data-test="InlineImage"><p>The sun sets behind the SpaceX Starship ahead of its fourth flight test at Boca Chica beach on June 05, 2024 in Brownsville, Texas.&nbsp;</p><p>Brandon Bell | Getty Images</p></div><div><p>The Starship system is designed to be fully reusable and aims to become a new method of flying cargo and people beyond Earth. The rocket is also critical to NASA's plan to return astronauts to the moon. SpaceX won a multibillion-dollar contract from the agency to use Starship as a crewed lunar lander as part of NASA's Artemis moon program.</p><p>Shortly after the flight, NASA Administrator Bill Nelson congratulated SpaceX on its progress.</p><p>"We are another step closer to returning humanity to the Moon through Artemis — then looking onward to Mars," Nelson wrote in a social media post.</p><p>SpaceX has flown the full Starship rocket system on three spaceflight tests previously, with launches in <a href="https://www.cnbc.com/2023/04/20/spacex-starship-orbital-launch-attempt-live-updates.html">April 2023</a>, <a href="https://www.cnbc.com/2023/11/18/spacex-starship-second-rocket-launch.html">November</a> and <a href="https://www.cnbc.com/2024/03/14/spacex-starship-rocket-third-test-flight-launch.html">March</a>. Each of the test flights has achieved more milestones than the last, but in each result prior to Thursday the rocket was destroyed before the flight's end.</p><p>During the company's third test flight SpaceX tested new capabilities including opening and closing the payload door once in space —&nbsp;which would be how the rocket deploys payloads such as satellites on future missions — and&nbsp;<a href="https://www.cnbc.com/2023/12/05/spacex-plans-nasa-refueling-demonstration-for-next-starship-launch.html">transferring fuel&nbsp;</a>during the flight in a NASA demonstration.</p><p>SpaceX heavily emphasizes an approach of building "on what we've learned from previous flights" in its approach to develop Starship. The company says its strategy focuses on "recursive improvement" to the rocket, where even test flights with fiery outcomes represent progress toward its goal of a fully reusable rocket that can deliver people to the moon and Mars.</p><p>Musk last year said he expected the company to <a href="https://www.cnbc.com/2023/04/29/elon-musk-spacexs-starship-costing-about-2-billion-this-year.html">spend about $2 billion on Starship development</a> in 2023.</p></div><h2><a id="headline0"></a>The rocket</h2><div id="Placeholder-ArticleBody-Video-107029162" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000237329" aria-labelledby="Placeholder-ArticleBody-Video-107029162"><p><img src="https://image.cnbcfm.com/api/v1/image/107013976-1644535900772-S20_Chopstick_Stack_Desktop.jpg?v=1647016871&amp;w=750&amp;h=422&amp;vtcrop=y" alt="Why Starship is indispensable for the future of SpaceX"><span></span><span></span></p></div><div><p>Starship is both the tallest and most powerful rocket ever launched. Fully stacked on the Super Heavy booster, Starship stands 397 feet tall and is about 30 feet in diameter.</p><p>The Super Heavy booster, which stands 232 feet tall, is what begins the rocket's journey to space. At its base are 33 Raptor engines, which together produce 16.7 million pounds of thrust – about double the 8.8 million pounds of thrust of NASA's Space Launch System rocket, which <a href="https://www.cnbc.com/2022/11/16/watch-live-nasa-launches-artemis-1-moon-mission.html">launched for the first time in 2022</a>.</p><p>Starship itself, at 165 feet tall, has six Raptor engines – three for use while in the Earth's atmosphere and three for operating in the vacuum of space.</p><p>The rocket is powered by liquid oxygen and liquid methane. The full system requires more than 10 million pounds of propellant for launch.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[lsix: Like "ls", but for images (182 pts)]]></title>
+            <title><![CDATA[lsix: Like "ls", but for images (189 pts)]]></title>
             <link>https://github.com/hackerb9/lsix</link>
             <guid>40598629</guid>
             <pubDate>Thu, 06 Jun 2024 15:29:56 GMT</pubDate>
@@ -428,7 +541,7 @@ A weighty tome which covers nearly everything in exacting detail. I referred mos
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Right Not to Be Subjected to AI Profiling Based on Publicly Available Data (226 pts)]]></title>
+            <title><![CDATA[The Right Not to Be Subjected to AI Profiling Based on Publicly Available Data (230 pts)]]></title>
             <link>https://link.springer.com/article/10.1007/s13347-023-00616-9</link>
             <guid>40597503</guid>
             <pubDate>Thu, 06 Jun 2024 14:03:17 GMT</pubDate>
@@ -806,7 +919,304 @@ at chapter 14 and <i>no</i> I will not be providing the answers to the last few 
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Roads of Ancient Rome Visualized in the Style of Modern Subway Maps (315 pts)]]></title>
+            <title><![CDATA[Martha Gellhorn, the only woman to report on the D-Day landings from the ground (103 pts)]]></title>
+            <link>https://www.smithsonianmag.com/history/martha-gellhorn-was-the-only-woman-to-report-on-the-d-day-landings-from-the-ground-180984456/</link>
+            <guid>40597249</guid>
+            <pubDate>Thu, 06 Jun 2024 13:35:24 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.smithsonianmag.com/history/martha-gellhorn-was-the-only-woman-to-report-on-the-d-day-landings-from-the-ground-180984456/">https://www.smithsonianmag.com/history/martha-gellhorn-was-the-only-woman-to-report-on-the-d-day-landings-from-the-ground-180984456/</a>, See on <a href="https://news.ycombinator.com/item?id=40597249">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+
+    <div data-article-body="">
+
+        
+
+      
+
+      <p>Clouds of dust swirled and filled the night air as <a href="https://www.jfklibrary.org/hemingway/martha-gellhorn-hemingway">Martha Gellhorn</a> walked up a rocky road on <a href="https://en.normandie-tourisme.fr/discover/history/d-day-and-the-battle-of-normandy/d-day-landing-beaches/omaha-beach/">Omaha Beach</a>. At the end of the path, the American war correspondent paused for a moment. Suddenly, her senses were overwhelmed by the pleasant reminder of another time.</p>
+
+<p>“It was perhaps the most surprising of all the day’s surprises to smell the sweet smell of summer grass, a smell of cattle and peace and sun that had warmed the earth some other time when summer was real,” she later wrote for <a href="https://www.unz.com/print/Colliers-1944aug05-00073/"><em>Collier’s</em> magazine</a>.</p>
+
+<p>That moment stood in stark contrast to what Gellhorn had witnessed earlier: destroyed and smoldering vehicles, broken and bloodied bodies, gaping holes in the soft sand. The vestiges of battle from the day before—<a href="https://www.army.mil/d-day/history.html">D-Day</a>, June 6, 1944—lined the beach, where soldiers from the United States Army had <a href="https://www.army.mil/d-day/history.html">fought their way</a> ashore as part of the <a href="https://www.britannica.com/event/Normandy-Invasion">Allied invasion</a> of France during World War II.</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/D5-T3ZiTqZeb4nQYuT3j-5QyAZo=/fit-in/1072x0/filters:focal(960x777:961x778)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/66/a3/66a335ea-6933-4b6d-b7ef-9381a5721b5f/into_the_jaws_of_death_23-0455m_edit.jpeg" alt="American troops disembark at Omaha Beach on June 6, 1944." loading="lazy">
+  
+
+  <figcaption>
+    
+      American troops disembark at Omaha Beach on June 6, 1944.&nbsp;
+    
+    
+      <span><a href="https://en.wikipedia.org/wiki/Omaha_Beach#/media/File:Into_the_Jaws_of_Death_23-0455M_edit.jpg" target="blank">Public domain via Wikimedia Commons</a></span>
+    
+  </figcaption>
+</figure>
+<p>Gellhorn was one of the first journalists—and the only <a href="https://www.military.com/history/how-martha-gellhorn-became-only-female-journalist-d-day.html">female correspondent</a>—to view that hellish scene 80 years ago. Lacking proper credentials, she lied her way onto a hospital ship traveling from England to France, then rode in a water ambulance to the still-dangerous Normandy shore as artillery shells from battleships roared overhead. Among other hazards, she endured snipers, landmines and strafing by German warplanes, all to get the story.</p>
+
+<p>“Double and triple clap of gunfire,” Gellhorn wrote in her diary. “Unseen planes roar. Barrage balloons. Gun flashes. One close shell burst. … Explosions jar the ship.”</p>
+
+<p>“The fighting went on for several days, and the landing craft were under attack,” says <a href="https://www.publishersweekly.com/pw/authorpage/caroline-moorehead.html">Caroline Moorehead</a>, author of <a href="https://amzn.to/3R7RYFA"><em>Gellhorn: A 20th-Century Life</em></a>. “People were still being killed as she was landing.”</p>
+
+<hr>
+<p>Gellhorn was a <a href="https://www.nationalww2museum.org/war/articles/martha-gellhorn-eyewitness-war">veteran war correspondent</a> who covered multiple conflicts over her six-decade career. Leading up to D-Day, she reported on the <a href="https://www.unz.com/print/Colliers-1937jul17-00012/">Spanish Civil War</a>, the rise of Nazi leader <a href="https://www.smithsonianmag.com/history/adolf-hitler-coup-prison-beer-hall-putsch-180983207/">Adolf Hitler</a> and the German <a href="https://www.theholocaustexplained.org/life-in-nazi-occupied-europe/foreign-policy-and-the-road-to-war/annexation-of-czechoslovakia/">annexation of Czechoslovakia</a> in 1938, the <a href="https://www.iwm.org.uk/history/a-short-history-of-the-winter-war">Winter War</a> between Finland and the Soviet Union in 1939, and the <a href="https://www.britannica.com/event/Second-Sino-Japanese-War">Japanese invasion of China</a> in 1941. She would later go on to report on the <a href="https://www.pbs.org/battlefieldvietnam/timeline/index1.html">Vietnam War</a>, the <a href="https://www.wilsoncenter.org/publication/the-1967-six-day-war">Six-Day War</a> in 1967 and other world crises.</p>
+
+<p>Born in St. Louis in 1908, the future journalist was the only daughter of George Gellhorn, a German-born doctor, and <a href="https://historicmissourians.shsmo.org/edna-gellhorn/">Edna Fischel Gellhorn</a>, a suffragist who helped found the League of Women Voters. Gellhorn’s father and maternal grandfather were Jewish, while her maternal grandmother was Protestant. Though Gellhorn wasn’t religious, this dual background had a lasting influence on her, particularly when she became one of the first journalists to view the <a href="https://encyclopedia.ushmm.org/content/en/article/dachau">Dachau concentration camp</a> in 1945.</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/gWBeOXk6m-PXZX6lwzlZPcLykAY=/fit-in/1072x0/filters:focal(300x186:301x187)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/ce/ed/ceedfadc-44bc-4c79-9b81-d0ca9f25ae84/the_golden_lane.jpg" alt="As a child, Gellhorn joined her mother, Edna Fischel Gellhorn, in a protest for women's suffrage at the 1916 Democratic National Convention." loading="lazy">
+  
+
+  <figcaption>
+    
+      As a child, Gellhorn joined her mother, Edna Fischel Gellhorn, in a protest for women's suffrage at the 1916 Democratic National Convention.
+    
+    
+      <span><a href="https://en.wikipedia.org/wiki/Martha_Gellhorn#/media/File:The_Golden_Lane.jpg" target="blank">Public domain via Wikimedia Commons</a></span>
+    
+  </figcaption>
+</figure>
+<p>Through her vocal support of pressing social issues, Edna helped shape the social consciousness that later pervaded her daughter’s writing. In 1916, Edna and 7-year-old Gellhorn marched in a rally for women’s suffrage at the Democratic National Convention in St. Louis.</p>
+
+<p>“For Gellhorn, I think it was all about making the world a better place,” says <a href="https://www.nationalww2museum.org/contributors/maggie-hartley-edd">Maggie Hartley</a>, director of public engagement at the <a href="https://www.nationalww2museum.org/">National WWII Museum</a> in New Orleans. “Whenever I give a talk, I like to include <a href="https://archive.org/details/faceofwar0000gell/page/337/mode/1up?q=%22better+way%22">this quote</a> by her: ‘There has to be a better way to run the world, and we had better see that we get it.’”</p>
+
+<p>Gellhorn attended <a href="https://www.brynmawr.edu/bulletin/dear-teecher">Bryn Mawr College</a> in Pennsylvania but did not graduate, instead leaving to pursue a career as a journalist. She wrote for several publications, including the <a href="https://newrepublic.com/authors/martha-gellhorn"><em>New Republic</em></a><em> </em>and the <em>Albany Times Union</em>, then joined the <a href="https://historicmissourians.shsmo.org/martha-gellhorn/">United Press</a> news agency in France. She was later fired from the bureau for reporting sexual harassment by a businessman with ties to the agency. In the mid-1930s, she worked as a <a href="https://www.newyorker.com/books/page-turner/chronicling-poverty-with-compassion-and-rage">field investigator</a> for the Federal Emergency Relief Administration and assisted first lady <a href="https://hazlitt.net/longreads/friendship-eleanor-roosevelt-and-martha-gellhorn">Eleanor Roosevelt</a> with correspondence and her magazine column. In 1937, she traveled to Madrid to report on the Spanish Civil War for <em>Collier’s</em>, a now-defunct weekly magazine that featured the bylines of the U.S.’s top journalists and writers.</p>
+
+<p>Where Gellhorn distinguished herself from other reporters was the focus of her articles. Rather than writing about generals or details of the fighting, she chronicled the stories of civilians unable to escape the violence of war: children, women, the elderly and others threatened by flying bullets and exploding shrapnel.</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/-hDtJ5o-BwzUn56h5ULsDP6-2fg=/fit-in/1072x0/filters:focal(960x695:961x696)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/76/bc/76bca59b-75c8-4050-a6e1-f4170ed6b1ec/ernest_and_martha_hemingway_photograph_-_nara_-_192698.jpeg" alt="Martha Gellhorn (second from left), Ernest Hemingway (third from right) and Chinese military officers in 1941" loading="lazy">
+  
+
+  <figcaption>
+    
+      Martha Gellhorn (second from left), Ernest Hemingway (third from right) and Chinese military officers in 1941
+    
+    
+      <span><a href="https://commons.wikimedia.org/wiki/Category:Martha_Gellhorn#/media/File:Ernest_and_Martha_Hemingway_Photograph_-_NARA_-_192698.jpg" target="blank">Public domain via Wikimedia Commons</a></span>
+    
+  </figcaption>
+</figure>
+<p>“Gellhorn was willing to put herself in positions where some journalists wouldn’t and then tell the stories that weren’t the traditional ‘what’s going on with a battle?’ or troop movements,” Hartley says. “It resonated, especially back home, where people were waiting on news about their loved ones. That personal take really did impact her audience.”</p>
+
+<hr>
+<p>For D-Day, Gellhorn was again working with <em>Collier’s</em>. She had hoped to be the publication’s lead reporter for the invasion, but her husband of four years, the novelist and writer <a href="https://www.smithsonianmag.com/smithsonian-institution/search-authentic-ernest-hemingway-180977368/">Ernest Hemingway</a>, stole the assignment. By the spring of 1944, the couple’s relationship was on the rocks, and Gellhorn believed her husband had taken the job out of spite.</p>
+
+<p>“It was clear to her that the marriage was over,” says Moorehead, whose mother was friends with Gellhorn. “Looking at the letters she wrote to her friends on the boat on the way over [to England], they’re very sad in a way. They’re sort of an epitaph on their marriage.” (Gellhorn had used her connections to secure Hemingway a spot on a flight to London, but her trans-Atlantic journey proved <a href="https://warfarehistorynetwork.com/article/ernest-hemingways-war/">more perilous</a>: She spent more than two weeks traveling on board a Norwegian freighter packed with dynamite.)</p>
+
+<p>Once in London, Hemingway arranged for transport to Normandy on the USS <a href="https://ww2ondeadline.com/2020/05/25/ernest-hemingway-d-day-london-car-crash-robert-capa/"><em>Dorothea L. Dix</em></a>. Gellhorn, meanwhile, didn’t have military approval to continue to France. In fact, the military denied all <a href="https://www.bbc.com/news/magazine-27677889">female journalists</a> permission to cover the Allied landings. But that wasn’t going to stop her.</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/fZfK8nvAXkIYtOr65M7H7ysnzjk=/fit-in/1072x0/filters:focal(1500x1193:1501x1194)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/7a/d1/7ad15dad-7810-4a91-b827-6cbc56bb40df/ernest_hemingway_with_colonel_charles_t_buck_lanham_september_18_1944_-_nara_-_192699.jpg" alt="Ernest Hemingway and Colonel Charles T. Lanham in Europe on September 18, 1944" loading="lazy">
+  
+
+  <figcaption>
+    
+      Ernest Hemingway and Colonel Charles T. Lanham in Europe on September 18, 1944
+    
+    
+      <span><a href="https://commons.wikimedia.org/wiki/Category:Ernest_Hemingway_Photograph_Collection_at_the_John_F._Kennedy_Presidential_Library_and_Museum#/media/File:Ernest_Hemingway_with_Colonel_Charles_T." target="blank">Public domain via Wikimedia Commons</a></span>
+    
+  </figcaption>
+</figure>
+<p>Contrary to <a href="https://www.military.com/history/how-martha-gellhorn-became-only-female-journalist-d-day.html">several</a> <a href="https://www.nationalww2museum.org/war/articles/martha-gellhorn-eyewitness-war">sources</a>, Gellhorn was not on Omaha Beach on June 6. According to Moorehead, when the reporter learned D-Day was underway that morning, she was in London attending a Ministry of Information briefing. Soon after, she made her way to Southampton, where the HMHS <a href="https://maritimearchaeologytrust.org/wp-content/uploads/2021/03/Hospital-Ships_Southampton_Roger-Burns_WEB.pdf"><em>Prague</em></a> was docked. To get on board the hospital carrier, she lied to a military policeman about wanting to interview nurses, then locked herself in a bathroom until the ship was safely en route.</p>
+
+<p>Complete with a surgical operating room and 422 beds, the <em>Prague </em>was the first hospital ship to reach Normandy, arriving at Omaha Beach early on the morning of June 7. Gellhorn spent most of the daylight hours watching as injured soldiers were moved from <a href="https://www.smithsonianmag.com/innovation/invention-won-world-war-ii-180972327/">Higgins boats</a> converted into <a href="https://www.ww2online.org/image/lcvp-transporting-wounded-servicemen-coast-normandy-france-1944">water ambulances</a> onto the hospital ship. She comforted the men as best she could.</p>
+
+<p>“It will be hard to tell you of the wounded, there were so many of them,” she <a href="https://www.unz.com/print/Colliers-1944aug05-00014">wrote</a> in her <em>Collier’s</em> article, which was published on August 5, 1944, and later reprinted in one of her anthologies, <a href="https://amzn.to/4bF8cOV"><em>The Face of War</em></a>. “There was no time to talk; there was too much else to do. They had to be fed, as most of them had not eaten for two days. … They wanted water; the nurses and orderlies, working like demons, had to be found and called quickly to a bunk where a man suddenly and desperately needed attention.”</p>
+
+<p>Gellhorn also described the stoicism of the American soldier:</p>
+
+<blockquote>
+<p>Men smiled who were in such pain that all they can really have wanted to do was turn their heads away and cry, and men made jokes when they needed their strength just to survive. All of them looked after one another, saying, “Give that boy a drink of water,” or “Miss, see that Ranger over there; he’s in bad shape. Could you go to him?”</p>
+</blockquote><figure>
+    <div data-type="video">
+    <p>Martha Gellhorn: The War Correspondent who Covered D-Day</p>
+    
+    <p><img src="https://i.ytimg.com/vi/kIKq-H6RLFw/maxresdefault.jpg" data-video-id="kIKq-H6RLFw"></p>
+  </div>
+    
+</figure>
+<p>Because she spoke several languages, Gellhorn assisted doctors and nurses by translating for injured German prisoners of war and French civilians. When the enemy wounded made too much noise, she wrote in her diary, she told them “<em>ruhig</em>”—German for “quiet”—“on doctor’s orders, and they were all instantly silent.”</p>
+
+<p>As night fell, word came back to the hospital ship that wounded men were still on the beach. Gellhorn jumped into a water ambulance and headed to land to help. Despite the dangers, she waded through the cold surf to search for the injured.</p>
+
+<p>“Everyone was violently busy on that crowded, dangerous shore,” Gellhorn wrote for <em>Collier’s</em>. “We walked with the utmost care between the narrowly placed white tape lines that marked the mine-cleared path and headed for a tent marked with a red cross.”</p>
+
+<p>Gellhorn helped load and tend to the wounded on a beached <a href="https://www.navytimes.com/news/your-navy/2019/06/06/the-unloved-unlovely-yet-indispensable-lst/">landing ship, tank</a>, or LST. Because of extreme tides, the vessel could not return to the hospital carrier until the wee hours of June 8. The soldiers were then taken on board the <em>Prague</em>, where the sickbeds were filled, and preparations were made for the return trip to England. Describing the scene in her article, Gellhorn wrote, “Piles of bloody clothing had been cut off and dumped out of the way in corners; coffee cups and cigarette stubs littered the decks, plasma bottles hung from cords, and all the fearful surgical apparatus for holding broken bones made shadows on the walls.”</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/vN7v7rFW2pnA58UJ5_7KUf_CXyI=/fit-in/1072x0/filters:focal(370x296:371x297)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/12/8c/128c5a84-9179-467a-b42e-05aff2024647/lci-convoy.jpeg" alt="A large landing craft convoy crosses the English Channel on June 6, 1944" loading="lazy">
+  
+
+  <figcaption>
+    
+      A large landing craft convoy crosses the English Channel on June 6, 1944
+    
+    
+      <span><a href="https://en.wikipedia.org/wiki/Normandy_landings#/media/File:Lci-convoy.jpg" target="blank">Public domain via Wikimedia Commons</a></span>
+    
+  </figcaption>
+</figure>
+<p>Despite the high numbers of injuries, only one man died on the hospital ship. The rest made it across the English Channel, where they were transferred to military hospitals for surgery and rehabilitation.</p>
+
+<p>Upon her return to London, Gellhorn was arrested by military police for traveling to Normandy <a href="https://ww2ondeadline.com/2020/06/07/d-day-martha-gellhorn-ernest-hemingway-colliers/comment-page-1/">without permission</a>. As punishment, she was sent to a training camp for American nurses and told she could go back to France when they did. By then, it was too late: She had already filed her story with <em>Collier’s</em>.</p>
+
+<p>Unlike his wife, <a href="https://www.archives.gov/publications/prologue/2006/spring/hemingway.html#:~:text=Hemingway%20accompanied%20American%20troops%20as,22nd%20Regiment%20commanded%20by%20Col.">Hemingway</a> never went ashore at Normandy. On June 6, all he could do was watch from a landing craft as American soldiers fought their way onto Omaha Beach.</p>
+
+<p>Even though Gellhorn scooped Hemingway, his story ran first. “<a href="https://www.unz.com/print/Colliers-1944jul22-00011/">Voyage to Victory</a>,” proclaimed the cover of <em>Collier’s</em> July 22, 1944, issue. The article identified Hemingway as “<em>Collier’s</em> famed war correspondent” and included a photo of the whiskered writer with Allied soldiers. Gellhorn’s story ran in the August 5 issue with the headline “<a href="https://www.unz.com/print/Colliers-1944aug05-00014/">The Wounded Come Home</a>.” No mention was made of the fact that she was the only female journalist on the ground at Omaha Beach.</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/-xNsGghd_zMrTABSJs97A9Eq7FA=/fit-in/1072x0/filters:focal(1912x2385:1913x2386)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/bc/dc/bcdc7b2e-aca9-4271-aaaf-d897efc4b12d/gettyimages-107806105.jpg" alt="A 1946 photo of Gellhorn" loading="lazy">
+  
+
+  <figcaption>
+    
+      A 1946 photo of Gellhorn
+    
+    
+      <span>FPG / Archive Photos / Getty Images</span>
+    
+  </figcaption>
+</figure>
+<p>Gellhorn’s success rankled Hemingway, resulting in a <a href="https://www.literaryladiesguide.com/literary-musings/marriage-of-martha-gellhorn-ernest-hemingway/">further fracturing</a> of their already faltering marriage. Gellhorn, too, was unhappy with her husband’s <a href="https://www.telegraph.co.uk/culture/4723541/The-war-for-Marthas-memory.html">abuse</a>, alcoholism and infidelity. The couple divorced in 1945.</p>
+
+<p>After D-Day, Gellhorn continued to cover the war in Europe. For months, word had <a href="https://www.smithsonianmag.com/history/the-holocaust-comic-that-brought-americans-into-the-nazis-gas-chambers-180980114/">filtered out</a> about the horrors unfolding at Dachau and other Nazi concentration camps. Gellhorn, one of the <a href="https://www.dw.com/en/the-liberation-of-dachau-75-years-ago/a-53270700">first journalists</a> to tour Dachau following its liberation in April 1945, thought she was prepared for the experience but quickly realized otherwise.</p>
+
+<p>In her <em>Collier’s</em> article, titled “<a href="http://www.oldmagazinearticles.com/war-correspondent-martha-gellhorn-at-DACHAU-death-camp-pdf">Dachau: Experimental Murder</a>,” Gellhorn described the shock of what she had witnessed: “There suddenly but never to be believed were the bodies of the dead. They were everywhere. There were piles of them inside the oven room, outside the door and alongside the building. They were all naked, and behind the crematorium, the ragged clothing of the dead was neatly stacked.”</p>
+
+<p>As Moorehead <a href="https://archive.org/details/marthagellhornli0000moor/page/284/mode/1up?q=%22something+changed%22">writes</a> in her biography of Gellhorn, “Something changed for [Gellhorn] that day; something to do with what she felt about memory and the past, and her own sense of optimism, and perhaps even about being Jewish. It was in Dachau, she said, that she really understood for the first time the true evil of man.”</p>
+
+<figure>
+  
+    <img src="https://th-thumbnailer.cdn-si-edu.com/dPR7ZN8C9M649UXMvn7A8FrIu7Q=/fit-in/1072x0/filters:focal(2147x1329:2148x1330)/https://tf-cmsv2-smithsonianmag-media.s3.amazonaws.com/filer_public/9a/5f/9a5fc800-bb95-4dd3-8cda-0b9ea3de8a6c/gettyimages-515451612.jpg" alt="Gellhorn and Virginia Cowles attend the opening night of their play" loading="lazy">
+  
+
+  <figcaption>
+    
+      Gellhorn (third from left) later co-wrote a play about her wartime experiences.
+    
+    
+      <span>Bettman via Getty Images</span>
+    
+  </figcaption>
+</figure>
+<p>Despite seeing so much death and destruction, Gellhorn continued to pursue her career as a war correspondent. She covered conflicts around the globe, including the <a href="https://granta.com/the-invasion-of-panama/">U.S. invasion of Panama</a> in 1989. With both her health and her vision failing, she retired to her apartment in London. Stricken with ovarian cancer and unable to perform even simple tasks, she swallowed a <a href="https://www.newyorker.com/news/letter-from-the-uk/a-memorial-for-the-remarkable-martha-gellhorn">cyanide pill</a> and <a href="https://www.nytimes.com/1998/02/17/arts/martha-gellhorn-daring-writer-dies-at-89.html">died</a> at age 89 in February 1998.</p>
+
+<p>Moorehead revered Gellhorn and even named her daughter after the legendary journalist, who also <a href="https://www.amazon.com/stores/Martha-Gellhorn/author/B001H6PSGC?ref=ap_rdr&amp;isDramIntegrated=true&amp;shoppingPortalEnabled=true">wrote</a> both fiction and nonfiction books. But the biographer acknowledges that Gellhorn could be a difficult person.</p>
+
+<p>“I admired her hugely,” Moorehead says. “I was a bit scared of her, though. She was very formidable. I thought she was a terrific reporter, and she was really brave. She could be quite tough, quite cruel, quite hard. She was very impatient with people not taking responsibility for themselves. She felt you had to face up to life and get on with it. She was old school and tough on herself.”</p>
+
+<p>Gellhorn remained a reporter until the very last, squeezing in a final reporting <a href="https://www.lrb.co.uk/the-paper/v18/n16/martha-gellhorn/mean-streets-of-salvador">trip to Brazil</a> at age 85. She always wanted to know the story and how it affected those who were part of it.</p>
+
+<p>“At the end of her life, she would invite people—mostly young journalists—over,” Moorehead says. “You’d go there for a drink. You’d take the lift up to her flat, and she would be leaning against the door. She’d give you a drink and ask you about yourself.”</p>
+
+      
+        
+  <div>
+      <p>Get the latest <strong>History</strong> stories in your inbox?</p>
+      
+    </div>
+
+
+      
+
+      
+      
+
+      
+        
+
+
+  
+    
+      
+    
+  
+
+  
+
+
+      
+
+      
+      
+
+      
+        
+          <section>
+            <nav>Filed Under:
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/american-history/">American History</a>, 
+                
+              
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/american-writers/">American Writers</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/ernest-hemingway/">Ernest Hemingway</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/holocaust/">Holocaust</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/journalism/">Journalism</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/magazines/">Magazines</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/military/">Military</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/us-military/">US Military</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/warfare/">Warfare</a>, 
+                
+              
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/womens-history/">Women's History</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/world-war-ii/">World War II</a>, 
+                
+              
+                
+                  <a href="https://www.smithsonianmag.com/tag/writers/">Writers</a>
+                
+              
+            </nav>
+          </section>
+        
+      
+
+    </div>
+
+    
+
+  </article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The Roads of Ancient Rome Visualized in the Style of Modern Subway Maps (320 pts)]]></title>
             <link>https://www.openculture.com/2024/06/the-roads-of-ancient-rome-visualized-in-modern-subway-maps.html</link>
             <guid>40597216</guid>
             <pubDate>Thu, 06 Jun 2024 13:32:36 GMT</pubDate>
@@ -831,7 +1241,7 @@ If you would like to sign up for Open Culture’s free email newslet­ter,&nbsp;
 <br>		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Super Heavy has splashed down in The Gulf of Mexico (568 pts)]]></title>
+            <title><![CDATA[Super Heavy has splashed down in The Gulf of Mexico (581 pts)]]></title>
             <link>https://twitter.com/SpaceX/status/1798701489097183286</link>
             <guid>40596883</guid>
             <pubDate>Thu, 06 Jun 2024 13:02:48 GMT</pubDate>
@@ -839,7 +1249,7 @@ If you would like to sign up for Open Culture’s free email newslet­ter,&nbsp;
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[AeroSpace is an i3-like tiling window manager for macOS (310 pts)]]></title>
+            <title><![CDATA[AeroSpace is an i3-like tiling window manager for macOS (319 pts)]]></title>
             <link>https://github.com/nikitabobko/AeroSpace</link>
             <guid>40596689</guid>
             <pubDate>Thu, 06 Jun 2024 12:39:01 GMT</pubDate>
@@ -940,7 +1350,88 @@ AeroSpace will either find another way (such as <a href="https://nikitabobko.git
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Don Estridge: A misfit who built the IBM PC (159 pts)]]></title>
+            <title><![CDATA[Brain overgrowth dictates autism severity, new research suggests (101 pts)]]></title>
+            <link>https://medicalxpress.com/news/2024-06-brain-overgrowth-dictates-autism-severity.html</link>
+            <guid>40596535</guid>
+            <pubDate>Thu, 06 Jun 2024 12:18:39 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://medicalxpress.com/news/2024-06-brain-overgrowth-dictates-autism-severity.html">https://medicalxpress.com/news/2024-06-brain-overgrowth-dictates-autism-severity.html</a>, See on <a href="https://news.ycombinator.com/item?id=40596535">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+									    
+<div data-thumb="https://scx1.b-cdn.net/csz/news/tmb/2024/brain-overgrowth-dicta-2.jpg" data-src="https://scx2.b-cdn.net/gfx/news/hires/2024/brain-overgrowth-dicta-2.jpg" data-sub-html="Culturing BCOs from human iPSCs. Credit: <i>Molecular Autism</i> (2024). DOI: 10.1186/s13229-024-00602-8">
+        <figure>
+            <img src="https://scx1.b-cdn.net/csz/news/800a/2024/brain-overgrowth-dicta-2.jpg" alt="Brain overgrowth dictates autism severity, new research suggests" title="Culturing BCOs from human iPSCs. Credit: Molecular Autism (2024). DOI: 10.1186/s13229-024-00602-8" width="800" height="496">
+             <figcaption>
+                Culturing BCOs from human iPSCs. Credit: <i>Molecular Autism</i> (2024). DOI: 10.1186/s13229-024-00602-8
+            </figcaption>        </figure>
+    </div><p>Some children with autism experience profound, lifelong difficulties like developmental delay, social struggles and even the inability to speak. Others experience more mild symptoms that improve with time.</p>
+
+                                        
+                                                                                  
+                                        
+                                                                                                                                    
+<p>The disparity in outcomes has been a mystery to scientists, until now. <a href="https://doi.org/10.1186/s13229-024-00602-8" target="_blank">A new study</a>, published in <i>Molecular Autism</i> by researchers at University of California San Diego, is the first to shed light on the matter. Among its findings: The biological basis for these two subtypes of <a href="https://medicalxpress.com/tags/autism/" rel="tag">autism</a> develops in utero.</p>
+<p>Researchers used blood-based stem cells from 10 toddlers, ages 1 through 4, with idiopathic autism (in which no single-gene cause was identified) to create brain cortical organoids (BCOs), or models of the fetal cortex. They also created BCOs from six neurotypical toddlers.</p>
+<p>Often referred to as gray matter, the cortex lines the outside of the brain. It holds tens of billions of <a href="https://medicalxpress.com/tags/nerve+cells/" rel="tag">nerve cells</a> and is responsible for essential functions like consciousness, thinking, reasoning, learning, memory, emotions and sensory functions.</p>
+<p>Among their findings: The BCOs of toddlers with autism were significantly larger—roughly 40 percent—than those of neurotypical controls, according to two rounds of study performed in different years (2021 and 2022). Each round involved the creation of hundreds of organoids from each patient.</p>
+
+<div data-thumb="https://scx1.b-cdn.net/csz/news/tmb/2024/brain-overgrowth-dicta.jpg" data-src="https://scx2.b-cdn.net/gfx/news/2024/brain-overgrowth-dicta.jpg" data-sub-html="Brain cortical organoids (BCOs) created by Dr. Alysson Muotri shown in a 2019 file photo. Muotri and colleagues at the University of California San Diego used stem cells from toddlers with autism and created BCOs from them. The stem cells of toddlers with autism developed into larger BCOs, they discovered. Toddlers with autism also had larger brain volumes, according to MRI. Credit: UC San Diego Health Sciences">
+        <figure>
+            <img src="https://scx1.b-cdn.net/csz/news/800a/2024/brain-overgrowth-dicta.jpg" alt="Brain overgrowth dictates autism severity, new research suggests" title="Brain cortical organoids (BCOs) created by Dr. Alysson Muotri shown in a 2019 file photo. Muotri and colleagues at the University of California San Diego used stem cells from toddlers with autism and created BCOs from them. The stem cells of toddlers with autism developed into larger BCOs, they discovered. Toddlers with autism also had larger brain volumes, according to MRI. Credit: UC San Diego Health Sciences">
+             <figcaption>
+                Brain cortical organoids (BCOs) created by Dr. Alysson Muotri shown in a 2019 file photo. Muotri and colleagues at the University of California San Diego used stem cells from toddlers with autism and created BCOs from them. The stem cells of toddlers with autism developed into larger BCOs, they discovered. Toddlers with autism also had larger brain volumes, according to MRI. Credit: UC San Diego Health Sciences
+            </figcaption>        </figure>
+    </div>
+<p>The researchers also found that abnormal BCO growth in toddlers with autism correlated with their disease presentation. The larger a toddler's BCO size, the more severe their social and language symptoms were later in life, and the larger their <a href="https://medicalxpress.com/tags/brain+structure/" rel="tag">brain structure</a> on MRI. Toddlers with excessively enlarged BCOs showed greater-than-typical volume in social, language and sensory brain areas when compared to neurotypical peers.</p>
+
+                                                                                                        <!-- Google middle Adsense block -->
+    
+                                                                                                                                            <p>"The bigger the brain, the better isn't necessarily true," said Alysson Muotri, Ph.D., director of the Sanford Stem Cell Institute (SSCI) Integrated Space Stem Cell Orbital Research Center at the university. The SSCI is directed by Catriona Jamieson, M.D., Ph.D., a leading physician-scientist in cancer stem cell biology whose research explores the fundamental question of how space alters cancer progression.</p>
+<p>"We found that in the brain organoids from toddlers with profound autism, there are more cells and sometimes more neurons—and that's not always for the best," added Muotri, who is also a professor in the Departments of Pediatrics and Cellular and Molecular Medicine at the UC San Diego School of Medicine.</p>
+<p>What's more, the BCOs of all children with autism, regardless of severity, grew roughly three times faster than those of neurotypical children. Some of the largest brain organoids—from children with the most severe, persistent cases of autism—also saw the accelerated formation of neurons. The more severe a toddler's autism, the quicker their BCO grew—sometimes to the point of developing an excess of neurons.</p>
+<p>Eric Courchesne, Ph.D., a professor in the School of Medicine's Department of Neurosciences who co-led the research with Muotri, called the study "one of a kind." Matching data on children with autism—including their IQs, symptom severity and imaging like MRIs—with their corresponding BCOs or similar stem cell-derived models makes an incredible amount of sense, he said. But oddly enough, such research hadn't been undertaken ahead of their work.</p>
+
+<div data-thumb="https://scx1.b-cdn.net/csz/news/tmb/2024/brain-overgrowth-dicta-1.jpg" data-src="https://scx2.b-cdn.net/gfx/news/hires/2024/brain-overgrowth-dicta-1.jpg" data-sub-html="Comparing ASD and Control BCO size distributions and BCO size correlation with ADOS social symptom severity. Credit: <i>Molecular Autism</i> (2024). DOI: 10.1186/s13229-024-00602-8">
+        <figure>
+            <img src="https://scx1.b-cdn.net/csz/news/800a/2024/brain-overgrowth-dicta-1.jpg" alt="Brain overgrowth dictates autism severity, new research suggests" title="Comparing ASD and Control BCO size distributions and BCO size correlation with ADOS social symptom severity. Credit: Molecular Autism (2024). DOI: 10.1186/s13229-024-00602-8">
+             <figcaption>
+                Comparing ASD and Control BCO size distributions and BCO size correlation with ADOS social symptom severity. Credit: <i>Molecular Autism</i> (2024). DOI: 10.1186/s13229-024-00602-8
+            </figcaption>        </figure>
+    </div>
+<p>"The core symptoms of autism are social affective and <a href="https://medicalxpress.com/tags/communication+problems/" rel="tag">communication problems</a>," said Courchesne, who also serves as co-director of the UC San Diego Autism Center of Excellence. "We need to understand the underlying neurobiological causes of those challenges and when they begin. We are the first to design an autism stem cell study of this specific and central question."</p>
+
+                                                                                                                                            <p>It's long been assumed that autism, a complex pool of progressive disorders, begins prenatally and involves multiple stages and processes. While no two people with autism are like—just as no two neurotypical people are—those with the neurodevelopmental condition can generally be grouped into two categories: those who have severe social struggles and require lifelong care, and may even be nonverbal, and those who have a milder version of the condition who eventually develop good language skills and <a href="https://medicalxpress.com/tags/social+relationships/" rel="tag">social relationships</a>.</p>
+<p>Scientists haven't been able to ascertain why at least two groups of individuals with autism exist. They also haven't been able to prenatally identify children with autism, let alone predict how severe their condition might be.</p>
+<p>Now that Courchesne and Muotri have established that brain overgrowth begins in the womb, they hope to pinpoint its cause, in a bid to develop a therapy that might ease intellectual and social functioning for those with the condition.</p>
+<p>Co-authors of the study include Vani Taluja, Sanaz Nazari, Caitlin M. Aamodt, Karen Pierce, Kuaikuai Duan, Sunny Stophaeros, Linda Lopez, Cynthia Carter Barnes, Jaden Troxel, Kathleen Campbell, Tianyun Wang, Kendra Hoekzema, Evan E. Eichler, Joao V. Nani, Wirla Pontes, Sandra Sanchez Sanchez, Michael V. Lombardo and Janaina S. de Souza.</p>
+
+
+                                                                                                                                                                            
+                                        											<div>
+												                                                    <p><strong>More information:</strong>
+                                                    Eric Courchesne et al, Embryonic origin of two ASD subtypes of social symptom severity: the larger the brain cortical organoid size, the more severe the social symptoms, <i>Molecular Autism</i> (2024). <a data-doi="1" href="https://dx.doi.org/10.1186/s13229-024-00602-8" target="_blank">DOI: 10.1186/s13229-024-00602-8</a>
+																								
+																								</p>
+																							</div>
+                                        											
+																					
+                                                                                                                        
+                                        <!-- print only -->
+                                        <div>
+                                            <p><strong>Citation</strong>:
+                                                 Brain overgrowth dictates autism severity, new research suggests (2024, June 5)
+                                                 retrieved 6 June 2024
+                                                 from https://medicalxpress.com/news/2024-06-brain-overgrowth-dictates-autism-severity.html
+                                            </p>
+                                            <p>
+                                            This document is subject to copyright. Apart from any fair dealing for the purpose of private study or research, no
+                                            part may be reproduced without the written permission. The content is provided for information purposes only.
+                                            </p>
+                                        </div>
+                                        
+									</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Don Estridge: A misfit who built the IBM PC (160 pts)]]></title>
             <link>https://every.to/the-crazy-ones/the-misfit-who-built-the-ibm-pc</link>
             <guid>40595920</guid>
             <pubDate>Thu, 06 Jun 2024 10:55:32 GMT</pubDate>
@@ -962,7 +1453,7 @@ AeroSpace will either find another way (such as <a href="https://nikitabobko.git
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I learned Vulkan and wrote a small game engine with it (390 pts)]]></title>
+            <title><![CDATA[I learned Vulkan and wrote a small game engine with it (396 pts)]]></title>
             <link>https://edw.is/learning-vulkan/</link>
             <guid>40595741</guid>
             <pubDate>Thu, 06 Jun 2024 10:24:23 GMT</pubDate>
@@ -970,7 +1461,7 @@ AeroSpace will either find another way (such as <a href="https://nikitabobko.git
 Couldn't get https://edw.is/learning-vulkan/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[St Michael Sword investigation: Are the 7 Cathedrals on a straight line? (285 pts)]]></title>
+            <title><![CDATA[St Michael Sword investigation: Are the 7 Cathedrals on a straight line? (287 pts)]]></title>
             <link>https://geospatial.netlify.app/posts/gds-2024-04-20-cathedrals/</link>
             <guid>40595499</guid>
             <pubDate>Thu, 06 Jun 2024 09:48:59 GMT</pubDate>
@@ -2049,7 +2540,7 @@ Implicit form  : -0.414 x -1 y + 47.873 = 0</code></pre>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Understanding QEMU Devices (2018) (131 pts)]]></title>
+            <title><![CDATA[Understanding QEMU Devices (2018) (134 pts)]]></title>
             <link>https://www.qemu.org/2018/02/09/understanding-qemu-devices/</link>
             <guid>40595384</guid>
             <pubDate>Thu, 06 Jun 2024 09:33:19 GMT</pubDate>
@@ -2635,65 +3126,6 @@ Couldn't get https://www.nytimes.com/2024/06/05/technology/nvidia-microsoft-open
   PORTB.OUT    = cmd;             /* Prepare command   */
   PORTA.OUTSET = _BV(OLED_A_WR);  /* Set the WR- bit   */
 }</code></pre></blockquote><p><span>Microchip has a </span><a href="https://ww1.microchip.com/downloads/en/Appnotes/Migration-from-megaAVR-to-AVR-DxMCU-Fam-DS00003731A.pdf" rel="">short migration doc</a><span> explaining the differences between the platforms. If you prefer to learn from examples, I also published the source code for two of my earlier AVR Dx projects: </span><a href="https://lcamtuf.coredump.cx/soft/embedded/playback.c" rel="">an audio toy</a><span> and an </span><a href="https://lcamtuf.coredump.cx/soft/embedded/sir-box-a-lot2.tgz" rel="">OLED game</a><span>.</span></p><p><em><span>For more articles about MCU programming and electronics, </span><a href="https://lcamtuf.coredump.cx/offsite.shtml" rel="">click here</a><span>.</span></em></p></div></article></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Microsoft AI Spying Scandal: Time to Rethink Privacy Standards (821 pts)]]></title>
-            <link>https://spectrum.ieee.org/online-privacy</link>
-            <guid>40592789</guid>
-            <pubDate>Thu, 06 Jun 2024 02:25:25 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://spectrum.ieee.org/online-privacy">https://spectrum.ieee.org/online-privacy</a>, See on <a href="https://news.ycombinator.com/item?id=40592789">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-headline="How Online Privacy Is Like Fishing"><p><a href="https://spectrum.ieee.org/tag/microsoft">Microsoft</a> recently <u><a href="https://www.reuters.com/technology/cybersecurity/microsoft-says-it-caught-hackers-china-russia-iran-using-its-ai-tools-2024-02-14/" target="_blank">caught state-backed hackers</a></u> using its generative AI tools to help with their attacks. In the security community, the immediate questions weren’t about how hackers were using the tools (that was utterly predictable), but about how Microsoft figured it out. The natural conclusion was that Microsoft was spying on its AI users, looking for harmful hackers at work.<br></p><p>Some <a href="https://news.ycombinator.com/item?id=39442429" target="_blank">pushed back</a> at characterizing Microsoft’s actions as “spying.” Of <em>course</em> cloud service providers monitor what users are doing. And because we expect Microsoft to be doing something like this, it’s not fair to call it spying.</p><p>We see this argument as an example of our shifting collective expectations of privacy. To understand what’s happening, we can learn from an unlikely source: fish.</p><p>In the mid-20th century, scientists began noticing that the number of fish in the ocean—so vast as to underlie the phrase “There are plenty of fish in the sea”—had started declining rapidly due to overfishing. They had already seen a similar decline in whale populations, when the post-WWII whaling industry nearly drove many species extinct. In whaling and later in commercial fishing, new technology made it easier to find and catch marine creatures in ever greater numbers. Ecologists, specifically those working in fisheries management, began studying how and when certain fish populations had gone into serious decline.</p><p>One scientist, <a href="https://oceans.ubc.ca/2023/05/19/daniel-pauly/" rel="noopener noreferrer" target="_blank">Daniel Pauly</a>, realized that researchers studying fish populations were making a major error when trying to determine acceptable catch size. It wasn’t that scientists didn’t recognize the declining fish populations. It was just that they didn’t realize how significant the decline was. Pauly noted that each generation of scientists had a different baseline to which they compared the current statistics, and that each generation’s baseline was lower than that of the previous one.</p><p>What seems normal to us in the security community is whatever was commonplace at the beginning of our <a href="https://spectrum.ieee.org/topic/careers/">careers</a>.</p><p>Pauly called this “<a href="https://en.wikipedia.org/wiki/Shifting_baseline" rel="noopener noreferrer" target="_blank">shifting baseline syndrome</a>” in a 1995 paper. The baseline most scientists used was the one that was normal when they began their research careers. By that measure, each subsequent decline wasn’t significant, but the cumulative decline was devastating. Each generation of researchers came of age in a new ecological and technological environment, inadvertently masking an exponential decline.</p><p>Pauly’s insights came too late to help those managing some fisheries. The ocean suffered catastrophes such as the <a href="https://en.wikipedia.org/wiki/Collapse_of_the_Atlantic_northwest_cod_fishery" target="_blank">complete collapse</a> of the Northwest Atlantic cod population in the 1990s.</p><p>Internet surveillance, and the resultant loss of privacy, is following the same trajectory. Just as certain fish populations in the world’s oceans have fallen 80 percent, from previously having fallen 80 percent, from previously having fallen 80 percent (ad infinitum), our expectations of privacy have similarly fallen precipitously. The pervasive nature of modern technology makes surveillance easier than ever before, while each successive generation of the public is accustomed to the privacy status quo of their youth. What seems normal to us in the security community is whatever was commonplace at the beginning of our careers.</p><p>Historically, people controlled their computers, and software was standalone. The always-connected cloud-deployment model of software and services flipped the script. Most apps and services are designed to be always-online, feeding usage information back to the company. A consequence of this modern deployment model is that everyone—cynical tech folks and even ordinary users—expects that what you do with modern tech isn’t private. But that’s because the baseline has shifted.</p><p>AI chatbots are the latest incarnation of this phenomenon: They produce output in response to your input, but behind the scenes there’s a complex cloud-based system keeping track of that input—both to improve the service and to <a href="https://about.ads.microsoft.com/en/blog/post/february-2023/the-new-bing-creating-value-for-advertisers" rel="noopener noreferrer" target="_blank">sell you ads</a>.</p><p>Shifting baselines are at the heart of our collective loss of privacy. The U.S. Supreme Court has long held that our right to privacy depends on whether we have a reasonable <a href="https://www.law.cornell.edu/wex/expectation_of_privacy" target="_blank">expectation of privacy</a>. But expectation is a slippery thing: It’s subject to shifting baselines.</p><p>The question remains: What now? Fisheries scientists, armed with knowledge of shifting-baseline syndrome, now look at the big picture. They no longer consider relative measures, such as comparing this decade with the last decade. Instead, they take a holistic, ecosystem-wide perspective to see what a healthy marine ecosystem and thus sustainable catch should look like. They then turn these scientifically derived sustainable-catch figures into limits to be codified by regulators.</p><p>In privacy and security, we need to do the same. Instead of comparing to a shifting baseline, we need to step back and look at what a healthy technological ecosystem would look like: one that respects people’s privacy rights while also allowing companies to recoup costs for services they provide. Ultimately, as with fisheries, we need to take a big-picture perspective and be aware of shifting baselines. A scientifically informed and democratic regulatory process is required to preserve a heritage—whether it be the ocean or the Internet—for the next generation.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Save Team Fortress 2 (#savetf2) (193 pts)]]></title>
-            <link>https://save.tf/</link>
-            <guid>40592611</guid>
-            <pubDate>Thu, 06 Jun 2024 01:50:49 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://save.tf/">https://save.tf/</a>, See on <a href="https://news.ycombinator.com/item?id=40592611">Hacker News</a></p>
-Couldn't get https://save.tf/: Error: Request failed with status code 403]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Most life on Earth is dormant, after pulling an 'emergency brake' (256 pts)]]></title>
-            <link>https://www.quantamagazine.org/most-life-on-earth-is-dormant-after-pulling-an-emergency-brake-20240605/</link>
-            <guid>40592575</guid>
-            <pubDate>Thu, 06 Jun 2024 01:45:25 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.quantamagazine.org/most-life-on-earth-is-dormant-after-pulling-an-emergency-brake-20240605/">https://www.quantamagazine.org/most-life-on-earth-is-dormant-after-pulling-an-emergency-brake-20240605/</a>, See on <a href="https://news.ycombinator.com/item?id=40592575">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>Researchers recently reported the discovery of a natural protein, named Balon, that can bring a cell’s production of new proteins to a screeching halt. Balon was found in bacteria that hibernate in Arctic permafrost, but it also seems to be made by many other organisms and may be an overlooked mechanism for dormancy throughout the tree of life.</p>
-<p>For most life forms, the ability to shut oneself off is a vital part of staying alive. Harsh conditions like lack of food or cold weather can appear out of nowhere. In these dire straits, rather than keel over and die, many organisms have mastered the art of dormancy. They slow down their activity and metabolism. Then, when better times roll back around, they reanimate.</p>
-<p>Sitting around in a dormant state is actually the norm for the majority of life on Earth: By some estimates, 60% of all microbial cells are hibernating at any given time. Even in organisms whose entire bodies do not go dormant, like most mammals, some cellular populations within them rest and wait for the best time to activate.</p>
-<p>“We live on a dormant planet,” said <a href="https://melnikovlab.com/">Sergey Melnikov</a>, an evolutionary molecular biologist at Newcastle University. “Life is mainly about being asleep.”</p>
-<p>But how do cells pull off this feat? Over the years, researchers have discovered a number of “hibernation factors,” proteins that cells use to induce and maintain a dormant state. When a cell detects some kind of adverse condition, like starvation or cold, it produces a suite of hibernation factors to shut its metabolism down.</p>
-<p>Some hibernation factors dismantle cellular machinery; others prevent genes from being expressed. The most important ones, however, shut down the ribosome — the cell’s machine for building new proteins. Making proteins accounts for more than <a href="https://doi.org/10.1016/j.cell.2014.02.033">50% of energy use</a> in a growing bacterial cell. These hibernation factors throw sand in the gears of the ribosome, preventing it from synthesizing new proteins and thereby saving energy for the needs of basic survival.</p>
-<p>Earlier this year, publishing in <em>Nature</em>, researchers reported the discovery of <a href="https://doi.org/10.1038/s41586-024-07041-8">a new hibernation factor</a>, which they have named Balon. The protein is shockingly common: A search for its gene sequence uncovered its presence in 20% of all cataloged bacterial genomes. And it works in a way that molecular biologists had never seen before.</p>
-
-<p>Previously, all known ribosome-disrupting hibernation factors worked passively: They waited for a ribosome to finish building a protein and then prevented it from starting a new one. Balon, however, pulls the emergency brake. It stuffs itself into every ribosome in the cell, even interrupting active ribosomes in the middle of their work. Before Balon, hibernation factors had only been seen in empty ribosomes.</p>
-<p>“The Balon paper is amazingly detailed,” said the evolutionary biologist <a href="https://lennonlab.github.io/">Jay Lennon</a>, who studies microbial dormancy at Indiana University and was not involved in the new study. “It will add to our view of how dormancy works.”</p>
-<p>Melnikov and his graduate student Karla Helena-Bueno discovered Balon in <em>Psychrobacter urativorans</em>, a cold-adapted bacterium native to frozen soils and harvested from Arctic permafrost. (According to Melnikov, the bacterium was first found infecting a pack of <a href="https://www.ccug.se/strain?id=4982">frozen sausages</a> in the 1970s and then rediscovered by the famed genomicist Craig Venter on a trip to the Arctic.) They study <em>P. urativorans</em> and other unusual microbes to characterize the diversity of protein-building tools used across the spectrum of life and to understand how ribosomes can adapt to extreme environments.</p>
-<p>Because dormancy can be triggered by a variety of conditions, including starvation and drought, the scientists pursue this research with a practical goal in mind: “We can probably use this knowledge in order to engineer organisms that can tolerate warmer climates,” Melnikov said, “and therefore withstand climate change.”</p>
-<h2><strong>Introducing: Balon</strong></h2>
-<p>Helena-Bueno discovered Balon entirely by accident. She was trying to coax <em>P</em>. <em>urativorans </em>to grow happily in the lab. Instead she did the opposite. She left the culture in an ice bucket for too long and managed to cold-shock it. By the time she remembered it was there, the cold-adapted bacteria had gone dormant.</p>
-<p>Not wanting to waste the culture, the researchers pursued their original interests anyway. Helena-Bueno extracted the cold-shocked bacteria’s ribosomes and subjected them to cryo-EM. Short for cryogenic electron microscopy, cryo-EM is a technique for <a href="https://www.quantamagazine.org/supercool-protein-imaging-gets-the-nobel-prize-20171004/">visualizing minuscule biological structures</a> at high resolution. Helena-Bueno saw a protein jammed into the stalled ribosome’s A site — the “door” where amino acids are delivered for the construction of new proteins.</p>
-<p>Helena-Bueno and Melnikov didn’t recognize the protein. Indeed, it had never been described before. It bore a similarity to another bacterial protein, one that’s important for disassembling and recycling ribosomal parts, called <a href="https://www.cell.com/trends/biochemical-sciences/abstract/S0968-0004(18)30230-5">Pelota</a> from the Spanish for “ball.” So they named the new protein Balon for a different Spanish word for “ball.”</p>
-
-<p>Balon’s ability to halt the ribosome’s activity in its tracks is a critical adaptation for a microbe under stress, said <a href="https://sites.northwestern.edu/yaplab/">Mee-Ngan Frances Yap</a>, a microbiologist at Northwestern University who wasn’t involved in the work. “When bacteria are actively growing, they produce lots of ribosomes and RNA,” she said. “When they encounter stress, a species might need to shut down translation” of RNA into new proteins to begin conserving energy for a potentially long hibernation period.</p>
-<p>Notably, Balon’s mechanism is a reversible process. Unlike other hibernation factors, it can be inserted to stall growth and then quickly ejected like a cassette tape. It enables a cell to rapidly go dormant in an emergency and resuscitate itself just as rapidly to readapt to more favorable conditions.</p>
-<p>Balon can do this because it latches on to ribosomes in a unique way. Every ribosomal hibernation factor previously discovered physically blocks the ribosome’s A site, so any protein-making process that’s in progress must be completed before the factor can attach to turn off the ribosome. Balon, on the other hand, binds near but not across the channel, which allows it to come and go regardless of what the ribosome is doing.</p>
-
-<p>Despite Balon’s mechanistic novelty, it’s an exceedingly common protein. Once it was identified, Helena-Bueno and Melnikov found genetic relatives of Balon in upward of 20% of all the bacterial genomes cataloged in public databases. With help from <a href="https://researchexperts.utmb.edu/en/persons/mariia-rybak">Mariia Rybak</a>, a molecular biologist at the University of Texas Medical Branch, they characterized two of these alternate bacterial proteins: one from the human pathogen <em>Mycobacterium tuberculosis</em>, which causes tuberculosis, and another in <em>Thermus thermophilus</em>, which lives in the last place you’d catch <em>P. urativorans</em> — in ultra-hot underwater thermal vents. Both proteins also bind to the ribosome’s A site, suggesting that at least some of these genetic relatives act similarly to Balon in other bacterial species.</p>
-<p>Balon is notably absent from <em>Escherichia coli</em> and <em>Staphylococcus aureus</em>, the two most commonly studied bacteria and the most widely used models for cellular dormancy. By focusing on just a few lab organisms, scientists had missed a widespread hibernation tactic, Helena-Bueno said. “I tried to look into an under-studied corner of nature and happened to find something.”</p>
-<h2><strong>Everybody Hibernates </strong></h2>
-<p>Every cell needs the ability to go dormant and wait for its moment. The laboratory model bacterium <em>E. coli </em>has five separate modes of hibernating, Melnikov said, each of which on its own is sufficient to enable the microbe to survive a crisis.</p>
-<p>“Most microbes are starving,” said <a href="https://ashley17061.wixsite.com/shadelab">Ashley Shade</a>, a microbiologist at the University of Lyon who was not involved in the new study. “They’re existing in a state of want. They’re not doubling. They’re not living their best life.”</p>
-
-<p>But dormancy is also necessary outside periods of starvation. Even in organisms, like most mammals, whose entire bodies do not go completely dormant, individual cellular populations must wait for the best time to activate. <a href="https://www.quantamagazine.org/how-idle-egg-cells-defend-their-dna-from-damage-20240513/">Human oocytes lie dormant</a> for decades waiting to be fertilized. Human stem cells are born into the bone marrow and then go quiescent, waiting for the body to call out to them to grow and differentiate. Fibroblasts in nervous tissue, lymphocytes of the immune system, and hepatocytes in the liver all enter dormant, inactive, nondividing phases and reactivate later.</p>
-<p>“This is not something that’s unique to bacteria or archaea,” Lennon said. “Every organism in the tree of life has a way of achieving this strategy. They can pause their metabolism.”</p>
-<p>Bears <a href="https://knowablemagazine.org/content/article/living-world/2022/bear-hibernation-more-winters-nap">hibernate</a>. Herpes viruses lysogenize. Worms form a dauer stage. Insects enter diapause. Amphibians aestivate. Birds go into torpor. All of these are words for the exact same thing: a dormant state that organisms can reverse when conditions are favorable.</p>
-<p>“Before the invention of hibernation, the only way to live was to keep growing without interruptions,” Melnikov said. “Putting life on pause is a luxury.”</p>
-<p>It’s also a type of population-level insurance. Some cells pursue dormancy by detecting environmental changes and responding accordingly. However, many bacteria use a stochastic strategy. “In randomly fluctuating environments, if you don’t go into dormancy sometimes, there’s a chance that the whole population will go extinct” through random encounters with disaster, Lennon said. In even the healthiest, happiest, fastest-growing cultures of <em>E. coli</em>, between 5% and 10% of the cells will nevertheless be dormant. They are the designated survivors who will live should something happen to their more active, vulnerable cousins.</p>
-
-<p>In that sense, dormancy is a survival strategy for global catastrophes. That’s why Helena-Bueno studies hibernation. She’s interested in which species might remain stable despite climate change, which ones might be able to recover, and which cellular processes, like Balon-assisted hibernation, might help.</p>
-<p>More fundamentally, Melnikov and Helena-Bueno hope that the discovery of Balon and its ubiquity will help people reframe what is important in life. We all frequently go dormant, and many of us quite enjoy it. “We spend one-third of our life asleep, but we don’t talk about it at all,” Melnikov said. Instead of complaining about what we’re missing when we’re asleep, maybe we can experience it as a process that connects us to all life on Earth, including microbes sleeping deep in the Arctic permafrost.</p>
-</div></div>]]></description>
         </item>
     </channel>
 </rss>
