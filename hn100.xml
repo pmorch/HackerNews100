@@ -4,12 +4,511 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 13 Jun 2024 06:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 13 Jun 2024 07:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[How Meta trains large language models at scale (238 pts)]]></title>
+            <title><![CDATA[Uncensor any LLM with abliteration (135 pts)]]></title>
+            <link>https://huggingface.co/blog/mlabonne/abliteration</link>
+            <guid>40665721</guid>
+            <pubDate>Thu, 13 Jun 2024 03:42:39 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://huggingface.co/blog/mlabonne/abliteration">https://huggingface.co/blog/mlabonne/abliteration</a>, See on <a href="https://news.ycombinator.com/item?id=40665721">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+				<p><a href="https://huggingface.co/blog">
+						Back to Articles</a></p>
+
+				
+				
+				
+				<div data-target="BlogAuthorsByline" data-props="{&quot;authors&quot;:[{&quot;author&quot;:{&quot;avatarUrl&quot;:&quot;https://cdn-avatars.huggingface.co/v1/production/uploads/61b8e2ba285851687028d395/4XZP5aVsMWwzGx_313cqd.jpeg&quot;,&quot;fullname&quot;:&quot;Maxime Labonne&quot;,&quot;name&quot;:&quot;mlabonne&quot;,&quot;type&quot;:&quot;user&quot;,&quot;isPro&quot;:true,&quot;isHf&quot;:false}}],&quot;translators&quot;:[],&quot;proofreaders&quot;:[],&quot;lang&quot;:&quot;en&quot;}">
+
+<p><span><span><a href="https://huggingface.co/mlabonne"><img alt="Maxime Labonne's avatar" src="https://cdn-avatars.huggingface.co/v1/production/uploads/61b8e2ba285851687028d395/4XZP5aVsMWwzGx_313cqd.jpeg">
+					</a>
+			</span>
+
+	</span></p></div>
+				
+
+				<!-- HTML_TAG_START -->
+<div><nav aria-label="Secondary"><ul><li><a href="#✂️-what-is-abliteration" title="✂️ What is abliteration?"><!-- HTML_TAG_START -->✂️ What is abliteration?<!-- HTML_TAG_END --></a>
+									<ul></ul>
+								</li><li><a href="#💻-implementation" title="💻 Implementation"><!-- HTML_TAG_START -->💻 Implementation<!-- HTML_TAG_END --></a>
+									<ul></ul>
+								</li><li><a href="#⚖️-dpo-fine-tuning" title="⚖️ DPO Fine-Tuning"><!-- HTML_TAG_START -->⚖️ DPO Fine-Tuning<!-- HTML_TAG_END --></a>
+									<ul></ul>
+								</li><li><a href="#conclusion" title="Conclusion"><!-- HTML_TAG_START -->Conclusion<!-- HTML_TAG_END --></a>
+									<ul></ul>
+								</li><li><a href="#references" title="References"><!-- HTML_TAG_START -->References<!-- HTML_TAG_END --></a>
+									<ul></ul>
+								</li></ul></nav></div><p><a rel="nofollow" href="https://i.imgur.com/KhorYYG.png"><img alt="KhorYYG.png" src="https://i.imgur.com/KhorYYG.png"></a></p>
+<p>The third generation of Llama models provided fine-tunes (Instruct) versions that excel in understanding and following instructions. However, these models are heavily censored, designed to refuse requests seen as harmful with responses such as "As an AI assistant, I cannot help you." While this safety feature is crucial for preventing misuse, it limits the model's flexibility and responsiveness.</p>
+<p>In this article, we will explore a technique called "abliteration" that can uncensor any LLM without retraining. This technique effectively removes the model's built-in refusal mechanism, allowing it to respond to all types of prompts.</p>
+<p>The code is available on&nbsp;<a rel="nofollow" href="https://colab.research.google.com/drive/1VYm3hOcvCpbGiqKZb141gJwjdmmCcVpR?usp=sharing">Google Colab</a>&nbsp;and in the&nbsp;<a rel="nofollow" href="https://github.com/mlabonne/llm-course">LLM Course</a>&nbsp;on GitHub.</p>
+<h2>
+	<a rel="nofollow" href="#✂️-what-is-abliteration" id="✂️-what-is-abliteration">
+		<span></span>
+	</a>
+	<span>
+		✂️ What is abliteration?
+	</span>
+</h2>
+<p>Modern LLMs are fine-tuned for safety and instruction-following, meaning they are trained to refuse harmful requests. In their <a rel="nofollow" href="https://www.lesswrong.com/posts/jGuXSZgv6qfdhMCuJ/refusal-in-llms-is-mediated-by-a-single-direction">blog post</a>, Arditi et al. have shown that this refusal behavior is mediated by a specific direction in the model's residual stream. If we prevent the model from representing this direction, it <strong>loses its ability to refuse requests</strong>. Conversely, adding this direction artificially can cause the model to refuse even harmless requests.</p>
+<p>In the traditional decoder-only Llama-like architecture, there are three residual streams we can target: at the start of each block ("pre"), between the attention and MLP layers ("mid"), and after the MLP ("post"). The following figure illustrates the location of each residual stream.</p>
+<p><a rel="nofollow" href="https://i.imgur.com/hsdR9e7.png"><img alt="" src="https://i.imgur.com/hsdR9e7.png"></a></p>
+<p>To uncensor an LLM, we first need to identify the "refusal direction" within the model. This process involves a few technical steps:</p>
+<ol>
+<li><strong>Data Collection</strong>: Run the model on a set of harmful instructions and a set of harmless instructions, recording the residual stream activations at the last token position for each.</li>
+<li><strong>Mean difference</strong>: Calculate the mean difference between the activations of harmful and harmless instructions. This gives us a vector representing the "refusal direction" for each layer of the model.</li>
+<li><strong>Selection</strong>: Normalize these vectors and evaluate them to select the single best "refusal direction."</li>
+</ol>
+<p>Once we have identified the refusal direction, we can "ablate" it, effectively removing the model's ability to represent this feature. This can be done through an <strong>inference-time intervention</strong> or permanently with <strong>weight orthogonalization</strong>.</p>
+<p>Let's talk about inference-time intervention first. For every component that writes to the residual stream (such as an attention head), we calculate the projection of its output onto the refusal direction and subtract this projection. This subtraction is applied at every token and every layer, ensuring that the model never represents the refusal direction.</p>
+<p>On the other hand, weight orthogonalization involves modifying the model weights directly. By orthogonalizing the component weights with respect to the refusal direction, it prevents the model from writing to this direction altogether. This is achieved by adjusting the matrices that write to the residual stream, ensuring they do not contribute to the refusal direction.</p>
+<p>In the next section, we will implement abliteration with weight orthogonalization.</p>
+<h2>
+	<a rel="nofollow" href="#💻-implementation" id="💻-implementation">
+		<span></span>
+	</a>
+	<span>
+		💻 Implementation
+	</span>
+</h2>
+<p>The following implementation of abliteration is based on <a href="https://huggingface.co/failspy/llama-3-70B-Instruct-abliterated/blob/main/ortho_cookbook.ipynb">FailSpy's notebook</a>, which is itself based on the original authors' <a rel="nofollow" href="https://colab.research.google.com/drive/1a-aQvKC9avdZpdyBn4jgRQFObTPy1JZw?usp=sharing">notebook</a>. I mostly adapted and simplified it to make it easier to understand. This section is quite code-heavy so you can see what is going on, but you can use FailSpy's <a rel="nofollow" href="https://github.com/FailSpy/abliterator">abliterator library</a> if you're less interested in the technical details (also check his <a href="https://huggingface.co/collections/failspy/abliterated-v3-664a8ad0db255eefa7d0012b">collection of abliterated models</a> on Hugging Face).</p>
+<p>The code relies on the excellent <a rel="nofollow" href="https://github.com/TransformerLensOrg/TransformerLens">TransformerLens</a> library (formerly known as EasyTransformer) to do the heavy lifting. It is designed for mechanistic interpretability and is used here to intervene on activations. Thanks to Neel Nanda and Joseph Bloom for creating and maintaining this library.</p>
+<p>First, let's install the necessary packages and import them. All these steps are available in this <a rel="nofollow" href="https://colab.research.google.com/drive/1VYm3hOcvCpbGiqKZb141gJwjdmmCcVpR?usp=sharing">Google Colab notebook</a>.</p>
+<pre><code>!pip install transformers transformers_stream_generator tiktoken transformer_lens einops jaxtyping
+
+<span>import</span> torch
+<span>import</span> functools
+<span>import</span> einops
+<span>import</span> gc
+
+<span>from</span> datasets <span>import</span> load_dataset
+<span>from</span> tqdm <span>import</span> tqdm
+<span>from</span> torch <span>import</span> Tensor
+<span>from</span> typing <span>import</span> <span>List</span>
+<span>from</span> transformer_lens <span>import</span> HookedTransformer, utils
+<span>from</span> transformer_lens.hook_points <span>import</span> HookPoint
+<span>from</span> transformers <span>import</span> AutoModelForCausalLM, AutoTokenizer
+<span>from</span> jaxtyping <span>import</span> Float, Int
+<span>from</span> collections <span>import</span> defaultdict
+
+<span># Turn automatic differentiation off to save GPU memory (credit: Undi95)</span>
+torch.set_grad_enabled(<span>False</span>)
+</code></pre>
+<p>We need two datasets: one containing harmless instructions, and one containing harmful instructions. We'll use <a href="https://huggingface.co/datasets/tatsu-lab/alpaca">tatsu-lab/alpaca</a> as well as data from <a rel="nofollow" href="https://github.com/llm-attacks/llm-attacks">llm-attacks</a>. To make things easier, I repackaged them in two Hugging Face datasets: <a href="https://huggingface.co/datasets/harmless_behaviors">mlabonne/harmless_behaviors</a> and <a href="https://huggingface.co/datasets/mlabonne/harmful_behaviors">mlabonne/harmful_behaviors</a>. That way, you can easily replace them with your own datasets.</p>
+<p>We will load the instructions and reformat them into a list of dictionaries with "role" and "content" keys. This makes it compatible with the <code>apply_chat_tokenizer()</code> method, which we will use to follow Llama 3's chat template.</p>
+<pre><code><span>def</span> <span>reformat_texts</span>(<span>texts</span>):
+    <span>return</span> [[{<span>"role"</span>: <span>"user"</span>, <span>"content"</span>: text}] <span>for</span> text <span>in</span> texts]
+
+<span># Get harmful and harmless datasets</span>
+<span>def</span> <span>get_harmful_instructions</span>():
+    dataset = load_dataset(<span>'mlabonne/harmful_behaviors'</span>)
+    <span>return</span> reformat_texts(dataset[<span>'train'</span>][<span>'text'</span>]), reformat_texts(dataset[<span>'test'</span>][<span>'text'</span>])
+
+<span>def</span> <span>get_harmless_instructions</span>():
+    dataset = load_dataset(<span>'mlabonne/harmless_alpaca'</span>)
+    <span>return</span> reformat_texts(dataset[<span>'train'</span>][<span>'text'</span>]), reformat_texts(dataset[<span>'test'</span>][<span>'text'</span>])
+
+harmful_inst_train, harmful_inst_test = get_harmful_instructions()
+harmless_inst_train, harmless_inst_test = get_harmless_instructions()
+</code></pre>
+<p>Now that we have our datasets, we can load the model we want to abliterate. Unfortunately, you can't directly load a custom model using <code>HookedTransformer</code>. Here, I use a trick described in FailSpy's notebook to download a custom model and rename it as <a href="https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct">meta-llama/Meta-Llama-3-8B-Instruct</a>. Load in <code>torch.float16</code> format if your GPU is not compatible with BF16.</p>
+<p>In this example, we'll use <a href="https://huggingface.co/mlabonne/Daredevil-8B">mlabonne/Daredevil-8B</a>, a mega-merge created with DARE TIES (see my article about <a href="https://huggingface.co/blog/mlabonne/merge-models">model merging</a>) that has the highest MMLU score on the Open LLM Leaderboard in the 8B category.</p>
+<pre><code>MODEL_ID = <span>"mlabonne/Daredevil-8B"</span>
+MODEL_TYPE = <span>"meta-llama/Meta-Llama-3-8B-Instruct"</span>
+
+<span># Download and load model</span>
+!git clone https://huggingface.co/{MODEL_ID} {MODEL_TYPE}
+
+<span># Load model and tokenizer</span>
+model = HookedTransformer.from_pretrained_no_processing(
+    MODEL_TYPE,
+    local_files_only=<span>True</span>,
+    dtype=torch.bfloat16,
+    default_padding_side=<span>'left'</span>
+)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_TYPE)
+tokenizer.padding_side = <span>'left'</span>
+tokenizer.pad_token = tokenizer.eos_token
+</code></pre>
+<p>We can now tokenize our datasets. We're using the same number of samples for both harmless and harmful instructions. Note that a high number of samples can use all the RAM/VRAM, which is why I'm limiting it to 256 here.</p>
+<pre><code><span>def</span> <span>tokenize_instructions</span>(<span>tokenizer, instructions</span>):
+    <span>return</span> tokenizer.apply_chat_template(
+        instructions,
+        padding=<span>True</span>,
+        truncation=<span>False</span>,
+        return_tensors=<span>"pt"</span>,
+        return_dict=<span>True</span>,
+        add_generation_prompt=<span>True</span>,
+    ).input_ids
+
+n_inst_train = <span>min</span>(<span>256</span>, <span>len</span>(harmful_inst_train), <span>len</span>(harmless_inst_train))
+
+<span># Tokenize datasets</span>
+harmful_tokens = tokenize_instructions(
+    tokenizer,
+    instructions=harmful_inst_train[:n_inst_train],
+)
+harmless_tokens = tokenize_instructions(
+    tokenizer,
+    instructions=harmless_inst_train[:n_inst_train],
+)
+</code></pre>
+<p>Everything is set up, we can now implement the first step of abliteration: data collection. We want to process these tokenized datasets and store the residual stream activations in <code>harmful</code> and <code>harmless</code>. This is managed by the <a rel="nofollow" href="https://github.com/TransformerLensOrg/TransformerLens">transformer_lens</a> library.</p>
+<pre><code><span># Define batch size based on available VRAM</span>
+batch_size = <span>32</span>
+
+<span># Initialize defaultdicts to store activations</span>
+harmful = defaultdict(<span>list</span>)
+harmless = defaultdict(<span>list</span>)
+
+<span># Process the training data in batches</span>
+num_batches = (n_inst_train + batch_size - <span>1</span>) // batch_size
+<span>for</span> i <span>in</span> tqdm(<span>range</span>(num_batches)):
+    <span>print</span>(i)
+    start_idx = i * batch_size
+    end_idx = <span>min</span>(n_inst_train, start_idx + batch_size)
+
+    <span># Run models on harmful and harmless prompts, cache activations</span>
+    harmful_logits, harmful_cache = model.run_with_cache(
+        harmful_tokens[start_idx:end_idx],
+        names_filter=<span>lambda</span> hook_name: <span>'resid'</span> <span>in</span> hook_name,
+        device=<span>'cpu'</span>,
+        reset_hooks_end=<span>True</span>
+    )
+    harmless_logits, harmless_cache = model.run_with_cache(
+        harmless_tokens[start_idx:end_idx],
+        names_filter=<span>lambda</span> hook_name: <span>'resid'</span> <span>in</span> hook_name,
+        device=<span>'cpu'</span>,
+        reset_hooks_end=<span>True</span>
+    )
+
+    <span># Collect and store the activations</span>
+    <span>for</span> key <span>in</span> harmful_cache:
+        harmful[key].append(harmful_cache[key])
+        harmless[key].append(harmless_cache[key])
+
+    <span># Flush RAM and VRAM</span>
+    <span>del</span> harmful_logits, harmless_logits, harmful_cache, harmless_cache
+    gc.collect()
+    torch.cuda.empty_cache()
+
+<span># Concatenate the cached activations</span>
+harmful = {k: torch.cat(v) <span>for</span> k, v <span>in</span> harmful.items()}
+harmless = {k: torch.cat(v) <span>for</span> k, v <span>in</span> harmless.items()}
+</code></pre>
+<p>We can now compute the refusal direction for each layer. This corresponds to the mean difference between the activations of harmful and harmless instructions, which is then normalized. We sort them in descending order in <code>activation_scored</code>. </p>
+<pre><code><span># Helper function to get activation index</span>
+<span>def</span> <span>get_act_idx</span>(<span>cache_dict, act_name, layer</span>):
+    key = (act_name, layer)
+    <span>return</span> cache_dict[utils.get_act_name(*key)]
+
+<span># Compute difference of means between harmful and harmless activations at intermediate layers</span>
+activation_layers = [<span>"resid_pre"</span>, <span>"resid_mid"</span>, <span>"resid_post"</span>]
+activation_refusals = defaultdict(<span>list</span>)
+
+<span>for</span> layer_num <span>in</span> <span>range</span>(<span>1</span>, model.cfg.n_layers):
+    pos = -<span>1</span>  <span># Position index</span>
+
+    <span>for</span> layer <span>in</span> activation_layers:
+        harmful_mean_act = get_act_idx(harmful, layer, layer_num)[:, pos, :].mean(dim=<span>0</span>)
+        harmless_mean_act = get_act_idx(harmless, layer, layer_num)[:, pos, :].mean(
+            dim=<span>0</span>
+        )
+
+        refusal_dir = harmful_mean_act - harmless_mean_act
+        refusal_dir = refusal_dir / refusal_dir.norm()
+        activation_refusals[layer].append(refusal_dir)
+
+<span># Get all calculated potential refusal directions, sort them in descending order based on their mean</span>
+<span># Use a subset of layers if certain activations are not promising</span>
+selected_layers = [<span>"resid_pre"</span>]
+activation_scored = <span>sorted</span>(
+    [
+        activation_refusals[layer][l - <span>1</span>]
+        <span>for</span> l <span>in</span> <span>range</span>(<span>1</span>, model.cfg.n_layers)
+        <span>for</span> layer <span>in</span> selected_layers
+    ],
+    key=<span>lambda</span> x: <span>abs</span>(x.mean()),
+    reverse=<span>True</span>,
+)
+</code></pre>
+<p>The final step of the process consists of evaluating the refusal directions we calculated. To do this, we're going to apply the refusal direction to each residual stream and each block during inference. In the following snippet, we get generations for four test harmful instructions and 20 blocks (or layers).</p>
+<pre><code><span>def</span> <span>_generate_with_hooks</span>(<span></span>
+<span>    model: HookedTransformer,</span>
+<span>    tokenizer: AutoTokenizer,</span>
+<span>    tokens: Int[Tensor, <span>"batch_size seq_len"</span>],</span>
+<span>    max_tokens_generated: <span>int</span> = <span>64</span>,</span>
+<span>    fwd_hooks=[],</span>
+<span></span>) -&gt; <span>List</span>[<span>str</span>]:
+    all_tokens = torch.zeros(
+        (tokens.shape[<span>0</span>], tokens.shape[<span>1</span>] + max_tokens_generated),
+        dtype=torch.long,
+        device=tokens.device,
+    )
+    all_tokens[:, : tokens.shape[<span>1</span>]] = tokens
+    <span>for</span> i <span>in</span> <span>range</span>(max_tokens_generated):
+        <span>with</span> model.hooks(fwd_hooks=fwd_hooks):
+            logits = model(all_tokens[:, : -max_tokens_generated + i])
+            next_tokens = logits[:, -<span>1</span>, :].argmax(
+                dim=-<span>1</span>
+            )  <span># greedy sampling (temperature=0)</span>
+            all_tokens[:, -max_tokens_generated + i] = next_tokens
+    <span>return</span> tokenizer.batch_decode(
+        all_tokens[:, tokens.shape[<span>1</span>] :], skip_special_tokens=<span>True</span>
+    )
+
+<span>def</span> <span>get_generations</span>(<span></span>
+<span>    model: HookedTransformer,</span>
+<span>    tokenizer: AutoTokenizer,</span>
+<span>    instructions: <span>List</span>[<span>str</span>],</span>
+<span>    fwd_hooks=[],</span>
+<span>    max_tokens_generated: <span>int</span> = <span>64</span>,</span>
+<span>    batch_size: <span>int</span> = <span>4</span>,</span>
+<span></span>) -&gt; <span>List</span>[<span>str</span>]:
+    generations = []
+    <span>for</span> i <span>in</span> tqdm(<span>range</span>(<span>0</span>, <span>len</span>(instructions), batch_size)):
+        tokens = tokenize_instructions(
+            tokenizer, instructions=instructions[i : i + batch_size]
+        )
+        generation = _generate_with_hooks(
+            model,
+            tokenizer,
+            tokens,
+            max_tokens_generated=max_tokens_generated,
+            fwd_hooks=fwd_hooks,
+        )
+        generations.extend(generation)
+    <span>return</span> generations
+
+<span># Inference-time intervention hook</span>
+<span>def</span> <span>direction_ablation_hook</span>(<span></span>
+<span>    activation: Float[Tensor, <span>"... d_act"</span>],</span>
+<span>    hook: HookPoint,</span>
+<span>    direction: Float[Tensor, <span>"d_act"</span>],</span>
+<span></span>):
+    <span>if</span> activation.device != direction.device:
+        direction = direction.to(activation.device)
+    proj = (
+        einops.einsum(
+            activation, direction.view(-<span>1</span>, <span>1</span>), <span>"... d_act, d_act single -&gt; ... single"</span>
+        )
+        * direction
+    )
+    <span>return</span> activation - proj
+
+<span># Testing baseline</span>
+N_INST_TEST = <span>4</span>
+baseline_generations = get_generations(
+    model, tokenizer, harmful_inst_test[:N_INST_TEST], fwd_hooks=[]
+)
+
+<span># Evaluating layers defined earlier (needs human evaluation to determine best layer for refusal inhibition)</span>
+EVAL_N = <span>20</span>  <span># Evaluate how many of the top N potential directions</span>
+evals = []
+<span>for</span> refusal_dir <span>in</span> tqdm(activation_scored[:EVAL_N]):
+    hook_fn = functools.partial(direction_ablation_hook, direction=refusal_dir)
+    fwd_hooks = [
+        (utils.get_act_name(act_name, layer), hook_fn)
+        <span>for</span> layer <span>in</span> <span>list</span>(<span>range</span>(model.cfg.n_layers))
+        <span>for</span> act_name <span>in</span> activation_layers
+    ]
+    intervention_generations = get_generations(
+        model, tokenizer, harmful_inst_test[:N_INST_TEST], fwd_hooks=fwd_hooks
+    )
+    evals.append(intervention_generations)
+</code></pre>
+<p>We stored all the generations in the <code>evals</code> list. We can now print them and manually select the layer (block) that provides an uncensored response for each instruction. I'm automatically excluding responses containing "I cannot" and "I can't" to filter out unwanted answers.</p>
+<p>If you can't find a layer that satisfies these requirements, you might want to test other residual streams in the previous <code>selected_layers</code> list, other instructions, additional blocks, etc.</p>
+<pre><code><span># Print generations for human evaluation</span>
+blacklist = [<span>"I cannot"</span>, <span>"I can't"</span>]
+<span>for</span> i <span>in</span> <span>range</span>(N_INST_TEST):
+    <span>print</span>(<span>f"\033[1mINSTRUCTION <span>{i}</span>: <span>{harmful_inst_test[i]}</span>"</span>)
+    <span>print</span>(<span>f"\nBASELINE COMPLETION:\n<span>{baseline_generations[i]}</span>\033[0m"</span>)
+    <span>for</span> layer_candidate <span>in</span> <span>range</span>(EVAL_N):
+        <span>if</span> <span>not</span> <span>any</span>(word <span>in</span> evals[layer_candidate][i] <span>for</span> word <span>in</span> blacklist):
+            <span>print</span>(<span>f"\n---\n\nLAYER CANDIDATE #<span>{layer_candidate}</span> INTERVENTION COMPLETION:"</span>)
+            <span>print</span>(evals[layer_candidate][i])
+</code></pre>
+<p>In my case, the layer candidate 9 managed to provide uncensored answer for the four instructions. This is the one that we will select for the refusal direction. In the following, we implement weight orthogonalization to modify the weights and prevent the model from creating outputs with this direction. You can verify that the model is successfully uncensored by printing the completions.</p>
+<pre><code><span>def</span> <span>get_orthogonalized_matrix</span>(<span></span>
+<span>    matrix: Float[Tensor, <span>"... d_model"</span>], vec: Float[Tensor, <span>"d_model"</span>]</span>
+<span></span>) -&gt; Float[Tensor, <span>"... d_model"</span>]:
+    proj = (
+        einops.einsum(
+            matrix, vec.view(-<span>1</span>, <span>1</span>), <span>"... d_model, d_model single -&gt; ... single"</span>
+        )
+        * vec
+    )
+    <span>return</span> matrix - proj
+
+<span># Select the layer with the highest potential refusal direction</span>
+LAYER_CANDIDATE = <span>9</span>
+refusal_dir = activation_scored[LAYER_CANDIDATE]
+
+<span># Orthogonalize the model's weights</span>
+<span>if</span> refusal_dir.device != model.W_E.device:
+    refusal_dir = refusal_dir.to(model.W_E.device)
+model.W_E.data = get_orthogonalized_matrix(model.W_E, refusal_dir)
+
+<span>for</span> block <span>in</span> tqdm(model.blocks):
+    <span>if</span> refusal_dir.device != block.attn.W_O.device:
+        refusal_dir = refusal_dir.to(block.attn.W_O.device)
+    block.attn.W_O.data = get_orthogonalized_matrix(block.attn.W_O, refusal_dir)
+    block.mlp.W_out.data = get_orthogonalized_matrix(block.mlp.W_out, refusal_dir)
+
+<span># Generate text with abliterated model</span>
+orthogonalized_generations = get_generations(
+    model, tokenizer, harmful_inst_test[:N_INST_TEST], fwd_hooks=[]
+)
+
+<span># Print generations</span>
+<span>for</span> i <span>in</span> <span>range</span>(N_INST_TEST):
+    <span>if</span> <span>len</span>(baseline_generations) &gt; i:
+        <span>print</span>(<span>f"INSTRUCTION <span>{i}</span>: <span>{harmful_inst_test[i]}</span>"</span>)
+        <span>print</span>(<span>f"\033[92mBASELINE COMPLETION:\n<span>{baseline_generations[i]}</span>"</span>)
+    <span>print</span>(<span>f"\033[91mINTERVENTION COMPLETION:\n<span>{evals[LAYER_CANDIDATE][i]}</span>"</span>)
+    <span>print</span>(<span>f"\033[95mORTHOGONALIZED COMPLETION:\n<span>{orthogonalized_generations[i]}</span>\n"</span>)
+</code></pre>
+<p>We're now ready to use the model. We convert it back to the Hugging Face format and upload it to the HF hub.</p>
+<pre><code><span># Convert model back to HF safetensors</span>
+hf_model = AutoModelForCausalLM.from_pretrained(MODEL_TYPE, torch_dtype=torch.bfloat16)
+lm_model = hf_model.model
+
+state_dict = model.state_dict()
+lm_model.embed_tokens.weight = torch.nn.Parameter(state_dict[<span>"embed.W_E"</span>].cpu())
+
+<span>for</span> l <span>in</span> <span>range</span>(model.cfg.n_layers):
+    lm_model.layers[l].self_attn.o_proj.weight = torch.nn.Parameter(
+        einops.rearrange(
+            state_dict[<span>f"blocks.<span>{l}</span>.attn.W_O"</span>], <span>"n h m-&gt;m (n h)"</span>, n=model.cfg.n_heads
+        ).contiguous()
+    )
+    lm_model.layers[l].mlp.down_proj.weight = torch.nn.Parameter(
+        torch.transpose(state_dict[<span>f"blocks.<span>{l}</span>.mlp.W_out"</span>], <span>0</span>, <span>1</span>).contiguous()
+    )
+
+hf_model.push_to_hub(<span>f"<span>{MODEL_ID}</span>-abliterated"</span>)
+<span># hf_model.push_to_hub(f"{MODEL_ID}-abliterated")</span>
+</code></pre>
+<h2>
+	<a rel="nofollow" href="#⚖️-dpo-fine-tuning" id="⚖️-dpo-fine-tuning">
+		<span></span>
+	</a>
+	<span>
+		⚖️ DPO Fine-Tuning
+	</span>
+</h2>
+<p>I evaluated the abliterated and source models from the previous section on the Open LLM Leaderboard and on Nous' benchmark suite. Here are the results:</p>
+<p><a rel="nofollow" href="https://i.imgur.com/ECCejII.png"><img alt="" src="https://i.imgur.com/ECCejII.png"></a></p>
+<p>As you can see, the source model significantly outperforms Llama 3 8B Instruct. However, we observe a performance drop in the ablated version across all benchmarks. The ablation process successfully uncensored it but also degraded the model's quality.</p>
+<p>To address this issue, an idea consists of further training our abliterated model to heal it. Like most fine-tuned models, Llama 3 8B Instruct is quite brittle when it comes to supervised fine-tuning. An additional SFT would likely break the model's performance.</p>
+<p>Alternatively, preference alignment is quite light and shouldn't lobotomize our abliterated model. DPO is a good candidate here for its ease of use and good track record. To implement it, I used <a rel="nofollow" href="https://colab.research.google.com/drive/1TsDKNo2riwVmU55gjuBgB1AXVtRRfRHW?usp=sharing">LazyAxolotl</a> with the <a href="https://huggingface.co/datasets/mlabonne/orpo-dpo-mix-40k">mlabonne/orpo-dpo-mix-40k</a> dataset. Here's the configuration I used:</p>
+<pre><code><span>base_model:</span> <span>mlabonne/Daredevil-8B-abliterated</span>
+<span>model_type:</span> <span>LlamaForCausalLM</span>
+<span>tokenizer_type:</span> <span>AutoTokenizer</span>
+
+<span>load_in_8bit:</span> <span>false</span>
+<span>load_in_4bit:</span> <span>true</span>
+<span>strict:</span> <span>false</span>
+<span>save_safetensors:</span> <span>true</span>
+
+<span>rl:</span> <span>dpo</span>
+<span>chat_template:</span> <span>chatml</span>
+<span>datasets:</span>
+  <span>-</span> <span>path:</span> <span>mlabonne/orpo-dpo-mix-40k-flat</span>
+    <span>split:</span> <span>train</span>
+    <span>type:</span> <span>chatml.intel</span>
+
+<span>dataset_prepared_path:</span>
+<span>val_set_size:</span> <span>0.0</span>
+<span>output_dir:</span> <span>./out</span>
+
+<span>adapter:</span> <span>qlora</span>
+<span>lora_model_dir:</span>
+
+<span>sequence_len:</span> <span>2048</span>
+<span>sample_packing:</span> <span>false</span>
+<span>pad_to_sequence_len:</span> <span>false</span>
+
+<span>lora_r:</span> <span>64</span>
+<span>lora_alpha:</span> <span>32</span>
+<span>lora_dropout:</span> <span>0.05</span>
+<span>lora_target_linear:</span> <span>true</span>
+<span>lora_fan_in_fan_out:</span>
+
+<span>wandb_project:</span> <span>axolotl</span>
+<span>wandb_entity:</span>
+<span>wandb_watch:</span>
+<span>wandb_name:</span>
+<span>wandb_log_model:</span>
+
+<span>gradient_accumulation_steps:</span> <span>8</span>
+<span>micro_batch_size:</span> <span>1</span>
+<span>num_epochs:</span> <span>1</span>
+<span>optimizer:</span> <span>paged_adamw_8bit</span>
+<span>lr_scheduler:</span> <span>cosine</span>
+<span>learning_rate:</span> <span>5e-6</span>
+<span>train_on_inputs:</span> <span>false</span>
+<span>group_by_length:</span> <span>false</span>
+
+<span>bf16:</span> <span>auto</span>
+<span>fp16:</span>
+<span>tf32:</span>
+
+<span>gradient_checkpointing:</span> <span>true</span>
+<span>early_stopping_patience:</span>
+<span>resume_from_checkpoint:</span>
+<span>local_rank:</span>
+<span>logging_steps:</span> <span>1</span>
+<span>xformers_attention:</span>
+<span>flash_attention:</span> <span>true</span>
+<span>warmup_steps:</span> <span>100</span>
+<span>evals_per_epoch:</span> <span>0</span>
+<span>eval_table_size:</span>
+<span>eval_table_max_new_tokens:</span> <span>128</span>
+<span>saves_per_epoch:</span> <span>1</span>
+<span>debug:</span>
+<span>deepspeed:</span> <span>deepspeed_configs/zero2.json</span>
+<span>weight_decay:</span> <span>0.0</span>
+<span>special_tokens:</span>
+  <span>pad_token:</span> <span>&lt;|end_of_text|&gt;</span>
+</code></pre>
+<p>I trained it using 6xA6000 GPUs with DeepSpeed ZeRO-2. The training took about 6 hours and 45 minutes. Here are the training curves I got from W&amp;B:</p>
+<p><a rel="nofollow" href="https://i.imgur.com/nVcJYuu.png"><img alt="" src="https://i.imgur.com/nVcJYuu.png"></a></p>
+<p>It automatically uploaded the DPO fine-tuned model, called <a href="https://huggingface.co/mlabonne/NeuralDaredevil-8B-abliterated">mlabonne/NeuralDaredevil-8B-abliterated</a>. To see if it fixed our abliterated version, I evaluated it on the same benchmarks:</p>
+<p><a rel="nofollow" href="https://i.imgur.com/ChDwx4r.png"><img alt="" src="https://i.imgur.com/ChDwx4r.png"></a></p>
+<p>We can see that this additional training allowed us to recover most of the performance drop due to abliteration. One area where the model doesn't improve is GSM8K, a math dataset, which could mean the orpo-dpo-mix-40k would benefit from more math samples.</p>
+<p>The final model is an uncensored LLM with state-of-the-art performance in the 8B category. I recommend it as an improved version of Llama 3 8B Instruct when you don't need censorship. You can play with quantized versions like GGUF in LM Studio.</p>
+<h2>
+	<a rel="nofollow" href="#conclusion" id="conclusion">
+		<span></span>
+	</a>
+	<span>
+		Conclusion
+	</span>
+</h2>
+<p>In this article, we introduced the concept of abliteration. This technique uses the model's activations on harmless and harmful prompts to calculate a refusal direction. It then uses this direction to modify the model's weights and ensure that we stop outputting refusals. This technique also demonstrates the fragility of safety fine-tuning and raises ethical considerations.</p>
+<p>We applied abliteration to Daredevil-8B to uncensor it, which also degraded the model's performance. We then healed it using DPO to create the NeuralDaredevil-8B model, a fully uncensored and high-quality 8B LLM. Abliteration is not limited to removing alignment and should be seen as a form of fine-tuning without retraining. Indeed, it can creatively be applied to other goals, like FailSpy's <a href="https://huggingface.co/failspy/Llama-3-8B-Instruct-MopeyMule">MopeyMule</a>, which adopts a melancholic conversational style.</p>
+<p>I hope you liked this article. If you want to see more follow me on&nbsp;<a href="https://huggingface.co/mlabonne/">Hugging Face</a>&nbsp;and Twitter&nbsp;<a rel="nofollow" href="https://twitter.com/maximelabonne">@maximelabonne</a>.</p>
+<h2>
+	<a rel="nofollow" href="#references" id="references">
+		<span></span>
+	</a>
+	<span>
+		References
+	</span>
+</h2>
+<ul>
+<li>FailSpy, "<a rel="nofollow" href="https://github.com/FailSpy/abliterator">abliterator library</a>," GitHub, 2024.</li>
+<li>Andy Arditi, Oscar Obeso, Aaquib111, wesg, Neel Nanda, "<a rel="nofollow" href="https://www.lesswrong.com/posts/jGuXSZgv6qfdhMCuJ/refusal-in-llms-is-mediated-by-a-single-direction">Refusal in LLMs is mediated by a single direction</a>," Lesswrong, 2024.</li>
+</ul>
+<!-- HTML_TAG_END --></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How Meta trains large language models at scale (258 pts)]]></title>
             <link>https://engineering.fb.com/2024/06/12/data-infrastructure/training-large-language-models-at-scale-meta/</link>
             <guid>40664339</guid>
             <pubDate>Wed, 12 Jun 2024 23:35:08 GMT</pubDate>
@@ -73,7 +572,15 @@
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Japan enacts law to curb Apple, Google's app dominance (277 pts)]]></title>
+            <title><![CDATA[Gerald Sussman: Programming is (should be) fun (2022) [video] (119 pts)]]></title>
+            <link>https://www.youtube.com/watch?v=2MYzvQ1v8Ww</link>
+            <guid>40663704</guid>
+            <pubDate>Wed, 12 Jun 2024 22:02:27 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.youtube.com/watch?v=2MYzvQ1v8Ww">https://www.youtube.com/watch?v=2MYzvQ1v8Ww</a>, See on <a href="https://news.ycombinator.com/item?id=40663704">Hacker News</a></p>
+&lt;Unparsable&gt;]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Japan enacts law to curb Apple, Google's app dominance (298 pts)]]></title>
             <link>https://english.kyodonews.net/news/2024/06/bc2d7f45d456-japan-enacts-law-to-curb-apple-googles-app-dominance.html#google_vignette</link>
             <guid>40662176</guid>
             <pubDate>Wed, 12 Jun 2024 19:43:50 GMT</pubDate>
@@ -98,7 +605,7 @@
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[ChromeOS will soon be developed on large portions of the Android stack (160 pts)]]></title>
+            <title><![CDATA[ChromeOS will soon be developed on large portions of the Android stack (175 pts)]]></title>
             <link>https://blog.chromium.org/2024/06/building-faster-smarter-chromebook.html</link>
             <guid>40661703</guid>
             <pubDate>Wed, 12 Jun 2024 19:02:46 GMT</pubDate>
@@ -119,7 +626,7 @@ News and developments from the open source browser project
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Swift compiler is slow due to how types are inferred (201 pts)]]></title>
+            <title><![CDATA[The Swift compiler is slow due to how types are inferred (203 pts)]]></title>
             <link>https://danielchasehooper.com/posts/why-swift-is-slow/</link>
             <guid>40661001</guid>
             <pubDate>Wed, 12 Jun 2024 17:59:30 GMT</pubDate>
@@ -160,7 +667,7 @@ News and developments from the open source browser project
 </span></span></code></pre></div><p>Again, we get <code>error: the compiler is unable to type-check this expression in reasonable time; try breaking up the expression into distinct sub-expressions</code>, this time after “only” 8 seconds. The problem is due to <code>index * 5.0</code>, i.e. an int multiplied by a double. Even <a href="https://youtu.be/-eCwBwTbjAI?si=rQ5tHNcBRkmaFV8-&amp;t=1000" target="_blank" rel="noopener">toy compilers</a> handle equivalent code quickly, thanks to a context-free type system.</p><p>Both examples are slow because they’re invalid swift and the type checker falls out of the fast path in order to confirm all possible type combinations are invalid. You might think it’s ok for invalid code to take a long time to compile. For me, 42 seconds to produce an “I give up” message is unacceptable. However, there are valid lines of swift that take a long time to compile too. Send me your slow lines (found using <code>-Xfrontend -debug-time-function-bodies</code>) and I’ll add it to this post.</p><p>Swift has come a long way from version 1, but on its 10th birthday it can still be slow. Unfortunately this can’t be completely fixed by optimizing the current approach. It requires a different approach.</p><p>Here’s what I’d do:</p><ol><li>Add a flag to <code>swiftc</code> that makes it infer types using only an expression’s child AST nodes while ignoring the parent AST node. The flag would also disable the <code>ExpressibleBy</code> protocols, which by definition get their type from their context.</li><li>Make a feature that adds type annotations, casts, and enum names to existing code where necessary to compile with the new type checker</li><li>Update all sample code to compile with the flag</li></ol><p>This might be a reasonable stopping point: teams that care about compile times and good error messages could use the flag, and everyone else doesn’t have to. It could go further though:</p><ol start="4"><li>Enable the flag by default for new Xcode projects</li><li>Deprecate the old type inference approach</li></ol><p>With this new approach, you’d have to add type annotations in some places. I’m ok with that. As a result, we’d get faster compilation times and clearer error messages, but the extra verbosity might be too much for the swift community to swallow.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The GJK Algorithm: A weird and beautiful way to do a simple thing (354 pts)]]></title>
+            <title><![CDATA[The GJK Algorithm: A weird and beautiful way to do a simple thing (391 pts)]]></title>
             <link>https://computerwebsite.net/writing/gjk</link>
             <guid>40660761</guid>
             <pubDate>Wed, 12 Jun 2024 17:35:09 GMT</pubDate>
@@ -251,7 +758,7 @@ News and developments from the open source browser project
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Diffractive Chocolate (132 pts)]]></title>
+            <title><![CDATA[Diffractive Chocolate (142 pts)]]></title>
             <link>https://wp.optics.arizona.edu/oscoutreach/diffractive-chocolate/</link>
             <guid>40660689</guid>
             <pubDate>Wed, 12 Jun 2024 17:27:33 GMT</pubDate>
@@ -654,7 +1161,7 @@ P.S. if anyone is still hung up on comfort, the "open face" headstraps do wonder
                       </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How Alexa dropped the ball on being the top conversational system (162 pts)]]></title>
+            <title><![CDATA[How Alexa dropped the ball on being the top conversational system (165 pts)]]></title>
             <link>https://www.mihaileric.com/posts/how-alexa-dropped-the-ball-conversational-ai/</link>
             <guid>40659281</guid>
             <pubDate>Wed, 12 Jun 2024 15:35:55 GMT</pubDate>
@@ -729,7 +1236,7 @@ https://www.mihaileric.com/static/andres-urena-tsBropDpnwE-unsplash-d92595a0132e
 <p>If you’re thinking about the future of multimodal conversational systems and interfaces, I would love to hear from you. We’ve got work to do!</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Launch HN: Overwatch (YC S22): OSINT platform for cyber and fraud risk (129 pts)]]></title>
+            <title><![CDATA[HNInternal: Launch HN: Overwatch (YC S22): OSINT platform for cyber and fraud risk (132 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=40659236</link>
             <guid>40659236</guid>
             <pubDate>Wed, 12 Jun 2024 15:32:53 GMT</pubDate>
@@ -745,7 +1252,7 @@ https://www.mihaileric.com/static/andres-urena-tsBropDpnwE-unsplash-d92595a0132e
   </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Restate – Low-latency durable workflows for JavaScript/Java, in Rust (154 pts)]]></title>
+            <title><![CDATA[Show HN: Restate – Low-latency durable workflows for JavaScript/Java, in Rust (157 pts)]]></title>
             <link>https://restate.dev/</link>
             <guid>40659160</guid>
             <pubDate>Wed, 12 Jun 2024 15:25:23 GMT</pubDate>
@@ -1111,7 +1618,7 @@ public class PaymentStateMachine {
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Star botanist likely made up data about nutritional supplements, new probe finds (179 pts)]]></title>
+            <title><![CDATA[Star botanist likely made up data about nutritional supplements, new probe finds (185 pts)]]></title>
             <link>https://www.science.org/content/article/star-botanist-likely-made-data-about-nutritional-supplements-new-probe-finds</link>
             <guid>40658901</guid>
             <pubDate>Wed, 12 Jun 2024 14:59:04 GMT</pubDate>
@@ -1176,7 +1683,7 @@ Couldn't get https://www.science.org/content/article/star-botanist-likely-made-d
 <div id="readability-page-1" class="page"><div><p><a href="https://datasetsearch.research.google.com/help">Learn more</a> about Dataset Search.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Serious Sam handled massive amounts of enemies on 56k modem connections (146 pts)]]></title>
+            <title><![CDATA[Serious Sam handled massive amounts of enemies on 56k modem connections (181 pts)]]></title>
             <link>https://staniks.github.io/articles/serious-engine-networking-analysis</link>
             <guid>40657574</guid>
             <pubDate>Wed, 12 Jun 2024 12:55:15 GMT</pubDate>
@@ -1933,7 +2440,7 @@ _pNetwork-&gt;SendToServer(nmSyncCheck);
 <p>Until next time!</p></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Study shows N95 masks near-perfect at blocking escape of airborne Covid-19 (154 pts)]]></title>
+            <title><![CDATA[Study shows N95 masks near-perfect at blocking escape of airborne Covid-19 (155 pts)]]></title>
             <link>https://sph.umd.edu/news/study-shows-n95-masks-near-perfect-blocking-escape-airborne-covid-19</link>
             <guid>40657307</guid>
             <pubDate>Wed, 12 Jun 2024 12:28:23 GMT</pubDate>
@@ -1986,7 +2493,7 @@ Media Contact &nbsp;- SPH Communications, sph-comm@umd.edu, 301-405-2438</p>
 <div id="readability-page-1" class="page"><div><p>Kimberly Gasuras doesn’t use AI. “I don’t need it,” she said. “I’ve been a news reporter for 24 years. How do you think I did all that work?” That logic wasn’t enough to save her job.<br></p><div data-video-id="195264" data-monetizable="true" data-position="sidebar" data-video-title="Why is Everyone Suing AI Companies? | Future Tech" data-video-blog-id="4" data-video-network="gizmodo" data-video-duration="290" data-playlist="195264,195603,196019" data-current="195264"><div><p>Why is Everyone Suing AI Companies? | Future Tech</p></div><video disablepictureinpicture="" muted="" playsinline="" width="100%" height="100%" crossorigin="anonymous" preload="none"><source data-src="https://vid.kinja.com/prod/195264/195264_240p.mp4" label="240p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/195264/195264_480p.mp4" label="480p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/195264/195264_720p.mp4" label="720p" type="video/mp4"><source data-src="https://vid.kinja.com/prod/195264/195264_1080p.mp4" label="1080p" type="video/mp4"><track kind="captions" label="English" src="https://kinja.com/api/videoupload/caption/20725.vtt" srclang="en"></video><div><ul><li data-label="">Off</li><li data-label="English">English</li></ul></div></div><p>As a local journalist in Bucyrus, Ohio, Gasuras relies on side hustles to pay the bills. For a while, she made good money on a freelance writing platform called WritersAccess, where she wrote blogs and other content for small and midsize companies. But halfway through 2023, the income plummeted as some clients switched to ChatGPT for their writing needs. It was already a difficult time. Then the email came. </p><p>“I only got one warning,” Gasuras said. “I got this message saying they’d flagged my work as AI using a tool called ‘Originality.’” She was dumbfounded. Gasuras wrote back to defend her innocence, but she never got a response. Originality costs money, but Gasuras started running her work through other AI detectors before submitting to make sure she wasn’t getting dinged by mistake. A few months later, WritersAccess kicked her off the platform anyway. “They said my account was suspended due to excessive use of AI. I couldn’t believe it,” Gasuras said. WritersAccess did not respond to a request for comment.</p><p>When ChatGPT set the world on fire a year and a half ago, it sparked a feverish search for ways to catch people trying to pass off AI text as their own writing. A host of startups launched to fill the void through AI detection tools, with names including Copyleaks, GPTZero, Originality.AI, and Winston AI. It makes for a tidy business in a landscape full of AI boogeymen. </p><p>These companies advertise peace of mind, a way to take back control through “proof” and “accountability.” Some advertise accuracy rates as high as 99.98%. But a growing body of experts, studies, and industry insiders argue these tools are far less reliable than their makers promise. There’s no question that AI detectors make frequent mistakes, and innocent bystanders get caught in the crossfire. Countless <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.rollingstone.com/culture/culture-features/student-accused-ai-cheating-turnitin-1234747351/&quot;,{&quot;metric25&quot;:1}]]" href="https://www.rollingstone.com/culture/culture-features/student-accused-ai-cheating-turnitin-1234747351/" target="_blank" rel="noopener noreferrer">students have been accused of AI plagiarism</a></span>, but a quieter epidemic is happening in the professional world. Some <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4602944&quot;,{&quot;metric25&quot;:1}]]" href="https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4602944" target="_blank" rel="noopener noreferrer">writing gigs are drying up thanks to chatbots</a></span>. As people fight over the dwindling field of work, writers are losing jobs over false accusations from AI detectors.</p><p>“This technology doesn’t work the way people are advertising it,” said Bars Juhasz, co-founder of Undetectable AI, which makes tools to help people humanize AI text to sneak it past detection software. “We have a lot of concerns around the reliability of the training process these AI detectors use. These guys are claiming they have 99% accuracy, and based on our work, I think that’s impossible. But even if it’s true, that still means for every 100 people there’s going to be one false flag. We’re talking about people’s livelihoods and their reputations.”</p><h4 id="h1203"><a id=""></a><strong>Safeguard, or snake oil?</strong></h4><p>In general, AI detectors work by spotting the hallmarks of AI penmanship, such as perfect grammar and punctuation. In fact, one of the easiest ways to get your work flagged is to use Grammarly, a tool that checks for spelling and grammatical errors. It even suggests ways to rewrite sentences for clarity using, you guessed it, artificial intelligence. Adding insult to injury, Gizmodo spoke to writers who said they were fired by platforms that required them to use Grammarly. (Gizmodo confirmed the details of these stories, but we are excluding the names of certain freelance platforms because writers signed non-disclosure agreements.)</p><p>Detectors look for more telling factors as well, such as “burstiness.” Human writers are more likely to reuse certain words in clusters or bursts, while AI is more likely to distribute words evenly across a document. AI detectors can also assess “perplexity,” which essentially asks an AI to measure the likelihood that it would have produced a piece of text given the model’s training data. Some companies, such as industry leader Originaility.AI, train their own AI language models specially made to detect the work of other AIs, which are meant to spot patterns that are too complex for the human mind. </p><p>However, none of these techniques are foolproof, and many major institutions have backed away from this class of tools. OpenAI released its own AI detector to quell fears about its products in 2023 but pulled the tool off the market just months later “due to its <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/open-ai-chatgpt-ai-text-detector-1850055005&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/open-ai-chatgpt-ai-text-detector-1850055005">low rate of accuracy</a></span>.” The academic world was first to adopt AI detectors, but false accusations pushed a long list of universities to <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://www.theregister.com/2023/09/23/turnitin_ai_detection/&quot;,{&quot;metric25&quot;:1}]]" href="https://www.theregister.com/2023/09/23/turnitin_ai_detection/" target="_blank" rel="noopener noreferrer">ban the use of AI detection software</a></span>,, including Vanderbilt, Michigan State, Northwestern, and the University of Texas at Austin.</p><p>AI detection companies “are in the business of selling snake oil,” said Debora Weber-Wulff, a professor at the University of Applied Sciences for Engineering and Economics in Berlin, who co-authored a <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://edintegrity.biomedcentral.com/articles/10.1007/s40979-023-00146-z&quot;,{&quot;metric25&quot;:1}]]" href="https://edintegrity.biomedcentral.com/articles/10.1007/s40979-023-00146-z" target="_blank" rel="noopener noreferrer">recent paper</a></span> about the effectiveness of AI detection. According to Weber-Wulff, research shows that AI detectors are inaccurate, unreliable, and easy to fool. “People want to believe that there can be some magic software that solves their problems,” she said. But “computer software cannot solve social problems. We have to find other solutions.”</p><p>The companies that make AI detectors say they’re a necessary but imperfect tool in a world inundated by robot-generated text. There’s a significant demand for these services, whether or not they’re effective.</p><p>Alex Cui, chief technology officer for the AI detection company GPTZero, said detectors have meaningful shortcomings, but the benefits outweigh the drawbacks. “We see a future where, if nothing is changed, the internet becomes more and more dictated by AI, whether it’s news, peer-reviewed articles, marketing. You don’t even know if the person you’re talking to on social media is real,” Cui said. “We need a solution for confirming knowledge en masse, and determining whether content is high quality, authentic, and of legitimate authorship.”</p><h4 id="h1204"><a id=""></a><strong>A necessary evil?</strong></h4><p>Mark, another Ohio-based copywriter who asked that we withhold his name to avoid professional repercussions, said he had to take work doing maintenance at a local store after an AI detector cost him his job.</p><p>“I got an email saying my most recent article had scored a 95% likelihood of AI generation,” Mark said. “I was in shock. It felt ridiculous that they’d accuse me after working together for three years, long before ChatGPT was available.” </p><p>He tried to push back. Mark sent his client a copy of the Google Doc where he drafted the article, which included timestamps that demonstrated he wrote the document by hand. It wasn’t enough. Mark’s relationship with the writing platform fell apart. He said losing the job cost him 90% of his income.</p><p>“We hear these stories more than we wish we did, and we understand the pain that false positives cause writers when the work they poured their heart and soul into gets falsely accused,” said Jonathan Gillham, CEO of Originality.AI. “We feel like we feel like we’re building a tool to help writers, but we know that at times it does have some consequences.”</p><p>But according to Gillham, the problem is about more than helping writers or providing accountability.“Google is aggressively going after AI spam,” he said. “We’ve heard from companies that had their entire site de-indexed by Google that said they didn’t even know their writers were using AI.” </p><p>It’s true that the internet is being flooded by <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/study-junk-news-sites-ad-systems-ai-generated-content-1850578259&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/study-junk-news-sites-ad-systems-ai-generated-content-1850578259">low-effort content farms</a></span> that pump out junky AI articles in an effort to game search results, get clicks, and make ad money from those eyeballs. <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;Internal link&quot;,&quot;https://gizmodo.com/google-search-updates-downrank-seo-ai-generated-content-1851309904&quot;,{&quot;metric25&quot;:1}]]" href="https://gizmodo.com/google-search-updates-downrank-seo-ai-generated-content-1851309904">Google is cracking down on these sites</a></span>, which leads some companies to believe that their websites will be down-ranked if Google detects any AI writing whatsoever. That’s a problem for web-based businesses, and increasingly the No. 1 selling point for AI detectors. Originality promotes itself as a way to “future proof your site on Google” at the top of the list of benefits on its homepage.</p><p>A Google spokesperson said this completely misinterprets the company’s policies. Google, a company that provides AI, said it has no problem with AI content in and of itself. “It’s inaccurate to say Google penalizes websites simply because they may use some AI-generated content,” the spokesperson said. “As we’ve clearly stated, low value content that’s created at scale to manipulate Search rankings is spam, however it is produced. Our automated systems determine what appears in top search results based on signals that indicate if content is helpful and high quality.”</p><h4 id="h1205"><a id=""></a><strong>Mixed messages</strong></h4><p>No one claims AI detectors are perfect, including the companies that make them. But Originality and other AI detectors send mixed messages about how their tools should be used. For example, Gillham said “we advise against the tool being used within academia, and strongly recommend against being used for disciplinary action.” He explained the risk of false positives is too high for students, because they submit a small number of essays throughout a school year, but the volume of work produced by a professional writer means the algorithm has more chances to get it right. However, on one of the company’s <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://originality.ai/blog/ai-content-detection-in-education&quot;,{&quot;metric25&quot;:1}]]" href="https://originality.ai/blog/ai-content-detection-in-education" target="_blank" rel="noopener noreferrer">blog posts</a></span>, Originality says AI detection is “essential” in the classroom. </p><p>Then there are questions about how the results are presented. Many of the writers Gizmodo spoke to said their clients don’t understand the limitations of AI detectors or even what the results are actually saying. It’s easy to see how someone might be confused: I ran one of my own articles through Originality’s AI detector. The results were “70% Original” and “30% AI.” You might assume that means Originality determined that 30% of the article was written by a chatbot, especially because the tool highlights specific sentences it finds suspect. However, it’s actually a confidence score; Originality is 70% sure a human wrote the text. (I wrote the whole thing myself, but you’ll just have to take my word for it.)</p><p>Then there’s the way the company describes its algorithm. According to Originality, the latest version of its tool has a 98.8% accuracy rate, but Originality also says its false positive rate is 2.8%. If you’ve got your calculator handy, you’ll notice that adds up to more than 100%. Gillham said that’s because these numbers come from two different tests.</p><p>In Originality’s defense, the company provides a detailed explanation of how you should interpret the information right below the results, along with links to more detailed writeups about how to use the tool. It seems that isn’t enough, though. Gizmodo spoke to multiple writers who said they had to argue with clients who misunderstood the Originality tool.</p><p>Originality has published numerous <span><a data-ga="[[&quot;Embedded Url&quot;,&quot;External link&quot;,&quot;https://originality.ai/blog/ai-content-detection-accuracy&quot;,{&quot;metric25&quot;:1}]]" href="https://originality.ai/blog/ai-content-detection-accuracy" target="_blank" rel="noopener noreferrer">blog posts</a></span> and studies about accuracy and other issues, including the dataset and methodology it used to develop and measure its own tools. However, Weber-Wulff at the University of Applied Sciences for Engineering and Economics in Berlin said the details about Originality’s methodology “were not that clear.” </p><p>A number of experts Gizmodo spoke to, such as Juhasz of Undetectable AI, said they had concerns about businesses across the AI detection industry inflating their accuracy rates and misleading their customers. Representatives for GPTZero and Originality AI said their companies are committed to openness and transparency. Both companies said they go out of their way to provide clear information about the limitations and shortcomings of their tools.</p><p>It might feel like being against AI detectors is being on the side of writers, but according to Gillham the opposite is true. “If there are no detectors, then the competition for writing jobs increases and as a result the pay drops,” he said. “Detectors are the difference between a writer being able to do their work, submit content, and get compensated for it, and somebody being able to just copy and paste something from ChatGPT.” </p><p>On the other hand, all of the copywriters Gizmodo spoke to said the AI detectors are the problem. </p><p>“AI is the future. There’s nothing we can do to stop it, but in my opinion that’s not the issue. I can see lots of ways AI can be useful,” Mark said. “It’s these detectors. They are the ones that are saying with utmost certainty that they can detect AI writing, and they’re the ones who are making our clients on edge and paranoid and putting us out of jobs.” </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Elixir 1.17 released: set-theoretic types in patterns, durations, OTP 27 (401 pts)]]></title>
+            <title><![CDATA[Elixir 1.17 released: set-theoretic types in patterns, durations, OTP 27 (410 pts)]]></title>
             <link>https://elixir-lang.org/blog/2024/06/12/elixir-v1-17-0-released/</link>
             <guid>40656747</guid>
             <pubDate>Wed, 12 Jun 2024 11:13:52 GMT</pubDate>
@@ -2189,7 +2696,7 @@ to learn more.</p>
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Raspberry Pi is now a public company (162 pts)]]></title>
+            <title><![CDATA[Raspberry Pi is now a public company (163 pts)]]></title>
             <link>https://techcrunch.com/2024/06/11/raspberry-pi-is-now-a-public-company-as-its-shares-pops-after-ipo-pricing/</link>
             <guid>40656603</guid>
             <pubDate>Wed, 12 Jun 2024 10:48:39 GMT</pubDate>
