@@ -4,12 +4,366 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 03 Jul 2024 16:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 03 Jul 2024 17:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Proton launches its own version of Google Docs (238 pts)]]></title>
+            <title><![CDATA[Do not taunt happy fun branch predictor (2023) (113 pts)]]></title>
+            <link>https://www.mattkeeter.com/blog/2023-01-25-branch/</link>
+            <guid>40866374</guid>
+            <pubDate>Wed, 03 Jul 2024 14:42:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.mattkeeter.com/blog/2023-01-25-branch/">https://www.mattkeeter.com/blog/2023-01-25-branch/</a>, See on <a href="https://news.ycombinator.com/item?id=40866374">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content">
+<!-- End header -->
+
+
+
+
+
+
+<p>I've been writing a lot of AArch64 assembly, for <em>reasons</em>.</p>
+<p>I recently came up with a "clever" idea to eliminate one jump from an inner
+loop, and was surprised to find that it slowed things down.  Allow me to explain
+my terrible error, so that you don't fall victim in the future.</p>
+<p>A toy model of the relevant code looks something like this:</p>
+<pre><code>float run(const float* data, size_t n) {
+    float g = 0.0;
+    while (n) {
+        n--;
+        const float f = *data++;
+        foo(f, &amp;g);
+    }
+    return g;
+}
+
+static void foo(float f, float* g) {
+    // do some stuff, modifying g
+}
+</code></pre>
+<p>(eliding headers and the forward declaration of <code>foo</code> for space)</p>
+<p>A simple translation into AArch64 assembly gives something like this:</p>
+<pre><code>// x0: const float* data
+// x1: size_t n
+// Returns a single float in s0
+
+// Prelude: store frame and link registers
+stp   x29, x30, [sp, #-16]!
+
+// Initialize g = 0.0
+fmov s0, #0.0
+
+loop:
+    cmp x1, #0
+    b.eq exit
+    sub x1, x1, #1
+    ldr s1, [x0], #4
+
+    bl foo   // call the function
+    b loop   // keep looping
+
+foo:
+    // Do some work, reading from s1 and accumulating into s0
+    // ...
+    ret
+
+exit: // Function exit
+    ldp   x29, x30, [sp], #16
+    ret
+</code></pre>
+<p>Here, <code>foo</code> is kinda like a <a href="https://github.com/rust-lang/rfcs/blob/master/text/1201-naked-fns.md">naked
+function</a>:
+it uses the same stack frame and registers as the parent function, reads from
+<code>s1</code>, and writes to <code>s0</code>.</p>
+<p>The call to <code>foo</code> uses the the <code>bl</code> instruction, which is "branch and link":
+it jumps to the given label, and stores the <strong>next</strong> instruction address in the
+link register (<code>lr</code> or <code>x30</code>).</p>
+<p>When <code>foo</code> is done, the <code>ret</code> instruction jumps to the address in the link
+register, which is the instruction following the original <code>bl</code>.</p>
+<p>Looking at this code, I was struck by the fact that it does two branches,
+one after the other.  Surely, it would be more efficient to only branch once.</p>
+<p>I had the clever idea to do so <strong>without changing <code>foo</code></strong>:</p>
+<pre><code>stp   x29, x30, [sp, #-16]!
+fmov s0, #0.0
+
+bl loop // Set up x30 to point to the loop entrance
+loop:
+    cmp x1, #0
+    b.eq exit
+    sub x1, x1, #1
+    ldr s1, [x0], #4
+
+foo:
+    // Do some work, accumulating into `s0`
+    // ...
+    ret
+
+exit: // Function exit
+    ldp   x29, x30, [sp], #16
+    ret
+</code></pre>
+<p>This is a little subtle:</p>
+<ul>
+<li>The first call to <code>bl loop</code> stores the beginning of the <code>loop</code> block in <code>x30</code></li>
+<li>After checking for loop termination, we fall through into the <code>foo</code> function
+(without a branch!)</li>
+<li><code>foo</code> still ends with <code>ret</code>, which returns to the <code>loop</code> block (because
+that's what's in <code>x30</code>).</li>
+</ul>
+<p>Within the body of the loop, we never change <code>x30</code>, so the repeated <code>ret</code>
+instructions always return to the same place.</p>
+<p>I set up a benchmark using a very simple <code>foo</code>:</p>
+<pre><code>foo:
+    fadd s0, s0, s1
+    ret
+</code></pre>
+<p>With this <code>foo</code>, the function as a whole sums the incoming array of <code>float</code>
+values.</p>
+<p>Benchmarking with <a href="https://docs.rs/criterion/latest/criterion/"><code>criterion</code></a>
+(on an M1 Max CPU),
+with a 1024-element array:</p>
+<table>
+<tbody><tr><th>Program</th><th>Time
+</th></tr><tr><td>Original </td><td>969 ns
+</td></tr><tr><td>"Optimized"</td><td>3.85 µs
+</td></tr></tbody></table>
+<p>The "optimized" code with one jump per loop is about <strong>4x slower</strong>
+than the original version with two jumps per loop!</p>
+<p>I found this surprising, so I asked a few colleagues about it.</p>
+<p>Between <a href="https://hachyderm.io/@cliffle">Cliff</a> and
+<a href="https://discuss.systems/@cross">Dan</a>,
+the consensus was that mismatched <code>bl</code> / <code>ret</code>
+pairs were confusing the
+<a href="https://en.wikipedia.org/wiki/Branch_predictor">branch predictor</a>.</p>
+<p>The <a href="https://developer.arm.com/documentation/102374/0101/Function-calls">ARM documentation</a> agrees:</p>
+<blockquote>
+<p>Why do we need a special function return instruction? Functionally, BR LR
+would do the same job as RET. Using RET tells the processor that this is a
+function return. Most modern processors, and all Cortex-A processors, support
+branch prediction. Knowing that this is a function return allows processors to
+more accurately predict the branch.</p>
+<p>Branch predictors guess the direction the program flow will take across
+branches. The guess is used to decide what to load into a pipeline with
+instructions waiting to be processed. If the branch predictor guesses
+correctly, the pipeline has the correct instructions and the processor does
+not have to wait for instructions to be loaded from memory.</p>
+</blockquote>
+<p>More specifically, the branch predictor probably keeps an internal stack of
+function return addresses, which is pushed to whenever a <code>bl</code> is executed. When
+the branch predictor sees a <code>ret</code> coming down the pipeline, it assumes that
+you're returning to the address associated with the most recent <code>bl</code> (and begins
+prefetching / speculative execution / whatever), then pops that top address from
+its internal stack.</p>
+<p>This works if you've got matched <code>bl</code> / <code>ret</code> pairs, but the prediction will
+fail if the same address is used by multiple <code>ret</code> instructions; you'll end up
+with (<em>vague handwaving</em>) useless prefetching, incorrect speculative execution,
+and pipeline stalls / flushes</p>
+<p>Dan made the great suggestion of replacing <code>ret</code> with <code>br x30</code> to test this
+theory.  Sure enough, this fixes the performance regression:</p>
+<table>
+<tbody><tr><th>Program</th><th>Time
+</th></tr><tr><td>Matched <code>bl</code> / <code>ret</code> </td><td>969 ns
+</td></tr><tr><td>One <code>bl</code>, many <code>ret</code></td><td>3.85 µs
+</td></tr><tr><td>One <code>bl</code>, many <code>br x30</code></td><td>913 ns
+</td></tr></tbody></table>
+<p>In fact, it's slightly faster, probably because it's only doing one branch
+per loop instead of two!</p>
+<p>To further test the "branch predictor" theory, I opened up Instruments and
+examined performance counters for the first two programs. Picking out the worst
+offenders, the results seem conclusive:</p>
+<table>
+<tbody><tr><th>Counter</th><th>Matched <code>bl</code> / <code>ret</code></th><th>One <code>bl</code>, many <code>ret</code>
+</th></tr><tr><td><code>BRANCH_RET_INDIR_MISPRED_NONSPECIFIC</code></td><td>92</td><td>928,644,975
+</td></tr><tr><td><code>FETCH_RESTART</code></td><td>61,121</td><td>987,765,276
+</td></tr><tr><td><code>MAP_DISPATCH_BUBBLE</code></td><td>1,155,632</td><td>7,350,085,139
+</td></tr><tr><td><code>MAP_REWIND</code></td><td>6,412,734</td><td>2,789,499,545
+</td></tr></tbody></table>
+<p>These measurements are captured while summing an array of 1B elements.  We see
+that with mismatched <code>bl</code> / <code>ret</code> pairs, the return branch predictor fails about
+93% of the time!</p>
+<p>Apple doesn't fully document these counters, but I'm guessing that the other
+counters are downstream effects of bad branch prediction:</p>
+<ul>
+<li><code>FETCH_RESTART</code> is presumably bad prefetching</li>
+<li><code>MAP_DISPATCH_BUBBLE</code> probably refers to <a href="https://en.wikipedia.org/wiki/Pipeline_stall">pipeline stalls</a></li>
+<li><code>MAP_REWIND</code> might be bad speculative execution that needs to be rewound</li>
+</ul>
+<p>In conclusion,
+<a href="https://www.youtube.com/watch?v=GmqeZl8OI2M">do not taunt happy fun branch predictor</a>
+with asymmetric usage of <code>bl</code> and <code>ret</code> instructions.</p>
+<hr>
+<h2>Appendix: Going Fast</h2>
+<p>Take a second look at this program:</p>
+<pre><code>stp   x29, x30, [sp, #-16]!
+fmov s0, #0.0
+
+loop:
+    cmp x1, #0
+    b.eq exit
+    sub x1, x1, #1
+    ldr s1, [x0], #4
+
+    bl foo   // call the function
+    b loop   // keep looping
+
+foo:
+    fadd s0, s0, s1
+    ret
+
+exit: // Function exit
+    ldp   x29, x30, [sp], #16
+    ret
+</code></pre>
+<p>Upon seeing this program, it's a common reaction to ask "why is <code>foo</code> a
+subroutine at all?"</p>
+<p>The answer is "because this is a didactic example, not code that's trying
+to go as fast as possible".</p>
+<p>Still, it's a fair question.  You wanna go fast?  Let's go fast.</p>
+<p>If we know the contents of <code>foo</code> when building this
+function (and it's shorter than the maximum jump distance), we can remove the
+<code>bl</code> and <code>ret</code> entirely:</p>
+<pre><code>loop:
+    cmp x1, #0
+    b.eq exit
+    sub x1, x1, #1
+    ldr s1, [x0], #4
+
+    // foo is completely inlined here
+    fadd s0, s0, s1
+
+    b loop
+
+exit: // Function exit
+    ldp   x29, x30, [sp], #16
+    ret
+</code></pre>
+<p>This is a roughly 6% speedup: from 969 ns to 911 ns.</p>
+<p>We can get faster still by trusting the compiler:</p>
+<pre><code>pub fn sum_slice(f: &amp;[f32]) -&gt; f32 {
+    f.iter().sum()
+}
+</code></pre>
+<p>This brings us down to 833 ns, a significant improvement!</p>
+<p><a href="https://godbolt.org/z/Kv77abW6c">Looking at the assembly</a>,
+it's doing some loop unrolling.
+However, even when compiled with <code>-C target-cpu=native</code>, it's not generating
+<a href="https://developer.arm.com/Architectures/Neon">NEON SIMD instructions</a>.
+Can we beat it?</p>
+<p><strong>We sure can!</strong></p>
+<pre><code>stp   x29, x30, [sp, #-16]!
+
+fmov s0, #0.0
+dup v1.4s, v0.s[0]
+dup v2.4s, v0.s[0]
+
+loop:  // 1x per loop
+    ands xzr, x1, #3
+    b.eq simd
+
+    sub x1, x1, #1
+    ldr s3, [x0], #4
+
+    fadd s0, s0, s3
+    b loop
+
+simd:  // 4x SIMD per loop
+    ands xzr, x1, #7
+    b.eq simd2
+
+    sub x1, x1, #4
+    ldp d3, d4, [x0], #16
+    mov v3.d[1], v4.d[0]
+
+    fadd v1.4s, v1.4s, v3.4s
+
+    b simd
+
+simd2:  // 2 x 4x SIMD per loop
+    cmp x1, #0
+    b.eq exit
+
+    sub x1, x1, #8
+
+    ldp d3, d4, [x0], #16
+    mov v3.d[1], v4.d[0]
+    fadd v1.4s, v1.4s, v3.4s
+
+    ldp d5, d6, [x0], #16
+    mov v5.d[1], v6.d[0]
+    fadd v2.4s, v2.4s, v5.4s
+
+    b simd2
+
+exit: // function exit
+    fadd v2.4s, v2.4s, v1.4s
+    mov s1, v2.s[0]
+    fadd s0, s0, s1
+    mov s1, v2.s[1]
+    fadd s0, s0, s1
+    mov s1, v2.s[2]
+    fadd s0, s0, s1
+    mov s1, v2.s[3]
+    fadd s0, s0, s1
+
+    ldp   x29, x30, [sp], #16
+    ret
+</code></pre>
+<p>This code includes three different loops:</p>
+<ul>
+<li>The first loop (<code>loop</code>) sums individual values
+into <code>s0</code> until we have a multiple of four values remaining</li>
+<li>The second loop (<code>simd</code>) uses SIMD instructions to sum 4 values at a time
+into the vector register <code>v1</code>, until we have a multiple of 8 values remaining</li>
+<li>The last loop (<code>simd2</code>) is the same as <code>simd</code>, but is unrolled 2x so it
+handles 8 values per loop iteration, summing into <code>v1</code> and <code>v2</code></li>
+</ul>
+<p>At the function exit, we accumulate the values in the vector registers <code>v1</code>/<code>v2</code>
+into <code>s0</code>, which is returned.</p>
+<p>The type punning here is particularly cute:</p>
+<pre><code>ldp d3, d4, [x0], #16
+mov v3.d[1], v4.d[0]
+fadd v1.4s, v1.4s, v3.4s
+</code></pre>
+<p>Remember, <code>x0</code> holds a <code>float*</code>.  We pretend that it's a <code>double*</code> to load 128
+bits (i.e. 4x <code>float</code> values) into <code>d3</code> and <code>d4</code>.  Then, we move the "double" in <code>d4</code>
+to occupy the top 64 bits of the <code>v3</code> vector register (of which <code>d3</code> is the
+<em>lower</em> 64 bits).</p>
+<p>Of course, each "double" is two floats, but that doesn't matter when shuffling
+them around.  When summing with <code>fadd</code>, we tell the processor to treat them as
+four floats (the <code>.4s</code> suffix), and everything works out fine.</p>
+<p>How fast are we now?</p>
+<p>This runs in 94 ns, or about <strong>8.8x faster</strong> than our previous best.</p>
+<p>Here's a summary of performance:</p>
+<table>
+<tbody><tr><th>Program</th><th>Time
+</th></tr><tr><td>Matched <code>bl</code> / <code>ret</code> </td><td>969 ns
+</td></tr><tr><td>One <code>bl</code>, many <code>ret</code></td><td>3.85 µs
+</td></tr><tr><td>One <code>bl</code>, many <code>br x30</code></td><td>913 ns
+</td></tr><tr><td>Plain loop with <code>b</code></td><td>911 ns
+</td></tr><tr><td>Rewrite it in Rust</td><td>833 ns
+</td></tr><tr><td>SIMD + manual loop unrolling</td><td>94 ns
+</td></tr></tbody></table>
+<p>Could we get even faster?  I'm sure it's possible; I make no claims to being
+the <a href="https://www.agner.org/optimize/">Agner Fog</a> of AArch64 assembly.</p>
+<p>Still, this is a reasonable point to wrap up: we've demystified the initial
+performance regression, and had some fun hand-writing assembly to go very
+fast indeed.</p>
+<p>The SIMD code does come with one asterisk, though: because floating-point
+addition is not associative, and it performs the summation in a different
+order, it <strong>may not get the same result</strong> as straight-line code.  In retrospect,
+this is likely why the compiler doesn't generate SIMD instructions to compute
+the sum!</p>
+<p>Does this matter for your use case?  Only you can know!</p>
+<hr>
+<p>All of the code from this post is
+<a href="https://github.com/mkeeter/arm64-test">published to GitHub</a>.</p>
+<p>You can reproduce benchmarks by running <code>cargo bench</code> on an ARM64 machine.</p>
+
+<!-- Begin footer -->
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Proton launches its own version of Google Docs (275 pts)]]></title>
             <link>https://www.engadget.com/proton-launches-its-own-version-of-google-docs-100044471.html</link>
             <guid>40864914</guid>
             <pubDate>Wed, 03 Jul 2024 11:25:29 GMT</pubDate>
@@ -17,7 +371,7 @@
 <div id="readability-page-1" class="page"><div><p><a data-i13n="cpos:1;pos:1" href="https://www.engadget.com/protons-windows-and-macos-mail-app-is-out-of-beta-and-available-now-110010822.html" data-ylk="slk:Proton;cpos:1;pos:1;elm:context_link;itc:0;sec:content-canvas">Proton</a> now has its own version of Google Docs in its Drive cloud storage service, and like the company's other products, it comes with end-to-end encryption. The company says its flavor of Docs "offers a unique solution in a market where most popular products neglect privacy" and recommends it for use in the healthcare, media, finance and legal industries. <a data-i13n="elm:affiliate_link;sellerN:;elmt:;cpos:2;pos:1" href="https://shopping.yahoo.com/rdlw?siteId=us-engadget&amp;pageId=1p-autolink&amp;featureId=text-link&amp;custData=eyJzb3VyY2VOYW1lIjoiV2ViLURlc2t0b3AtVmVyaXpvbiIsImxhbmRpbmdVcmwiOiJodHRwczovL3Byb3Rvbi5tZS9ibG9nL2RvY3MtcHJvdG9uLWRyaXZlIiwiY29udGVudFV1aWQiOiJjMmYyMGEyYS05ZGEzLTQyZmMtYjhmMC03MGI3ZDRlMGFhNmYifQ&amp;signature=AQAAAWZaQ6nJO7zP4rH3JS2Y44qB7q_HbbOpt8RRVvU6nYbn&amp;gcReferrer=https%3A%2F%2Fproton.me%2Fblog%2Fdocs-proton-drive" rel="nofollow noopener" target="_blank" data-ylk="slk:Proton Docs;elm:affiliate_link;sellerN:;elmt:;cpos:2;pos:1;itc:0;sec:content-canvas">Proton Docs</a> has advanced formatting and image embed options like Google Docs has and can create, open and edit documents in multiple formats, including Microsoft .docx.</p><p>It has collaboration tools similar to Google Docs', as well. Users can invite anyone to view and edit their documents, though those without a Proton account will be prompted to create one first. The free tier of Proton Drive includes essential document features so people don't have to pay for the service if they don't want to. Participants will be able to add comments to the document, reply to them and resolve them. And users will see other participants' presence and their cursor placements in real time, so that they know who's working on which part of the document and so that their edits don't clash.</p><p>Proton didn't say whether the launch of Docs means it's going to roll out analogues of Google's other Workspace apps in the future, but the company did <a data-i13n="cpos:3;pos:1" href="https://www.engadget.com/proton-encrypted-email-vpn-calendar-rebrand-103024950.html" data-ylk="slk:expand its offerings;cpos:3;pos:1;elm:context_link;itc:0;sec:content-canvas">expand its offerings</a> with several different products over the last few years. In addition to Drive cloud storage — and, of course, its email service — the company has a VPN, an encrypted calendar and even a <a data-i13n="cpos:4;pos:1" href="https://www.engadget.com/proton-launches-its-own-password-manager-115039870.html" data-ylk="slk:password manager;cpos:4;pos:1;elm:context_link;itc:0;sec:content-canvas">password manager</a>. Docs will make its way to Proton users over the coming days.</p><p>This article contains affiliate links; if you click such a link and make a purchase, we may earn a commission.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I Received an AI Email (630 pts)]]></title>
+            <title><![CDATA[I Received an AI Email (631 pts)]]></title>
             <link>https://timharek.no/blog/i-received-an-ai-email</link>
             <guid>40862865</guid>
             <pubDate>Wed, 03 Jul 2024 05:05:35 GMT</pubDate>
@@ -33,7 +387,7 @@
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><p><span>Recently, </span><a href="http://adept.ai/" rel="">Adept AI</a><span> announced </span><a href="https://techcrunch.com/2024/06/28/amazon-hires-founders-away-from-ai-startup-adept/?guccounter=1&amp;guce_referrer=aHR0cHM6Ly93d3cuZ29vZ2xlLmNvbS8&amp;guce_referrer_sig=AQAAAM7kyimVR-Nntc7w3SCp466ss9rI61B5U68ESaJExyUE65kA2h6sdH5pHKpdJ0oi6Y0SvXy7wg2OgsX1JTB-hZw9n0esnLkFCY_6JckUVqoIbgGFEy2gSjzMw4YJBYwbCFKJqPR19xgviwpcnO8cCVPa99I_tMkjrjBWHoQqPtTI" rel="">they are being acquired by Amazon</a><span>, and this solidified a somewhat controversial opinion I’ve held for a while - </span><strong>that AI infra startups are a tarpit idea</strong><span>, </span><strong><span>especially as a “venture-scale” business.</span></strong></p><p><span>The term “tarpit idea” refers to startup ideas that sound reasonable on the surface, but when put to test against reality or rigorous thought, fail to hold up.</span><br></p><div><p><span>I believe most AI infra startups will also fall into this category, where AI infra refers to the “building blocks” companies </span><strong>between the cloud layer and the application layer</strong><span> - RAG services, finetuning infrastructure, text processing services, TTS APIs, vector databases, etc. I won’t name specific names, but just think of any AI infra startup that raised sizable seed rounds off of open source or social media momentum.</span></p></div><p><span>I also believe </span><strong>many founders agree with this viewpoint</strong><span>, which explains the sale of Adept (to Amazon), </span><a href="https://openai.com/index/openai-acquires-rockset/" rel="">Rockset (to OpenAI)</a><span>, InflectionAI (to Microsoft), as well as the soon to be acquisitions of Stability (if it happens), </span><a href="http://character.ai/" rel="">Character</a><span>AI, etc. Every incumbent is looking at M&amp;A to paint an “end-to-end AI platform” story. Only a lucky few will get bought.</span><br></p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png" width="1456" height="819" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:819,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;June 28 updated AI Infra market map&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null}" alt="June 28 updated AI Infra market map" title="June 28 updated AI Infra market map" srcset="https://substackcdn.com/image/fetch/w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 424w, https://substackcdn.com/image/fetch/w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 848w, https://substackcdn.com/image/fetch/w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 1272w, https://substackcdn.com/image/fetch/w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fddeab17f-4637-437e-baeb-cd2ffb0e846a_1600x900.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a><figcaption>Source: Bessemer Venture Partners</figcaption></figure></div><div><p><span>So why is selling AI infrastructure </span><em>as a startup</em><span> a tarpit idea? On paper, it’s perfectly reasonable to sell picks and shovels amidst proliferation of AI startups and enterprises building Gen AI features. After all, there’s over 30K “.ai” domains registered every month.</span></p></div><div><p><strong>In a nutshell, the new AI infra startups will struggle to succeed because they lack significant differentiation and capital to crack the enterprise segment.</strong><span> It’s not the startups’ fault, the real problem is competitive dynamics. There’s simply too many entities offering the same table stakes features within 1-3 months apart from each other, which creates a collective tarpit dynamic, where only the incumbents can keep swimming.</span></p></div><p>The argument goes:</p><ul><li><p>For AI infra startups to be “venture scale”, they will eventually need to win over enterprise customers. No question. That requires the startups to have some sustainable edge that separates their products from the incumbents’ (GCP, AWS, as well as the likes of Vercel, Databricks, Datadog, etc).</p></li><li><p>Unfortunately, most cutting edge innovation either comes from the incumbents or the research / OSS community - and incumbents are in a better position to commercialize the innovations because they have more usage data than startups, as well as the relationships.</p></li><li><p>To add salt to the injury, any good ideas that originate from startups get benchmarked and copied quickly. For example, I was quite surprised how quickly Databricks and Datadog caught up to the leading LLMOps products from the startup world (e.g. Arize AI). </p></li><li><p>Furthermore, OSS community can’t help but create OSS versions of other AI infra startups’ products - perhaps a testament to how easy it has become to write software.</p></li><li><p>Thus, startups struggle to maintain a sustainable lead over the incumbents to buy them time to win enterprise contracts.</p></li><li><p>And enterprise customers are incentivized to “hold off” on onboarding new vendors, because vendor products diminish in value so quickly because AI landscape changes every few months.</p></li><li><p>This ultimately lengthens sales cycles, and increases churn, which hurts startups more than the incumbents.</p></li></ul><div><p><span>There are also some other dynamics at play (to be discussed in the next section) - but essentially the AI infrastructure space becomes a grind that favors players with the longest runways.</span></p></div><div><p><span>My intention here is not to doom-post, but to highlight some real challenges, which I’m happy to be wrong on (DM me if you disagree). Also, I will end by offering some advice to AI infra startups.</span></p></div><p><em><span>To clarify, by “AI infra startup”, I’m referring to “venture scale” AI infrastructure startups. I’m sure founders can create essentially system integration agencies targeting SMB or mid market, and call themselves an AI infra company. But that’s a completely different business with a much smaller upside.</span><br></em></p><p>There’s three other major forces that’s worsening the competitive environment:</p><ol><li><p>Builders are now conditioned to “demand” composability, a.k.a making it easy to switch out your product for others’. This is great for application layer companies, but not infrastructure companies. Developers can rip out Langchain with Llamaindex, OpenAI models with Claude 3.5 through AWS Bedrock, etc. Every layer of the LLM training and inference stack has at least 10+ viable solutions, that it becomes difficult to create any type of lock-in.</p></li><li><p>The ongoing plummeting of inference costs also plays a role. The COGS are dropping fast, so AI infra players need to constantly price-match the incumbents who have the biggest economies of scale. Models or code have little perceived differentiation, so the consumption goes to the lowest cost providers (incumbents).</p></li><li><p>Incumbents seem to all have the same business strategy of creating an “end-to-end AI platform”. Databricks is getting into AI model training and business intelligence, competing with AWS Sagemaker and Tableau. Github Workspaces is getting into AI-powered security reviews, etc.</p><ol><li><p>Everyone’s default product strategy is to own all upstream and downstream workloads from their core product, which unintentionally makes startups’ lives more difficult, since it becomes hard to compete with a point solution.</p></li></ol></li></ol><p><br><span>With all these challenges, some AI infra startups have chosen to go vertical or move to the application layer. For example, I have been tracking a “Business Intelligence with Natural Language” startup since late 2022 that has pivoted three times already from:</span></p><ul><li><p>a general purpose “chat with data” platform, to</p></li><li><p>“chat with business intelligence data” platform, to</p></li><li><p>“chat with financial data” platform.</p></li></ul><div><p><span>The AI infra darlings LlamaIndex and Langchain also took this path of focus when it comes to their enterprise-oriented products. LlamaIndex is focusing on managed document parsing / OCR, whereas Langchain is focusing on LLMOps and agent building solutions. My guess is that both are working on narrowing their focus even further, since even selling a managed document parsing service is a huge scope for a seed-stage startup, given that Google and AWS already have existing vertical text extraction services. It’s not easy.</span></p></div><div><p><span>Narrowing the scope and going vertical is a typical response for AI infra startups - but I argue that these pivots rarely work out and cause new set of problems. Most importantly, these vertical pivots underestimate the importance of deep domain expertise once you go vertical, which many AI infra founders lack. Accumulating domain knowledge is time consuming. Also, your product may need to be heavily customized for the unique needs of the vertical, which means lower margins.</span></p></div><p><span>Not to mention, these application layer ecosystems have even worse competition (e.g. VCs’ LegalTech ecosystem maps ran out of space to put new logos long time ago). There’s not just the other AI startup competition, but competition from the legacy software companies. Pivoting to a vertical does not suddenly get rid of your competitors - you will just have new ones in that vertical who have been there before you. For example, legal tech industry has existed for ages, and many Legal AI companies are now competing with </span><strong>the legacy legal tech providers plus system integrators.</strong></p><div><p><span>So what’s the solution for AI infra startups? Should we all hope to be acquihired, or is it possible for startups to also stay independent for longer and find product market fit?</span></p><p><span>Here’s a somewhat anti-climatic answer, but the solution for startups goes back to the fundamentals: </span><strong>think deeply about how to be different from the incumbents.</strong><span> Here are four ways to iterate from here:</span></p></div><ul><li><p><strong>Narrow down the scope even further:</strong><span> focus on a very tiny segment of enterprise customers, as opposed to serving all customers. Don’t build all the integrations. Be a managed RAG service for customers using Salesforce with on-prem VMWare, as opposed to a general purpose RAG service. Startups don’t have the resources to solve for every environment, at least initially.</span></p></li><li><p><strong>Focus on just one workload:</strong><span> startups shouldn’t try to solve for too many workloads. Do one thing really well. Don’t try to be a platform for finetuning any LLM - there’s already too many of those. Instead, try to be the best platform for finetuning Tagalog models. The catch: the TAM might be too small.</span></p></li><li><p><strong>Raise more VC money than you think you need:</strong><span> long runways are non-negotiable. It can take a while for enterprises to be receptive to buying startup AI infra solutions, if ever. Be prepared for the worst case scenario.</span></p></li><li><p><strong>Or, don’t raise any VC money at all:</strong><span> raising VC money kind of forces you to orient business strategy around selling to the enterprise - which might be not something you can or want to do. You want the flexibility to work on more interesting and promising problems when they arise, given there’s constantly new changes in AI landscape.</span></p></li></ul><p><span>Lastly, AI startups should be open to being acquired by a larger player, even if it’s not a prestigious destination like OpenAI or Google. </span><strong>My view is that M&amp;A landscape for AI infrastructure sector will become worse, not better, over time.</strong></p><p><span>The acquisition market will become more “efficient” as the winners/losers emerge, and the workloads and enterprise needs become more clearly defined. Thus, in order to sell your startup at an “attractive” valuation, it needs to be marketed prior to the dust settles when the market is less efficient. Don’t wait for another 18 months to shop your startup, when all AI infra startups start running out of runway at the same time.</span></p></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Why Bridges Don't Sink (182 pts)]]></title>
+            <title><![CDATA[Why Bridges Don't Sink (208 pts)]]></title>
             <link>https://practical.engineering/blog/2024/7/2/why-bridges-dont-sink</link>
             <guid>40861520</guid>
             <pubDate>Tue, 02 Jul 2024 23:43:10 GMT</pubDate>
@@ -43,7 +397,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Illustrated Transformer (2018) (134 pts)]]></title>
+            <title><![CDATA[The Illustrated Transformer (2018) (139 pts)]]></title>
             <link>https://jalammar.github.io/illustrated-transformer/</link>
             <guid>40861148</guid>
             <pubDate>Tue, 02 Jul 2024 22:42:00 GMT</pubDate>
@@ -519,12 +873,157 @@ The positional encoding shown above is from the Tensor2Tensor implementation of 
                                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[All I want for Christmas is a negative leap second (155 pts)]]></title>
+            <title><![CDATA[All I want for Christmas is a negative leap second (169 pts)]]></title>
             <link>https://qntm.org/leap</link>
             <guid>40860831</guid>
             <pubDate>Tue, 02 Jul 2024 22:01:01 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://qntm.org/leap">https://qntm.org/leap</a>, See on <a href="https://news.ycombinator.com/item?id=40860831">Hacker News</a></p>
 Couldn't get https://qntm.org/leap: Error: Request failed with status code 403]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Python Modern Practices (103 pts)]]></title>
+            <link>https://www.stuartellis.name/articles/python-modern-practices/</link>
+            <guid>40860803</guid>
+            <pubDate>Tue, 02 Jul 2024 21:56:40 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.stuartellis.name/articles/python-modern-practices/">https://www.stuartellis.name/articles/python-modern-practices/</a>, See on <a href="https://news.ycombinator.com/item?id=40860803">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        <p><a href="https://www.python.org/" target="_blank" rel="noreferrer">Python</a> has a long history, and it has evolved over time. This article describes some agreed modern best practices.</p>
+<h2 id="using-python">Using Python <span><a href="#using-python" aria-label="Anchor">#</a></span></h2><h3 id="install-python-with-tools-that-support-multiple-versions">Install Python With Tools That Support Multiple Versions <span><a href="#install-python-with-tools-that-support-multiple-versions" aria-label="Anchor">#</a></span></h3><p>Use a tool like <a href="https://mise.jdx.dev/" target="_blank" rel="noreferrer">mise</a> or <a href="https://github.com/pyenv/pyenv" target="_blank" rel="noreferrer">pyenv</a> to install Python on your development systems, so that you can switch between different versions of Python for your projects. This enables you to upgrade each project to a new version of Python without interfering with other tools and projects that use Python.</p>
+<p>Alternatively, consider using <a href="https://containers.dev/" target="_blank" rel="noreferrer">Development Containers</a>, which enable you to define an isolated environment for a software project. This also allows you to use a separate version of Python for each project.</p>
+<p>Ensure that the tool compiles Python, rather than downloading <a href="https://gregoryszorc.com/docs/python-build-standalone/main/" target="_blank" rel="noreferrer">standalone builds</a>. The standlone builds are modified versions of Python that are maintained by a third-party. Both the pyenv tool and the <a href="https://github.com/devcontainers/features/blob/main/src/python/README.md" target="_blank" rel="noreferrer">Visual Studio Code Dev Container feature</a> automatically compile Python, but you must <a href="https://mise.jdx.dev/lang/python.html#precompiled-python-binaries" target="_blank" rel="noreferrer">change the mise configuration</a> to use compilation. <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a> and <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a> always download standalone builds when you use them to set up versions of Python.</p>
+<p>If your operating system includes a Python installation, avoid using it. This Python installation is for operating system tools. It is likely to use an older version of Python, and may not include all of the standard features. An operating system copy of Python should be <a href="https://packaging.python.org/en/latest/specifications/externally-managed-environments/#externally-managed-environments" target="_blank" rel="noreferrer">marked</a> to prevent you from installing packages into it, but not all operating systems set the marker.</p>
+<h3 id="use-the-most-recent-version-of-python-that-you-can">Use The Most Recent Version of Python That You Can <span><a href="#use-the-most-recent-version-of-python-that-you-can" aria-label="Anchor">#</a></span></h3><p>For new projects, choose the most recent stable version of Python 3. This ensures that you have the latest security fixes, as well as the fastest performance.</p>
+<p>Upgrade your projects as new Python versions are released. The Python development team usually support each version for five years, but some Python libraries may only support each version of Python for a shorter period of time. If you use tools that support multiple versions of Python and automated testing, you can test your projects on new Python versions with little risk.</p>
+<p><span>
+    <span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><path fill="currentColor" d="M506.3 417l-213.3-364c-16.33-28-57.54-28-73.98 0l-213.2 364C-10.59 444.9 9.849 480 42.74 480h426.6C502.1 480 522.6 445 506.3 417zM232 168c0-13.25 10.75-24 24-24S280 154.8 280 168v128c0 13.25-10.75 24-23.1 24S232 309.3 232 296V168zM256 416c-17.36 0-31.44-14.08-31.44-31.44c0-17.36 14.07-31.44 31.44-31.44s31.44 14.08 31.44 31.44C287.4 401.9 273.4 416 256 416z"></path></svg>
+</span>
+  </span>
+  <span><em>Avoid using Python 2.</em> It is not supported by the Python development team or by the developers of most popular Python libraries.</span>
+</p>
+
+<h3 id="use-pipx-to-run-developer-applications">Use pipx To Run Developer Applications <span><a href="#use-pipx-to-run-developer-applications" aria-label="Anchor">#</a></span></h3><p>Use <a href="https://pipx.pypa.io/" target="_blank" rel="noreferrer">pipx</a> to run Python applications on development systems, rather than installing the applications with <em>pip</em> or another method. This ensures that each application has the correct libraries, because <em>pipx</em> automatically puts the libraries for each application into a separate <a href="https://docs.python.org/3/tutorial/venv.html" target="_blank" rel="noreferrer">Python virtual environment</a>.</p>
+<p>Consider using the <a href="https://pipx.pypa.io/stable/#walkthrough-running-an-application-in-a-temporary-virtual-environment" target="_blank" rel="noreferrer">pipx run</a> command, rather than <em>pipx install</em>. The <em>pipx run</em> command downloads and runs the application without installing it. Each application is cached for several days after the first download, which means that <em>pipx run</em> may not be slower than running a manually installed application.</p>
+<p>The Python Packaging Authority maintain <em>pipx</em>, but it is not included with Python. To install <em>pipx</em>, run this command:</p>
+<div><pre tabindex="0"><code data-lang="shell"><span><span>python3 -m pip install --user pipx
+</span></span></code></pre></div><p>This enables you to use any Python command-line application with <em>pipx</em>. For example, this command downloads and runs the latest version of <a href="https://github.com/aristocratos/bpytop" target="_blank" rel="noreferrer">bpytop</a>, a system monitoring tool:</p>
+<blockquote>
+<p><a href="https://peps.python.org/pep-0668/#guide-users-towards-virtual-environments" target="_blank" rel="noreferrer">PEP 668 - Marking Python base environments as “externally managed”</a> recommends that users install Python applications with pipx.</p>
+</blockquote>
+<h2 id="developing-python-projects">Developing Python Projects <span><a href="#developing-python-projects" aria-label="Anchor">#</a></span></h2><h3 id="avoid-using-poetry">Avoid Using Poetry <span><a href="#avoid-using-poetry" aria-label="Anchor">#</a></span></h3><p>Avoid using <a href="https://python-poetry.org/" target="_blank" rel="noreferrer">Poetry</a> for new projects. Poetry predates many standards for Python tooling. This means that it uses non-standard implementations of key features, such as the dependency resolver and configuration formats in <em>pyproject.toml</em> files.</p>
+<p>If you would like to use a similar tool to develop your applications, consider using <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a>. <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a> is another alternative to Poetry, but it is most useful for developing Python libraries. Both of these tools follow modern standards, which avoids compatibility issues.</p>
+<h3 id="use-a-pyprojecttoml-file">Use a pyproject.toml File <span><a href="#use-a-pyprojecttoml-file" aria-label="Anchor">#</a></span></h3><p>Create a <em>pyproject.toml</em> file in the root directory of each Python project. Use this file as the central place to store configuration information about the project and the tools that it uses. The <a href="https://www.pyopensci.org/python-package-guide/package-structure-code/pyproject-toml-python-package-metadata.html" target="_blank" rel="noreferrer">pyOpenSci project documentation on pyproject.toml</a> provides an introduction to the file format.</p>
+<p>Modern Python tools use the <em>pyproject.toml</em> file to store configuration. Some tools support <em>pyproject.toml</em>, but do not use it by default. Python project management tools like <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a> and <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a> automatically create and use a <em>pyproject.toml</em> file.</p>
+<blockquote>
+<p>The various features of <em>pyproject.toml</em> files are defined these PEPs: <a href="https://peps.python.org/pep-0517/" target="_blank" rel="noreferrer">PEP 517</a>, <a href="https://peps.python.org/pep-0518/" target="_blank" rel="noreferrer">PEP 518</a>, <a href="https://peps.python.org/pep-0621/" target="_blank" rel="noreferrer">PEP 621</a> and <a href="https://peps.python.org/pep-0660/" target="_blank" rel="noreferrer">PEP 660</a>.</p>
+</blockquote>
+<h3 id="create-a-directory-structure-that-uses-the-src-layout">Create a Directory Structure That Uses the src Layout <span><a href="#create-a-directory-structure-that-uses-the-src-layout" aria-label="Anchor">#</a></span></h3><p>Python itself does not require a specific directory structure for your projects. The Python packaging documentation describes two popular directory structures: <a href="https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/" target="_blank" rel="noreferrer">the src layout and the flat layout</a>.
+The <a href="https://www.pyopensci.org/python-package-guide/package-structure-code/python-package-structure.html" target="_blank" rel="noreferrer">pyOpenSci project documentation on directory structures</a> explains the practical differences between the two.</p>
+<p>For modern Python projects, use the src layout. This requires you to use <a href="https://setuptools.pypa.io/en/latest/userguide/development_mode.html" target="_blank" rel="noreferrer">editable installs</a> of the packages in your project, but tools like <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a> and <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a> will handle this for you.</p>
+<h3 id="use-virtual-environments-for-development">Use Virtual Environments for Development <span><a href="#use-virtual-environments-for-development" aria-label="Anchor">#</a></span></h3><p>The <a href="https://docs.python.org/3/tutorial/venv.html" target="_blank" rel="noreferrer">virtual environments</a> feature enables you to define separate sets of packages for each Python project, so that the packages for a project do not conflict with any other Python packages on the system. Always use Python virtual environments for your projects.</p>
+<p>Several tools automate creating and switching between virtual environments. The <a href="https://mise.jdx.dev/" target="_blank" rel="noreferrer">mise</a> version manager includes <a href="https://mise.jdx.dev/lang/python.html#automatic-virtualenv-activation" target="_blank" rel="noreferrer">support for virtual environments</a>. The <a href="https://github.com/pyenv/pyenv" target="_blank" rel="noreferrer">pyenv</a> version manager supports virtual environments with the <a href="https://github.com/pyenv/pyenv-virtualenv" target="_blank" rel="noreferrer">virtualenv plugin</a>. If you use a tool like <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a> or <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a> to develop your projects, these also manage Python virtual environments for you.</p>
+<p>You can set up and use virtual environments with <em>venv</em>, which is part of the Python standard library, but this is a manual process.</p>
+<h3 id="use-requirementstxt-files-to-install-packages-into-environments">Use requirements.txt Files to Install Packages Into Environments <span><a href="#use-requirementstxt-files-to-install-packages-into-environments" aria-label="Anchor">#</a></span></h3><p>Avoid using <em>pip</em> commands to install packages into virtual environments. If you use <a href="https://pdm-project.org/" target="_blank" rel="noreferrer">PDM</a> or <a href="https://hatch.pypa.io/" target="_blank" rel="noreferrer">Hatch</a>, they manage packages in development and test environments. For other cases, create a <em>requirements.txt</em> file that specifies all of the packages that are required in the environment.</p>
+<p>You can create <em>requirements.txt</em> files with whichever tool is appropriate. For example, PDM includes <a href="https://pdm-project.org/en/stable/usage/lockfile/#export-locked-packages-to-alternative-formats" target="_blank" rel="noreferrer">an export feature</a> that creates <em>requirements.txt</em> files. If you do not already have a tool to create <em>requirements.txt</em> files, use the <em>pip-compile</em> utility that is provided by <a href="https://github.com/jazzband/pip-tools/" target="_blank" rel="noreferrer">pip-tools</a>.</p>
+<p>You can then use the <em>pip-sync</em> utility in <a href="https://github.com/jazzband/pip-tools/" target="_blank" rel="noreferrer">pip-tools</a> to add the packages that are specified in the <em>requirements.txt</em> file into a target virtual environment. The <em>pip-sync</em> utility ensures that the packages in a virtual environment match the list in the <em>requirements.txt</em> file.</p>
+<p>If you need to install packages without using <em>pip-sync</em>, run <em>pip install</em> with a <em>requirements.txt</em> file. For example, these commands install the packages that are specified by the file <em>requirements-dev.txt</em> into the virtual environment <em>.venv</em>:</p>
+<div><pre tabindex="0"><code data-lang="shell"><span><span><span>source</span> ./.venv/bin/activate
+</span></span><span><span>python3 -m pip install -r requirements-dev.txt
+</span></span></code></pre></div><blockquote>
+<p>Ensure that your <em>requirements.txt</em> files include hashes for the packages. The <em>pip-compile</em> utility generates <em>requirements.txt</em> files with hashes if you specify the <em>generate-hashes</em> option.</p>
+</blockquote>
+<h3 id="format-your-code">Format Your Code <span><a href="#format-your-code" aria-label="Anchor">#</a></span></h3><p>Use a formatting tool with a plugin to your editor, so that your code is automatically formatted to a consistent style.</p>
+<p><a href="https://black.readthedocs.io/en/stable/" target="_blank" rel="noreferrer">Black</a> is currently the most popular code formatting tool for Python, but consider using <a href="https://docs.astral.sh/ruff/" target="_blank" rel="noreferrer">Ruff</a>. Ruff provides both code formatting and quality checks for Python code.</p>
+<p>Run the formatting tool with your CI system, so that it rejects any code that does not match the format for your project.</p>
+<h3 id="use-a-code-linter">Use a Code Linter <span><a href="#use-a-code-linter" aria-label="Anchor">#</a></span></h3><p>Use a code linting tool with a plugin to your editor, so that your code is automatically checked for issues.</p>
+<p><a href="https://flake8.pycqa.org/en/latest/" target="_blank" rel="noreferrer">flake8</a> is currently the most popular linter for Python, but consider using <a href="https://docs.astral.sh/ruff/" target="_blank" rel="noreferrer">Ruff</a>. Ruff includes the features of both flake8 itself and the most popular plugins for flake8.</p>
+<p>Run the linting tool with your CI system, so that it rejects any code that does not meet the standards for your project.</p>
+<h3 id="test-with-pytest">Test with pytest <span><a href="#test-with-pytest" aria-label="Anchor">#</a></span></h3><p>Use <a href="http://pytest.org/" target="_blank" rel="noreferrer">pytest</a> for testing. It has superseded <em>nose</em> as the most popular testing system for Python. Use the <em>unittest</em> module in the standard library for situations where you cannot add <em>pytest</em> to the project.</p>
+<h3 id="package-your-applications">Package Your Applications <span><a href="#package-your-applications" aria-label="Anchor">#</a></span></h3><p>Use <em>wheel</em> packages for libraries, or for tools that are intended to be used with an existing installation of Python. If you publish your Python application as a <em>wheel</em>, other developers can use it with <em>pipx</em> and <em>pip-sync</em>. These packages cannot be used without a Python installation.</p>
+<p>In most cases, you should package an application in a format that enables you to include your code, the dependencies and a copy of the required version of Python. This ensures that your code runs with the expected version of Python, and has the correct version of each dependency.</p>
+<p>Use container images to package applications that provide a network service, such as a Web application. Use <a href="https://pyinstaller.org/" target="_blank" rel="noreferrer">PyInstaller</a> to publish desktop and command-line applications as a single executable file. Each container image and PyInstaller file includes a copy of Python, along with your code and the required dependencies.</p>
+<h2 id="language-syntax">Language Syntax <span><a href="#language-syntax" aria-label="Anchor">#</a></span></h2><h3 id="use-type-hinting">Use Type Hinting <span><a href="#use-type-hinting" aria-label="Anchor">#</a></span></h3><p>Current versions of Python support type hinting. Consider using type hints in any critical application. If you develop a shared library, use type hints.</p>
+<p>Once you add type hints, the <a href="http://www.mypy-lang.org/" target="_blank" rel="noreferrer">mypy</a> tool can check your code as you develop it. Code editors can also read type hints to display information about the code that you are working with.</p>
+<p>If you use <a href="https://docs.pydantic.dev/" target="_blank" rel="noreferrer">Pydantic</a> in your application, it can work with type hints. Use the <a href="https://docs.pydantic.dev/latest/integrations/mypy/" target="_blank" rel="noreferrer">mypy plugin for Pydantic</a> to improve the integration between mypy and Pydantic.</p>
+<blockquote>
+<p><a href="https://peps.python.org/pep-0484/" target="_blank" rel="noreferrer">PEP 484 - Type Hints</a> and <a href="https://peps.python.org/pep-0526/" target="_blank" rel="noreferrer">PEP 526 – Syntax for Variable Annotations</a> define the notation for type hinting.</p>
+</blockquote>
+<h3 id="format-strings-with-f-strings">Format Strings with f-strings <span><a href="#format-strings-with-f-strings" aria-label="Anchor">#</a></span></h3><p>The new <a href="https://docs.python.org/3/reference/lexical_analysis.html#f-strings" target="_blank" rel="noreferrer">f-string</a> syntax is both more readable and has better performance than older methods. Use f-strings instead of <em>%</em> formatting, <em>str.format()</em> or <em>str.Template()</em>.</p>
+<p>The older features for formatting strings will not be removed, to avoid breaking backward compatibility.</p>
+<p>The f-strings feature was added in version 3.6 of Python. Alternate implementations of Python may include this specific feature, even when they do not support version 3.6 syntax.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0498/" target="_blank" rel="noreferrer">PEP 498</a> explains f-strings in detail.</p>
+</blockquote>
+<h3 id="use-datetime-objects-with-time-zones">Use Datetime Objects with Time Zones <span><a href="#use-datetime-objects-with-time-zones" aria-label="Anchor">#</a></span></h3><p>Always use <em>datetime</em> objects that are <a href="https://docs.python.org/3/library/datetime.html?highlight=datetime#aware-and-naive-objects" target="_blank" rel="noreferrer">aware</a> of time zones. By default, Python creates <em>datetime</em> objects that do not include a time zone. The documentation refers to <em>datetime</em> objects without a time zone as <strong>naive</strong>.</p>
+<p>Avoid using <em>date</em> objects, except where the time of day is completely irrelevant. The <em>date</em> objects are always <strong>naive</strong>, and do not include a time zone.</p>
+<p>Use aware <em>datetime</em> objects with the UTC time zone for timestamps, logs and other internal features.</p>
+<p>To get the current time and date in UTC as an aware <em>datetime</em> object, specify the UTC time zone with <em>now()</em>. For example:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span>from</span> <span>datetime</span> <span>import</span> <span>datetime</span><span>,</span> <span>timezone</span>
+</span></span><span><span>
+</span></span><span><span><span>dt</span> <span>=</span> <span>datetime</span><span>.</span><span>now</span><span>(</span><span>timezone</span><span>.</span><span>utc</span><span>)</span>
+</span></span></code></pre></div><p>Python 3.9 and above include the <strong>zoneinfo</strong> module. This provides access to the standard IANA database of time zones. Previous versions of Python require a third-party library for time zones.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0615/" target="_blank" rel="noreferrer">PEP 615</a> describes support for the IANA time zone database with <strong>zoneinfo</strong>.</p>
+</blockquote>
+<h3 id="use-enum-or-named-tuples-for-immutable-sets-of-key-value-pairs">Use enum or Named Tuples for Immutable Sets of Key-Value Pairs <span><a href="#use-enum-or-named-tuples-for-immutable-sets-of-key-value-pairs" aria-label="Anchor">#</a></span></h3><p>Use the <em>enum</em> type in Python 3.4 or above for immutable collections of key-value pairs. Enums can use class inheritance.</p>
+<p>Python 3 also has <em>collections.namedtuple()</em> for immutable key-value pairs. Named tuples do not use classes.</p>
+<h3 id="create-data-classes-for-custom-data-objects">Create Data Classes for Custom Data Objects <span><a href="#create-data-classes-for-custom-data-objects" aria-label="Anchor">#</a></span></h3><p>The data classes feature enables you to reduce the amount of code that you need to define classes for objects that exist to store values. The new syntax for data classes does not affect the behavior of the classes that you define with it. Each data class is a standard Python class.</p>
+<p>You can set a <em>frozen</em> option to make <a href="https://docs.python.org/3/library/dataclasses.html#frozen-instances" target="_blank" rel="noreferrer">frozen instances</a> of a data class.</p>
+<p>Data classes were introduced in version 3.7 of Python.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0557/" target="_blank" rel="noreferrer">PEP 557</a> describes data classes.</p>
+</blockquote>
+<h3 id="use-collectionsabc-for-custom-collection-types">Use collections.abc for Custom Collection Types <span><a href="#use-collectionsabc-for-custom-collection-types" aria-label="Anchor">#</a></span></h3><p>The abstract base classes in <em>collections.abc</em> provide the components for building your own custom collection types.</p>
+<p>Use these classes, because they are fast and well-tested. The implementations in Python 3.7 and above are written in C, to provide better performance than Python code.</p>
+<h3 id="use-breakpoint-for-debugging">Use breakpoint() for Debugging <span><a href="#use-breakpoint-for-debugging" aria-label="Anchor">#</a></span></h3><p>This function drops you into the debugger at the point where it is called. Both the <a href="https://docs.python.org/3/library/pdb.html" target="_blank" rel="noreferrer">built-in debugger</a> and external debuggers can use these breakpoints.</p>
+<p>The <a href="https://docs.python.org/3/library/functions.html#breakpoint" target="_blank" rel="noreferrer">breakpoint()</a> feature was added in version 3.7 of Python.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0553/" target="_blank" rel="noreferrer">PEP 553</a> describes the <em>breakpoint()</em> function.</p>
+</blockquote>
+<h2 id="application-design">Application Design <span><a href="#application-design" aria-label="Anchor">#</a></span></h2><h3 id="use-logging-for-diagnostic-messages-rather-than-print">Use Logging for Diagnostic Messages, Rather Than print() <span><a href="#use-logging-for-diagnostic-messages-rather-than-print" aria-label="Anchor">#</a></span></h3><p>The built-in <em>print()</em> statement is convenient for adding debugging information, but you should include logging in your scripts and applications. Use the <a href="https://docs.python.org/3/library/logging.html#logrecord-attributes" target="_blank" rel="noreferrer">logging</a> module in the standard library, or a third-party logging module.</p>
+<h3 id="use-the-toml-format-for-configuration">Use The TOML Format for Configuration <span><a href="#use-the-toml-format-for-configuration" aria-label="Anchor">#</a></span></h3><p>Use <a href="https://toml.io/" target="_blank" rel="noreferrer">TOML</a> for data files that must be written or edited by human beings. Use the JSON format for data that is transferred between computer programs. Avoid using the INI or YAML formats.</p>
+<p>Python 3.11 and above include <em>tomllib</em> to read the TOML format. Use <a href="https://pypi.org/project/tomli/" target="_blank" rel="noreferrer">tomli</a> to add support for reading TOML to applications that run on older versions of Python.</p>
+<p>If your Python software needs to generate TOML, add <a href="https://pypi.org/project/tomli-w/" target="_blank" rel="noreferrer">Tomli-W</a>.</p>
+<blockquote>
+<p><a href="https://peps.python.org/pep-0680/" target="_blank" rel="noreferrer">PEP 680 - tomllib: Support for Parsing TOML in the Standard Library</a> explains why TOML is now included with Python.</p>
+</blockquote>
+<h3 id="only-use-async-where-it-makes-sense">Only Use async Where It Makes Sense <span><a href="#only-use-async-where-it-makes-sense" aria-label="Anchor">#</a></span></h3><p>The <a href="https://docs.python.org/3/library/asyncio.html" target="_blank" rel="noreferrer">asynchronous features of Python</a> enable a single process to avoid blocking on I/O operations. To achieve concurrency with Python, you must run multiple Python processes. Each of these processes may or may not use asynchronous I/O.</p>
+<p>To run multiple application processes, either use a container system, with one container per process, or an application server like <a href="https://gunicorn.org/" target="_blank" rel="noreferrer">Gunicorn</a>. If you need to build a custom application that manages muliple processes, use the <a href="https://docs.python.org/3/library/multiprocessing.html" target="_blank" rel="noreferrer">multiprocessing</a> package in the Python standard library.</p>
+<p>Code that uses asynchronous I/O must not call <em>any</em> function that uses synchronous I/O, such as <em>open()</em>, or the <em>logging</em> module in the standard library. Instead, you need to use either the equivalent functions from <em>asyncio</em> in the standard library or a third-party library that is designed to support asynchronous code.</p>
+<p>The <a href="https://fastapi.tiangolo.com/" target="_blank" rel="noreferrer">FastAPI</a> Web framework supports <a href="https://fastapi.tiangolo.com/async/" target="_blank" rel="noreferrer">using both synchronous and asynchronous functions in the same application</a>. You must still ensure that asynchronous functions never call any synchronous function.</p>
+<p>If you would like to work with <em>asyncio</em>, use Python 3.7 or above. Version 3.7 of Python introduced <a href="https://docs.python.org/3/library/contextvars.html" target="_blank" rel="noreferrer">context variables</a>, which enable you to have data that is local to a specific <em>task</em>, as well as the <em>asyncio.run()</em> function.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0567/" target="_blank" rel="noreferrer">PEP 0567</a> describes context variables.</p>
+</blockquote>
+<h2 id="libraries">Libraries <span><a href="#libraries" aria-label="Anchor">#</a></span></h2><h3 id="handle-command-line-input-with-argparse">Handle Command-line Input with argparse <span><a href="#handle-command-line-input-with-argparse" aria-label="Anchor">#</a></span></h3><p>The <a href="https://docs.python.org/3/library/argparse.html" target="_blank" rel="noreferrer">argparse</a> module is now the recommended way to process command-line input. Use <em>argparse</em>, rather than the older <em>optparse</em> and <em>getopt</em>.</p>
+<p>The <em>optparse</em> module is officially deprecated, so update code that uses <em>optparse</em> to use <em>argparse</em> instead.</p>
+<p>Refer to <a href="https://docs.python.org/3/howto/argparse.html" target="_blank" rel="noreferrer">the argparse tutorial</a> in the official documentation for more details.</p>
+<h3 id="use-pathlib-for-file-and-directory-paths">Use pathlib for File and Directory Paths <span><a href="#use-pathlib-for-file-and-directory-paths" aria-label="Anchor">#</a></span></h3><p>Use <a href="https://docs.python.org/3/library/pathlib.html" target="_blank" rel="noreferrer">pathlib</a> objects instead of strings whenever you need to work with file and directory pathnames.</p>
+<p>Consider using the <a href="https://docs.python.org/3/library/pathlib.html#correspondence-to-tools-in-the-os-module" target="_blank" rel="noreferrer">the pathlib equivalents for os functions</a>.</p>
+<p>The existing methods in the standard library have been updated to support Path objects.</p>
+<p>To list all of the the files in a directory, use either the <em>.iterdir()</em> function of a Path object, or the <em>os.scandir()</em> function.</p>
+<p>This <a href="https://realpython.com/working-with-files-in-python/#directory-listing-in-modern-python-versions" target="_blank" rel="noreferrer">RealPython article</a> provides a full explanation of the different Python functions for working with files and directories.</p>
+<p>The <em>pathlib</em> module was added to the standard library in Python 3.4, and other standard library functions were updated to support Path objects in version 3.5 of Python.</p>
+<h3 id="use-osscandir-instead-of-oslistdir">Use os.scandir() Instead of os.listdir() <span><a href="#use-osscandir-instead-of-oslistdir" aria-label="Anchor">#</a></span></h3><p>The <em>os.scandir()</em> function is significantly faster and more efficient than <em>os.listdir()</em>. Use <em>os.scandir()</em> wherever you previously used the <em>os.listdir()</em> function.</p>
+<p>This function provides an iterator, and works with a context manager:</p>
+<div><pre tabindex="0"><code data-lang="python"><span><span><span>import</span> <span>os</span>
+</span></span><span><span>
+</span></span><span><span><span>with</span> <span>os</span><span>.</span><span>scandir</span><span>(</span><span>'some_directory/'</span><span>)</span> <span>as</span> <span>entries</span><span>:</span>
+</span></span><span><span>    <span>for</span> <span>entry</span> <span>in</span> <span>entries</span><span>:</span>
+</span></span><span><span>        <span>print</span><span>(</span><span>entry</span><span>.</span><span>name</span><span>)</span>
+</span></span></code></pre></div><p>The context manager frees resources as soon as the function completes. Use this option if you are concerned about performance or concurrency.</p>
+<p>The <em>os.walk()</em> function now calls <em>os.scandir()</em>, so it automatically has the same improved performance as this function.</p>
+<p>The <em>os.scandir()</em> function was added in version 3.5 of Python.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0471/" target="_blank" rel="noreferrer">PEP 471</a> explains <em>os.scandir()</em>.</p>
+</blockquote>
+<h3 id="run-external-commands-with-subprocess">Run External Commands with subprocess <span><a href="#run-external-commands-with-subprocess" aria-label="Anchor">#</a></span></h3><p>The <a href="https://docs.python.org/3/library/subprocess.html" target="_blank" rel="noreferrer">subprocess</a> module provides a safe way to run external commands. Use <em>subprocess</em> rather than shell backquoting or the functions in <em>os</em>, such as <em>spawn</em>, <em>popen2</em> and <em>popen3</em>. The <em>subprocess.run()</em> function in current versions of Python is sufficient for most cases.</p>
+<blockquote>
+<p><a href="https://www.python.org/dev/peps/pep-0324/" target="_blank" rel="noreferrer">PEP 324</a> explains the technical details of subprocess in detail.</p>
+</blockquote>
+<h3 id="use-httpx-for-web-clients">Use httpx for Web Clients <span><a href="#use-httpx-for-web-clients" aria-label="Anchor">#</a></span></h3><p>Use <a href="https://www.python-httpx.org/" target="_blank" rel="noreferrer">httpx</a> for Web client applications. It <a href="https://www.python-httpx.org/http2/" target="_blank" rel="noreferrer">supports HTTP/2</a>, and <a href="https://www.python-httpx.org/async/" target="_blank" rel="noreferrer">async</a>. The httpx package supersedes <a href="https://requests.readthedocs.io/en/latest/" target="_blank" rel="noreferrer">requests</a>, which only supports HTTP 1.1.</p>
+<p>Avoid using <em>urllib.request</em> from the Python standard library. It was designed as a low-level library, and lacks the features of httpx.</p>
+
+      </div></div>]]></description>
         </item>
         <item>
             <title><![CDATA[Apple poised to get OpenAI board observer role as part of AI pact (128 pts)]]></title>
@@ -549,7 +1048,7 @@ Couldn't get https://qntm.org/leap: Error: Request failed with status code 403]]
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: I made a search engine for Hacker News (196 pts)]]></title>
+            <title><![CDATA[Show HN: I made a search engine for Hacker News (198 pts)]]></title>
             <link>https://hackernews.demo.vectara.com/</link>
             <guid>40860022</guid>
             <pubDate>Tue, 02 Jul 2024 20:11:43 GMT</pubDate>
@@ -557,7 +1056,7 @@ Couldn't get https://qntm.org/leap: Error: Request failed with status code 403]]
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Google's carbon emissions surge nearly 50% due to AI energy demand (148 pts)]]></title>
+            <title><![CDATA[Google's carbon emissions surge nearly 50% due to AI energy demand (149 pts)]]></title>
             <link>https://www.cnbc.com/2024/07/02/googles-carbon-emissions-surge-nearly-50percent-due-to-ai-energy-demand.html</link>
             <guid>40859993</guid>
             <pubDate>Tue, 02 Jul 2024 20:07:55 GMT</pubDate>
@@ -747,7 +1246,7 @@ This violates S101, S116, S100, S101 for a total of 4.7k hits. This has caused e
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[An epigenetic editor to silence genes (112 pts)]]></title>
+            <title><![CDATA[An epigenetic editor to silence genes (116 pts)]]></title>
             <link>https://www.science.org/doi/10.1126/science.adq3334</link>
             <guid>40859876</guid>
             <pubDate>Tue, 02 Jul 2024 19:50:13 GMT</pubDate>
@@ -755,7 +1254,7 @@ This violates S101, S116, S100, S101 for a total of 4.7k hits. This has caused e
 Couldn't get https://www.science.org/doi/10.1126/science.adq3334: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Aboriginal ritual passed down over 12,000 years, cave find shows (198 pts)]]></title>
+            <title><![CDATA[Aboriginal ritual passed down over 12,000 years, cave find shows (214 pts)]]></title>
             <link>https://phys.org/news/2024-07-aboriginal-ritual-years-cave.html</link>
             <guid>40859393</guid>
             <pubDate>Tue, 02 Jul 2024 18:48:28 GMT</pubDate>
@@ -824,203 +1323,6 @@ Couldn't get https://www.science.org/doi/10.1126/science.adq3334: Error: Request
 										</div>
                                         
 									</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Exploring biphasic programming: a new approach in language design (111 pts)]]></title>
-            <link>https://rybicki.io/blog/2024/06/30/biphasic-programming.html</link>
-            <guid>40858670</guid>
-            <pubDate>Tue, 02 Jul 2024 17:20:08 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://rybicki.io/blog/2024/06/30/biphasic-programming.html">https://rybicki.io/blog/2024/06/30/biphasic-programming.html</a>, See on <a href="https://news.ycombinator.com/item?id=40858670">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div aria-label="Content">
-        <article itemscope="" itemtype="http://schema.org/BlogPosting">
-
-  
-
-  <div itemprop="articleBody">
-    <p>I’ve noticed a small but interesting trend in the programming languages space. I’m not sure how novel it is, but this pattern, which I’ll refer to as “biphasic programming,” is characterized by languages and frameworks that enable identical syntax to express computations executed in two distinct phases or environments while maintaining consistent behavior (i.e., semantics) across phases. These phases typically differ temporally (when they run), spatially (where they run), or both.<sup id="fnref:1" role="doc-noteref"><a href="#fn:1" rel="footnote">1</a></sup></p>
-
-<p>“Biphasic programming” is a term I’ve coined, but I feel like it helps capture the essence of several languages. What’s interesting to me is how it can be applied to different types of problems. To illustrate the concept, I’ll go through a few examples.</p>
-
-<h2 id="zig">Zig</h2>
-
-<p>The first example is Zig. <a href="https://ziglang.org/">Zig</a> is a systems programming language that lets you write highly performant code with relatively easy incremental adoption into C/C++ codebases. One of its main innovations is a fresh approach to metaprogramming called “comptime” which allows you to run ordinary functions at compile time.</p>
-
-<p>What makes comptime unique compared to preprocessing systems and macro systems like those in C, C++, and Rust is that it gives you the same <sup id="fnref:2" role="doc-noteref"><a href="#fn:2" rel="footnote">2</a></sup> expressivity of the base language through the “comptime” keyword, instead of introducing an entirely separate domain-specific language that only advanced users might want to learn. Here’s a (silly) example from their docs:</p>
-
-<div><pre><code><span>const</span> <span>expect</span> <span>=</span> <span>@import</span><span>(</span><span>"std"</span><span>).</span><span>testing</span><span>.</span><span>expect</span><span>;</span>
-
-<span>fn</span> <span>fibonacci</span><span>(</span><span>index</span><span>:</span> <span>u32</span><span>)</span> <span>u32</span> <span>{</span>
-    <span>if</span> <span>(</span><span>index</span> <span>&lt;</span> <span>2</span><span>)</span> <span>return</span> <span>index</span><span>;</span>
-    <span>return</span> <span>fibonacci</span><span>(</span><span>index</span> <span>-</span> <span>1</span><span>)</span> <span>+</span> <span>fibonacci</span><span>(</span><span>index</span> <span>-</span> <span>2</span><span>);</span>
-<span>}</span>
-
-<span>test</span> <span>"fibonacci"</span> <span>{</span>
-    <span>// test fibonacci at run-time</span>
-    <span>try</span> <span>expect</span><span>(</span><span>fibonacci</span><span>(</span><span>7</span><span>)</span> <span>==</span> <span>13</span><span>);</span>
-
-    <span>// test fibonacci at compile-time</span>
-    <span>try</span> <span>comptime</span> <span>expect</span><span>(</span><span>fibonacci</span><span>(</span><span>7</span><span>)</span> <span>==</span> <span>13</span><span>);</span>
-<span>}</span>
-</code></pre></div>
-
-<p>As a case of biphasic programming, comptime lets Zig users seamlessly switch between running code during build time versus during runtime within their source code in a way that doesn’t introduce a steep learning curve. It shifts the developer’s mental model from thinking of metaprogramming as advanced wizardry to being more of an optimization tool that can also be leveraged to implement generics and other code generation uses. I haven’t had a chance to write many Zig programs yet but the comptime system seems like a clever approach to reduce both compiler complexity and soften the language’s learning curve.</p>
-
-<p>For what it’s worth, compile-time code execution isn’t a brand-new idea. However, Zig’s approach does seem to avoid several drawbacks. For example, unlike Rust and its <a href="https://doc.rust-lang.org/reference/const_eval.html">const functions</a>, Zig doesn’t impose <a href="https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/">function coloring</a> for comptime functions. Likewise, unlike C++’s <a href="https://en.cppreference.com/w/cpp/language/template_parameters">templating system</a>, Zig doesn’t introduce any new syntax for representing generics. And compared to Lisps like Scheme and Racket which support hygenic macros, well, Zig doesn’t require everything to be a list.</p>
-
-<p><strong>TL;DR:</strong> Zig supports a form of biphasic programming where the same functions can run in either of two distinct phases, which differ temporally (build time vs runtime) and spatially (on the build system vs on the machine running the binary).</p>
-
-<h2 id="react-server-components">React Server Components</h2>
-
-<p>The second example of biphasic programming I’ve noticed is <a href="https://react.dev/reference/rsc/server-components">React Server Components</a> (RSC). React isn’t a language of its own, but as a JavaScript web framework, it has quite a sizeable mindshare as a foundational system for writing and composing UI components and their associated UI logic for large websites. Lately, the front-end JavaScript ecosystem has been doing a lot of exploration to figure out how to most efficiently render UI components on either the server or client to improve page performance. Many solutions have been proposed, and one of the most ambitious is RSC.</p>
-
-<p>The idea behind RSC is to allow a React component to specify whether it should be rendered on the server side or the client side and to allow such components to be composed together freely. For example, a <code>Feed</code> component might be rendered on the server (as it needs to fetch the list of feed items from the database), while each child <code>FeedItem</code> can be rendered on the client (as they’re pure functions of the item state), while a <code>FeedItemPreview</code> may be rendered on the server (since it needs to fetch the item’s content from the database). The developer can choose which components should be calculated where, and the underlying engine (usually a JavaScript bundler that produces both server-side code and client-side code) optimizes everything so that components are rendered on the server or client when needed, minimizing the amount of dynamic HTML and component information shipped back and forth.</p>
-
-<p><img src="https://www.plasmic.app/blog/static/images/react-server-components.png" alt="Whiteboard diagram of React components"></p>
-
-<p>This is just my rough understanding of RSC. From what I’ve heard, getting this all working and stabilized is still a massive work in progress. But I think the paradigm is a curious example of biphasic programming. There are many ways one could go about reducing the amount of code that needs to be shipped and executed on a client browser and offloading more work onto the server, but most existing solutions today require developers to treat React components as a pure client-side abstraction, or as a pure server-side abstraction. For example, either an entire page is rendered on the server, or an entire page is rendered on the client, and vice versa. Taking the React component model and letting the developer switch where a component should be rendered feels like it could be a powerful abstraction if the engine can be optimized enough and if the generated code can be made sufficiently debuggable.</p>
-
-<p><strong>TL;DR:</strong> React Server Components promises a form of biphasic programming where the same JavaScript + JSX syntax can be used to represent components that are rendered on the server or client and can be flexibly composed. Server-side and client-side rendering operate at the same time, but they differ spatially (on the server vs on your browser).</p>
-
-<blockquote>
-  <p>I also want to give an honorable mention to <a href="https://github.com/hyperfiddle/electric">Electric Clojure</a>, a project I discovered at a lightning talk its creator gave at <a href="https://systemsdistributed.com/">Systems Distributed</a> which applies a similar idea to offer strong composition over the frontend/backend boundary, but using the Clojure language. I’m not familiar enough with it to cover it in detail, but I’ve included a screenshot from their repo that hopefully suggests how it parallels React Server Components.</p>
-
-  <p><img src="https://github.com/hyperfiddle/electric/raw/master/docs/electric-explainer-5.png" alt="Screenshot of Clojure code"></p>
-</blockquote>
-
-<h2 id="winglang">Winglang</h2>
-
-<p>A large part of the reason I’ve been so curious about this “biphasic programming” idea is that for the past two years, I’ve been working on <a href="https://www.winglang.io/">Winglang</a>, a new programming language for writing cloud applications, which embraces this concept pretty heavily in its design.
-This project is the most nascent of the three examples I’m covering (it’s only been in development for two years), but for this post I’m going to try and keep the introduction as short possible to give just enough context for its biphasic type system.</p>
-
-<p>The gist behind Winglang is that thanks to the availability of vast amounts of compute, major cloud providers like AWS, Azure, and GCP have been able to provide developers with a variety of scalable, high-level services like queues, pub-sub topics, workflows, streams, storage buckets, etc. Colloquially, these are often called resources. Infrastructure-as-code tools like <a href="https://www.terraform.io/">Terraform</a> and <a href="https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cloudformation-overview.html">CloudFormation</a> make it possible to manage these resources with JSON or YAML.</p>
-
-<p>In principle, it shouldn’t be hard build complex applications with these resources. But if your application large enough and has many resources, it can become error-prone explicitly wiring up every single serverless function or container service with the permissions and configuration of its required resources. It’s also difficult to design custom interfaces around these resources.</p>
-
-<p>Winglang aims to let you write libraries and applications that compose both infrastructure resources and application logic together, through what the language calls preflight and inflight code. Here’s an example program to demonstrate:<sup id="fnref:3" role="doc-noteref"><a href="#fn:3" rel="footnote">3</a></sup></p>
-
-<div><pre><code><span>// Import some libraries.</span>
-<span>bring</span> <span>s3</span><span>;</span>
-<span>bring</span> <span>lambda</span><span>;</span>
-<span>bring</span> <span>redis</span><span>;</span>
-<span>bring</span> <span>triggers</span><span>;</span>
-
-<span>// Define our abstraction.</span>
-<span>class</span> <span>Cache</span> <span>{</span>
-    <span>_redis</span><span>:</span> <span>redis</span><span>.</span><span>Redis</span><span>;</span>
-    <span>_bucket</span><span>:</span> <span>s3</span><span>.</span><span>Bucket</span><span>;</span>
-    <span>new</span><span>()</span> <span>{</span>
-        <span>this</span><span>.</span><span>_redis</span> <span>=</span> <span>new</span> <span>redis</span><span>.</span><span>Redis</span><span>();</span>
-        <span>this</span><span>.</span><span>_bucket</span> <span>=</span> <span>new</span> <span>s3</span><span>.</span><span>Bucket</span><span>();</span>
-    <span>}</span>
-
-    <span>pub</span> <span>inflight</span> <span>get</span><span>(</span><span>key</span><span>:</span> <span>str</span><span>):</span> <span>str</span> <span>{</span>
-        <span>// Check Redis first, otherwise fall back to S3</span>
-        <span>let</span> <span>var</span> <span>value</span> <span>=</span> <span>this</span><span>.</span><span>_redis</span><span>.</span><span>get</span><span>(</span><span>key</span><span>);</span>
-        <span>if</span> <span>value</span> <span>==</span> <span>nil</span> <span>{</span>
-            <span>value</span> <span>=</span> <span>this</span><span>.</span><span>_bucket</span><span>.</span><span>getObject</span><span>(</span><span>key</span><span>);</span>
-            <span>this</span><span>.</span><span>_redis</span><span>.</span><span>set</span><span>(</span><span>key</span><span>,</span> <span>value</span><span>!</span><span>);</span>
-        <span>}</span>
-        <span>return</span> <span>value</span><span>!</span><span>;</span>
-    <span>}</span>
-
-    <span>pub</span> <span>inflight</span> <span>set</span><span>(</span><span>key</span><span>:</span> <span>str</span><span>,</span> <span>value</span><span>:</span> <span>str</span><span>)</span> <span>{</span>
-        <span>// Update S3 and redis with the new entry</span>
-        <span>this</span><span>.</span><span>_bucket</span><span>.</span><span>putObject</span><span>(</span><span>key</span><span>,</span> <span>value</span><span>);</span>
-        <span>this</span><span>.</span><span>_redis</span><span>.</span><span>set</span><span>(</span><span>key</span><span>,</span> <span>value</span><span>);</span>
-    <span>}</span>
-
-    <span>pub</span> <span>inflight</span> <span>reset</span><span>()</span> <span>{</span>
-        <span>this</span><span>.</span><span>_redis</span><span>.</span><span>flush</span><span>();</span>
-        <span>this</span><span>.</span><span>_bucket</span><span>.</span><span>empty</span><span>();</span>
-    <span>}</span>
-<span>}</span>
-
-<span>let</span> <span>cache</span> <span>=</span> <span>new</span> <span>Cache</span><span>();</span>
-
-<span>// Empty the cache once an hour.</span>
-<span>let</span> <span>schedule</span> <span>=</span> <span>new</span> <span>triggers</span><span>.</span><span>Schedule</span><span>(</span><span>rate</span><span>:</span> <span>1</span><span>h</span><span>);</span>
-<span>schedule</span><span>.</span><span>onTick</span><span>(</span><span>inflight</span> <span>()</span> <span>=&gt;</span> <span>{</span>
-    <span>cache</span><span>.</span><span>reset</span><span>();</span>
-<span>});</span>
-
-<span>// Create an AWS Lambda function to do some fake business logic.</span>
-<span>let</span> <span>fn</span> <span>=</span> <span>new</span> <span>lambda</span><span>.</span><span>Function</span><span>(</span><span>inflight</span> <span>(</span><span>key</span><span>)</span> <span>=&gt;</span> <span>{</span>
-    <span>let</span> <span>value</span> <span>=</span> <span>cache</span><span>.</span><span>get</span><span>(</span><span>key</span><span>!</span><span>);</span>
-    <span>return</span> <span>"</span><span>Found value: </span><span>"</span> <span>+</span> <span>value</span><span>;</span>
-<span>});</span>
-
-<span>// Publish the function to a public URL.</span>
-<span>fn</span><span>.</span><span>expose</span><span>();</span>
-</code></pre></div>
-
-<p>At the top-level scope of the program, all code is preflight. Among other things, we can define classes, instantiate resources, and call preflight functions (like <code>onTick()</code> and <code>expose()</code>) to augment and create infrastructure. These statements are executed at compile time. But wherever the <code>inflight</code> keyword is used, we’re introducing a scope for code that can only run once the application is deployed to the cloud. <code>get()</code>, <code>set()</code>, and <code>reset()</code> are all inflight functions.</p>
-
-<p>The Winglang compiler enforces several phase-related invariants. For example, inflight functions can reference data from preflight, but they can’t call preflight functions, since doing so could modify your graph of resources. Likewise, preflight functions can’t run inflight functions, but they can convert inflight functions into bundled JavaScript. (Yes, Winglang relies on JavaScript as its underlying runtime).<sup id="fnref:4" role="doc-noteref"><a href="#fn:4" rel="footnote">4</a></sup> But despite these rules, preflight code and inflight code are otherwise grounded in the same syntax. Both provide access to the same language facilities like variables, for loops, structs, strings, arrays, classes, and so on.</p>
-
-<p>It’s possible to draw parallels between Winglang’s preflight/inflight distinction and Zig’s comptime/runtime distinction. But it’s probably no surprise that since the languages have been built around different use cases, they’ve ended up with pretty different designs. For example, Zig’s comptime aims to avoid all potential side effects, while Winglang’s preflight encourages side effects so you can mutate your infrastructure graph.</p>
-
-<p><strong>TL;DR:</strong> Wing offers a form of biphasic programming where code can be executed for defining cloud infrastructure, or for interacting interacting with cloud infrastructure. These two phases, called preflight and inflight, differ temporally (compile time vs runtime) and spatially (preflight runs on the build system while inflight code may be executed on any compute system that supports a JavaScript runtime).</p>
-
-<h2 id="so-what">So what?</h2>
-
-<p>One takeaway is that this biphasic programming thing can be used to solve a lot of different problems. In Zig, it makes it easy for people to do compile-time metaprogramming. In React, it makes it possible to write more specialized and optimized frontend apps. In Wing, it lets you model the infrastructure and application concerns of a distributed program. That’s pretty cool!</p>
-
-<p>But there’s likely more to explore here - like how the rules of these biphasic solutions overlap or differ. In Zig, every function that you can run at comptime is also safe to run at runtime - so we can say there’s a subset relationship between what functions can be run at comptime and which can be run at runtime. The same applies to React Server Components - any component that you can render on the client can also be rendered on the server. But in Wing, the two phases of preflight and inflight are strictly separate, so to represent code that can run in either phase, you’d need a separate label for these functions (like “unphased functions”).</p>
-
-<p>Another open question is understanding to what degree biphasic programming represents capabilities that can’t be expressed in normal languages. Zig needed a new keyword for this comptime thing - but are there other existing languages that let you do this, perhaps in userland? Does providing it as a dedicated language feature provide any improved safety or error handling?</p>
-
-
-  </div>
-</article>
-
-      </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Bruce Bastian, WordPerfect co-creator, has died (265 pts)]]></title>
-            <link>https://www.heraldextra.com/news/local/2024/jun/17/bruce-bastian-byu-alum-turned-tech-pioneer-and-equality-advocate-dies-at-76/</link>
-            <guid>40858583</guid>
-            <pubDate>Tue, 02 Jul 2024 17:11:16 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.heraldextra.com/news/local/2024/jun/17/bruce-bastian-byu-alum-turned-tech-pioneer-and-equality-advocate-dies-at-76/">https://www.heraldextra.com/news/local/2024/jun/17/bruce-bastian-byu-alum-turned-tech-pioneer-and-equality-advocate-dies-at-76/</a>, See on <a href="https://news.ycombinator.com/item?id=40858583">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section id="article_content">
-															
-								    <p><img width="350" height="500" src="https://ogden_images.s3.amazonaws.com/www.heraldextra.com/images/2024/06/17151419/50372586-8111-47C2-A83E-7E1AC692B4E5-350x500.jpeg" alt="">								    </p>
-																<div id="caption"><p><span>Courtesy Human Rights Campaign</span></p><p>Bruce Bastian, a former tech entrepreneur, philanthropist and advocate for LGBTQ+ communities, died Sunday, June 16, 2024, at age 76.</p></div>														<!-- <input type=radio id="show" name="group"><label for="show">SHOW ARTICLE</label> 
-							<div class="hide_article"> -->
-								<p>Bruce Bastian, an alumnus of Brigham Young University who pioneered a successful word-processing application and later would become an advocate for the LGBTQ+ community, died Sunday.</p>
-<p>Bastian, 76, passed away surrounded by his four sons, husband Clint Ford, friends and other family members, the <a href="https://www.hrc.org/press-releases/human-rights-campaign-mourns-the-loss-of-bruce-bastian-champion-for-lgbtq-equality-hrc-board-member-for-22-years" target="_blank" rel="noopener">Human Rights Campaign</a> reported.</p>
-<p>His death was marked family and members of the LGBTQ+ community he championed, as well as other organizations he was involved with.</p>
-<p>“I think people will remember him for a number of reasons, from his work with technology, his philanthropy, and within the LGBTQ community. As for others, we’ll remember him as a loving husband and father,” Bastian’s oldest son, Rick, told the Daily Herald.</p>
-<p>Bastian was a member of the Human Rights Campaign, Encircle, Equality Utah and the Utah Pride Center. He traveled to the nation’s capital and fought for equal marriage rights while advocating for inclusion of people with differing sexual orientations.</p>
-<p>“Bruce was in this fight, working at every level of politics and advocacy, for over three decades,” Kelley Robinson, president of the Human Rights Campaign, said in a press release. “He traveled all across this country on HRC’s behalf and worked tirelessly to help build an inclusive organization where more people could be a part of this work.”</p>
-<p>Bastian also was a major supporter of organizations like Equality Utah, Utah Pride Center, and Encircle.</p>
-<p><a href="https://encircletogether.org/" target="_blank" rel="noopener">Encircle</a> has a series of homes throughout Utah that provide mental health services, resources and tools for LGBTQ+ youth and families. Encircle opened its first location seven years ago <a href="https://encircletogether.org/visit-a-home" target="_blank" rel="noopener">in Provo</a>, and it was named after Bastian and Ford.</p>
-<p>“Bruce was an invaluable member of our community and worked tirelessly to make our country a safer place for LGBTQ+ individuals,” Encircle’s CEO, Jordan Sgro, said in an emailed statement sent to the Daily Herald. “He was instrumental in building Encircle and we would not be where we are today without support from Bruce and his husband, Clint. Most importantly, Bruce was a friend and an incredible mentor, and served for years on our Board of Directors. He will be greatly missed.”</p>
-<p>Prior to his social impact and philanthropic work, or even entrepreneurship, Bastian moved to Utah from southern Idaho to attend Brigham Young University. During the mid 1970s, he served as director of the <a href="https://byucougars.com/the-power-of-the-wasatch" target="_blank" rel="noopener">Cougar Marching Band</a>.</p>
-<p>In 1979, while still attending the university as a graduate student in computer science, he co-founded what would eventually become WordPerfect Corp. along with faculty member Alan Ashton. It initially was developed as a word-processing software for a minicomputer owned by the City of Orem. Bastian and Ashton were able to maintain ownership of the software.</p>
-<p>The company served as a dominant force in the technology space throughout the 1980s and 1990s. At one point, Bastian was worth $840 million, the <a href="https://www.deseret.com/2003/6/22/19730449/bastian-s-profile-low-151-in-utah-at-least/" target="_blank" rel="noopener">Deseret News</a> reported in 2003.</p>
-<p>Bastian stepped down from his role as chairman of WordPerfect in 1994 and the company was sold to Novell a short time later.</p>
-<p>Bastian would go on to focus his time on charitable causes and philanthropy. In 1997, he started the <a href="https://bastianfoundation.org/about_us" target="_blank" rel="noopener">B.W. Bastian Foundation</a>, whose commitment is to only support organizations that fully embrace equality.</p>
-<p>“The impact he had on so many lives was immeasurable,” Michael Marriott, the foundation’s executive director, said in a press release. “His spirit and memory will live on through Clint, his husband of six years, through Bruce’s four sons and their families, and through the many lives he touched through his generosity, time, energy and commitment to making the world a better place. And Bruce’s legacy will continue in the work of the B.W. Bastian Foundation and its mission.”</p>
-<p>Bastian also maintained his love for music and the arts. In 2010, then-President Barack Obama <a href="https://obamawhitehouse.archives.gov/realitycheck/the-press-office/president-obama-announces-more-key-administration-posts-22610" target="_blank" rel="noopener">appointed him to the Presidential Advisory Committee on the Arts</a>.</p>
-<p>Bastian continued to use his resources and fortune to support organizations providing services to Utah’s LGBTQ+ community and other pro-equality causes, including the Utah Democratic Party.</p>
-<p>“Bruce Bastian was a light to the people of our state,” Utah Democratic Party Chair Diane Lewis said in a statement. “His example calls on us to do more, especially when it comes to supporting our LGBTQ+ community.”</p>
-<p>Bastian was born March 23, 1948, in Twin Falls, Idaho. He grew up on his family’s farm before moving south to Provo to attend BYU, where he earned a bachelor’s in music education and his master’s in computer science.</p>
-<p>His adult life was spent in Orem and Palm Springs, California, where he lived with Ford.</p>
-<p>In addition to his partner and four sons, Bastian also leaves behind 14 grandchildren, two sisters and a brother.</p>
-<p>Rick Bastian says he wants his father to be remembered as being courageous, someone who stood up for social justice and advocated for others. “We’ll miss him dearly,” he said.</p>
-
-														                        
-
-
-<h3>Newsletter</h3>
-<section id="newsletter">
-    <p>Join thousands already receiving our daily newsletter.</p>
-    
-</section>
-
-
-
-					</section></div>]]></description>
         </item>
     </channel>
 </rss>
