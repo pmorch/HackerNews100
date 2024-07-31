@@ -4,12 +4,646 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 31 Jul 2024 10:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 31 Jul 2024 11:30:01 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Meta introduces Segment Anything Model 2 (164 pts)]]></title>
+            <title><![CDATA[Rustgo: Calling Rust from Go with near-zero overhead (2017) (107 pts)]]></title>
+            <link>https://words.filippo.io/rustgo/</link>
+            <guid>41116639</guid>
+            <pubDate>Wed, 31 Jul 2024 05:43:33 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://words.filippo.io/rustgo/">https://words.filippo.io/rustgo/</a>, See on <a href="https://news.ycombinator.com/item?id=41116639">Hacker News</a></p>
+<div id="readability-page-1" class="page"><section>
+            <p>
+[<a href="https://habrahabr.ru/post/337348/?ref=words.filippo.io">русский</a><!-- — 日本語]-->]
+</p>
+<p>Go has good support for calling into assembly, and a lot of the fast cryptographic code in the stdlib is carefully optimized assembly, bringing speedups of over 20 times.</p>
+<p>However, writing assembly code is hard, reviewing it is possibly harder, and <a href="https://groups.google.com/forum/?ref=words.filippo.io#!topic/golang-announce/B5ww0iFt1_Q">cryptography is unforgiving</a>. Wouldn't it be nice if we could write these hot functions in a higher level language?</p>
+<p>This post is the story of a slightly-less-than-sane experiment to call Rust code from Go fast enough to replace assembly. No need to know Rust, or compiler internals, but knowing what a linker is would help.</p>
+<blockquote>
+<p>Hello, readers from the future! In the seven years since writing this a couple things changed, but note that this was always a fun technical exploration, not a production guide.</p>
+<p>If you're looking for <em>serious</em> ways to call Rust from Go, know that cgo these days <a href="https://shane.ai/posts/cgo-performance-in-go1.21/?ref=words.filippo.io">is faster</a> and <a href="https://github.com/golang/go/issues/56378?ref=words.filippo.io">is still getting faster</a>. There are also some experimental cgo-less alternatives, like <a href="https://github.com/ebitengine/purego?ref=words.filippo.io">purego</a> and <a href="https://wazero.io/?ref=words.filippo.io">wazero</a>. I toyed for years with the idea of using Wasm for cross-platform Go FFI withg better DX. I admit I even used a tecnique similar to this in the standard library, to <a href="https://go-review.googlesource.com/c/go/+/227037?ref=words.filippo.io">invoke the macOS X.509 verifier</a>.</p>
+<p>As for me, I gave <a href="https://www.youtube.com/watch?v=eymMKjymgGA&amp;list=PLwiyx1dc3P2KWbISzXf3T63_fenq7sOoL&amp;index=10&amp;t=227&amp;ref=words.filippo.io">a talk</a> about this at a Go conference wearing a (freshly printed) Rust Evangelism Strike Force t-shirt. That kind of landed me a job on the Go team at Google, which I left to <a href="https://words.filippo.io/geomys/">become an independent Go maintainer</a>.</p>
+<p>The fight against cryptographic assembly continues, but now with <a href="https://go.dev/wiki/AssemblyPolicy?ref=words.filippo.io">strict policies</a> and <a href="https://github.com/mmcloughlin/avo?ref=words.filippo.io">dedicated generators</a>. Just yesterday I [livestreamed a benchmarking session to replace some P-256 curve assembly] with formally verified Go code.</p>
+</blockquote>
+<h2 id="why-rust">Why Rust</h2>
+<p>I'll be upfront: I don't know Rust, and don't feel compelled to do my day-to-day programming in it. However, I know Rust is a very tweakable and optimizable language, while still more readable than assembly. (After all, everything is more readable than assembly!)</p>
+<p>Go strives to find defaults that are good for its core use cases, and only accepts features that are fast enough to be enabled by default, in a constant and successful fight against knobs. I love it for that. But for what we are doing today we need a language that won't flinch when asked to generate stack-only functions with manually hinted away safety checks.</p>
+<p>So if there's a language that we might be able to constrain enough to behave like assembly, and to optimize enough to be as useful as assembly, it might be Rust.</p>
+<p>Finally, Rust is safe, actively developed, and not least, there's already a good ecosystem of high-performance Rust cryptography code to tap into.</p>
+<h2 id="why-not-cgo">Why not cgo</h2>
+<p>Go has a <a href="https://en.wikipedia.org/wiki/Foreign_function_interface?ref=words.filippo.io">Foreign Function Interface</a>, <em>cgo</em>. <a href="https://golang.org/cmd/cgo/?ref=words.filippo.io">cgo</a> allows Go programs to call C functions in the most natural way possible—which is unfortunately not very natural at all. (I know <a href="https://speakerdeck.com/filosottile/from-cgo-back-to-go-gophercon-2016?ref=words.filippo.io">more than I'd like to about cgo</a>, and I can tell you <a href="https://dave.cheney.net/2016/01/18/cgo-is-not-go?ref=words.filippo.io">it's not fun</a>.)</p>
+<p>By using the C <a href="https://en.wikipedia.org/wiki/Application_binary_interface?ref=words.filippo.io">ABI</a> as <a href="https://en.wikipedia.org/wiki/Lingua_franca?ref=words.filippo.io">lingua franca</a> of FFIs, we can call anything from anything: Rust can compile into a library exposing the C ABI, and cgo can use that. It's awkward, but it works.</p>
+<p>We can even use reverse-cgo to build Go into a C library and call it from random languages, like <a href="https://blog.filippo.io/building-python-modules-with-go-1-5/?ref=words.filippo.io">I did with Python as a stunt</a>. (It was a stunt folks, stop taking me seriously.)</p>
+<p>But cgo does a lot of things to enable that bit of Go naturalness it provides: it will setup a whole stack for C to live in, it makes defer calls to prepare for a panic in a Go callback... this <s>could be</s> will be a whole post of its own.</p>
+<p>As a result, the performance cost of each cgo call is way too high for the use case we are thinking about—<em>small hot functions</em>.</p>
+<h2 id="linking-it-together">Linking it together</h2>
+<p>So here's the idea: if we have Rust code that is as constrained as assembly, we should be able to use it <strong>just like assembly</strong>, and call straight into it. Maybe with a thin layer of glue.</p>
+<p>We don't have to work at the <a href="https://idea.popcount.org/2013-07-24-ir-is-better-than-assembly/?ref=words.filippo.io">IR</a> level: the Go compiler converts both code and high-level assembly into machine code before linking <a href="https://talks.golang.org/2016/asm.slide?ref=words.filippo.io">since Go 1.3</a>.</p>
+<p>This is confirmed by the existence of "<a href="https://docs.google.com/document/d/1nr-TQHw_er6GOQRsF6T43GGhFDelrAP0NqSS_00RgZQ/preview?ref=words.filippo.io">external linking</a>", where the system linker is used to put together a Go program. It's how cgo works, too: it compiles C with the C compiler, Go with the Go compiler, and links it all together with <code>clang</code> or <code>gcc</code>. We can even pass flags to the linker with <code>CGO_LDFLAGS</code>.</p>
+<p>Underneath all the safety features of cgo, we surely find a cross-language function call, after all.</p>
+<p>It would be nice if we could figure out how to do this without patching the compiler, though. First, let's figure out how to link a Go program with a Rust archive.</p>
+<p>I could not find a decent way to link against a foreign blob with <code>go build</code> (why should there be one?) except using <code>#cgo</code> directives. However, invoking cgo <a href="https://github.com/golang/go/issues/19448?ref=words.filippo.io">makes <code>.s</code> files go to the C compiler instead of the Go one</a>, and my friends, we <em>will</em> need Go assembly.</p>
+<p>Thankfully <a href="https://golang.org/pkg/go/build/?ref=words.filippo.io">go/build</a> is nothing but a frontend! Go offers a set of low level tools to <a href="https://golang.org/cmd/compile/?ref=words.filippo.io">compile</a> and <a href="https://golang.org/cmd/link/?ref=words.filippo.io">link</a> programs, <code>go build</code> just collects files and invokes those tools. We can follow what it does by using the <code>-x</code> flag.</p>
+<p>I built this small Makefile by following a <code>-x -ldflags "-v -linkmode=external '-extldflags=-v'"</code> invocation of a cgo build.</p>
+<pre><code>rustgo: rustgo.a
+        go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v rustgo.a
+
+rustgo.a: hello.go hello.o
+        go tool compile -o rustgo.a -p main -buildid b01dca11ab1e -pack hello.go
+        go tool pack r rustgo.a hello.o
+
+hello.o: hello.s
+        go tool asm -I "$(shell go env GOROOT)/pkg/include" -D GOOS_darwin -D GOARCH_amd64 -o hello.o hello.s
+</code></pre>
+<p>This compiles a simple main package composed of a Go file (<code>hello.go</code>) and a Go assembly file (<code>hello.s</code>).</p>
+<p>Now, if we want to link in a Rust object we first build it as a static library...</p>
+<pre><code>libhello.a: hello.rs
+        rustc -g -O --crate-type staticlib hello.rs
+</code></pre>
+<p>... and then just tell the external linker to link it together.</p>
+<pre><code>rustgo: rustgo.a libhello.a
+        go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v -extldflags='-lhello -L"$(CURDIR)"' rustgo.a
+</code></pre>
+<pre><code>$ make
+go tool asm -I "/usr/local/Cellar/go/1.8.1_1/libexec/pkg/include" -D GOOS_darwin -D GOARCH_amd64 -o hello.o hello.s
+go tool compile -o rustgo.a -p main -buildid b01dca11ab1e -pack hello.go
+go tool pack r rustgo.a hello.o
+rustc --crate-type staticlib hello.rs
+note: link against the following native artifacts when linking against this static library
+
+note: the order and any duplication can be significant on some platforms, and so may need to be preserved
+
+note: library: System
+
+note: library: c
+
+note: library: m
+
+go tool link -o rustgo -extld clang -buildmode exe -buildid b01dca11ab1e -linkmode external -v -extldflags="-lhello -L/Users/filippo/code/misc/rustgo" rustgo.a
+HEADER = -H1 -T0x1001000 -D0x0 -R0x1000
+searching for runtime.a in /usr/local/Cellar/go/1.8.1_1/libexec/pkg/darwin_amd64/runtime.a
+searching for runtime/cgo.a in /usr/local/Cellar/go/1.8.1_1/libexec/pkg/darwin_amd64/runtime/cgo.a
+ 0.00 deadcode
+ 0.00 pclntab=166785 bytes, funcdata total 17079 bytes
+ 0.01 dodata
+ 0.01 symsize = 0
+ 0.01 symsize = 0
+ 0.01 reloc
+ 0.01 dwarf
+ 0.02 symsize = 0
+ 0.02 reloc
+ 0.02 asmb
+ 0.02 codeblk
+ 0.03 datblk
+ 0.03 sym
+ 0.03 headr
+ 0.06 host link: "clang" "-m64" "-gdwarf-2" "-Wl,-headerpad,1144" "-Wl,-no_pie" "-Wl,-pagezero_size,4000000" "-o" "rustgo" "-Qunused-arguments" "/var/folders/ry/v14gg02d0y9cb2w9809hf6ch0000gn/T/go-link-412633279/go.o" "/var/folders/ry/v14gg02d0y9cb2w9809hf6ch0000gn/T/go-link-412633279/000000.o" "-g" "-O2" "-lpthread" "-lhello" "-L/Users/filippo/code/misc/rustgo"
+ 0.34 cpu time
+12641 symbols
+5764 liveness data
+</code></pre>
+<h2 id="jumping-into-rust">Jumping into Rust</h2>
+<p>Alright, so we linked it, but the symbols are not going to do anything just by sitting next to each other. We need to somehow call the Rust function from our Go code.</p>
+<p>We know how to call a Go function from Go. In assembly the same call looks like <code>CALL hello(SB)</code>, where SB is a virtual register all global symbols are relative to.</p>
+<p>If we want to call an assembly function from Go we make the compiler aware of its existence like a C header, by writing <code>func hello()</code> without a function body.</p>
+<p>I tried all combinations of the above to call an external (Rust) function, but they all complained that they couldn't find either the symbol name, or the function body.</p>
+<p>But cgo, which at the end of the day is just a giant code generator, somehow manages to eventually invoke that foreign function! How?</p>
+<p>I stumbled upon <a href="https://github.com/golang/go/blob/c3c2e453c968c7b450c59a47dc9502bd44257164/src/cmd/cgo/out.go?ref=words.filippo.io#L1475-L1478">the answer</a> a couple days later.</p>
+<pre><code>//go:cgo_import_static _cgoPREFIX_Cfunc__Cmalloc
+//go:linkname __cgofn__cgoPREFIX_Cfunc__Cmalloc _cgoPREFIX_Cfunc__Cmalloc
+var __cgofn__cgoPREFIX_Cfunc__Cmalloc byte
+var _cgoPREFIX_Cfunc__Cmalloc = unsafe.Pointer(&amp;__cgofn__cgoPREFIX_Cfunc__Cmalloc)
+</code></pre>
+<p>That looks like an interesting pragma! <code>//go:linkname</code> just creates a symbol alias in the local scope (which <a href="https://sitano.github.io/2016/04/28/golang-private/?ref=words.filippo.io">can be used to call private functions</a>!), and I'm pretty sure the <code>byte</code> trick is only cleverness to have something to take the address of, but <code>//go:cgo_import_static</code>... this imports an external symbol!</p>
+<blockquote>
+<p><strong>2024 note</strong>: <code>cgo_import_static</code> is <a href="https://github.com/golang/go/issues/23672?ref=words.filippo.io">not usable anymore</a>, but there are <a href="https://github.com/FiloSottile/ed25519-dalek-rustgo/pull/1?ref=words.filippo.io">alternative strategies</a>.</p>
+</blockquote>
+<p>Armed with this new tool and the Makefile above, we have a chance to invoke this Rust function (<code>hello.rs</code>)</p>
+<pre><code>#[no_mangle]
+pub extern fn hello() {
+    println!("Hello, Rust!");
+}
+</code></pre>
+<p>(The no-mangle-pub-extern incantation is from <a href="https://doc.rust-lang.org/1.5.0/book/rust-inside-other-languages.html?ref=words.filippo.io">this tutorial</a>.)</p>
+<p>from this Go program (<code>hello.go</code>)</p>
+<pre><code>package main
+
+//go:cgo_import_static hello
+
+func trampoline()
+
+func main() {
+    println("Hello, Go!")
+    trampoline()
+}
+</code></pre>
+<p>with the help of this assembly snippet. (<code>hello.s</code>)</p>
+<pre><code>TEXT ·trampoline(SB), 0, $2048
+    JMP hello(SB)
+    RET
+</code></pre>
+<p><code>CALL</code> was a bit too smart to work, but using a simple <code>JMP</code>...</p>
+<pre><code>Hello, Go!
+Hello, Rust!
+panic: runtime error: invalid memory address or nil pointer dereference
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x0]
+</code></pre>
+<p>💥</p>
+<p>Well, it crashes when it tries to return. Also that <code>$2048</code> value is the whole stack size Rust is allowed (if it's even putting the stack in the right place), and don't ask me what happens if Rust tries to touch a heap... but hell, I'm surprised it works at all!</p>
+<h2 id="calling-conventions">Calling conventions</h2>
+<p>Now, to make it return cleanly, and take some arguments, we need to look more closely at the Go and Rust calling conventions. A <a href="https://en.wikipedia.org/wiki/Calling_convention?ref=words.filippo.io">calling convention</a> defines where arguments and return values sit across function calls.</p>
+<p>The Go calling convention is described <a href="https://github.com/golang/go/files/447163/GoFunctionsInAssembly.pdf?ref=words.filippo.io">here</a> and <a href="https://golang.org/doc/asm?ref=words.filippo.io">here</a>. For Rust we'll look at the <a href="https://doc.rust-lang.org/beta/book/first-edition/ffi.html?ref=words.filippo.io#calling-rust-code-from-c">default for FFI</a>, which is the standard C calling convention.</p>
+<p>To keep going we're going to need a debugger. (LLDB supports Go, but <a href="https://github.com/golang/go/issues/20568?ref=words.filippo.io">breakpoints are somehow broken on macOS</a>, so I had to play inside a privileged Docker container.)</p>
+
+<p>
+![Zelda dangerous to go alone](/content/images/2017/08/zelda-2.png)
+</p>
+<h3 id="the-go-calling-convention">The Go calling convention</h3>
+<p><img src="https://words.filippo.io/content/images/2017/08/Go-stack-layout-3.png" alt="Go calling convention diagram" loading="lazy"></p>
+<p>The Go calling convention is mostly <a href="https://github.com/golang/go/issues/16922?ref=words.filippo.io">undocumented</a>, but we'll need to understand it to proceed, so here is what we can learn from a disassembly (amd64 specific). Let's look at a very simple function.</p>
+<pre><code>// func foo(x, y uint64) uint64
+TEXT ·foo(SB), 0, $256-24
+    MOVQ x+0(FP), DX
+    MOVQ DX, ret+16(FP)
+    RET
+</code></pre>
+<p><code>foo</code> has 256 (0x100) bytes of local frame, 16 bytes of arguments, 8 bytes of return value, and it returns its first argument.</p>
+<pre><code>func main() {
+    foo(0xf0f0f0f0f0f0f0f0, 0x5555555555555555)
+</code></pre>
+<pre><code>rustgo[0x49d785]:  movabsq $-0xf0f0f0f0f0f0f10, %rax
+rustgo[0x49d78f]:  movq   %rax, (%rsp)
+rustgo[0x49d793]:  movabsq $0x5555555555555555, %rax
+rustgo[0x49d79d]:  movq   %rax, 0x8(%rsp)
+rustgo[0x49d7a2]:  callq  0x49d8a0                  ; main.foo at hello.s:14
+</code></pre>
+<p>The caller, seen above, does very little: it places the arguments on the stack in reverse order, at the bottom of its own frame (<code>rsp</code> to <code>16(rsp)</code>, remember that the stack grows down) and executes <code>CALL</code>. The <code>CALL</code> will push the return pointer to the stack and jump. There's no caller cleanup, just a plain <code>RET</code>.</p>
+<p>Notice that <code>rsp</code> is fixed, and we have <code>movq</code>s, not <code>push</code>s.</p>
+<pre><code>rustgo`main.foo at hello.s:14:
+rustgo[0x49d8a0]:  movq   %fs:-0x8, %rcx
+rustgo[0x49d8a9]:  leaq   -0x88(%rsp), %rax
+rustgo[0x49d8b1]:  cmpq   0x10(%rcx), %rax
+rustgo[0x49d8b5]:  jbe    0x49d8ee                  ; main.foo + 78 at hello.s:14
+                   [...]
+rustgo[0x49d8ee]:  callq  0x495d10                  ; runtime.morestack_noctxt at asm_amd64.s:405
+rustgo[0x49d8f3]:  jmp    0x49d8a0                  ; main.foo at hello.s:14
+</code></pre>
+<p>The first 4 and last 2 instructions of the function are checking if there is enough space for the stack, and if not calling <code>runtime.morestack</code>. They are probably skipped for <code>NOSPLIT</code> functions.</p>
+<pre><code>rustgo[0x49d8b7]:  subq   $0x108, %rsp
+                   [...]
+rustgo[0x49d8e6]:  addq   $0x108, %rsp
+rustgo[0x49d8ed]:  retq
+</code></pre>
+<p>Then there's the <code>rsp</code> management, which subtracts 0x108, making space for the entire 0x100 bytes of frame in one go, and the 8 bytes of frame pointer. So <code>rsp</code> points to the bottom (the end) of the function frame, and is callee managed. Before returning, <code>rsp</code> is returned to where it was (just past the return pointer).</p>
+<pre><code>rustgo[0x49d8be]:  movq   %rbp, 0x100(%rsp)
+rustgo[0x49d8c6]:  leaq   0x100(%rsp), %rbp
+                   [...]
+rustgo[0x49d8de]:  movq   0x100(%rsp), %rbp
+</code></pre>
+<p>Finally the <a href="https://stackoverflow.com/questions/579262/what-is-the-purpose-of-the-ebp-frame-pointer-register?ref=words.filippo.io">frame pointer</a>, which is effectively pushed to the stack just after the return pointer, and updated at <code>rbp</code>. So <code>rbp</code> is also callee saved, and should be updated to point at where the caller's <code>rbp</code> is stored to enable stack trace unrolling.</p>
+<pre><code>rustgo[0x49d8ce]:  movq   0x110(%rsp), %rdx
+rustgo[0x49d8d6]:  movq   %rdx, 0x120(%rsp)
+</code></pre>
+<p>Finally, from the body itself we learn that return values go just above the arguments.</p>
+<h4 id="virtual-registers">Virtual registers</h4>
+<p>The Go docs say that <code>SP</code> and <code>FP</code> are virtual registers, not just aliases of <code>rsp</code> and <code>rbp</code>.</p>
+<p>Indeed, when accessing <code>SP</code> from Go assembly, the offsets are adjusted relative to the real <code>rsp</code> so that <code>SP</code> points to the top, not the bottom, of the frame. That's convenient because it means not having to change all offsets when changing the frame size, but it's just syntactic sugar. Naked access to the register (like <code>MOVQ SP, DX</code>) accesses <code>rsp</code> directly.</p>
+<p>The <code>FP</code> virtual register is simply an adjusted offset over <code>rsp</code>, too. It points to the bottom of the caller frame, where arguments are, and there's no direct access.</p>
+<p>Note: Go maintains <code>rbp</code> and frame pointers to help debugging, but then uses a fixed <code>rsp</code> and <code>omit-stack-pointer</code>-style <code>rsp</code> offsets for the virtual <code>FP</code>. You can learn more about frame pointers and not using them from <a href="https://www.imperialviolet.org/2017/01/18/cfi.html?ref=words.filippo.io">this Adam Langley blog post</a>.</p>
+<h3 id="the-c-calling-convention">The C calling convention</h3>
+<p>"<a href="https://en.wikipedia.org/wiki/X86_calling_conventions?ref=words.filippo.io#System_V_AMD64_ABI">sysv64</a>", the default C calling convention on x86-64, is quite different:</p>
+<ul>
+<li>The arguments are passed via registers: RDI, RSI, RDX, RCX, R8, and R9.</li>
+<li>The return value goes to RAX.</li>
+<li>Some registers are callee-saved: RBP, RBX, and R12–R15.
+<ul>
+<li>We care little about this, since in Go all registers are caller-saved.</li>
+</ul>
+</li>
+<li>The stack must be aligned to 16-bytes.
+<ul>
+<li>(I think this is why <code>JMP</code> worked and <code>CALL</code> didn't, we failed to align the stack!)</li>
+</ul>
+</li>
+</ul>
+<p>Frame pointers work the same way (and are generated by <code>rustc</code> with <code>-g</code>).</p>
+<h3 id="gluing-them-together">Gluing them together</h3>
+<p>Building a simple trampoline between the two conventions won't be hard. We can also look at <a href="https://github.com/golang/go/blob/57bf6aca711a53aa7fea877b98896cd0445c6ad0/src/runtime/asm_amd64.s?ref=words.filippo.io#L585"><code>asmcgocall</code></a> for inspiration, since it does approximately the same job, but for cgo.</p>
+<p>We need to remember that we want the Rust function to use the stack space of our assembly function, since Go ensured for us that it's present. To do that, we have to rollback <code>rsp</code> from the end of the stack.</p>
+<pre><code>package main
+
+//go:cgo_import_static increment
+func trampoline(arg uint64) uint64
+
+func main() {
+    println(trampoline(41))
+}
+</code></pre>
+<center>⬇</center>
+<pre><code>TEXT ·trampoline(SB), 0, $2048-16
+    MOVQ arg+0(FP), DI // Load the argument before messing with SP
+    MOVQ SP, BX        // Save SP in a callee-saved registry
+    ADDQ $2048, SP     // Rollback SP to reuse this function's frame
+    ANDQ $~15, SP      // Align the stack to 16-bytes
+    CALL increment(SB)
+    MOVQ BX, SP        // Restore SP
+    MOVQ AX, ret+8(FP) // Place the return value on the stack
+    RET
+</code></pre>
+<center>⬇</center>
+<pre><code>#[no_mangle]
+pub extern fn increment(a: u64) -&gt; u64 {
+    return a + 1;
+}
+</code></pre>
+<h3 id="call-on-macos">CALL on macOS</h3>
+<p><code>CALL</code> didn't quite work on macOS. For some reason, there the function call was replaced with an intermediate call to <code>_cgo_thread_start</code>, which is not that incredible considering we are using something called <code>cgo_import_static</code> and that <code>CALL</code> is virtual in Go assembly.</p>
+<pre><code>callq  0x40a27cd                 ; x_cgo_thread_start + 29
+</code></pre>
+<p>We can bypass that "helper" by using the full <code>//go:linkname</code> incantation we found in the standard library to take a pointer to the function, and then calling the function pointer, like this.</p>
+<pre><code>import _ "unsafe"
+
+//go:cgo_import_static increment
+//go:linkname increment increment
+var increment uintptr
+var _increment = &amp;increment
+</code></pre>
+<pre><code>    MOVQ ·_increment(SB), AX
+    CALL AX
+</code></pre>
+<h2 id="is-it-fast">Is it fast?</h2>
+<p>The point of this whole exercise is to be able to call Rust instead of assembly for cryptographic operations (and to have fun). So a rustgo call will have to be almost <a href="https://speakerdeck.com/gtank/i-wanna-go-fast?ref=words.filippo.io">as fast as an assembly call</a> to be useful.</p>
+<p>Benchmark time!</p>
+<p>We'll compare incrementing a uint64 inline, with a <code>//go:noinline</code> function, with the rustgo call above, and with a cgo call to the exact same Rust function.</p>
+<p>Rust was compiled with <code>-g -O</code>, and the benchmarks were run on macOS on a 2.9GHz Intel Core i5.</p>
+<pre><code>name                 time/op
+CallOverhead/Inline  1.72ns ± 3%
+CallOverhead/Go      4.60ns ± 2%
+CallOverhead/rustgo  5.11ns ± 4%
+CallOverhead/cgo     73.6ns ± 0%
+</code></pre>
+<p>rustgo is 11% slower than a Go function call, and almost 15 times faster than cgo!</p>
+<p>The performance is even better when run on Linux without the function pointer workaround, with only a 2% overhead.</p>
+<pre><code>name                 time/op
+CallOverhead/Inline  1.67ns ± 2%
+CallOverhead/Go      4.49ns ± 3%
+CallOverhead/rustgo  4.58ns ± 3%
+CallOverhead/cgo     69.4ns ± 0%
+</code></pre>
+<h2 id="a-real-example">A real example</h2>
+<p>For a real-world demo, I picked the excellent curve25519-dalek library, and specifically the task of multiplying the curve basepoint by a scalar and returning its Edwards representation.</p>
+<p>The Cargo benchmarks swing widely between executions because of <a href="https://wiki.debian.org/HowTo/CpuFrequencyScaling?ref=words.filippo.io">CPU frequency scaling</a>, but they suggest the operation will take 22.9µs ± 17%.</p>
+<pre><code>test curve::bench::basepoint_mult    ... bench:      17,276 ns/iter (+/- 3,057)
+test curve::bench::edwards_compress  ... bench:       5,633 ns/iter (+/- 858)
+</code></pre>
+<p>On the Go side, we'll expose a simple API.</p>
+<pre><code>func ScalarBaseMult(dst, in *[32]byte)
+</code></pre>
+<p>On the Rust side, it's not different from building <a href="https://doc.rust-lang.org/beta/book/first-edition/ffi.html?ref=words.filippo.io#calling-rust-code-from-c">an interface for normal FFI</a>.</p>
+<p>I'll be honest, it took me forever to figure out enough Rust to make this work.</p>
+<pre><code>#![no_std]
+
+extern crate curve25519_dalek;
+use curve25519_dalek::scalar::Scalar;
+use curve25519_dalek::constants;
+
+#[no_mangle]
+pub extern fn scalar_base_mult(dst: &amp;mut [u8; 32], k: &amp;[u8; 32]) {
+    let res = &amp;constants::ED25519_BASEPOINT_TABLE * &amp;Scalar(*k);
+    dst.clone_from(res.compress_edwards().as_bytes());
+}
+</code></pre>
+<p>To build the <code>.a</code> we use <code>cargo build --release</code> with a <code>Cargo.toml</code> that defines the dependencies, enables frame pointers, and configures curve25519-dalek to use its most efficient math and no standard library.</p>
+<pre><code>[package]
+name = "ed25519-dalek-rustgo"
+version = "0.0.0"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies.curve25519-dalek]
+version = "^0.9"
+default-features = false
+features = ["nightly"]
+
+[profile.release]
+debug = true
+</code></pre>
+<p>Finally, we need to adjust the trampoline to take two arguments and return no value.</p>
+<pre><code>TEXT ·ScalarBaseMult(SB), 0, $16384-16
+    MOVQ dst+0(FP), DI
+    MOVQ in+8(FP), SI
+
+    MOVQ SP, BX
+    ADDQ $16384, SP
+    ANDQ $~15, SP
+
+    MOVQ ·_scalar_base_mult(SB), AX
+    CALL AX
+
+    MOVQ BX, SP
+    RET
+</code></pre>
+<p>The result is a transparent Go call with performance that closely resembles the pure Rust benchmark, and is almost 6% faster than cgo!</p>
+<pre><code>name            old time/op  new time/op  delta
+RustScalarBaseMult  23.7µs ± 1%  22.3µs ± 4%  -5.88%  (p=0.003 n=5+7)
+</code></pre>
+<p>For comparison, similar functionality is provided by github.com/agl/ed25519/edwards25519, and that pure-Go library takes almost 3 times as long.</p>
+<pre><code>h := &amp;edwards25519.ExtendedGroupElement{}
+edwards25519.GeScalarMultBase(h, &amp;k)
+h.ToBytes(&amp;dst)
+</code></pre>
+<pre><code>name            time/op
+GoScalarBaseMult  66.1µs ± 2%
+</code></pre>
+<h2 id="packaging-up">Packaging up</h2>
+<p>Now we know it actually works, that's exciting! But to be usable it will have to be an importable package, not forced into <code>package main</code> by a weird build process.</p>
+<p>This is where <a href="https://github.com/golang/proposal/blob/master/design/2775-binary-only-packages.md?ref=words.filippo.io"><code>//go:binary-only-package</code></a> comes in! That annotation allows us to tell the compiler to ignore the source of the package, and to only use the pre-built <code>.a</code> library file in <code>$GOPATH/pkg</code>.</p>
+<blockquote>
+<p><strong>2024 note</strong>: <code>binary-only-package</code> is <a href="https://github.com/golang/go/issues/28152?ref=words.filippo.io">also gone</a>, but <a href="https://github.com/FiloSottile/ed25519-dalek-rustgo/pull/1?ref=words.filippo.io">using a .syso file</a> was probably the correct answer back then, too. Still, this was a fun detour into linking tooling.</p>
+</blockquote>
+<p>If we can manage to build a <code>.a</code> file that works with Go's native linker (<a href="https://godoc.org/cmd/link?ref=words.filippo.io">cmd/link</a>, referred to also as the <em>internal</em> linker), <strong>we can redistribute that and it will let our users import the package as if it was a native one</strong>, including cross-compiling (provided we included a <code>.a</code> for that platform)!</p>
+<p>The Go side is easy, and pairs with the assembly and Rust we already have. We can even include docs for <code>go doc</code>'s benefit.</p>
+<pre><code>//go:binary-only-package
+
+// Package edwards25519 implements operations on an Edwards curve that is
+// isomorphic to curve25519.
+//
+// Crypto operations are implemented by calling directly into the Rust
+// library curve25519-dalek, without cgo.
+//
+// You should not actually be using this.
+package edwards25519
+
+import _ "unsafe"
+
+//go:cgo_import_static scalar_base_mult
+//go:linkname scalar_base_mult scalar_base_mult
+var scalar_base_mult uintptr
+var _scalar_base_mult = &amp;scalar_base_mult
+
+// ScalarBaseMult multiplies the scalar in by the curve basepoint, and writes
+// the compressed Edwards representation of the resulting point to dst.
+func ScalarBaseMult(dst, in *[32]byte)
+</code></pre>
+<p>The Makefile will have to change quite a bit—since we aren't building a binary anymore we don't get to keep using <code>go tool link</code>.</p>
+<p>A <code>.a</code> archive is just a pack of <code>.o</code> object files in <a href="https://en.wikipedia.org/wiki/Ar_(Unix)?ref=words.filippo.io">an ancient format with a symbol table</a>. If we could get the symbols from the Rust <code>libed25519_dalek_rustgo.a</code> library into the <code>edwards25519.a</code> archive that <code>go tool compile</code> made, we <em>should</em> be golden.</p>
+<p><code>.a</code> archives are managed by the <code>ar</code> UNIX tool, or by its Go internal counterpart, <a href="https://godoc.org/cmd/pack?ref=words.filippo.io">cmd/pack</a> (as in <code>go tool pack</code>). The two formats are ever-so-subtly different, of course. We'll need to use the platform <code>ar</code> for <code>libed25519_dalek_rustgo.a</code> and the Go cmd/pack for <code>edwards25519.a</code>.</p>
+<p>(For example, the platform <code>ar</code> on my macOS uses <a href="https://en.wikipedia.org/wiki/Ar_(Unix)?ref=words.filippo.io#BSD_variant">the BSD convention</a> of calling files <code>#1/LEN</code> and then embedding the filename of length LEN at the beginning of the file, to exceed the 16 bytes max file length. That was confusing.)</p>
+<p>To bundle the two libraries I tried doing the simplest (read: hackish) thing: extract <code>libed25519_dalek_rustgo.a</code> into a temporary folder, and then pack the objects back into <code>edwards25519.a</code>.</p>
+<pre><code>edwards25519/edwards25519.a: edwards25519/rustgo.go edwards25519/rustgo.o target/release/libed25519_dalek_rustgo.a
+               go tool compile -N -l -o $@ -p main -pack edwards25519/rustgo.go
+               go tool pack r $@ edwards25519/rustgo.o # from edwards25519/rustgo.s
+               mkdir -p target/release/libed25519_dalek_rustgo &amp;&amp; cd target/release/libed25519_dalek_rustgo &amp;&amp; \
+                       rm -f *.o &amp;&amp; ar xv "$(CURDIR)/target/release/libed25519_dalek_rustgo.a"
+               go tool pack r $@ target/release/libed25519_dalek_rustgo/*.o
+
+.PHONY: install
+install: edwards25519/edwards25519.a
+               mkdir -p "$(shell go env GOPATH)/pkg/darwin_amd64/$(IMPORT_PATH)/"
+               cp edwards25519/edwards25519.a "$(shell go env GOPATH)/pkg/darwin_amd64/$(IMPORT_PATH)/"
+</code></pre>
+<p>Imagine my surprise when it worked!</p>
+<p>With the <code>.a</code> in place it's just a matter of making a simple program using the package.</p>
+<pre><code>package main
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"testing"
+
+	"github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519"
+)
+
+func main() {
+	input, _ := hex.DecodeString("39129b3f7bbd7e17a39679b940018a737fc3bf430fcbc827029e67360aab3707")
+	expected, _ := hex.DecodeString("1cc4789ed5ea69f84ad460941ba0491ff532c1af1fa126733d6c7b62f7ebcbcf")
+
+	var dst, k [32]byte
+	copy(k[:], input)
+
+	edwards25519.ScalarBaseMult(&amp;dst, &amp;k)
+	if !bytes.Equal(dst[:], expected) {
+		fmt.Println("rustgo produces a wrong result!")
+	}
+
+	fmt.Printf("BenchmarkScalarBaseMult\t%v\n", testing.Benchmark(func(b *testing.B) {
+		for i := 0; i &lt; b.N; i++ {
+			edwards25519.ScalarBaseMult(&amp;dst, &amp;k)
+		}
+	}))
+}
+</code></pre>
+<p>And running <code>go build</code>!</p>
+<pre><code>$ go build -ldflags '-linkmode external -extldflags -lresolv'
+$ ./ed25519-dalek-rustgo
+BenchmarkScalarBaseMult	  100000	     19914 ns/op
+</code></pre>
+<p>Well, it almost worked. We cheated. The binary would not compile unless we linked it to <code>libresolv</code>. To be fair, the Rust compiler tried to tell us. (But who listens to everything the Rust compiler tells you anyway?)</p>
+<pre><code>note: link against the following native artifacts when linking against this static library
+
+note: the order and any duplication can be significant on some platforms, and so may need to be preserved
+
+note: library: System
+
+note: library: resolv
+
+note: library: c
+
+note: library: m
+</code></pre>
+<p>Now, linking against system libraries would be a problem, because it will never happen with internal linking and cross-compilation...</p>
+<p>But hold on a minute, <em>libresolv</em>?! Why does our <code>no_std</code>, "should be like assembly", stack only Rust library want to <em>resolve DNS names</em>?</p>
+<h3 id="i-really-meant-nostd">I really meant <code>no_std</code></h3>
+<p>The problem is that the library is not actually <code>no_std</code>. Look at all that stuff in there! We want nothing to do with allocators!</p>
+<pre><code>$ ar t target/release/libed25519_dalek_rustgo.a
+__.SYMDEF
+ed25519_dalek_rustgo-742a1d9f1c101d86.0.o
+ed25519_dalek_rustgo-742a1d9f1c101d86.crate.allocator.o
+curve25519_dalek-03e3ca0f6d904d88.0.o
+subtle-cd04b61500f6e56a.0.o
+std-72653eb2361f5909.0.o
+panic_unwind-d0b88496572d35a9.0.o
+unwind-da13b913698118f9.0.o
+arrayref-2be0c0ff08ae2c7d.0.o
+digest-f1373d68da35ca45.0.o
+generic_array-95ca86a62dc11ddc.0.o
+nodrop-7df18ca19bb4fc21.0.o
+odds-3bc0ea0bdf8209aa.0.o
+typenum-a61a9024d805e64e.0.o
+rand-e0d585156faee9eb.0.o
+alloc_system-c942637a1f049140.0.o
+libc-e038d130d15e5dae.0.o
+alloc-0e789b712308019f.0.o
+std_unicode-9735142be30abc63.0.o
+compiler_builtins-8a5da980a34153c7.0.o
+absvdi2.o
+absvsi2.o
+absvti2.o
+[... snip ...]
+truncsfhf2.o
+ucmpdi2.o
+ucmpti2.o
+core-9077840c2cc91cbf.0.o
+</code></pre>
+<p>So how do we actually make it <code>no_std</code>? This turned out to be <a href="https://twitter.com/FiloSottile/status/894663496410988544?ref=words.filippo.io">an entire side-quest</a>, but I'll give you a recap.</p>
+<ul>
+<li>If any dependency is not <code>no_std</code>, your <code>no_std</code> flag is nullified. One of the <code>curve25519-dalek</code> dependencies had this problem, <code>cargo update</code> fixed that.</li>
+<li>Actually making a <code>no_std</code> <em>staticlib</em> (that is, an library for external use, as opposed to for inclusion in a Rust program) is more like making a <code>no_std</code> <em>executable</em>, which is much harder as it must be self-contained.</li>
+<li>The docs on how to make a <code>no_std</code> <em>executable</em> are sparse. I mostly used <a href="https://doc.rust-lang.org/1.5.0/book/no-stdlib.html?ref=words.filippo.io">an old version of the Rust book</a> and eventually found <a href="https://doc.rust-lang.org/beta/unstable-book/language-features/lang-items.html?ref=words.filippo.io#writing-an-executable-without-stdlib">this section in the lang_items chapter</a>. <a href="https://os.phil-opp.com/set-up-rust/?ref=words.filippo.io">This blog post</a> was useful.</li>
+<li>For starters, you need to define "lang_items" functions to handle functionality that is normally in the stdlib, like <code>panic_fmt</code>.</li>
+<li>Then you are without the Rust equivalents of <code>compiler-rt</code>, so you have to import the crate compiler_builtins. (<a href="https://github.com/rust-lang/rust/issues/43264?ref=words.filippo.io">rust-lang/rust#43264</a>)</li>
+<li>Then there's a problem with <code>rust_begin_unwind</code> being unexported, which don't ask me why but is solved by marking <code>panic_fmt</code> as <code>no_mangle</code>, which the linter is not happy about. (<a href="https://github.com/rust-lang/rust/issues/38281?ref=words.filippo.io">rust-lang/rust#38281</a>)</li>
+<li>Then you are without <code>memcpy</code>, but thankfully there's a native Rust reimplementation in the <a href="https://github.com/alexcrichton/rlibc?ref=words.filippo.io">rlibc</a> crate. Super useful <a href="https://github.com/rust-lang-nursery/compiler-builtins/issues/182?ref=words.filippo.io">learning</a> that <code>nm -u</code> will tell you what symbols are missing from an object.</li>
+</ul>
+<p>This all boils down to a bunch of arcane lines at the top of our <code>lib.rs</code>.</p>
+<pre><code>#![no_std]
+#![feature(lang_items, compiler_builtins_lib, core_intrinsics)]
+use core::intrinsics;
+#[allow(private_no_mangle_fns)] #[no_mangle] // rust-lang/rust#38281
+#[lang = "panic_fmt"] fn panic_fmt() -&gt; ! { unsafe { intrinsics::abort() } }
+#[lang = "eh_personality"] extern fn eh_personality() {}
+extern crate compiler_builtins; // rust-lang/rust#43264
+extern crate rlibc;
+</code></pre>
+<p>And with that, <code>go build</code> works (!!!) on macOS.</p>
+<h3 id="linux">Linux</h3>
+<p>On Linux nothing works.</p>
+<p>External linking complains about <code>fmax</code> and other symbols missing, and it seems to be right.</p>
+<pre><code>$ ld -r -o linux.o target/release/libed25519_dalek_rustgo/*.o
+$ nm -u linux.o
+                 U _GLOBAL_OFFSET_TABLE_
+                 U abort
+                 U fmax
+                 U fmaxf
+                 U fmaxl
+                 U logb
+                 U logbf
+                 U logbl
+                 U scalbn
+                 U scalbnf
+                 U scalbnl
+</code></pre>
+<p>A friend thankfully suggested making sure that I was using <code>--gc-sections</code> to strip dead code, which might reference things I don't actually need. And sure enough, this worked. (That's three layers of flag-passing right there.)</p>
+<pre><code>$ go build -ldflags '-extld clang -linkmode external -extldflags -Wl,--gc-sections'
+</code></pre>
+<p>But umh, in the Makefile we aren't using a linker at all, so where do we put <code>--gc-sections</code>? The answer is to stop hacking <code>.a</code>s together and actually reading the <a href="https://linux.die.net/man/1/ld?ref=words.filippo.io">linker man page</a>.</p>
+<p>We can build a <code>.o</code> containing a given symbol and all the symbols it references with <code>ld -r --gc-sections -u $SYMBOL</code>. <code>-r</code> makes the object reusable for a later link, and <code>-u</code> marks a symbol as needed, or everything would end up garbage collected. <code>$SYMBOL</code> is <code>scalar_base_mult</code> in our case.</p>
+<p>Why wasn't this a problem on macOS? It would have been if we linked manually, but the macOS compiler apparently does dead symbol stripping by default.</p>
+<pre><code>$ ld -e _scalar_base_mult target/release/libed25519_dalek_rustgo/*.o
+Undefined symbols for architecture x86_64:
+  "___assert_rtn", referenced from:
+      _compilerrt_abort_impl in int_util.o
+  "_copysign", referenced from:
+      ___divdc3 in divdc3.o
+      ___muldc3 in muldc3.o
+  "_copysignf", referenced from:
+      ___divsc3 in divsc3.o
+      ___mulsc3 in mulsc3.o
+  "_copysignl", referenced from:
+      ___divxc3 in divxc3.o
+      ___mulxc3 in mulxc3.o
+  "_fmax", referenced from:
+      ___divdc3 in divdc3.o
+  "_fmaxf", referenced from:
+      ___divsc3 in divsc3.o
+  "_fmaxl", referenced from:
+      ___divxc3 in divxc3.o
+  "_logb", referenced from:
+      ___divdc3 in divdc3.o
+  "_logbf", referenced from:
+      ___divsc3 in divsc3.o
+  "_logbl", referenced from:
+      ___divxc3 in divxc3.o
+  "_scalbn", referenced from:
+      ___divdc3 in divdc3.o
+  "_scalbnf", referenced from:
+      ___divsc3 in divsc3.o
+  "_scalbnl", referenced from:
+      ___divxc3 in divxc3.o
+ld: symbol(s) not found for inferred architecture x86_64
+$ ld -e _scalar_base_mult -dead_strip target/release/libed25519_dalek_rustgo/*.o
+</code></pre>
+<p>This is also the part where <a href="https://github.com/rust-lang/rust/issues/35052?ref=words.filippo.io">we learn painfully that the macOS platform prepends a <code>_</code> to all symbol names</a>, because reasons.</p>
+<p>So here's the Makefile portion that will work with external linking out of the box.</p>
+<pre><code>edwards25519/edwards25519.a: edwards25519/rustgo.go edwards25519/rustgo.o edwards25519/libed25519_dalek_rustgo.o
+		go tool compile -N -l -o $@ -p main -pack edwards25519/rustgo.go
+		go tool pack r $@ edwards25519/rustgo.o edwards25519/libed25519_dalek_rustgo.o
+
+edwards25519/libed25519_dalek_rustgo.o: target/$(TARGET)/release/libed25519_dalek_rustgo.a
+ifeq ($(shell go env GOOS),darwin)
+		$(LD) -r -o $@ -arch x86_64 -u "_$(SYMBOL)" $^
+else
+		$(LD) -r -o $@ --gc-sections -u "$(SYMBOL)" $^
+endif
+</code></pre>
+<p>The last missing piece is internal linking on Linux. In short, <a href="https://gist.github.com/FiloSottile/0d938bc4e8a7f3eab1fa4f672c334842?ref=words.filippo.io#file-internal-linking-issue-diff">it was not linking the Rust code</a>, even if the compilation seemed to succeed. The relocations were not happening and the <code>CALL</code> instructions in our Rust function left pointing at meaningless addresses.</p>
+<p>At that point I felt like it had to be a silent linker bug, the final boss in implementing rustgo, and reached out to people much smarter than me. One of them was guiding me in <a href="https://gist.github.com/FiloSottile/0d938bc4e8a7f3eab1fa4f672c334842?ref=words.filippo.io#file-relocations-txt">debugging cmd/link</a> (which was fascinating!) when Ian Lance Taylor, the author of cgo, helpfully pointed out that <code>//cgo:cgo_import_static</code> is not enough for internal linking, and that I also wanted <code>//cgo:cgo_import_dynamic</code>.</p>
+<pre><code>//go:cgo_import_static scalar_base_mult
+//go:cgo_import_dynamic scalar_base_mult
+</code></pre>
+<p>I still have no idea <em>why</em> leaving it out would result in that issue, but adding it finally made our rustgo package compile both with external and internal linking, on Linux and macOS, out of the box.</p>
+<h3 id="redistributable">Redistributable</h3>
+<p>Now that we can build a <code>.a</code>, we can take the suggestion in the <a href="https://github.com/golang/proposal/blob/master/design/2775-binary-only-packages.md?ref=words.filippo.io"><code>//go:binary-only-package</code></a> spec, and build a tarball with <code>.a</code>s for <code>linux_amd64</code>/<code>darwin_amd64</code> and the package source, to untar into a GOPATH to install.</p>
+<pre><code>$ tar tf ed25519-dalek-rustgo_go1.8.3.tar.gz
+src/github.com/FiloSottile/ed25519-dalek-rustgo/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/.gitignore
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Cargo.lock
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Cargo.toml
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/main.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/Makefile
+src/github.com/FiloSottile/ed25519-dalek-rustgo/release.sh
+src/github.com/FiloSottile/ed25519-dalek-rustgo/src/
+src/github.com/FiloSottile/ed25519-dalek-rustgo/target.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/src/lib.rs
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/rustgo.go
+src/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519/rustgo.s
+pkg/linux_amd64/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519.a
+pkg/darwin_amd64/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519.a
+</code></pre>
+<p>Once installed like that, the package will be usable just like a native one, cross-compilation included (as long as we packaged a <code>.a</code> for the target)!</p>
+<p>The only thing we have to worry about is that if we build Rust with <code>-Ctarget-cpu=native</code> it might not run on older CPUs. Thankfully benchmarks (<a href="https://twitter.com/isislovecruft/status/887787163072507904?ref=words.filippo.io">and the curve25519-dalek authors</a>) tell us that the only real difference is between post and pre-Haswell processors, so we only have to make a universal build and a Haswell one.</p>
+<pre><code>$ benchstat bench-none.txt bench-haswell.txt
+name                   old time/op  new time/op  delta
+ScalarBaseMult/rustgo  22.0µs ± 3%  20.2µs ± 2%  -8.41%  (p=0.001 n=7+6)
+$ benchstat bench-haswell.txt bench-native.txt
+name                   old time/op  new time/op  delta
+ScalarBaseMult/rustgo  20.2µs ± 2%  20.1µs ± 2%   ~     (p=0.945 n=6+7)
+</code></pre>
+<p>As the cherry on top, I made the Makefile obey GOOS/GOARCH, converting them as needed into Rust target triples, so if you have Rust set up for cross-compilation you can even cross-compile the <code>.a</code> itself.</p>
+<p>Here's the result: <a href="https://github.com/FiloSottile/ed25519-dalek-rustgo?ref=words.filippo.io">github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519</a>. It's even on <a href="https://godoc.org/github.com/FiloSottile/ed25519-dalek-rustgo/edwards25519?ref=words.filippo.io">godoc</a>.</p>
+<h2 id="turning-it-into-a-real-thing">Turning it into a real thing</h2>
+<p>Well, this was fun.</p>
+<p>But to be clear, rustgo is not a real thing that you should use <s>in production</s>. For example, I suspect I should be saving <code>g</code> before the jump, the stack size is completely arbitrary, and shrinking the trampoline frame like that will probably confuse the hell out of debuggers. Also, a panic in Rust might get weird.</p>
+<p>To make it a real thing I'd start by calling <code>morestack</code> manually from a <code>NOSPLIT</code> assembly function to ensure we have enough goroutine stack space (instead of rolling back <code>rsp</code>) with a size obtained maybe from static analysis of the Rust function (instead of, well, made up).</p>
+<p>It could all be analyzed, generated and built by some "rustgo" tool, instead of hardcoded in Makefiles and assembly files. cgo itself is little more than a code-generation tool after all. It might make sense as a <code>go:generate</code> thing, but I know someone who wants to make it a cargo command. (Finally some Rust-vs-Go fighting!) Also, a Rust-side collection of FFI types like, say, <code>GoSlice</code> would be nice.</p>
+<pre><code>#[repr(C)]
+struct GoSlice {
+    array: *mut u8,
+    len: i32,
+    cap: i32,
+}
+</code></pre>
+<p>Or maybe a Go or Rust adult will come and tell us to stop before we get hurt.</p>
+<p>In the meantime, you might want to <a href="https://twitter.com/FiloSottile?ref=words.filippo.io">follow me on Twitter</a>.</p>
+<p>EDIT: It was pointed out to me that if we simply named the Rust object file <code>libed25519_dalek_rustgo.syso</code>, we could skip all the <code>go tool</code> invocations and simply use <code>go build</code> which automatically links <code>.syso</code> files found in the package. But what's the fun in that.</p>
+<blockquote>
+<p>Thanks (in no particular order) to David, Ian, Henry, Isis, Manish, Zaki, Anna, George, Kaylyn, Bill, David, Jess, Tony and Daniel for making this possible. Don't blame them for the mistakes and horrors, those are mine.</p>
+</blockquote>
+<center>
+<blockquote data-cards="hidden" data-lang="en-gb">— Filippo Valsorda (@FiloSottile) <a href="https://twitter.com/FiloSottile/status/897434109613674496?ref=words.filippo.io">15 August 2017</a></blockquote>
+
+</center>
+<p>P.S. Before anyone tries to compare this to cgo (which has many more safety features) or pure Go, it's not meant to replace either. It's meant to replace manually written assembly with something much safer and more readable, with comparable performance. Or better yet, it was meant to be a fun experiment.</p>
+
+        </section></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Meta introduces Segment Anything Model 2 (224 pts)]]></title>
             <link>https://ai.meta.com/sam2/</link>
             <guid>41116635</guid>
             <pubDate>Wed, 31 Jul 2024 05:42:37 GMT</pubDate>
@@ -17,7 +651,7 @@
 <div id="readability-page-1" class="page"><div><hr><div><p>Key capabilities</p><p><h2>Segment any object, now in any video or image</h2></p><div><p>SAM 2 is the first unified model for segmenting objects across images and videos. You can use a click, box, or mask as the input to select an object on any image or frame of video.</p><a href="https://ai.meta.com/research/publications/sam-2-segment-anything-in-images-and-videos/" data-ms-clickable="true" data-ms="{&quot;creative&quot;:&quot;click_external-link&quot;,&quot;creative_detail&quot;:&quot;sam2_key_capabilities_read_the_research_paper_cta&quot;}" target="_self"><svg viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg"><path opacity="0.4" fill-rule="evenodd" clip-rule="evenodd" d="M19 37C9.05887 37 1 28.9411 1 19C1 9.05887 9.05887 1 19 1C28.9411 1 37 9.05887 37 19C37 28.9411 28.9411 37 19 37Z" stroke="CurrentColor"></path><path d="M21.9657 12L28.9287 18.963L21.9657 25.926L20.7348 24.7193L25.6203 19.8334L10.0001 19.8334V18.0926L25.5966 18.0926L20.7348 13.2309L21.9657 12Z" fill="CurrentColor"></path><path d="M21.9657 12L28.9287 18.963L21.9657 25.926L20.7348 24.7193L25.6203 19.8334L10.0001 19.8334V18.0926L25.5966 18.0926L20.7348 13.2309L21.9657 12Z" fill="CurrentColor"></path></svg>Read the research paper</a></div></div><div><div><h3>Select objects and make adjustments across video frames</h3><div><p>Using SAM 2, you can select one or multiple objects in a video frame. Use additional prompts to refine the model predictions.</p></div></div><div><h3>Robust segmentation, even in <br>unfamiliar videos</h3><div><p>SAM 2 is capable of strong zero-shot performance for objects, images and videos not previously seen during model training, enabling use in a wide range of real-world applications.</p></div></div><div><h3>Real-time interactivity and results</h3><p>SAM 2 is designed for efficient video processing with streaming inference to enable real-time, interactive applications.</p></div></div><div><div><p><h2>State-of-the-art performance for object segmentation</h2></p><p>SAM 2 outperforms the best models in the field for object segmentation in videos and images. </p></div><div><h3>Highlights</h3><div><ul><li>SAM 2 improves on SAM for segmentation in images</li><li>SAM 2 outperforms existing video object segmentation models, especially for tracking parts</li><li>SAM 2 requires less interaction time than existing interactive video segmentation methods</li></ul></div></div></div><div><h2>Try it yourself</h2><div><p>Track an object across any video interactively with as little as a single click on one frame, and create fun effects.</p><a href="https://sam2.metademolab.com/?utm_source=ai_meta_site&amp;utm_medium=web&amp;utm_content=AI_demos_page&amp;utm_campaign=July_moment" data-ms-clickable="true" data-ms="{&quot;creative&quot;:&quot;click_external-link&quot;,&quot;creative_detail&quot;:&quot;try_demos_SAM2_tryyourself_CTA&quot;}" target="_blank" rel="noreferrer noopener" data-lnfb-mode="ie" id="u_0_g_k9"><svg viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg"><path opacity="0.4" fill-rule="evenodd" clip-rule="evenodd" d="M19 37C9.05887 37 1 28.9411 1 19C1 9.05887 9.05887 1 19 1C28.9411 1 37 9.05887 37 19C37 28.9411 28.9411 37 19 37Z" stroke="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path></svg>Try the demo</a></div></div><div><p>Our approach</p><h2>The next generation of Meta Segment Anything</h2><p>SAM 2 brings state-of-the-art video and image segmentation capabilities into a single model, while preserving a simple design and fast inference speed.</p></div><div><p>Model architecture</p><div><p>The SAM 2 model extends the promptable capability of SAM to the video domain by adding a per session memory module that captures information about the target object in the video. This allows SAM 2 to track the selected object throughout all video frames, even if the object temporarily disappears from view, as the model has context of the object from previous frames. SAM 2 also supports the ability to make corrections in the mask prediction based on additional prompts on any frame. </p><p>SAM 2’s streaming architecture—which processes video frames one at a time—is also a natural generalization of SAM to the video domain. When SAM 2 is applied to images, the memory module is empty and the model behaves like SAM.</p></div></div><hr><div><p>The Segment Anything Video Dataset</p><h2>A large and diverse video segmentation dataset</h2><p>SAM 2 was trained on a large and diverse set of videos and masklets (object masks over time), created by applying SAM 2 interactively in a model in the loop data-engine. The training data includes the SA-V dataset, which we are open sourcing.</p><p>Please email <a href="mailto:support@segment-anything.com" target="_blank" data-lnfb-mode="ie">support@segment-anything.com</a> with any issues or questions regarding the SA-V dataset.</p><a href="https://ai.meta.com/datasets/segment-anything-video/" data-ms-clickable="true" data-ms="{&quot;creative&quot;:&quot;click_external-link&quot;,&quot;creative_detail&quot;:&quot;sam2_the_segment_anything_video_dataset_explore_the_dataset_cta&quot;}" target="_self"><svg viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg"><path opacity="0.4" fill-rule="evenodd" clip-rule="evenodd" d="M19 37C9.05887 37 1 28.9411 1 19C1 9.05887 9.05887 1 19 1C28.9411 1 37 9.05887 37 19C37 28.9411 28.9411 37 19 37Z" stroke="CurrentColor"></path><path d="M21.9657 12L28.9287 18.963L21.9657 25.926L20.7348 24.7193L25.6203 19.8334L10.0001 19.8334V18.0926L25.5966 18.0926L20.7348 13.2309L21.9657 12Z" fill="CurrentColor"></path><path d="M21.9657 12L28.9287 18.963L21.9657 25.926L20.7348 24.7193L25.6203 19.8334L10.0001 19.8334V18.0926L25.5966 18.0926L20.7348 13.2309L21.9657 12Z" fill="CurrentColor"></path></svg>Explore the dataset</a><div><h3>Highlights</h3><div><ul><li>~600K+ masklets collected on ~51K videos</li><li>Geographically diverse, real world scenarios collected across 47 countries</li><li>Annotations include whole objects, parts, and challenging occlusions</li></ul></div></div></div><div><div><p>Access our research</p><h2>Open innovation</h2><p>To enable the research community to build upon this work, we’re publicly releasing a pretrained Segment Anything 2 model, along with the SA-V dataset, a demo, and code.</p><a href="https://github.com/facebookresearch/segment-anything-2" data-ms-clickable="true" data-ms="{&quot;creative&quot;:&quot;click_external-link&quot;,&quot;creative_detail&quot;:&quot;download_model_SAM2&quot;}" target="_blank" rel="noreferrer noopener" data-lnfb-mode="ie" id="u_0_q_Ll"><svg viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg"><path opacity="0.4" fill-rule="evenodd" clip-rule="evenodd" d="M19 37C9.05887 37 1 28.9411 1 19C1 9.05887 9.05887 1 19 1C28.9411 1 37 9.05887 37 19C37 28.9411 28.9411 37 19 37Z" stroke="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path></svg>Download the model</a><div><h3>Highlights</h3><div><ul><li>We are providing transparency into the SAM 2 training data </li><li>We prioritized geographic diversity in the SA-V dataset for real-world representation</li><li>We conducted a fairness evaluation of SAM 2</li></ul></div></div></div><div><p><img src="https://static.xx.fbcdn.net/rsrc.php/v3/y4/r/-PAXP-deijE.gif" alt="Person coding on desktop computer"></p></div></div><hr><div><h2>Potential model applications</h2><div><p>SAM 2 can be used by itself, or as part of a larger system with other models in future work to enable novel experiences. </p><a href="https://github.com/facebookresearch/segment-anything-2" data-ms-clickable="true" data-ms="{&quot;creative&quot;:&quot;click_external-link&quot;,&quot;creative_detail&quot;:&quot;download_model_SAM2&quot;}" target="_blank" rel="noreferrer noopener" data-lnfb-mode="ie" id="u_0_r_ft"><svg viewBox="0 0 38 38" fill="none" xmlns="http://www.w3.org/2000/svg"><path opacity="0.4" fill-rule="evenodd" clip-rule="evenodd" d="M19 37C9.05887 37 1 28.9411 1 19C1 9.05887 9.05887 1 19 1C28.9411 1 37 9.05887 37 19C37 28.9411 28.9411 37 19 37Z" stroke="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path><path d="M16.3102 12.2707L26.1574 12.2707L26.1574 22.1179L24.4338 22.135L24.4335 15.2256L13.3883 26.2707L12.1574 25.0398L23.1858 14.0114L16.3102 14.0115L16.3102 12.2707Z" fill="CurrentColor"></path></svg>Download the model</a></div><div><div><h3>Extensible outputs</h3><div><p>The video object segmentation outputs from SAM 2 could be used as input to other AI systems such as modern video generation models to enable precise editing capabilities.</p></div></div><div><h3>Extensible inputs </h3><p>SAM 2 can be extended to take other types of input prompts such as in the future enabling creative ways of interacting with objects in real-time or live video.</p></div></div></div><hr><div><p><h2>Explore additional resources</h2></p></div><div><div><p><h5>Read the AI at Meta blog</h5></p></div><div><p><h5>Read the research paper</h5></p></div><div><p><h5>Download the dataset</h5></p></div><div><p><h5>Explore the dataset</h5></p></div><div><p><h5>Download the model</h5></p></div><div><p><h5>Try the demo</h5></p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[macOS in Docker Container (140 pts)]]></title>
+            <title><![CDATA[macOS in Docker Container (164 pts)]]></title>
             <link>https://github.com/sickcodes/Docker-OSX</link>
             <guid>41116473</guid>
             <pubDate>Wed, 31 Jul 2024 04:51:12 GMT</pubDate>
@@ -1930,7 +2564,7 @@ docker <span>exec</span> containerID bash -c <span><span>"</span>grep -v Install
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[`find` + `mkdir` is Turing complete (184 pts)]]></title>
+            <title><![CDATA[`find` + `mkdir` is Turing complete (195 pts)]]></title>
             <link>https://ogiekako.vercel.app/blog/find_mkdir_tc</link>
             <guid>41115941</guid>
             <pubDate>Wed, 31 Jul 2024 02:22:41 GMT</pubDate>
@@ -1938,7 +2572,7 @@ docker <span>exec</span> containerID bash -c <span><span>"</span>grep -v Install
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Call of Duty: Warzone Caldera Data Set for Academic Use (103 pts)]]></title>
+            <title><![CDATA[Call of Duty: Warzone Caldera Data Set for Academic Use (108 pts)]]></title>
             <link>https://blog.activision.com/activision/2024/activision-releases-call-of-duty-warzone-caldera-data-set</link>
             <guid>41115619</guid>
             <pubDate>Wed, 31 Jul 2024 01:06:09 GMT</pubDate>
@@ -2011,7 +2645,7 @@ docker <span>exec</span> containerID bash -c <span><span>"</span>grep -v Install
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Our Audit of Homebrew (548 pts)]]></title>
+            <title><![CDATA[Our Audit of Homebrew (568 pts)]]></title>
             <link>https://blog.trailofbits.com/2024/07/30/our-audit-of-homebrew/</link>
             <guid>41114839</guid>
             <pubDate>Tue, 30 Jul 2024 22:39:21 GMT</pubDate>
@@ -2090,7 +2724,7 @@ docker <span>exec</span> containerID bash -c <span><span>"</span>grep -v Install
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Creativity fundamentally comes from memorization (132 pts)]]></title>
+            <title><![CDATA[Creativity fundamentally comes from memorization (141 pts)]]></title>
             <link>https://shwin.co/blog/creativity-fundamentally-comes-from-memorization</link>
             <guid>41114825</guid>
             <pubDate>Tue, 30 Jul 2024 22:37:24 GMT</pubDate>
@@ -2098,7 +2732,7 @@ docker <span>exec</span> containerID bash -c <span><span>"</span>grep -v Install
 <div id="readability-page-1" class="page"><article id="block-blog-creativity-fundamentally-comes-from-memorization"><p id="block-b294026f0085409aa8083c2ba28086bb">July 2024</p><p id="block-13c08ff8edaa462fb8c83ec3719a40c6">I'm often made fun of for bringing a "system" into creative outlets.</p><p id="block-c048424fee404b37b3b7a95b1d3bc957">Things like:</p><ul><li id="block-6680669f67f645c5aa7a44d5746724db">written-down heuristics on best DJ transitions</li><li id="block-3aee7afa7481460b982a09507f4862f6">breaking down the humor patterns of comedians and memes</li><li id="block-3973a2736bfc486c82eefa8e35488322">or a checklist of best practices for competitive video games (e.g. Rocket League, Call of Duty).</li></ul><p id="block-b5ce1052ad514429b7b2e6b54d2edc4b">But I think this critique misunderstands what creativity truly is: </p><p id="block-17becdb07d9d4765830940e025f7fb80">a flash of inspiration connecting internalized concepts.</p><p id="block-6264bddc13e5415abf9f3248b0ebb897">The inspirational lightning bolt writers and artists experience can't happen unless they know how to write or draw. A pun can't be created unless the author sees the similarity between one word and another they already know. A DJ can't mashup two songs unless they're familiar with both.</p><p id="block-84e00f4ae01b454ba45792c9f4bf6bb6">By definition, you can't even be certain of novelty without familiarity of existing works.</p><p id="block-d75e7185a08b4e798f0ab38112d7367a">Creativity comes to those who have internalized the patterns of their art -- they can see the connection or novelty because it's all in their head.</p><p id="block-63a9acfe180645bf97d0853ddcf1c3ab">Therefore autonomy enables creativity, and a system helps achieve autonomy quicker.</p><span id="e40b61990d524cdc833da032c37b103f"></span><h2 id="block-e40b61990d524cdc833da032c37b103f">It all starts with learning</h2><p id="block-1a59aab06cbb45b795069d6a5b770ce3">Some time back I discovered a method for learning anything quickly.</p><p id="block-9cfd275902ec421db980418a21772263">It involved two steps:</p><ol type="1"><li id="block-75684240e00246ee947a919579aa3174">Memorizing the different classifications/patterns in a concept [1]</li><li id="block-51b5b44c29f240bd9283217c7ff9d2f4">Exposing myself to a breadth of cases so I could match the real-world example to one of the previously learned patterns</li></ol><p id="block-468e43b751dc4a70acbc0127594a2e2e">For many that remember school, this won't sound novel. Yet what's often missed is the application beyond academic subjects:</p><ul><li id="block-9103cf62851048c1893434742f057a23">sports - learning to recognize weaknesses in a defense</li><li id="block-248cb6c7a0e440d08a3ec9aaffde0db5">sales - learning to recognize someone's "conversational type"</li><li id="block-0946c6799975459abbf56d49fdd2866f">humor - recognizing common opportunities for humor in a situation</li></ul><p id="block-a570b4558af044b19a50e6ea03791202">Even academically, while older western curriculums seemed to emphasize memorization, new school teaching seems to have shifted towards understanding-based, which is just a memorization aid. [1]</p><p id="block-d9f9da27b8064bbf9fc0002e19950143">Eastern cultures, on the other hand, have maintained focus on drilling these primitives to unlock autonomy, as shown by popular tutoring services like Kumon -- which involve daily, timed tests to develop speed.</p><p id="block-a0a2ffe5bc5542bdaa16fa3a4de0916c">Growing up with Indian parents in California, I was exposed to both. My mom would write daily Kumon sheets out by hand for me to do, and teach me from Indian textbooks from the same grade (which were much more advanced than the US equivalents). The result was me breezing through the US school system without much thought. [2]</p><p id="block-23ddb919f3d9432587ddf91968620ffb">The key here is memorization's role in learning. We often tout the difference between memorization and true "understanding", which are indeed distinct. Memorizing the different methods of attacking mathematical integrations is different from being able to use the right one in the moment.</p><p id="block-33938c60a47b47c4821fc05d78ab52a9">But I maintain that such pattern recognition is just another form of memorization, though often a more subconscious one. This is learned from repeated exposure, and what I'm attempting to do when I try to see a "breadth" of cases after learning the framework and available patterns to use.</p><p id="block-db98f257a6974f7a988966612384332a">What this is really doing under the hood, is creating a heuristic and... wait for it... memorizing it!</p><p id="block-72ceb407a5b04463a1b49732298cb23d">Once this heuristic is internalized, it becomes a new primitive and we focus our attention to higher-level problems.</p><p id="block-0d1890092d36484f90c9fd2c60088982">Yet even if knowledge is memorized without understanding (as high schoolers so often do) — this creates an opportunity for understanding to manifest at a later date. I’ll never forget the shock I received when working through a proof in college on electromagnetic waves and suddenly ending up with 3e8 — a value I’d memorized blindly as the speed of light.</p><span id="fd8cda833b8b485d8345b1aab87b426b"></span><h2 id="block-fd8cda833b8b485d8345b1aab87b426b">But doesn't this make things mechanical instead of creative and intuitive?</h2><p id="block-885b86d619314dcdb1fefc4775a1bef4">But doesn't this stifle creativity? Making things mechanical instead of creative and intuitive?</p><p id="block-fce16ad752d8478a99274dc9f5afcf67">On the contrary, it enables creativity and intuitiveness by reducing energy needed for the basics, freeing you up to focus on higher-level novelty.</p><p id="block-5a6f30e22974482e93c57f4dc8218007">Once a dancer learns the fundamental movements of their specialization, they're able to improvise. So are pianists once they learn scales, and mathematicians (though sadly many of us never experience the joy of mathematical improvisation -- as Paul Lockhart covers in his <a href="https://worrydream.com/refs/Lockhart_2002_-_A_Mathematician's_Lament.pdf" target="_blank" rel="noopener noreferrer">Mathematician's Lament</a>).</p><p id="block-10abebbfd3c649d88df90feae9396612">The key is understanding that a system doesn't directly <em>make</em> creativity, it just <em>enables</em> it. Memorization’s role is similar.</p><p id="block-9574f3d9f6b442bbb0077ee0afe0a2f6">Another strategy that works well in both humor and famous EDM drops is "violating the expectation", but you need to know the expectation before you can violate it. Once you learn music theory, you're able to violate it in ways that resonate. Avant-garde art requires knowing what the establishment is to push the boundaries as orthogonally as possible.</p><p id="block-e1c59eb2795a4e419601b64a07acd0b4">One of my best personal examples is learning sales (which eventually be another blog post). As a not-intuitively charismatic guy, I had to learn systems for it. Things like tactical delivery skills:</p><ul><li id="block-3d0b3cca2e734e8a8e4b383357a3f649">pause for 2 seconds before responding</li><li id="block-2bddb45f76014d739c80ebac80b69011">don't use too many conditionals in a sentence</li><li id="block-8c3e8ad888ca432485921ea2315d36c4">start with the answer, then go into detail (McKinsey Pyramid Principle)</li></ul><p id="block-76fb363a4e494cacb4cc4e3ec952d78a">As well as what questions to ask (from SPIN selling):</p><ul><li id="block-5516d55a56864f8ab016db873c858c78">situation questions</li><li id="block-eb073e09f82a41e1a492cb92c42d1239">problem questions</li><li id="block-2a33b15957f5401281ea0cf160ccd03d">impact questions</li><li id="block-3478f81fc7ca4d71885b8d178186a0f0">needs-payoff questions</li></ul><p id="block-7bc9c8e3a14d49d283bfd238a7471b3f">While at first calls were clunky, once internalized -- creativity abounds. Recognizing when the convo is naturally jumping straight to the "Impact" section of questions means I don't force us back to the "Problem" questions, we just shift forward.</p><p id="block-065b1194e7584e5c9ef232ad17104fe6">All of a sudden sales calls (and human interactions in general) get fun, life improves.</p><span id="0aed9d6f394e49c19136d90e64a857c2"></span><h2 id="block-0aed9d6f394e49c19136d90e64a857c2">Ramifications</h2><p id="block-bb43b4245463422e8efa20685f1d1ca6">The obvious thing I've taken from this is my learning system: using the steps above I can learn things quickly to accomplish personal/career goals.</p><p id="block-767586cab08944559da65a647bca8c41">Most recently:</p><ul><li id="block-011dd87820b541f5aecf8084b16a755c">how to sell</li><li id="block-4b8745b5876c47d893c46a783a9b8bd5">how to fundraise</li><li id="block-9989bcf871d44f639334364dcd75eed6">how to be wittier</li></ul><p id="block-338f1fd91b3f467e8d267786db568e96">The less obvious thing is a creativity system.</p><p id="block-42576caa39a8496fa27998579d07406d">If creativity is born from autonomy in multiple areas, then one way to become more creative is to become autonomous in many areas!</p><p id="block-a53459bb1f4e46b49639652cea8cdf21">This can be within a single domain, like music. Deeply studying and learning the patterns of hip-hop and country can lead to the creation of a hit fusion like Lil Nas X's Old Town Road.</p><p id="block-33d26ef64bfd4241bf4b50b00e40b85d">But it can also be across domains -- like we see in most startups today. I used to work as a reverse engineer hacking drones at Skysafe, which was a company born of intersecting expertise in information security + radio. Even Dopplio emerged from my understanding of information security exploits, magic tricks, and sales.</p><p id="block-91e726f78d7f4408a4619cfdc22e8c10">As the internet democratizes information and low-hanging fruit is harder to come by, we're seeing that expertise in multiple fields like this is needed to create something novel and valuable (as seen in startups, music).</p><p id="block-4d03755ad2504e19b94345ee5a3dd0c5">"Generalists" these days are more like "repeat specialists".</p><p id="block-d7607d36130e47548a3ab0f0fc60e31c">So if you want to be creative, learn lots of things in-depth, and learn how to learn them fast. Embrace systems to achieve this, and use them to free you up from the basics -- so you can focus on the novel.</p><p id="block-5d2355bf4be04ad0ada7e58f45a8adc8">If you’re interested in more dissections like this you can follow me on <a href="https://x.com/shw1nm" target="_blank" rel="noopener noreferrer">Twitter</a></p><p id="block-268092c36654412da099e07798ebe5e2"><u>Footnotes</u></p><p id="block-6e05ca4f05b94101970d45a23334d3d0">[1] I made both the "memorization" step and "US schools shifting to understanding-based" footnotes point here b/c they touch on something I call the "web of knowledge". Understanding something deeply means fitting into your model of the world and seeing how it connects to other learned patterns. Besides the connections to other subjects, the biggest value in this is ease of recall from having multiple "entryways" via the connected subjects. This is extremely valuable, and I naturally do this during my memorization step, but functionally is just another way to aid recall imo.</p><p id="block-d88538040b004cac87650bb2735d9ef9">[2] Yet America tends to dominate when it comes to creativity, why?</p><p id="block-f56eeb46828e44ec82005801e5020477">My theory is that while eastern students start with a much stronger base from this discipline, many never unlock the exponential gains that come from the joy of learning. Part of this is probably due to more stability in the US, with a more developed safety system, stable (although it may not seem like it) political and financial system relatively, with lots of opportunity -- we can focus on higher Maslow's-hierarchy needs like passion and self actualization.</p><p id="block-a47bc2bdfe74441da9dec316b0a849b0">This is partly why I think we're seeing (and will continue to see) Indians and Asians rise in prominence as kids raised with eastern fundamentals but the US love of learning unlock new levels of creativity. And as generational wealth builds, a branch out from the more traditionally "Asian" fields like STEM and into arts and US politics (we're already seeing this, with Vivek, Nikki Haley, etc.)</p></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Building static binaries with Go on Linux (114 pts)]]></title>
+            <title><![CDATA[Building static binaries with Go on Linux (120 pts)]]></title>
             <link>https://eli.thegreenplace.net/2024/building-static-binaries-with-go-on-linux/</link>
             <guid>41114601</guid>
             <pubDate>Tue, 30 Jul 2024 22:07:53 GMT</pubDate>
@@ -2618,7 +3252,7 @@ Summary
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Fake Job Interviews Are Securities Fraud (263 pts)]]></title>
+            <title><![CDATA[Fake Job Interviews Are Securities Fraud (264 pts)]]></title>
             <link>https://www.bloomberg.com/opinion/articles/2024-07-30/fake-job-interviews-are-securities-fraud</link>
             <guid>41112855</guid>
             <pubDate>Tue, 30 Jul 2024 18:55:14 GMT</pubDate>
@@ -2640,7 +3274,7 @@ Summary
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Porffor: A from-scratch ahead-of-time JS engine (361 pts)]]></title>
+            <title><![CDATA[Porffor: A from-scratch ahead-of-time JS engine (370 pts)]]></title>
             <link>https://porffor.dev/</link>
             <guid>41112854</guid>
             <pubDate>Tue, 30 Jul 2024 18:55:10 GMT</pubDate>
@@ -2725,7 +3359,7 @@ Summary
   </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Federal regulator says Amazon can be held responsible for faulty goods (124 pts)]]></title>
+            <title><![CDATA[Federal regulator says Amazon can be held responsible for faulty goods (125 pts)]]></title>
             <link>https://www.cnbc.com/2024/07/30/cpsc-says-amazon-responsible-for-faulty-goods-sold-on-its-marketplace.html</link>
             <guid>41111317</guid>
             <pubDate>Tue, 30 Jul 2024 16:53:11 GMT</pubDate>
@@ -2733,7 +3367,7 @@ Summary
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-107157826" data-test="InlineImage"><p>Packages move along a conveyor belt at an Amazon Fulfillment center on Cyber Monday in Robbinsville, New Jersey, on Nov. 28, 2022.</p><p>Stephanie Keith | Bloomberg | Getty Images</p></div><div><p>Federal regulators <a href="https://www.cpsc.gov/Newsroom/News-Releases/2024/CPSC-Finds-Amazon-Responsible-Under-Federal-Safety-Law-for-Hazardous-Products-Sold-by-Third-Party-Sellers-on-Amazon-com" target="_blank">have determined</a> that <span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-2"><a href="https://www.cnbc.com/quotes/AMZN/">Amazon</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> can be held responsible for defective goods sold by third-party merchants on its online marketplace, rejecting the company's position that it's merely an intermediary between consumers and sellers.</p><p>In <a href="https://www.cpsc.gov/s3fs-public/pdfs/recall/lawsuits/abc/142%20-%20In%20the%20Matter%20of%20Amazon.com%20Inc.%20Decision%20and%20Order.pdf?" target="_blank">a landmark order</a> released Tuesday, the U.S. Consumer Product Safety Commission said the agency unanimously agreed Amazon "fits squarely" within the definition of a distributor of goods, "and therefore bears legal responsibility for their recall."</p><p>As part of the agency's decision, Amazon is required to develop a plan to notify purchasers and the public about the product hazards, as well as offer shoppers refunds or replacements for the affected products.</p><p>Amazon's marketplace, which hosts millions of third-party sellers, now accounts for&nbsp;<a href="https://blog.aboutamazon.com/policy/statement-by-jeff-bezos-to-the-u-s-house-committee-on-the-judiciary" target="_blank">approximately 60%</a>&nbsp;of the company's e-commerce sales. While the marketplace has helped Amazon bring in record revenue, it has also proven to host&nbsp;<a href="https://www.cnbc.com/2016/05/25/amazon-counterfeiters-wreak-havoc-on-artists-and-small-businesses.html">counterfeit</a>,&nbsp;<a href="https://www.cnbc.com/2019/08/29/senators-ask-jeff-bezos-to-crack-down-on-unsafe-products-on-amazon.html">unsafe</a>&nbsp;and even&nbsp;<a href="https://www.cnbc.com/2019/10/20/amazon-is-shipping-expired-baby-formula-and-other-out-of-date-foods.html">expired goods</a>. The company has previously said it invests hundreds of millions of dollars per year to ensure products sold are safe and compliant.</p><p>The decision addresses a thorny issue that's been debated for years. In numerous lawsuits, Amazon has maintained it just serves as the conduit between buyers and sellers on its marketplace and that it's not involved in the sourcing or distribution of products sold by third-party sellers, removing it from liability. That has been a successful defense for Amazon in the past, including&nbsp;<a href="https://www.cnbc.com/2018/06/02/amazon-not-liable-for-exploding-hoverboard-marketplace-argument-wins.html">in a 2018 case</a>&nbsp;concerning the purchase of a faulty hoverboard that exploded and burned down an Amazon shopper's house in Tennessee.&nbsp;In other cases, <a href="https://www.cnbc.com/2020/08/13/amazon-can-be-held-liable-for-faulty-goods-court-rules.html">federal courts</a> and <a href="https://www.cnbc.com/2020/08/31/controversial-ca-consumer-bill-will-not-advance-in-its-present-form.html">legislators</a> have said the e-commerce giant should be held liable.</p><p>In 2021, the CPSC <a href="https://www.cnbc.com/2021/07/14/us-regulator-sues-amazon-demands-recall-of-hazardous-products.html">sued</a> Amazon to force it to recall hundreds of thousands of products that it deemed hazardous. At issue were 418,818 goods sold through Amazon, including faulty carbon monoxide detectors, hairdryers without electrocution protection and children's sleepwear that posed a burn risk.</p><p>Amazon argued in its response to the agency complaint that it should be characterized as a third-party logistics provider, saying it only receives and transports the products sold through its site.</p><p>Still, Amazon removed all the products flagged by the CPSC and prohibited merchants from selling them on its marketplace. The company informed shoppers who purchased the items of "potential safety issues," told them to destroy the items and offered a credit.</p><p>The CPSC called these actions "inadequate," saying the company should've offered refunds to incentivize consumers to destroy or return the product.</p><p>In Tuesday's ruling, the agency said an administrative law judge dismissed Amazon's argument that it should be classified as a third-party logistics provider. The judge pointed to Amazon's Fulfilled by Amazon service, where sellers ship inventory into the company's warehouses, and those products are stored until they're purchased.</p><p>This program gives Amazon "far-reaching control" over the products sold on its platform, the judge said.</p><p>"Amazon cannot sidestep its obligations under the [Consumer Product Safety Act] simply because some portion of its extensive services involve logistics," the decision states. "Amazon must therefore comply with the CPSA to protect consumers from injury."</p><p>An Amazon spokesperson said in a statement that the company is "disappointed" by the CPSC's decision and plans to appeal. They added that Amazon stands behind the safety of every product in its store, regardless of whether it's sold by the company our a third-party seller. </p><p>If a product is recalled, Amazon removes them from its platform and informs shoppers of any product safety information, the spokesperson said. In 2021, the company <a href="https://www.cnbc.com/2021/08/10/amazon-lets-consumers-file-complaints-for-faulty-goods-from-3p-sellers.html">updated its returns policy</a> to allow shoppers to contact Amazon directly with any complaints of faulty goods, rather than communicating with the third-party merchant. </p></div><div id="RegularArticle-RelatedContent-1"><h2>Don’t miss these insights from CNBC PRO</h2><div><ul><li><a href="https://www.cnbc.com/2024/07/26/nvidia-may-face-a-massive-technical-sell-off-chart-analyst-warns.html">Nvidia could be on the verge of a massive technical sell-off, chart analyst warns</a></li><li><a href="https://www.cnbc.com/2024/07/25/tom-lee-says-the-rotation-out-of-large-caps-is-just-beginning-small-caps-to-surge-15percent-in-august.html">Tom Lee says the rotation out of large caps is just beginning, small caps to surge 15% in August</a></li><li><a href="https://www.cnbc.com/2024/07/24/5-attractively-valued-growth-stocks-to-buy-hold-for-next-decade-pros5-attractively-valued-growth-stocks-to-buy-hold-for-next-decade-pros.html">Buy and hold these 5 attractively valued growth stocks for the next decade, the pros say</a></li><li><a href="https://www.cnbc.com/2024/07/23/magnificent-7-alternatives-buy-these-stocks-instead-wealth-manager-says.html">Avoid the ‘Magnificent 7’ and buy these lesser-known stocks instead, wealth manager says</a></li></ul></div></div><div id="Placeholder-ArticleBody-Video-107131531" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000267761" aria-labelledby="Placeholder-ArticleBody-Video-107131531"><p><img src="https://image.cnbcfm.com/api/v1/image/107132294-1665466235480-bags.jpg?v=1665579541&amp;w=750&amp;h=422&amp;vtcrop=y" alt="How Amazon private labels work, from AmazonBasics to its 100+ other owned brands"><span></span><span></span></p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Meta to pay Texas $1.4B for using facial recognition without users' permission (359 pts)]]></title>
+            <title><![CDATA[Meta to pay Texas $1.4B for using facial recognition without users' permission (361 pts)]]></title>
             <link>https://www.texastribune.org/2024/07/30/texas-meta-facebook-biometric-data-settlement/</link>
             <guid>41111145</guid>
             <pubDate>Tue, 30 Jul 2024 16:41:13 GMT</pubDate>
@@ -2811,7 +3445,7 @@ Summary
 An earlier version of this story said the Texas attorney general's office announced the settlement on Monday. It was on Tuesday.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Swift Homomorphic Encryption (262 pts)]]></title>
+            <title><![CDATA[Swift Homomorphic Encryption (264 pts)]]></title>
             <link>https://www.swift.org/blog/announcing-swift-homomorphic-encryption/</link>
             <guid>41111129</guid>
             <pubDate>Tue, 30 Jul 2024 16:40:13 GMT</pubDate>
@@ -2939,7 +3573,7 @@ researchers in the Swift community to enable new use cases!</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Truth About Linear Regression (2015) (255 pts)]]></title>
+            <title><![CDATA[The Truth About Linear Regression (2015) (257 pts)]]></title>
             <link>https://www.stat.cmu.edu/~cshalizi/TALR/</link>
             <guid>41111115</guid>
             <pubDate>Tue, 30 Jul 2024 16:38:40 GMT</pubDate>
@@ -2947,7 +3581,7 @@ researchers in the Swift community to enable new use cases!</p>
 Couldn't get https://www.stat.cmu.edu/~cshalizi/TALR/: Error: unable to verify the first certificate]]></description>
         </item>
         <item>
-            <title><![CDATA[JavaScript garbage collection and closures (120 pts)]]></title>
+            <title><![CDATA[JavaScript garbage collection and closures (121 pts)]]></title>
             <link>https://jakearchibald.com/2024/garbage-collection-and-closures/</link>
             <guid>41111062</guid>
             <pubDate>Tue, 30 Jul 2024 16:35:04 GMT</pubDate>
@@ -3048,7 +3682,7 @@ globalThis<span>.</span>innerFunc2 <span>=</span> <span>undefined</span><span>;<
 </div><p><small><a href="https://github.com/jakearchibald/jakearchibald.com/blob/main/static-build/posts/2024/07/garbage-collection-and-closures/index.md">View this page on GitHub</a></small></p></div><section><figure><h2><picture><source srcset="https://jakearchibald.com/c/me-cat-2a46b6f2.avif" type="image/avif"><source srcset="https://jakearchibald.com/c/me-cat-29ff6dc5.webp" type="image/webp"><img width="800" height="844" src="https://jakearchibald.com/c/me-cat-862e9e16.jpg" alt="Jake Archibald in a garden with a black cat"></picture></h2></figure><p>Hello, I'm Jake and that's me there. The one that isn't a cat. I'm a developer of sorts.</p><h2>Elsewhere</h2><h2>Contact</h2><p>Feel free to <a href="mailto:jaffathecake@gmail.com">throw me an email</a>, unless you're a recruiter, or someone trying to offer me 'sponsored content' for this site, in which case write your request on a piece of paper, and fling it out the window.</p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Launch HN: SSOReady (YC W24) – Making SAML SSO painless and open source (259 pts)]]></title>
+            <title><![CDATA[HNInternal: Launch HN: SSOReady (YC W24) – Making SAML SSO painless and open source (265 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=41110850</link>
             <guid>41110850</guid>
             <pubDate>Tue, 30 Jul 2024 16:19:45 GMT</pubDate>
@@ -3062,7 +3696,7 @@ globalThis<span>.</span>innerFunc2 <span>=</span> <span>undefined</span><span>;<
   </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[DARPA: Translating All C to Rust (Tractor) (298 pts)]]></title>
+            <title><![CDATA[DARPA: Translating All C to Rust (Tractor) (302 pts)]]></title>
             <link>https://www.darpa.mil/program/translating-all-c-to-rust</link>
             <guid>41110269</guid>
             <pubDate>Tue, 30 Jul 2024 15:42:06 GMT</pubDate>
@@ -3125,7 +3759,7 @@ globalThis<span>.</span>innerFunc2 <span>=</span> <span>undefined</span><span>;<
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dear AI Companies, instead of scraping OpenStreetMap, how about a $10k donation? (375 pts)]]></title>
+            <title><![CDATA[Dear AI Companies, instead of scraping OpenStreetMap, how about a $10k donation? (378 pts)]]></title>
             <link>https://en.osm.town/@Firefishy/112875549871566269</link>
             <guid>41109926</guid>
             <pubDate>Tue, 30 Jul 2024 15:11:44 GMT</pubDate>
@@ -3133,7 +3767,7 @@ globalThis<span>.</span>innerFunc2 <span>=</span> <span>undefined</span><span>;<
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Why doesn't advice work? (262 pts)]]></title>
+            <title><![CDATA[Why doesn't advice work? (267 pts)]]></title>
             <link>https://dynomight.substack.com/p/advice</link>
             <guid>41109891</guid>
             <pubDate>Tue, 30 Jul 2024 15:07:51 GMT</pubDate>
@@ -4161,28 +4795,6 @@ send a chunk of heap to the server:</p>
 }
 </code></pre></div>
 
-
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[FTC Wins Round Two in Its Non-Compete Ban Defense (140 pts)]]></title>
-            <link>https://www.jdsupra.com/legalnews/ftc-wins-round-two-in-its-non-compete-4112148/</link>
-            <guid>41107845</guid>
-            <pubDate>Tue, 30 Jul 2024 10:56:10 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.jdsupra.com/legalnews/ftc-wins-round-two-in-its-non-compete-4112148/">https://www.jdsupra.com/legalnews/ftc-wins-round-two-in-its-non-compete-4112148/</a>, See on <a href="https://news.ycombinator.com/item?id=41107845">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="HTMLContentViewPanel">
-
-<p>The Federal Trade Commission (FTC) is seeking to ban nearly all employee non-compete agreements in the United States [see <a href="https://www.mccarter.com/insights/yes-the-ftc-did-just-try-to-ban-non-compete-agreements-for-now/">April 25, 2024 Alert</a>]. Almost immediately after the FTC issued its final rule, lawsuits challenging that attempt were filed in several courts around the country. On July 3, 2024, the first court ruling in those lawsuits held, on a preliminary basis, that the FTC likely did not have the authority to issue such a sweeping rule [see <a href="https://www.mccarter.com/insights/the-ftcs-non-compete-ban-has-suffered-its-first-setback/">July 10, 2024 Alert</a>]. The United States District Court for the Northern District of Texas held that the FTC’s enabling statute did not authorize it to issue substantive rules to prevent “unfair methods of competition” but rather only allowed the FTC to make substantive rules about “unfair or deceptive acts or practices.” Because the FTC declared that non-competes fell into the former category rather than the latter, the Texas Court determined, the FTC lacked the authority to issue the regulation.</p>
-
-<p>Less than three weeks later, however, another federal court held, again on a preliminary basis, that the FTC likely <strong>did</strong> have the authority to ban all employee non-compete agreements. The United States District Court for the Eastern District of Pennsylvania considered a preliminary injunction motion brought by a tree care company with a dozen employees, each of whom had signed a non-compete agreement. The Court denied the employer’s request for a preliminary injunction on two grounds. First, the Court held that the company had not demonstrated irreparable harm in the absence of a preliminary injunction. Second, and more interesting for purposes of discerning whether the ban will ever actually go into effect, the Court held that the FTC did indeed have the power under its statute to issue substantive rules regarding unfair methods of competition.</p>
-
-<p>As the Pennsylvania Court explained, the core issue was “whether the FTC, under Sections 5 and 6 of the [Federal Trade Commission] Act, has the authority to promulgate substantive regulations like the [Non-Compete ban], or whether the FTC’s enforcement authority is limited to adjudication and strictly procedural rulemaking related to the adjudication process.” The Court began by noting that the FTC Act gave the FTC the power “to make rules and regulations for the purpose of carrying out the provisions of this subchapter,” 15 U.S.C. § 46(g). The Court observed that the statute did not distinguish between “procedural” and “substantive” regulations, and in fact mentioned neither term. The Pennsylvania Court stated that the plaintiff’s proposed interpretation of the FTC Act–the one that had been adopted three weeks earlier in the Texas case–“runs contrary to logic.” Further, the Pennsylvania Court determined that giving the FTC the power to “prevent” unfair methods of competition implies the power to issue substantive regulations in the area. Finally, the Pennsylvania Court declined to infer from the statute’s specific grant of authority to the FTC to issue rules for “unfair or deceptive acts” any limit to its ability to issue regulations related to “unfair methods of competition,” in large part because that section of the statute provides that it “shall not affect any authority of the<a href="https://www.law.cornell.edu/definitions/uscode.php?width=840&amp;height=800&amp;iframe=true&amp;def_id=15-USC-1283237621-1323160499&amp;term_occur=999&amp;term_src="> Commission </a>to prescribe rules (including interpretive rules), and general statements of policy, with respect to unfair methods of competition in or affecting commerce.”</p>
-
-<p>So to switch from the boxing metaphor of our title to a baseball metaphor, after two innings the score is tied 1-1 with plenty of opportunities for both sides left in the game. We expect another preliminary ruling from a federal court in Florida soon, and the Texas Court has indicated that it will rule on the request for a final injunction by the end of August. Then, of course, the appeals will commence. Ultimately, it seems likely that the US Supreme Court will weigh in on the matter unless the political process stops the rule before it gets the chance. We expect several developments on this issue before the September 4, 2024, effective date of the non-compete rule, so stay tuned.</p>
-
-<p>As we noted in our discussion of the Texas decision, the consequences of non-compliance with the FTC non-compete rule appear to be limited. The FTC has authority to seek civil penalties of up to $10,000 per violation in response to violations of its rules concerning <em>unfair or deceptive acts or practices, but not with regard to unfair methods of competition</em>. The non-compete rule is expressly based on the FTC’s finding that non-competes are an <em>unfair method of competition</em>. That (likely) means that even if the non-compete rule goes into effect, the FTC would not be able to impose civil penalties against an employer unless and until it first issues an administrative complaint, holds a hearing, issues a cease and desist order, and that order becomes final (meaning that the time to appeal expired or that all appeals have been exhausted). At that time, if the employer violated the final cease and desist order, the FTC could then file a lawsuit asking a court to award it civil penalties. Employers with non-compete agreements should discuss these issues with their attorneys in order to make the best decisions possible in this dynamic environment.</p>
-
-<p>[<a href="https://www.mccarter.com/insights/ftc-wins-round-two-in-its-non-compete-ban-defense/" target="_blank">View source</a>.]</p>
 
 </div></div>]]></description>
         </item>
