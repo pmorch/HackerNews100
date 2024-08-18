@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 18 Aug 2024 08:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 18 Aug 2024 09:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Postmortem of my 9 year journey at Google (112 pts)]]></title>
+            <title><![CDATA[Postmortem of my 9 year journey at Google (114 pts)]]></title>
             <link>https://tinystruggles.com/posts/google_postmortem/</link>
             <guid>41278907</guid>
             <pubDate>Sat, 17 Aug 2024 23:30:00 GMT</pubDate>
@@ -155,7 +155,645 @@ Other things that appealed to me were the pay, the perks and fun international c
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FlightAware Leaks Customer Data (Name, Email Addresses and Passwords) (169 pts)]]></title>
+            <title><![CDATA[Build your own SQLite, Part 1: Listing tables (106 pts)]]></title>
+            <link>https://blog.sylver.dev/build-your-own-sqlite-part-1-listing-tables</link>
+            <guid>41278807</guid>
+            <pubDate>Sat, 17 Aug 2024 23:13:53 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.sylver.dev/build-your-own-sqlite-part-1-listing-tables">https://blog.sylver.dev/build-your-own-sqlite-part-1-listing-tables</a>, See on <a href="https://news.ycombinator.com/item?id=41278807">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="post-content-parent"><p>As developers, we use databases all the time. But how do they work? In this series, we'll try to answer that question by building our own SQLite-compatible database from scratch.</p>
+<p>Source code examples will be provided in Rust, but you are encouraged to follow along using your language of choice, as we won't be relying on many language-specific features or libraries.</p>
+<p>As an introduction, we'll implement the simplest version of the <code>tables</code> command, which lists the names of all the tables in a database. While this looks simple, we'll see that it requires us to make our first deep dive into the SQLite file format.</p>
+<p>The complete source code is available on <a target="_blank" href="https://github.com/geoffreycopin/rqlite/tree/16e2dbe95a420d1d88ad2555552c2072206d2308">Github</a>.</p>
+<h2 id="heading-building-the-test-database">Building the test database</h2>
+<p>To keep things as simple as possible, let's build a minimalistic test database:</p>
+<pre><code>sqlite3 minimal_test.db
+sqlite&gt; create table table1(id <span>integer</span>);
+sqlite&gt; create table table2(id <span>integer</span>);
+sqlite&gt; .<span>exit</span>
+</code></pre>
+<p>This creates a database with two tables, <code>table1</code> and <code>table2</code>, each with a single column, <code>id</code>. We can verify this by running the <code>tables</code> command in the SQLite shell:</p>
+<pre><code>sqlite3 minimal_test.db
+sqlite&gt; .tables
+table1  table2
+sqlite&gt; .<span>exit</span>
+</code></pre>
+<h2 id="heading-bootstrapping-the-project">Bootstrapping the project</h2>
+<p>Let's start by creating a new Rust project. We'll use the <code>cargo add</code> to add our only dependency for now, <code>anyhow</code>:</p>
+<pre><code>cargo new rsqlite
+<span>cd</span> rsqlite
+cargo add anyhow
+</code></pre>
+<h2 id="heading-the-sqlite-file-format">The SQLite file format</h2>
+<p><img loading="lazy" src="https://cdn.hashnode.com/res/hashnode/image/upload/v1721572171598/5c4195b6-5472-4ba1-826d-d8f5b6660527.png?auto=compress,format&amp;format=webp" alt=""></p>
+<p>SQLite databases are stored in a single file, the format of which is documented in the <a target="_blank" href="https://www.sqlite.org/fileformat.html">SQLite File Format Specification</a>. The file is divided into pages, with each page having the same size: a power of 2, between 512 and 65536 bytes. The first 100 bytes of the first page contain the database header, which includes information such as the page size and the file format version. In this first part, we'll only be interested in the page size. Pages can be of different types, but for this first article, we'll only be interested in <code>table btree leaf</code> pages, which store the actual table data.</p>
+<p>Our first task will be to implement a <code>Pager</code> struct that reads and caches pages from the database file. But before we do, we'll have to read the page size from the database header. Let's start by defining our <code>Header</code> struct:</p>
+<pre><code><span>// src/page.rs</span>
+<span>#[derive(Debug, Copy, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>DbHeader</span></span> {
+    <span>pub</span> page_size: <span>u32</span>,
+}
+</code></pre>
+<p>The header starts with the magic string <code>SQLite format 3\0</code>, followed by the page size encoded as a big-endian 2-byte integer at offset 16. With this information, we can implement a function that reads the header from a buffer:</p>
+<pre><code><span>// src/pager.rs</span>
+<span>pub</span> <span>const</span> HEADER_SIZE: <span>usize</span> = <span>100</span>;
+<span>const</span> HEADER_PREFIX: &amp;[<span>u8</span>] = <span>b"SQLite format 3\0"</span>;
+<span>const</span> HEADER_PAGE_SIZE_OFFSET: <span>usize</span> = <span>16</span>;
+
+<span>const</span> PAGE_MAX_SIZE: <span>u32</span> = <span>65536</span>;
+
+<span>pub</span> <span><span>fn</span> <span>parse_header</span></span>(buffer: &amp;[<span>u8</span>]) -&gt; anyhow::<span>Result</span>&lt;page::DbHeader&gt; {
+    <span>if</span> !buffer.starts_with(HEADER_PREFIX) {
+        <span>let</span> prefix = <span>String</span>::from_utf8_lossy(&amp;buffer[..HEADER_PREFIX.len()]);
+        anyhow::bail!(<span>"invalid header prefix: {prefix}"</span>);
+    }
+
+    <span>let</span> page_size_raw = read_be_word_at(buffer, HEADER_PAGE_SIZE_OFFSET);
+    <span>let</span> page_size = <span>match</span> page_size_raw {
+        <span>1</span> =&gt; PAGE_MAX_SIZE,
+        n <span>if</span> n.is_power_of_two() =&gt; n <span>as</span> <span>u32</span>,
+        _ =&gt; anyhow::bail!(<span>"page size is not a power of 2: {}"</span>, page_size_raw),
+    };
+
+    <span>Ok</span>(page::Header { page_size })
+}
+
+<span><span>fn</span> <span>read_be_word_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>u16</span> {
+    <span>u16</span>::from_be_bytes(input[offset..offset + <span>2</span>].try_into().unwrap())
+}
+</code></pre>
+<p>As the maximum page size cannot be represented as a 2-byte integer, a page size of 1 is use to represent the maximum page size.</p>
+
+<h2 id="heading-decoding-table-b-tree-leaf-pages">Decoding Table B-tree leaf pages</h2>
+<p><img loading="lazy" src="https://cdn.hashnode.com/res/hashnode/image/upload/v1721571943115/f84ad91d-d3a3-462e-8f2b-1b1975badb1a.png?auto=compress,format&amp;format=webp" alt=""></p>
+<p>Now that we have the minimum information we need to read pages from the disk, let's explore the content of a <code>table btree-leaf</code> page. <code>table btree-leaf</code> pages start with an 8-byte header, followed by an sequence of "cell pointers" containing the offset of every cell in the page. The cells contain the table data, and we can think of them as key-value pairs, where the key is a 64-bits integer encoded as a <a target="_blank" href="https://carlmastrangelo.com/blog/lets-make-a-varint">varint</a> (the <code>rowid</code>) and the value is an arbitrary sequence of bytes representing the row data. The header contains the following fields:</p>
+<ul>
+<li><p><code>page_type</code>: byte representing the page type. For <code>table btree-leaf</code> pages, this is 0x0D.</p>
+</li>
+<li><p><code>first_freeblock</code>: 2-byte integer representing the offset of the first free block in the page, or zero if there is no freeblock.</p>
+</li>
+<li><p><code>cell_count</code>: 2-byte integer representing the number of cells in the page.</p>
+</li>
+<li><p><code>cell_content_offset</code>: 2-byte integer representing the offset of the first cell.</p>
+</li>
+<li><p><code>fragmented_bytes_count</code>: 1-byte integer representing the number of fragmented free bytes in the page (we won't make use of it for now).</p>
+</li>
+</ul>
+<p>We'll start by defining a <code>Page</code> enum representing a parsed page, along with the necessary structs to represent the page header and the cell pointers:</p>
+<pre><code><span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>enum</span> <span>Page</span></span> {
+    TableLeaf(TableLeafPage),
+}
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>TableLeafPage</span></span> {
+    <span>pub</span> header: PageHeader,
+    <span>pub</span> cell_pointers: <span>Vec</span>&lt;<span>u16</span>&gt;,
+    <span>pub</span> cells: <span>Vec</span>&lt;TableLeafCell&gt;,
+}
+
+<span>#[derive(Debug, Copy, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>PageHeader</span></span> {
+    <span>pub</span> page_type: PageType,
+    <span>pub</span> first_freeblock: <span>u16</span>,
+    <span>pub</span> cell_count: <span>u16</span>,
+    <span>pub</span> cell_content_offset: <span>u32</span>,
+    <span>pub</span> fragmented_bytes_count: <span>u8</span>,
+}
+
+<span>#[derive(Debug, Copy, Clone)]</span>
+<span>pub</span> <span><span>enum</span> <span>PageType</span></span> {
+    TableLeaf,
+}
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>TableLeafCell</span></span> {
+    <span>pub</span> size: <span>i64</span>,
+    <span>pub</span> row_id: <span>i64</span>,
+    <span>pub</span> payload: <span>Vec</span>&lt;<span>u8</span>&gt;,
+}
+</code></pre>
+<p>The corresponding parsing functions are quite straightforward. Note the offset handling in <code>parse_page</code>: since the first page contains the database header, we start parsing the page at offset 100.</p>
+<pre><code><span>/// pager.rs</span>
+<span>const</span> PAGE_LEAF_HEADER_SIZE: <span>usize</span> = <span>8</span>;
+<span>const</span> PAGE_FIRST_FREEBLOCK_OFFSET: <span>usize</span> = <span>1</span>;
+<span>const</span> PAGE_CELL_COUNT_OFFSET: <span>usize</span> = <span>3</span>;
+<span>const</span> PAGE_CELL_CONTENT_OFFSET: <span>usize</span> = <span>5</span>;
+<span>const</span> PAGE_FRAGMENTED_BYTES_COUNT_OFFSET: <span>usize</span> = <span>7</span>;
+
+<span><span>fn</span> <span>parse_page</span></span>(buffer: &amp;[<span>u8</span>], page_num: <span>usize</span>) -&gt; anyhow::<span>Result</span>&lt;page::Page&gt; {
+    <span>let</span> ptr_offset = <span>if</span> page_num == <span>1</span> { HEADER_SIZE <span>as</span> <span>u16</span> } <span>else</span> { <span>0</span> };
+
+    <span>match</span> buffer[<span>0</span>] {
+        PAGE_LEAF_TABLE_ID =&gt; parse_table_leaf_page(buffer, ptr_offset),
+        _ =&gt; <span>Err</span>(anyhow::anyhow!(<span>"unknown page type: {}"</span>, buffer[<span>0</span>])),
+    }
+}
+
+<span><span>fn</span> <span>parse_table_leaf_page</span></span>(buffer: &amp;[<span>u8</span>], ptr_offset: <span>u16</span>) -&gt; anyhow::<span>Result</span>&lt;page::Page&gt; {
+    <span>let</span> header = parse_page_header(buffer)?;
+
+    <span>let</span> content_buffer = &amp;buffer[PAGE_LEAF_HEADER_SIZE..];
+    <span>let</span> cell_pointers = parse_cell_pointers(content_buffer, header.cell_count <span>as</span> <span>usize</span>, ptr_offset);
+
+    <span>let</span> cells = cell_pointers
+        .iter()
+        .map(|&amp;ptr| parse_table_leaf_cell(&amp;buffer[ptr <span>as</span> <span>usize</span>..]))
+        .collect::&lt;anyhow::<span>Result</span>&lt;<span>Vec</span>&lt;page::TableLeafCell&gt;&gt;&gt;()?;
+
+    <span>Ok</span>(page::Page::TableLeaf(page::TableLeafPage {
+        header,
+        cell_pointers,
+        cells,
+    }))
+}
+
+
+<span><span>fn</span> <span>parse_page_header</span></span>(buffer: &amp;[<span>u8</span>]) -&gt; anyhow::<span>Result</span>&lt;page::PageHeader&gt; {
+    <span>let</span> page_type = <span>match</span> buffer[<span>0</span>] {
+        <span>0x0d</span> =&gt; page::PageType::TableLeaf,
+        _ =&gt; anyhow::bail!(<span>"unknown page type: {}"</span>, buffer[<span>0</span>]),
+    };
+
+    <span>let</span> first_freeblock = read_be_word_at(buffer, PAGE_FIRST_FREEBLOCK_OFFSET);
+    <span>let</span> cell_count = read_be_word_at(buffer, PAGE_CELL_COUNT_OFFSET);
+    <span>let</span> cell_content_offset = <span>match</span> read_be_word_at(buffer, PAGE_CELL_CONTENT_OFFSET) {
+        <span>0</span> =&gt; <span>65536</span>,
+        n =&gt; n <span>as</span> <span>u32</span>,
+    };
+    <span>let</span> fragmented_bytes_count = buffer[PAGE_FRAGMENTED_BYTES_COUNT_OFFSET];
+
+    <span>Ok</span>(page::PageHeader {
+        page_type,
+        first_freeblock,
+        cell_count,
+        cell_content_offset,
+        fragmented_bytes_count,
+    })
+}
+
+
+<span><span>fn</span> <span>parse_cell_pointers</span></span>(buffer: &amp;[<span>u8</span>], n: <span>usize</span>, ptr_offset: <span>u16</span>) -&gt; <span>Vec</span>&lt;<span>u16</span>&gt; {
+    <span>let</span> <span>mut</span> pointers = <span>Vec</span>::with_capacity(n);
+    <span>for</span> i <span>in</span> <span>0</span>..n {
+        pointers.push(read_be_word_at(buffer, <span>2</span> * i) - ptr_offset);
+    }
+    pointers
+}
+
+<span><span>fn</span> <span>parse_table_leaf_cell</span></span>(<span>mut</span> buffer: &amp;[<span>u8</span>]) -&gt; anyhow::<span>Result</span>&lt;page::TableLeafCell&gt; {
+    <span>let</span> (n, size) = read_varint_at(buffer, <span>0</span>);
+    buffer = &amp;buffer[n <span>as</span> <span>usize</span>..];
+
+    <span>let</span> (n, row_id) = read_varint_at(buffer, <span>0</span>);
+    buffer = &amp;buffer[n <span>as</span> <span>usize</span>..];
+
+    <span>let</span> payload = buffer[..size <span>as</span> <span>usize</span>].to_vec();
+
+    <span>Ok</span>(page::TableLeafCell {
+        size,
+        row_id,
+        payload,
+    })
+}
+
+<span><span>fn</span> <span>read_varint_at</span></span>(buffer: &amp;[<span>u8</span>], <span>mut</span> offset: <span>usize</span>) -&gt; (<span>u8</span>, <span>i64</span>) {
+    <span>let</span> <span>mut</span> size = <span>0</span>;
+    <span>let</span> <span>mut</span> result = <span>0</span>;
+
+    <span>while</span> size &lt; <span>8</span> &amp;&amp; buffer[offset] &gt;= <span>0b1000_0000</span> {
+        result |= ((buffer[offset] <span>as</span> <span>i64</span>) &amp; <span>0b0111_1111</span>) &lt;&lt; (<span>7</span> * size);
+        offset += <span>1</span>;
+        size += <span>1</span>;
+    }
+
+    result |= (buffer[offset] <span>as</span> <span>i64</span>) &lt;&lt; (<span>7</span> * size);
+
+    (size + <span>1</span>, result)
+}
+</code></pre>
+<p>To read a varint, we copy the 7 least significant bits of each byte to the result, as long as the most significant bit is set. As the maximum length of a varint is 9 bytes, we stop after reading 8 bytes to avoid potential overflows.</p>
+<p>We can finally implement the pager itself. For now, it only loads and caches pages without any eviction policy:</p>
+<pre><code><span>// pager.rs</span>
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>Pager</span></span>&lt;I: Read + Seek = std::fs::File&gt; {
+    input: I,
+    page_size: <span>usize</span>,
+    pages: HashMap&lt;<span>usize</span>, page::Page&gt;,
+}
+
+<span>impl</span>&lt;I: Read + Seek&gt; Pager&lt;I&gt; {
+    <span>pub</span> <span><span>fn</span> <span>new</span></span>(input: I, page_size: <span>usize</span>) -&gt; <span>Self</span> {
+        <span>Self</span> {
+            input,
+            page_size,
+            pages: HashMap::new(),
+        }
+    }
+
+    <span>pub</span> <span><span>fn</span> <span>read_page</span></span>(&amp;<span>mut</span> <span>self</span>, n: <span>usize</span>) -&gt; anyhow::<span>Result</span>&lt;&amp;page::Page&gt; {
+        <span>if</span> <span>self</span>.pages.contains_key(&amp;n) {
+            <span>return</span> <span>Ok</span>(<span>self</span>.pages.get(&amp;n).unwrap());
+        }
+
+        <span>let</span> page = <span>self</span>.load_page(n)?;
+        <span>self</span>.pages.insert(n, page);
+        <span>Ok</span>(<span>self</span>.pages.get(&amp;n).unwrap())
+    }
+
+    <span><span>fn</span> <span>load_page</span></span>(&amp;<span>mut</span> <span>self</span>, n: <span>usize</span>) -&gt; anyhow::<span>Result</span>&lt;page::Page&gt; {
+        <span>let</span> offset = HEADER_SIZE + n.saturating_sub(<span>1</span>) * <span>self</span>.page_size;
+
+        <span>self</span>.input
+            .seek(SeekFrom::Start(offset <span>as</span> <span>u64</span>))
+            .context(<span>"seek to page start"</span>)?;
+
+        <span>let</span> <span>mut</span> buffer = <span>vec!</span>[<span>0</span>; <span>self</span>.page_size];
+        <span>self</span>.input.read_exact(&amp;<span>mut</span> buffer).context(<span>"read page"</span>)?;
+
+        parse_page(&amp;buffer, n)
+    }
+}
+</code></pre>
+<h2 id="heading-records">Records</h2>
+<p><img loading="lazy" src="https://cdn.hashnode.com/res/hashnode/image/upload/v1721683662504/a35ea5c9-4215-4385-9dc3-3c7779f8af0b.png?auto=compress,format&amp;format=webp" alt=""></p>
+<p>We now have a way to read pages, and to access the pages cells. But how to decode the values of the cells? Each cell contains the value of a row in the table, encoded using the <a target="_blank" href="https://www.sqlite.org/fileformat2.html#record_format">SQLite record format</a>. The record format is quite simple: a record consists of a header, followed by a sequence of field values. The header starts with a varint representing the byte size of the headerm followed by a sequence of varints -one per column- determining the type of each column according to the following table:</p>
+<ul>
+<li><p>0: NULL</p>
+</li>
+<li><p>1: 8-bits signed integer</p>
+</li>
+<li><p>2: 16-bits signed integer</p>
+</li>
+<li><p>3: 24-bits signed integer</p>
+</li>
+<li><p>4: 32-bits signed integer</p>
+</li>
+<li><p>5: 48-bits signed integer</p>
+</li>
+<li><p>6: 64-bits signed integer</p>
+</li>
+<li><p>7: 64-bits IEEE floating point number</p>
+</li>
+<li><p>8: value is the integer 0</p>
+</li>
+<li><p>9: value is the integer 1</p>
+</li>
+<li><p>10 &amp; 11: reserved for internal use</p>
+</li>
+<li><p>n with n even and n &gt; 12: BLOB of size (n - 12) / 2</p>
+</li>
+<li><p>n with n odd and n &gt; 13: text of size (n - 13) / 2</p>
+</li>
+</ul>
+<p>We now have all the informations we need to parse and represent record's headers:</p>
+<pre><code><span>// src/cursor.rs</span>
+<span>#[derive(Debug, Copy, Clone)]</span>
+<span>pub</span> <span><span>enum</span> <span>RecordFieldType</span></span> {
+    Null,
+    I8,
+    I16,
+    I24,
+    I32,
+    I48,
+    I64,
+    Float,
+    Zero,
+    One,
+    <span>String</span>,
+    Blob,
+}
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>RecordField</span></span> {
+    <span>pub</span> offset: <span>usize</span>,
+    <span>pub</span> field_type: RecordFieldType,
+}
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>struct</span> <span>RecordHeader</span></span> {
+    <span>pub</span> fields: <span>Vec</span>&lt;RecordField&gt;,
+}
+
+<span><span>fn</span> <span>parse_record_header</span></span>(<span>mut</span> buffer: &amp;[<span>u8</span>]) -&gt; anyhow::<span>Result</span>&lt;RecordHeader&gt; {
+    <span>let</span> (varint_size, header_length) = crate::pager::read_varint_at(buffer, <span>0</span>);
+    buffer = &amp;buffer[varint_size <span>as</span> <span>usize</span>..header_length <span>as</span> <span>usize</span>];
+
+    <span>let</span> <span>mut</span> fields = <span>Vec</span>::new();
+    <span>let</span> <span>mut</span> current_offset = header_length <span>as</span> <span>usize</span>;
+
+    <span>while</span> !buffer.is_empty() {
+        <span>let</span> (discriminant_size, discriminant) = crate::pager::read_varint_at(buffer, <span>0</span>);
+        buffer = &amp;buffer[discriminant_size <span>as</span> <span>usize</span>..];
+
+        <span>let</span> (field_type, field_size) = <span>match</span> discriminant {
+            <span>0</span> =&gt; (RecordFieldType::Null, <span>0</span>),
+            <span>1</span> =&gt; (RecordFieldType::I8, <span>1</span>),
+            <span>2</span> =&gt; (RecordFieldType::I16, <span>2</span>),
+            <span>3</span> =&gt; (RecordFieldType::I24, <span>3</span>),
+            <span>4</span> =&gt; (RecordFieldType::I32, <span>4</span>),
+            <span>5</span> =&gt; (RecordFieldType::I48, <span>6</span>),
+            <span>6</span> =&gt; (RecordFieldType::I64, <span>8</span>),
+            <span>7</span> =&gt; (RecordFieldType::Float, <span>8</span>),
+            <span>8</span> =&gt; (RecordFieldType::Zero, <span>0</span>),
+            <span>9</span> =&gt; (RecordFieldType::One, <span>0</span>),
+            n <span>if</span> n &gt;= <span>12</span> &amp;&amp; n % <span>2</span> == <span>0</span> =&gt; {
+                <span>let</span> size = ((n - <span>12</span>) / <span>2</span>) <span>as</span> <span>usize</span>;
+                (RecordFieldType::Blob(size), size)
+            }
+            n <span>if</span> n &gt;= <span>13</span> &amp;&amp; n % <span>2</span> == <span>1</span> =&gt; {
+                <span>let</span> size = ((n - <span>13</span>) / <span>2</span>) <span>as</span> <span>usize</span>;
+                (RecordFieldType::<span>String</span>(size), size)
+            }
+            n =&gt; anyhow::bail!(<span>"unsupported field type: {}"</span>, n),
+        };
+
+        fields.push(RecordField {
+            offset: current_offset,
+            field_type,
+        });
+
+        current_offset += field_size;
+    }
+
+    <span>Ok</span>(RecordHeader { fields })
+}
+</code></pre>
+<p>To make it easier to work with records, we'll define a <code>Value</code> type, representing field values and a <code>Cursor</code> struct that uniquely identifies a record within a database file. The <code>Cursor</code> will expose a <code>field</code> method, returning the value of the record's n-th field:</p>
+<pre><code><span>// src/value.rs</span>
+<span>use</span> std::borrow::Cow;
+
+<span>#[derive(Debug, Clone)]</span>
+<span>pub</span> <span><span>enum</span> <span>Value</span></span>&lt;<span>'p</span>&gt; {
+    Null,
+    <span>String</span>(Cow&lt;<span>'p</span>, <span>str</span>&gt;),
+    Blob(Cow&lt;<span>'p</span>, [<span>u8</span>]&gt;),
+    Int(<span>i64</span>),
+    Float(<span>f64</span>),
+}
+
+<span>impl</span>&lt;<span>'p</span>&gt; Value&lt;<span>'p</span>&gt; {
+    <span>pub</span> <span><span>fn</span> <span>as_str</span></span>(&amp;<span>self</span>) -&gt; <span>Option</span>&lt;&amp;<span>str</span>&gt; {
+        <span>if</span> <span>let</span> Value::<span>String</span>(s) = <span>self</span> {
+            <span>Some</span>(s.as_ref())
+        } <span>else</span> {
+            <span>None</span>
+        }
+    }
+}
+</code></pre>
+<pre><code><span>// src/cursor.rs</span>
+<span>#[derive(Debug)]</span>
+<span>pub</span> <span><span>struct</span> <span>Cursor</span></span>&lt;<span>'p</span>&gt; {
+    header: RecordHeader,
+    pager: &amp;<span>'p</span> <span>mut</span> Pager,
+    page_index: <span>usize</span>,
+    page_cell: <span>usize</span>,
+}
+
+<span>impl</span>&lt;<span>'p</span>&gt; Cursor&lt;<span>'p</span>&gt; {
+    <span>pub</span> <span><span>fn</span> <span>field</span></span>(&amp;<span>mut</span> <span>self</span>, n: <span>usize</span>) -&gt; <span>Option</span>&lt;Value&gt; {
+        <span>let</span> record_field = <span>self</span>.header.fields.get(n)?;
+
+        <span>let</span> payload = <span>match</span> <span>self</span>.pager.read_page(<span>self</span>.page_index) {
+            <span>Ok</span>(Page::TableLeaf(leaf)) =&gt; &amp;leaf.cells[<span>self</span>.page_cell].payload,
+            _ =&gt; <span>return</span> <span>None</span>,
+        };
+
+        <span>match</span> record_field.field_type {
+            RecordFieldType::Null =&gt; <span>Some</span>(Value::Null),
+            RecordFieldType::I8 =&gt; <span>Some</span>(Value::Int(read_i8_at(payload, record_field.offset))),
+            RecordFieldType::I16 =&gt; <span>Some</span>(Value::Int(read_i16_at(payload, record_field.offset))),
+            RecordFieldType::I24 =&gt; <span>Some</span>(Value::Int(read_i24_at(payload, record_field.offset))),
+            RecordFieldType::I32 =&gt; <span>Some</span>(Value::Int(read_i32_at(payload, record_field.offset))),
+            RecordFieldType::I48 =&gt; <span>Some</span>(Value::Int(read_i48_at(payload, record_field.offset))),
+            RecordFieldType::I64 =&gt; <span>Some</span>(Value::Int(read_i64_at(payload, record_field.offset))),
+            RecordFieldType::Float =&gt; <span>Some</span>(Value::Float(read_f64_at(payload, record_field.offset))),
+            RecordFieldType::<span>String</span>(length) =&gt; {
+                <span>let</span> value = std::<span>str</span>::from_utf8(
+                    &amp;payload[record_field.offset..record_field.offset + length],
+                ).expect(<span>"invalid utf8"</span>);
+                <span>Some</span>(Value::<span>String</span>(Cow::Borrowed(value)))
+            }
+            RecordFieldType::Blob(length) =&gt; {
+                <span>let</span> value = &amp;payload[record_field.offset..record_field.offset + length];
+                <span>Some</span>(Value::Blob(Cow::Borrowed(value)))
+            }
+            _ =&gt; <span>panic!</span>(<span>"unimplemented"</span>),
+        }
+    }
+}
+
+<span><span>fn</span> <span>read_i8_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    input[offset] <span>as</span> <span>i64</span>
+}
+
+<span><span>fn</span> <span>read_i16_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    <span>i16</span>::from_be_bytes(input[offset..offset + <span>2</span>].try_into().unwrap()) <span>as</span> <span>i64</span>
+}
+
+<span><span>fn</span> <span>read_i24_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    (<span>i32</span>::from_be_bytes(input[offset..offset + <span>3</span>].try_into().unwrap()) &amp; <span>0x00FFFFFF</span>) <span>as</span> <span>i64</span>
+}
+
+<span><span>fn</span> <span>read_i32_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    <span>i32</span>::from_be_bytes(input[offset..offset + <span>4</span>].try_into().unwrap()) <span>as</span> <span>i64</span>
+}
+
+<span><span>fn</span> <span>read_i48_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    <span>i64</span>::from_be_bytes(input[offset..offset + <span>6</span>].try_into().unwrap()) &amp; <span>0x0000FFFFFFFFFFFF</span>
+}
+
+<span><span>fn</span> <span>read_i64_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>i64</span> {
+    <span>i64</span>::from_be_bytes(input[offset..offset + <span>8</span>].try_into().unwrap())
+}
+
+<span><span>fn</span> <span>read_f64_at</span></span>(input: &amp;[<span>u8</span>], offset: <span>usize</span>) -&gt; <span>f64</span> {
+    <span>f64</span>::from_be_bytes(input[offset..offset + <span>8</span>].try_into().unwrap())
+}
+</code></pre>
+<p>To simplify iteration over a page's records, we'll also implement a <code>Scanner</code> struct that wraps a page and allows us to get a <code>Cursor</code> for each record:</p>
+<pre><code><span>// src/cursor.rs</span>
+<span>#[derive(Debug)]</span>
+<span>pub</span> <span><span>struct</span> <span>Scanner</span></span>&lt;<span>'p</span>&gt; {
+    pager: &amp;<span>'p</span> <span>mut</span> Pager,
+    page: <span>usize</span>,
+    cell: <span>usize</span>,
+}
+
+<span>impl</span>&lt;<span>'p</span>&gt; Scanner&lt;<span>'p</span>&gt; {
+    <span>pub</span> <span><span>fn</span> <span>new</span></span>(pager: &amp;<span>'p</span> <span>mut</span> Pager, page: <span>usize</span>) -&gt; Scanner&lt;<span>'p</span>&gt; {
+        Scanner {
+            pager,
+            page,
+            cell: <span>0</span>,
+        }
+    }
+    <span>pub</span> <span><span>fn</span> <span>next_record</span></span>(&amp;<span>mut</span> <span>self</span>) -&gt; <span>Option</span>&lt;anyhow::<span>Result</span>&lt;Cursor&gt;&gt; {
+        <span>let</span> page = <span>match</span> <span>self</span>.pager.read_page(<span>self</span>.page) {
+            <span>Ok</span>(page) =&gt; page,
+            <span>Err</span>(e) =&gt; <span>return</span> <span>Some</span>(<span>Err</span>(e)),
+        };
+
+        <span>match</span> page {
+            Page::TableLeaf(leaf) =&gt; {
+                <span>let</span> cell = leaf.cells.get(<span>self</span>.cell)?;
+
+                <span>let</span> header = <span>match</span> parse_record_header(&amp;cell.payload) {
+                    <span>Ok</span>(header) =&gt; header,
+                    <span>Err</span>(e) =&gt; <span>return</span> <span>Some</span>(<span>Err</span>(e)),
+                };
+
+                <span>let</span> record = Cursor {
+                    header,
+                    pager: <span>self</span>.pager,
+                    page_index: <span>self</span>.page,
+                    page_cell: <span>self</span>.cell,
+                };
+
+                <span>self</span>.cell += <span>1</span>;
+
+                <span>Some</span>(<span>Ok</span>(record))
+            }
+        }
+    }
+}
+</code></pre>
+<h2 id="heading-table-descriptions">Table descriptions</h2>
+<p>With most of the leg work out of the way, we can get back to our original goal: listing tables. SQLite stores the schema of a database in a special table called <code>sqlite_master</code>. The schema for the <code>sqlite_master</code> table is as follows:</p>
+<pre><code><span>CREATE</span> <span>TABLE</span> sqlite_schema(
+  <span>type</span> <span>text</span>,
+  <span>name</span> <span>text</span>,
+  tbl_name <span>text</span>,
+  rootpage <span>integer</span>,
+  <span>sql</span> <span>text</span>
+);
+</code></pre>
+<p>Theses columns are used as follows:</p>
+<ul>
+<li><p><code>type</code>: the type of the schema object. For tables, this will always be <code>table</code>.</p>
+</li>
+<li><p><code>name</code>: the name of the schema object.</p>
+</li>
+<li><p><code>tbl_name</code>: the name of the table the schema object is associated with. In the case of tables, this will be the same as <code>name</code>.</p>
+</li>
+<li><p><code>rootpage</code>: root page of the table, we'll use it later to read the table's content.</p>
+</li>
+<li><p><code>sql</code>: the SQL statement used to create the table.</p>
+</li>
+</ul>
+<p>Since our simple database only handles basic schemas for now, we can assume that the entire schema fits in the first page of our database file. In order to list the tables in the database, we'll need to:</p>
+<ul>
+<li><p>initialize the pager with the database file</p>
+</li>
+<li><p>create a <code>Scanner</code> for the first page</p>
+</li>
+<li><p>iterate over the records, and print the value of the <code>name</code> field (at index 1) for each record.</p>
+</li>
+</ul>
+<p>First, we'll define a <code>Db</code> struct to hold our global state:</p>
+<pre><code><span>// src/db.rs</span>
+<span>use</span> std::{io::Read, path::Path};
+
+<span>use</span> anyhow::Context;
+
+<span>use</span> crate::{cursor::Scanner, page::DbHeader, pager, pager::Pager};
+
+<span>pub</span> <span><span>struct</span> <span>Db</span></span> {
+    <span>pub</span> header: DbHeader,
+    pager: Pager,
+}
+
+<span>impl</span> Db {
+    <span>pub</span> <span><span>fn</span> <span>from_file</span></span>(filename: <span>impl</span> <span>AsRef</span>&lt;Path&gt;) -&gt; anyhow::<span>Result</span>&lt;Db&gt; {
+        <span>let</span> <span>mut</span> file = std::fs::File::open(filename.as_ref()).context(<span>"open db file"</span>)?;
+
+        <span>let</span> <span>mut</span> header_buffer = [<span>0</span>; pager::HEADER_SIZE];
+        file.read_exact(&amp;<span>mut</span> header_buffer)
+            .context(<span>"read db header"</span>)?;
+
+        <span>let</span> header = pager::parse_header(&amp;header_buffer).context(<span>"parse db header"</span>)?;
+
+        <span>let</span> pager = Pager::new(file, header.page_size <span>as</span> <span>usize</span>);
+
+        <span>Ok</span>(Db { header, pager })
+    }
+
+    <span>pub</span> <span><span>fn</span> <span>scanner</span></span>(&amp;<span>mut</span> <span>self</span>, page: <span>usize</span>) -&gt; Scanner {
+        Scanner::new(&amp;<span>mut</span> <span>self</span>.pager, page)
+    }
+}
+</code></pre>
+<p>The implementation of a basic REPL supporting the <code>tables</code> and <code>tables</code> commands is straightforward:</p>
+<pre><code><span>use</span> std::io::{stdin, BufRead, Write};
+
+<span>use</span> anyhow::Context;
+
+<span>mod</span> cursor;
+<span>mod</span> db;
+<span>mod</span> page;
+<span>mod</span> pager;
+<span>mod</span> value;
+
+<span><span>fn</span> <span>main</span></span>() -&gt; anyhow::<span>Result</span>&lt;()&gt; {
+    <span>let</span> database = db::Db::from_file(std::env::args().nth(<span>1</span>).context(<span>"missing db file"</span>)?)?;
+    cli(database)
+}
+
+<span><span>fn</span> <span>cli</span></span>(<span>mut</span> db: db::Db) -&gt; anyhow::<span>Result</span>&lt;()&gt; {
+    print_flushed(<span>"rqlite&gt; "</span>)?;
+
+    <span>let</span> <span>mut</span> line_buffer = <span>String</span>::new();
+
+    <span>while</span> stdin().lock().read_line(&amp;<span>mut</span> line_buffer).is_ok() {
+        <span>match</span> line_buffer.trim() {
+            <span>".exit"</span> =&gt; <span>break</span>,
+            <span>".tables"</span> =&gt; display_tables(&amp;<span>mut</span> db)?,
+            _ =&gt; {
+                <span>println!</span>(<span>"Unrecognized command '{}'"</span>, line_buffer.trim());
+            }
+        }
+
+        print_flushed(<span>"\nrqlite&gt; "</span>)?;
+
+        line_buffer.clear();
+    }
+
+    <span>Ok</span>(())
+}
+
+<span><span>fn</span> <span>display_tables</span></span>(db: &amp;<span>mut</span> db::Db) -&gt; anyhow::<span>Result</span>&lt;()&gt; {
+    <span>let</span> <span>mut</span> scanner = db.scanner(<span>1</span>);
+
+    <span>while</span> <span>let</span> <span>Some</span>(<span>Ok</span>(<span>mut</span> record)) = scanner.next_record() {
+        <span>let</span> type_value = record
+            .field(<span>0</span>)
+            .context(<span>"missing type field"</span>)
+            .context(<span>"invalid type field"</span>)?;
+
+        <span>if</span> type_value.as_str() == <span>Some</span>(<span>"table"</span>) {
+            <span>let</span> name_value = record
+                .field(<span>1</span>)
+                .context(<span>"missing name field"</span>)
+                .context(<span>"invalid name field"</span>)?;
+
+            <span>print!</span>(<span>"{} "</span>, name_value.as_str().unwrap());
+        }
+    }
+
+    <span>Ok</span>(())
+}
+
+<span><span>fn</span> <span>print_flushed</span></span>(s: &amp;<span>str</span>) -&gt; anyhow::<span>Result</span>&lt;()&gt; {
+    <span>print!</span>(<span>"{}"</span>, s);
+    std::io::stdout().flush().context(<span>"flush stdout"</span>)
+}
+</code></pre>
+<h2 id="heading-conclusion">Conclusion</h2>
+<p>The first part of our SQLite-compatible database is now complete. We can read the database header, parse table btree-leaf pages and decode records, but we still have a long way to go before we can support rich queries. In the next part, we'll learn how to parse the SQL language and make our first strides towards implementing the <code>SELECT</code> statement!</p>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[FlightAware Leaks Customer Data (Name, Email Addresses and Passwords) (179 pts)]]></title>
             <link>https://loyaltylobby.com/2024/08/16/flightaware-leaks-customer-data-name-email-addresses-passwords/</link>
             <guid>41277429</guid>
             <pubDate>Sat, 17 Aug 2024 19:54:12 GMT</pubDate>
@@ -163,7 +801,7 @@ Other things that appealed to me were the pay, the perks and fun international c
 Couldn't get https://loyaltylobby.com/2024/08/16/flightaware-leaks-customer-data-name-email-addresses-passwords/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Are you better than a language model at predicting the next word? (148 pts)]]></title>
+            <title><![CDATA[Are you better than a language model at predicting the next word? (154 pts)]]></title>
             <link>https://joel.tools/smarter/</link>
             <guid>41277179</guid>
             <pubDate>Sat, 17 Aug 2024 19:21:52 GMT</pubDate>
@@ -191,7 +829,7 @@ But how good are you at the quintessential language model task of predicting the
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[mpv a free, open-source, and cross-platform media player (637 pts)]]></title>
+            <title><![CDATA[mpv a free, open-source, and cross-platform media player (674 pts)]]></title>
             <link>https://mpv.io/</link>
             <guid>41277014</guid>
             <pubDate>Sat, 17 Aug 2024 18:56:36 GMT</pubDate>
@@ -286,7 +924,7 @@ Post a patch or request it!
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Blockbuster Video VHS insert template (239 pts)]]></title>
+            <title><![CDATA[Blockbuster Video VHS insert template (245 pts)]]></title>
             <link>https://github.com/rfinnie/blockbuster</link>
             <guid>41276605</guid>
             <pubDate>Sat, 17 Aug 2024 18:09:49 GMT</pubDate>
@@ -320,7 +958,7 @@ Post a patch or request it!
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Magic Wormhole: get things from one computer to another, safely (536 pts)]]></title>
+            <title><![CDATA[Magic Wormhole: get things from one computer to another, safely (557 pts)]]></title>
             <link>https://github.com/magic-wormhole/magic-wormhole</link>
             <guid>41275920</guid>
             <pubDate>Sat, 17 Aug 2024 16:59:47 GMT</pubDate>
@@ -365,7 +1003,7 @@ versions up to 3.12).</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Flaw has Microsoft Authenticator overwriting MFA accounts, locking users out (225 pts)]]></title>
+            <title><![CDATA[Flaw has Microsoft Authenticator overwriting MFA accounts, locking users out (235 pts)]]></title>
             <link>https://www.csoonline.com/article/3480918/design-flaw-has-microsoft-authenticator-overwriting-mfa-accounts-locking-users-out.html</link>
             <guid>41275846</guid>
             <pubDate>Sat, 17 Aug 2024 16:51:34 GMT</pubDate>
@@ -559,7 +1197,7 @@ versions up to 3.12).</p>
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Alien – CUDA-powered artificial life simulation program (190 pts)]]></title>
+            <title><![CDATA[Alien – CUDA-powered artificial life simulation program (198 pts)]]></title>
             <link>https://github.com/chrxh/alien</link>
             <guid>41275759</guid>
             <pubDate>Sat, 17 Aug 2024 16:41:21 GMT</pubDate>
@@ -765,7 +1403,7 @@ If the conditions are met and the error still occurs, please start ALIEN with th
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[pg_duckdb: Splicing Duck and Elephant DNA (115 pts)]]></title>
+            <title><![CDATA[pg_duckdb: Splicing Duck and Elephant DNA (118 pts)]]></title>
             <link>https://motherduck.com/blog/pg_duckdb-postgresql-extension-for-duckdb-motherduck/</link>
             <guid>41275751</guid>
             <pubDate>Sat, 17 Aug 2024 16:40:13 GMT</pubDate>
@@ -791,7 +1429,7 @@ If the conditions are met and the error still occurs, please start ALIEN with th
 </ul><p>Check out the <a href="https://github.com/duckdb/pg_duckdb">repository</a> today. We are excited to build this in the open and embrace contributions, feedback, and suggestions from everybody. As they say, “if you want to go far, go together.” We recognize that there are a lot of technical challenges ahead, and we welcome help and guidance on the project.</p><p>Also, please share your feedback with us on the MotherDuck <a href="https://slack.motherduck.com/">Slack</a>! If you’d like to discuss your use case in more detail, please connect with us - we’d love to learn more about what you’re building.</p></section></div><div><div><h6>CONTENT</h6><ol></ol></div><div><p>Subscribe to MotherDuck Blog</p><form><div><p><label for="subscribe_md_emails">Also subscribe to other MotherDuck updates</label></p></div></form></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[X says it is closing operations in Brazil due to judge's content orders (281 pts)]]></title>
+            <title><![CDATA[X says it is closing operations in Brazil due to judge's content orders (286 pts)]]></title>
             <link>https://www.reuters.com/technology/x-close-operations-brazil-effective-immediately-2024-08-17/</link>
             <guid>41275600</guid>
             <pubDate>Sat, 17 Aug 2024 16:20:19 GMT</pubDate>
@@ -799,7 +1437,7 @@ If the conditions are met and the error still occurs, please start ALIEN with th
 Couldn't get https://www.reuters.com/technology/x-close-operations-brazil-effective-immediately-2024-08-17/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Do we need to pay billions in fees to Stripe, Block, PayPal and Visa/MC? (186 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Do we need to pay billions in fees to Stripe, Block, PayPal and Visa/MC? (189 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=41275342</link>
             <guid>41275342</guid>
             <pubDate>Sat, 17 Aug 2024 15:45:43 GMT</pubDate>
@@ -1444,7 +2082,7 @@ its tens of billions spread across a bunch of different organizations, honestly 
 <div id="readability-page-1" class="page"><div><article id="content"><div><div><div><h2>Ex-Google CEO says successful AI startups can steal IP and hire lawyers to ‘clean up the mess’</h2><p><span><span> / </span><h2>“But if nobody uses your product, it doesn’t matter that you stole all the content,” Eric Schmidt said during a recent talk at Stanford that has been taken offline.</h2></span></p></div><div><p><span>By</span> <span><span></span> <span><a href="https://www.theverge.com/authors/alex-heath">Alex Heath</a></span><span>, <span>a deputy editor and author of the <i><a href="https://www.theverge.com/command-line-newsletter">Command Line </a></i>newsletter. He has over a decade of experience covering the tech industry.</span></span></span></p><p><time datetime="2024-08-15T00:00:24.437Z"> <!-- -->Aug 15, 2024, 12:00 AM UTC</time></p><div><h2>Share this story</h2></div></div></div><div><figure><span><span></span><img alt="Collision 2022 - Day Two" sizes="(max-width: 768px) calc(100vw - 100px), (max-width: 1180px) 700px, 600px" srcset="https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/16x11/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 16w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/32x21/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 32w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/48x32/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 48w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/64x43/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 64w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/96x64/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 96w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/128x85/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 128w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/256x171/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 256w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/376x251/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 376w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/384x256/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 384w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/415x277/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 415w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/480x320/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 480w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/540x360/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 540w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/640x427/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 640w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/750x500/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 750w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/828x552/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 828w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/1080x720/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 1080w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/1200x800/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 1200w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/1440x960/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 1440w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/1920x1280/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 1920w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/2048x1365/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 2048w, https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/2400x1600/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg 2400w" src="https://duet-cdn.vox-cdn.com/thumbor/0x0:7496x5379/2400x1600/filters:focal(3909x2019:3910x2020):format(webp)/cdn.vox-cdn.com/uploads/chorus_asset/file/25572964/1241460753.jpg" decoding="async" data-nimg="responsive"></span><div><figcaption><em>Eric Schmidt.</em></figcaption> <p><cite>Photo By Lukas Schulze/Sportsfile for Collision via Getty Images</cite></p></div></figure></div></div><div><div><p>Former Google CEO and chairman Eric Schmidt has made headlines for saying that Google was blindsided by the early the rise of ChatGPT because its employees decided that <a href="https://www.theverge.com/2024/8/13/24219912/googles-former-ceo-on-why-the-company-was-caught-off-guard-by-openai">“working from home was more important than winning.”</a></p><p>The comment was made in front of Stanford students during a recent interview, video of which was removed from the university’s YouTube channel after Schmidt’s gaffe was widely picked up by the press. I managed to watch most of Schmidt’s chat with Stanford’s Erik Brynjolfsson before it was taken down, however, and something else he said stands out. (You can still <a href="https://github.com/ociubotaru/transcripts/blob/main/Stanford_ECON295%E2%A7%B8CS323_I_2024_I_The_Age_of_AI%2C_Eric_Schmidt.txt">read the full transcript here</a>.)</p><p>While talking about a future world in which AI agents can do complex tasks on behalf of humans, Schmidt says:</p><div><blockquote><p>If TikTok is banned, here’s what I propose each and every one of you do: Say to your LLM the following: “Make me a copy of TikTok, steal all the users, steal all the music, put my preferences in it, produce this program in the next 30 seconds, release it, and in one hour, if it’s not viral, do something different along the same lines.”</p><p>That’s the command. Boom, boom, boom, boom.</p></blockquote></div><p>A bit later, Schmidt returns to his TikTok example and says:</p><div><blockquote><p>So, in the example that I gave of the TikTok competitor — and by the way, I was not arguing that you should illegally steal everybody’s music — what you would do if you’re a Silicon Valley entrepreneur, which hopefully all of you will be, is if it took off, then you’d hire a whole bunch of lawyers to go clean the mess up, right? But if nobody uses your product, it doesn’t matter that you stole all the content.</p><p>And do not quote me.</p></blockquote></div><p>At this point, Brynjolfsson points out that, “You’re on camera,” to which Schmidt responds:</p><div><blockquote><p>Yeah, that’s right. But you see my point. In other words, Silicon Valley will run these tests and clean up the mess. And that’s typically how those things are done.</p></blockquote></div><p>While Schmidt stepped away from his chairman role at Google in 2015, he remains influential in Silicon Valley and a prolific investor in startups. During this same talk at Stanford, he touts his investment in the AI startup Mistral and being “a licensed arms dealer” to the US military. He also calls Sam Altman “a close friend,” and recalls a recent dinner he had with Elon Musk while praising what the Tesla CEO “gets out of people” who work for him.</p><p>I emailed Schmidt and Brynjolfsson requesting comment about the removal of their chat from YouTube and haven’t heard back yet. Schmidt earlier <a href="https://www.wsj.com/tech/ai/google-eric-schmidt-ai-remote-work-stanford-f92f4ca5">told <em>The Wall Street Journal</em></a><em> </em>that he “misspoke about Google and their work hours” and requested the video be taken down.</p><div><form><div><h2>Command Line</h2><p> / <span>A newsletter from Alex Heath about the tech industry’s inside conversation.</span></p></div></form></div></div><div><p>Most Popular</p><p>Most Popular</p><ol><li><a href="https://www.theverge.com/2024/8/16/24221826/olympics-paris-what-happened-air-conditioning-heat"><h2>What happened to all the temporary air conditioning units at the Olympic Village?</h2></a><hr></li><li><a href="https://www.theverge.com/2024/8/16/24221353/eric-schmidt-says-the-quiet-part-out-loud"><h2>Eric Schmidt says the quiet part out loud</h2></a><hr></li><li><a href="https://www.theverge.com/2024/8/16/24221721/gemini-google-pixel-apple-app-pricing-tv-shootout-vergecast"><h2>Gemini is taking over Google</h2></a><hr></li><li><a href="https://www.theverge.com/2024/8/16/24221755/google-team-pixel-reviews-influencers"><h2>Google threatened tech influencers unless they ‘preferred’ the Pixel</h2></a><hr></li><li><a href="https://www.theverge.com/24220359/google-pixel-9-camera-bar-small-phones-claude-zellweger-interview"><h2>Google’s head of Pixel 9 design won’t apologize for its big, beautiful camera bump</h2></a><hr></li></ol></div></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[An unordered list of things I miss in Go (115 pts)]]></title>
+            <title><![CDATA[An unordered list of things I miss in Go (121 pts)]]></title>
             <link>https://kokada.capivaras.dev/blog/an-unordered-list-of-things-i-miss-in-go/</link>
             <guid>41274850</guid>
             <pubDate>Sat, 17 Aug 2024 14:28:47 GMT</pubDate>
@@ -1683,7 +2321,7 @@ about the possibility of this feature is still ongoing.</p>
 <div id="readability-page-1" class="page"><div><div><p><time datetime="2024-08-08T13:25:33.183Z"> <!-- -->Aug 8th 2024</time><span>|</span><span>Shanghai</span></p></div><section data-body-id="cp2"><p data-component="falseparagraph"><span data-caps="initial">M</span><small>ost news </small>on China’s manufacturers is bad news for rivals around the world. Foreign governments fear their domestic champions will be pummelled by low-cost Chinese rivals. But on August 5th the world got a small reminder that China’s producers face big problems of their own. Hengchi, an electric-vehicle (<small>EV</small>) maker owned by Evergrande, a failed property developer, told investors that two of its subsidiaries had been forced into bankruptcy. The group originally aimed to sell 1m <small>EV</small>s a year by 2025; amid feverish competition it sold just 1,389 last year.</p></section><p><h3 id="article-tags">Explore more</h3><nav aria-labelledby="article-tags"><a href="https://www.economist.com/topics/china" data-analytics="tags:china"><span>China</span></a></nav></p><p>This article appeared in the Business section of the print edition under the headline “Industrial involution”</p><div data-tracking-id="content-well-chapter-list"><h2><a href="https://www.economist.com/business/">Business</a> <span>August 10th 2024</span></h2><ul><li><a href="https://www.economist.com/business/2024/08/08/why-people-have-fallen-out-of-love-with-dating-apps"><span>Why people have fallen out of love with dating apps</span></a></li><li><a href="https://www.economist.com/business/2024/08/08/chinas-manufacturers-are-going-broke"><span>China’s manufacturers are going broke</span></a></li><li><a href="https://www.economist.com/business/2024/08/08/china-is-overhauling-its-company-law"><span>China is overhauling its company law</span></a></li><li><a href="https://www.economist.com/business/2024/08/08/what-can-olympians-teach-executives"><span>What can Olympians teach executives?</span></a></li><li><a href="https://www.economist.com/business/2024/08/06/a-court-says-google-is-a-monopolist-now-what"><span>A court says Google is a monopolist. Now what?</span></a></li><li><a href="https://www.economist.com/business/2024/08/06/a-history-lovers-guide-to-the-market-panic-over-ai"><span>A history-lover’s guide to the market panic over AI</span></a></li></ul></div><div orientation="vertical" data-test-id="vertical"><div orientation="vertical"><figure><img alt="How to respond" loading="lazy" width="1280" height="1709" decoding="async" data-nimg="1" sizes="300px" srcset="https://www.economist.com/cdn-cgi/image/width=16,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 16w, https://www.economist.com/cdn-cgi/image/width=32,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 32w, https://www.economist.com/cdn-cgi/image/width=48,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 48w, https://www.economist.com/cdn-cgi/image/width=64,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 64w, https://www.economist.com/cdn-cgi/image/width=96,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 96w, https://www.economist.com/cdn-cgi/image/width=128,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 128w, https://www.economist.com/cdn-cgi/image/width=256,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 256w, https://www.economist.com/cdn-cgi/image/width=360,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 360w, https://www.economist.com/cdn-cgi/image/width=384,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 384w, https://www.economist.com/cdn-cgi/image/width=480,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 480w, https://www.economist.com/cdn-cgi/image/width=600,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 600w, https://www.economist.com/cdn-cgi/image/width=834,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 834w, https://www.economist.com/cdn-cgi/image/width=960,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 960w, https://www.economist.com/cdn-cgi/image/width=1096,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 1096w, https://www.economist.com/cdn-cgi/image/width=1280,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 1280w, https://www.economist.com/cdn-cgi/image/width=1424,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg 1424w" src="https://www.economist.com/cdn-cgi/image/width=1424,quality=80,format=auto/media-assets/image/20240810_DE_UK.jpg"></figure></div><div orientation="vertical"><h3 orientation="vertical">From the August 10th 2024 edition</h3><p orientation="vertical">Discover stories from this section and more in the list of contents</p><p><a href="https://www.economist.com/weeklyedition/2024-08-10" data-analytics="sidebar:weekly_edition"><span>Explore the edition</span></a></p></div></div><div><p><a href="https://s100.copyright.com/AppDispatchServlet?publisherName=economist&amp;publication=economist&amp;title=China%E2%80%99s%20manufacturers%20are%20going%20broke&amp;publicationDate=2024-08-08&amp;contentID=%2Fcontent%2Fbb6fo1em2jq2m2h4jnc7kh0k27iiuvhu&amp;type=A&amp;orderBeanReset=TRUE" target="_blank" rel="noreferrer" data-analytics="end_of_article:reuse_this_content"><span>Reuse this content</span></a></p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Increasing Retention Without Increasing Study Time [pdf] (289 pts)]]></title>
+            <title><![CDATA[Increasing Retention Without Increasing Study Time [pdf] (294 pts)]]></title>
             <link>https://files.eric.ed.gov/fulltext/ED505647.pdf</link>
             <guid>41274602</guid>
             <pubDate>Sat, 17 Aug 2024 13:53:11 GMT</pubDate>
@@ -2142,7 +2780,7 @@ app.alert(‘XSS’); = &lt;6170702e616c657274282758535327293b&gt;</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Xapian: Open source search engine library (158 pts)]]></title>
+            <title><![CDATA[Xapian: Open source search engine library (159 pts)]]></title>
             <link>https://xapian.org/</link>
             <guid>41273415</guid>
             <pubDate>Sat, 17 Aug 2024 10:42:54 GMT</pubDate>
@@ -2187,161 +2825,6 @@ is 1.4.26</a>, released on 2024-07-18.</p>
 is 1.2.25</a>, released on 2017-09-26.</p>
 
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Google Removed Organic Maps from the Playstore (534 pts)]]></title>
-            <link>https://twitter.com/organicmapsapp/status/1824727403580596260</link>
-            <guid>41272925</guid>
-            <pubDate>Sat, 17 Aug 2024 09:01:24 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://twitter.com/organicmapsapp/status/1824727403580596260">https://twitter.com/organicmapsapp/status/1824727403580596260</a>, See on <a href="https://news.ycombinator.com/item?id=41272925">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
-        </item>
-        <item>
-            <title><![CDATA[X to pay €550k to employee fired for not replying to yes-or-resign ultimatum (450 pts)]]></title>
-            <link>https://fortune.com/europe/2024/08/14/x-ordered-to-pay-550000-to-irish-employee-fired-for-not-replying-to-elon-musk-yes-or-resign-extremely-hardcore-ultimatum/</link>
-            <guid>41272861</guid>
-            <pubDate>Sat, 17 Aug 2024 08:46:56 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://fortune.com/europe/2024/08/14/x-ordered-to-pay-550000-to-irish-employee-fired-for-not-replying-to-elon-musk-yes-or-resign-extremely-hardcore-ultimatum/">https://fortune.com/europe/2024/08/14/x-ordered-to-pay-550000-to-irish-employee-fired-for-not-replying-to-elon-musk-yes-or-resign-extremely-hardcore-ultimatum/</a>, See on <a href="https://news.ycombinator.com/item?id=41272861">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-cy="article-content"><p>Elon Musk’s X has been ordered to pay compensation to a former staff member of its Irish unit in an unfair dismissal case.</p><div>
-
-
-
-<p>The social network platform formerly known as Twitter was ordered to pay out over €550,000 ($602,640) to the former employee, Ireland’s Workplace Relations Commission, the state body responsible for adjudicating employment disputes, said on Tuesday. It is the largest sum the agency has ever awarded, according to Irish broadcaster RTE.&nbsp;</p>
-
-
-
-<p>Gary Rooney, who held a senior procurement role at the time of his dismissal in December 2022, had been employed by the company since September 2013. The Commission heard that the social media platform maintained that the employee had resigned voluntarily after he failed to tick a box committing to new unspecified working arrangements in an email from the company’s new owner Musk. &nbsp;</p>
-
-
-
-<p>Rooney was one of thousands of Twitter employees sent an email by Musk requiring them to pledge to stay with the company, working long hours at “high intensity” during its transformation, or to accept a buyout. Staff were given a day to click “yes” to agree to unspecified employment terms.</p>
-
-
-
-<p>The commission rejected X’s argument that Rooney quit voluntarily and ruled that not clicking “yes” in response to the email did not constitute an act of resignation.</p>
-
-
-
-<p>“It is not OK for Mr. Musk, or indeed any large company to treat employees in such a manner in this country or jurisdiction. The record award reflects the seriousness and the gravity of the case,” the complainant’s solicitor Barry Kenny told Bloomberg.</p>
-
-
-
-<p>It’s one in a string of cases that have sprung up since Musk purchased the platform. Multiple lawsuits have already alleged that Twitter employees didn’t receive their promised severance benefits, while the site has come under more intense scrutiny since he acquired it.</p>
-
-
-
-<p>The dispute arose in Dublin after billionaire Musk took ownership of the platform in late 2022. The Irish capital had about 500 employees before the takeover, but has since been impacted by the global staff exodus from the firm.</p>
-
-
-
-<p>The WRC in its 73-page ruling stated the emails had been sent “at a time of rapid change in Twitter and in the context of inconsistent, contradictory and confusing communications from the Respondent in connection with the takeover of the Company by Mr. Musk.”</p>
-
-
-
-<p>X didn’t immediately respond to a request for comment. The company can lodge an appeal to the Labour Court within 42 days.&nbsp;</p></div><p><strong>Recommended Newsletter:</strong> The Fortune Next to Lead newsletter is a must-read for the next generation of C-suite leaders. Every Monday, the newsletter provides the strategies, resources, and expert insight needed to claim the most coveted positions in business. <a href="https://fortune.com/newsletters/next-to-lead?&amp;itm_source=fortune&amp;itm_medium=article_tout&amp;itm_campaign=next_to_lead_v2&amp;itm_content=elon_amazon_google" target="_self" aria-label="Go to https://fortune.com/newsletters/next-to-lead?&amp;itm_source=fortune&amp;itm_medium=article_tout&amp;itm_campaign=next_to_lead_v2&amp;itm_content=elon_amazon_google">Subscribe now</a>.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Just use Postgres (214 pts)]]></title>
-            <link>https://mccue.dev/pages/8-16-24-just-use-postgres</link>
-            <guid>41272854</guid>
-            <pubDate>Sat, 17 Aug 2024 08:44:26 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://mccue.dev/pages/8-16-24-just-use-postgres">https://mccue.dev/pages/8-16-24-just-use-postgres</a>, See on <a href="https://news.ycombinator.com/item?id=41272854">Hacker News</a></p>
-<div id="readability-page-1" class="page">
-
-<p> by:  <b> Ethan McCue</b></p>
-
-<p>This is one part actionable advice, one part question for the audience.</p>
-<p>Advice: When you are making a new application that requires persistent storage of data, like is the case for most web applications, your default choice should be <code>Postgres</code>.</p>
-<h3 id="why-not-sqlite">Why not <code>sqlite</code>?</h3>
-<p><code>sqlite</code> is a pretty good database, but its data is stored in a single file.</p>
-<p>This implies that whatever your application is, it is running on one machine and one machine only. Or at least one shared filesystem.</p>
-<p>If you are making a desktop or mobile app, that's perfect. If you are making a website it might not be.</p>
-<p>There are many success stories of using <code>sqlite</code> for a website, but they mostly involve people who set up their own servers and infrastructure. Platforms as a service-s like Heroku, Railway, Render, etc. generally expect you to use a database accessed over network boundary. It's not <em>wrong</em> to give up some of the benefits of those platforms, but do consider if the benefits of <code>sqlite</code> are worth giving up platform provided automatic database backups and the ability to provision more than one application server.</p>
-<p><a href="https://www.sqlite.org/whentouse.html">The official documentation</a> has a good guide with some more specifics.</p>
-<h3 id="why-not-dynamodb-cassandra-or-mongodb">Why not <code>DynamoDB</code>, <code>Cassandra</code>, or <code>MongoDB</code>?</h3>
-<p>Wherever Ray Houlihan is, I hope he is having a good day.</p>
-<p>I watch a lot of conference talks, but his <a href="https://www.youtube.com/watch?v=HaEPXoXVf2k">2018 DynamoDB Deep Dive</a> might be the one I've watched the most. I know very few of you are going to watch an hour-long talk, but you really should. It's a good one.</p>
-<p>The thrust of it is that databases that are in the same genre as <code>DynamoDB</code> - which includes <code>Cassandra</code> and <code>MongoDB</code> - are fantastic <strong>if</strong> - and this is a load bearing if:</p>
-<ul>
-<li>You know exactly what your app needs to do, up-front</li>
-<li>You know exactly what your access patterns will be, up-front</li>
-<li>You have a known need to scale to really large sizes of data</li>
-<li>You are okay giving up some level of consistency</li>
-</ul>
-<p>This is because this sort of database is basically a giant distributed hash map. The only operations that work without needing to scan the entire database are lookups by partition key and scans that make use of a sort key.</p>
-<p>Whatever queries you need to make, you need to encode that knowledge in one of those indexes before you store it. You want to store users and look them up by either first name or last name? Well you best have a sort key that looks like <code>&lt;FIRST NAME&gt;$&lt;LAST NAME&gt;</code>. Your access patterns should be baked into how you store your data. If your access patterns change significantly, you might need to reprocess all of your data.</p>
-<p>It's annoying because, especially with <code>MongoDB</code>, people come into it having been sold on it being a more "flexible" database. Yes, you don't need to give it a schema. Yes, you can just dump untyped JSON into collections. No, this is not a flexible kind of database. It is an efficient one.</p>
-<p>With a relational database you can go from getting all the pets of a person to getting all the owners of a pet by slapping an index or two on your tables. With this genre of NoSQL, that can be a tall order.</p>
-<p>Its also not amazing if you need to run analytics queries. Arbitrary questions like "How many users signed up in the last month" can be trivially answered by writing a SQL query, perhaps on a read-replica if you are worried about running an expensive query on the same machine that is dealing with customer traffic. It's just outside the scope of this kind of database. You need to be ETL-ing your data out to handle it.</p>
-<p>If you see a college student or fresh grad using <code>MongoDB</code> stop them. They need help. They have been led astray.</p>
-<h3 id="why-not-valkey">Why not <code>Valkey</code>?</h3>
-<p>The artist formerly known as <code>Redis</code> is best known for being an efficient out-of-process cache. You compute something expensive once and slap it in <code>Valkey</code> so all 5 or so HTTP servers you have don't need to recompute it.</p>
-<p>However, you <em>can</em> use it as your primary database. It stores all its data in RAM, so it's pretty fast if you do that.</p>
-<p>Obvious problems:</p>
-<ul>
-<li>You can only have so much RAM. You can have a lot more than you'd think, but its still pretty limited compared to hard drives.</li>
-<li>Same as the <code>DynamoDB</code>-likes, you need to make concessions on how you model your data.</li>
-</ul>
-<h3 id="why-not-datomic">Why not <code>Datomic</code>?</h3>
-<p>If you already knew about this one, you get a gold star.</p>
-<p><code>Datomic</code> is a <code>NoSQL</code> database, but it is a relational one. The "up-front design" problems aren't there, and it does have some neat properties.</p>
-<p>You don't store data in tables. It's all "entity-attribute-value-time" (EAVT) pairs. Instead of a person row with <code>id</code>, <code>name</code>, and <code>age</code> you store <code>1 :person/name "Beth"</code> and <code>1 :person/age 30</code>. Then your queries work off of "universal" indexes.</p>
-<p>You don't need to coordinate with writers when making queries. You query the database "as-of" a given time. New data, even deletions (or as they call them "retractions"), don't actually delete old data.</p>
-<p>But there are some significant problems</p>
-<ul>
-<li>It only works with JVM languages.</li>
-<li>Outside of <code>Clojure</code>, a relatively niche language, its API sucks.</li>
-<li>If you structure a query badly the error messages you get are terrible.</li>
-<li>The whole universe of tools that exist for SQL just aren't there.</li>
-</ul>
-<h3 id="why-not-xtdb">Why not <code>XTDB</code>?</h3>
-<p><code>Clojure</code> people make a lot of databases.</p>
-<p><code>XTDB</code> is spiritually similar do <code>Datomic</code> but:</p>
-<ul>
-<li>There is an HTTP api, so you aren't locked to the JVM.</li>
-<li>It has two axes of time you can query against. "System Time" - when records were inserted - and "Valid Time."</li>
-<li>It has a SQL API.</li>
-</ul>
-<p>The biggest points against it are:</p>
-<ul>
-<li>It's new. Its SQL API is something that popped up in the last year. It recently changed its whole storage model. Will the company behind it survive the next 10 years? Who knows!</li>
-</ul>
-<p>Okay that's just one point. I'm sure I could think of more, but treat this as a stand-in for any recently developed database. The best predictor something will continue to exist into the future is how long it has existed. COBOL been around for decades, it will likely continue to exist for decades.</p>
-<p>If you have persistent storage, you want as long a support term as you can get. You can certainly choose to pick a newer or experimental database for your app but, regardless of technical properties, that's a risky choice. It shouldn't be your default.</p>
-<h3 id="why-not-kafka">Why not <code>Kafka</code>?</h3>
-<p><code>Kafka</code> is an append only log. It can handle TBs of data. It is a very good append only log. It works amazingly well if you want to do event sourcing type stuff with data flowing in from multiple services maintained by multiple teams of humans.</p>
-<p>But:</p>
-<ul>
-<li>Up to a certain scale, a table in Postgres works perfectly fine as an append only log.</li>
-<li>You likely do not have hundreds of people working on your product nor TBs of events flowing in.</li>
-<li>Making a Kafka consumer is a bit more error-prone than you'd expect. You need to keep track of your place in the log after all.</li>
-<li>Even when maintained by a cloud provider (and there are good managed <code>Kafka</code> services) its another piece of infrastructure you need to monitor.</li>
-</ul>
-<h3 id="why-not-elasticsearch">Why not <code>ElasticSearch</code>?</h3>
-<p>Is searching over data the primary function of your product?</p>
-<p>If yes, <code>ElasticSearch</code> is going to give you some real pros. You will need to ETL your data into it and manage that whole process, but <code>ElasticSearch</code> is built for searching. It does searching good.</p>
-<p>If no, <code>Postgres</code> will be fine. A sprinkling of <code>ilike</code> and the built-in <a href="https://www.postgresql.org/docs/current/textsearch.html">full text search</a> is more than enough for most applications. You can always bolt on a dedicated search thing later.</p>
-<h3 id="why-not-mssql-or-oracle-db">Why not <code>MSSQL</code> or <code>Oracle DB</code>?</h3>
-<p>Genuine question you should ask yourself: Are these worth the price tag?</p>
-<p>I don't just mean the straight-up cost to license, but also the cost of lock-in. Once your data is in <code>Oracle DB</code> you are going to be paying Oracle forever. You are going to have to train your coders on its idiosyncrasies, forever. You are going to have to decide between enterprise features and your wallet, forever.</p>
-<p>I know its super unlikely that you will contribute a patch to <code>Postgres</code>, so I won't pretend that there is some magic "power of open source" going on, but I think you should have a very specific need in mind to choose a proprietary DB. If you don't have some killer <code>MSSQL</code> feature that you simply cannot live without, don't use it.</p>
-<h3 id="why-not-mysql">Why not <code>MySQL</code>?</h3>
-<p>This is the one that I need some audience help with.</p>
-<p><code>MySQL</code> is owned by Oracle. There are <a href="https://www.mysql.com/products/enterprise/compare/">features locked behind their enterprise editions</a>. To an extent you will have lock-in issues the same as any other DB.</p>
-<p>But the free edition <code>MySQL</code> has also been used in an extremely wide range of things. It's been around for a long time. There are people who know how to work with it.</p>
-<p>My problem is that I've only spent ~6 months of my professional career working with it. I genuinely don't know enough to compare it intelligently to <code>Postgres</code>.</p>
-<p>I'm convinced it isn't secretly so much better that I am doing folks a disservice when telling them to use <code>Postgres</code>, and I do remember reading about how <code>Postgres</code> generally has better support for enforcing invariants in the DB itself, but I wouldn't mind being schooled a bit here.</p>
-<h3 id="why-not-some-ai-vector-db">Why not some AI vector DB?</h3>
-<ul>
-<li>Most are new. Remember the risks of using something new.</li>
-<li>AI is a bubble. A load-bearing bubble, but a bubble. Don't build a house on it if you can avoid it.</li>
-<li>Even if your business is another AI grift, you probably only need to <code>import openai</code>.</li>
-</ul>
-<h3 id="why-not-google-sheets">Why not Google Sheets?</h3>
-<p>You're right. I can't think of any downsides. Go for it.</p>
-<hr>
-<h4 id="--index"><a href="https://mccue.dev/">&lt;- Index</a></h4>
-</div>]]></description>
         </item>
     </channel>
 </rss>
