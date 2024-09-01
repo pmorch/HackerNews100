@@ -4,12 +4,1313 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 01 Sep 2024 08:30:06 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 01 Sep 2024 09:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[AirTags key to discovery of Houston's plastic recycling deception (127 pts)]]></title>
+            <title><![CDATA[Playstation 2 GS emulation – the final frontier of Vulkan compute emulation (103 pts)]]></title>
+            <link>https://themaister.net/blog/2024/07/03/playstation-2-gs-emulation-the-final-frontier-of-vulkan-compute-emulation/</link>
+            <guid>41413662</guid>
+            <pubDate>Sun, 01 Sep 2024 02:14:19 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://themaister.net/blog/2024/07/03/playstation-2-gs-emulation-the-final-frontier-of-vulkan-compute-emulation/">https://themaister.net/blog/2024/07/03/playstation-2-gs-emulation-the-final-frontier-of-vulkan-compute-emulation/</a>, See on <a href="https://news.ycombinator.com/item?id=41413662">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article id="post-754">
+	
+	<!-- .entry-header -->
+
+	<div>
+		<p>As you may, or may not know, I wrote paraLLEl-RDP back in 2020. It aimed at implementing the N64 RDP in Vulkan compute. Lightning fast, and extremely accurate, plus the added support of up-scaling on top. I’m quite happy how it turned out. Of course, the extreme accuracy was due to Angrylion being used as reference and I could aim for bit-exactness against that implementation.</p>
+<p>Since then, there’s been the lingering idea of doing the same thing, but for PlayStation 2. Until now, there’s really only been one implementation in town, GSdx, which has remained the state-of-the-art for 20 years.</p>
+<p><a href="https://github.com/Arntzen-Software/parallel-gs">paraLLEl-GS</a> is actually not the first compute implementation of the PS2 GS. An attempt was made back in 2014 for OpenCL as far as I recall, but it was never completed. At the very least, I cannot find it in the current upstream repo anymore.</p>
+<p>The argument for doing compute shader raster on PS2 is certainly weaker than on N64. Angrylion was – and is – extremely slow, and N64 is extremely sensitive to accuracy where hardware acceleration with graphics APIs is impossible without serious compromises. PCSX2 on the other hand has a well-optimized software renderer, and a pretty solid graphics-based renderer, but that doesn’t mean there aren’t issues. The software renderer does not support up-scaling for example, and there are a myriad bugs and glitches with the graphics-based renderer, especially with up-scaling. As we’ll see, the PS2 GS is quite the nightmare to emulate in its own way.</p>
+<p>My main motivation here is basically “because I can”. I already had a project lying around that did “generic” compute shader rasterization. I figured that maybe we could retro-fit this to support PS2 rendering.</p>
+<p>I didn’t work on this project alone. My colleague, Runar Heyer, helped out a great deal in the beginning to get this started, doing all the leg-work to study the PS2 from various resources, doing the initial prototype implementation and fleshing out the Vulkan GLSL to emulate PS2 shading. Eventually, we hit some serious roadblocks in debugging various games, and the project was put on ice for a while since I was too drained dealing with horrible D3D12 game debugging day in and day out. The last months haven’t been a constant fire fight, so I’ve finally had the mental energy to finish it.</p>
+<p>My understanding of the GS is mostly based on what Runar figured out, and what I’ve seen by debugging games. The GSdx software renderer does not seem like it’s hardware bit-accurate, so we were constantly second-guessing things when trying to compare output. This caused a major problem when we had the idea of writing detailed tests that directly compared against GSdx software renderer, and the test-driven approach fell flat very quickly. As a result, paraLLEl-GS isn’t really aiming for bit-accuracy against hardware, but it tries hard to avoid obvious accuracy issues at the very least.</p>
+<h2>Basic GS overview</h2>
+<p>Again, this is based on my understanding, and it might not be correct. 😀</p>
+<h3>GS is a pixel-pushing monster</h3>
+<p>The GS is infamous for its insane fill-rate and bandwidth. It could push over a billion pixels per second (in theory at least) back in 2000 which was nuts. While the VRAM is quite small (4 MiB), it was designed to be continuously streamed into using the various DMA engines.</p>
+<p>Given the extreme fill-rate requirements, we have to design our renderer accordingly.</p>
+<h3>GS pixel pipeline is very basic, but quirky</h3>
+<p>In many ways, the GS is actually simpler than N64 RDP. Single texture, and a single cycle combiner, where N64 had a two stage combiner + two stage blender. Whatever AA support is there is extremely basic as well, where N64 is delightfully esoteric. The parts of the pixel pipeline that is painful to implement with traditional graphics APIs is:</p>
+<h4>Blending goes beyond 1.0</h4>
+<p>Inherited from PS1, 0x80 is treated as 1.0, and it can go all the way up to 0xff (almost 2). Shifting by 7 is easier than dividing by 255 I suppose. I’ve seen some extremely ugly workarounds in PCSX2 before to try working around this since UNORM formats cannot support this as is. Textures are similar, where alpha &gt; 1.0 is representable.</p>
+<p>There is also wrapping logic that can be used for when colors or alpha goes above 0xFF.</p>
+<h4>Destination alpha testing</h4>
+<p>The destination alpha can be used as a pseudo-stencil of sorts, and this is extremely painful without programmable blending. I suspect this was added as PS1 compatibility, since PS1 also had this strange feature.</p>
+<h4>Conditional blending</h4>
+<p>Based on the alpha, it’s possible to conditionally disable blending. Quite awkward without programmable blending … This is another PS1 compat feature. With PS1, it can be emulated by rendering every primitive twice with state changes in-between, but this quickly gets impractical with PS2.</p>
+<h4>Alpha correction</h4>
+<p>Before alpha is written out, it’s possible to OR in the MSB. Essentially forcing alpha to 1. It is not equivalent to alphaToOne however, since it’s a bit-wise OR of the MSB.</p>
+<h4>Alpha test can partially discard</h4>
+<p>A fun thing alpha tests can do is to partially discard. E.g. you can discard just color, but keep the depth write. Quite nutty.</p>
+<h4>AA1 – coverage-to-alpha – can control depth write per pixel</h4>
+<p>This is also kinda awkward. The only anti-alias PS2 has is AA1 which is a coverage-to-alpha feature. Supposedly, less than 100% coverage should disable depth writes (and blending is enabled), but the GSdx software renderer behavior here is extremely puzzling. I don’t really understand it yet.</p>
+<h4>32-bit fixed-point Z</h4>
+<p>I’ve still yet to see any games actually using this, but technically, it has D32_UINT support. Fun! From what I could grasp, GSdx software renderer implements this with FP64 (one of the many reasons I refuse to believe GSdx is bit-accurate), but FP64 is completely impractical on GPUs. When I have to, I’ll implement this with fixed-point math. 24-bit Z and 16-bit should be fine with FP32 interpolation I think.</p>
+<h4>Pray you have programmable blending</h4>
+<p>If you’re on a pure TBDR GPU most of this is quite doable, but immediate mode desktop GPUs quickly degenerates into ROV or per-pixel barriers after every primitive to emulate programmable blending, both which are horrifying for performance. Of course, with compute we can make our own TBDR to bypass all this. 🙂</p>
+<h3>D3D9-style raster rules</h3>
+<p>Primitives are fortunately provided in a plain form in clip-space. No awkward N64 edge equations here. The VU1 unit is supposed to do transforms and clipping, and emit various per-vertex attributes:</p>
+<p>X/Y: 12.4 unsigned fixed-point<br>
+Z: 24-bit or 32-bit uint<br>
+FOG: 8-bit uint<br>
+RGBA: 8-bit, for per-vertex lighting<br>
+STQ: For perspective correct texturing with normalized coordinates. Q = 1 / w, S = s * Q, T = t * Q. Apparently the lower 8-bits of the mantissa are clipped away, so bfloat24? Q can be negative, which is always fun. No idea how this interacts with Inf and NaN …<br>
+UV: For non-perspective correct texturing. 12.4 fixed-point un-normalized.</p>
+<ul>
+<li>Triangles are top-left raster, just like modern GPUs.</li>
+<li>Pixel center is on integer coordinate, just like D3D9. (This is a common design mistake that D3D10+ and GL/Vulkan avoids).</li>
+<li>Lines use Bresenham’s algorithm, which is not really feasible to upscale, so we have to fudge it with rect or parallelogram.</li>
+<li>Points snap to nearest pixel. Unsure which rounding is used though … There is no interpolation ala gl_PointCoord.</li>
+<li>Sprites are simple quads with two coordinates. STQ or UV can be interpolated and it seems to assume non-rotated coordinates. To support rotation, you’d need 3 coordinates to disambiguate.</li>
+</ul>
+<p>All of this can be implemented fairly easily in normal graphics APIs, as long as we don’t consider upscaling. We have to rely on implementation details in GL and Vulkan, since these APIs don’t technically guarantee top-left raster rules.</p>
+<p>Since X/Y is unsigned, there is an XY offset that can be applied to center the viewport where you want. This means the effective range of X/Y is +/- 4k pixels, a healthy guard band for 640×448 resolutions.</p>
+<h3>Vertex queue</h3>
+<p>The GS feels very much like old school OpenGL 1.0 with glVertex3f and friends. It even supports TRIANGLE_FAN! Amazing … RGBA, STQ and various registers are set, and every XYZ register write forms a vertex “kick” which latches vertex state and advances the queue. An XYZ register write may also be a drawing kick, which draws a primitive if the vertex queue is sufficiently filled. The vertex queue is managed differently depending on the topology. The semantics here seem to be pretty straight forward where strip primitives shift the queue by one, and list primitives clear the queue. Triangle fans keep the first element in the queue.</p>
+<h3>Fun swizzling formats</h3>
+<p>A clever idea is that while rendering to 24-bit color or 24-bit depth, there is 8 bits left unused in the MSBs. You can place textures there, because why not. 8H, 4HL, 4HH formats support 8-bit and 4-bit palettes nicely.</p>
+<p>Pixel coordinates on PS2 are arranged into “pages”, which are 8 KiB, then subdivided into 32 blocks, and then, the smaller blocks are swizzled into a layout that fits well with a DDA-style renderer. E.g. for 32-bit RGBA, a page is 64×32 pixels, and 32 8×8 blocks are Z-order swizzled into that page.</p>
+<h3>Framebuffer cache and texture cache</h3>
+<p>There is a dedicated cache for framebuffer rendering and textures, one page’s worth. Games often abuse this to perform feedback loops, where they render on top of the pixels being sampled from. This is the root cause of extreme pain. N64 avoided this problem by having explicit copies into TMEM (and not really having the bandwidth to do elaborate feedback effects), and other consoles rendered to embedded SRAM (ala a tiler GPU), so these feedbacks aren’t as painful, but the GS is complete YOLO. Dealing with this gracefully is probably the biggest challenge. Combined with the PS2 being a bandwidth monster, developers knew how to take advantage of copious blending and blurring passes …</p>
+<h3>Texturing</h3>
+<p>Texturing on the GS is both very familar, and arcane.</p>
+<p>On the plus side, the texel-center is at half-pixel, just like modern APIs. It seems like it has 4-bit sub-texel precision instead of 8 however. This is easily solved with some rounding. It also seems to have floor-rounding instead of nearest-rounding for bi-linear.</p>
+<p>The bi-linear filter is a normal bi-linear. No weird 3-point N64 filter here.</p>
+<p>On the weirder side, there are two special addressing modes.</p>
+<p>REGION_CLAMP supports an arbitrary clamp inside a texture atlas (wouldn’t this be nice in normal graphics APIs? :D). It also works with REPEAT, so you can have REPEAT semantics on border, but then clamp slightly into the next “wrap”. This is trivial to emulate.</p>
+<p>REGION_REPEAT is … worse. Here we can have custom bit-wise computation per coordinate. So something like u’ = (u &amp; MASK) | FIX. This is done per-coordinate in bi-linear filtering, which is … painful, but solvable. This is another weird PS1 feature that was likely inherited for compatibility. At least on PS1, there was no bi-linear filtering to complicate things 🙂</p>
+<p>Mip-mapping is also somewhat curious. Rather than relying on derivatives, the log2 of interpolated Q factor, along with some scaling factors are used to compute the LOD. This is quite clever, but I haven’t really seen any games use it. The down-side is that triangle-setup becomes rather complex if you want to account for correct tri-linear filtering, and it cannot support e.g. anisotropic filtering, but this is 2000, who cares! Not relying on derivatives is a huge boon for the compute implementation.</p>
+<p>Formats are always “normalized” to RGBA8_UNORM. 5551 format is expanded to 8888 without bit-replication. There is no RGBA4444 format.</p>
+<p>It’s quite feasible to implement the texturing with plain bindless.</p>
+<h3>CLUT</h3>
+<p>This is a 1 KiB cache that holds the current palette. There is an explicit copy step from VRAM into that CLUT cache before it can be used. Why hello there, N64 TMEM!</p>
+<p>The CLUT is organized such that it can hold one full 256 color palette in 32-bit colors. On the other end, it can hold 32 palettes of 16 colors at 16 bpp.</p>
+<h3>TEXFLUSH</h3>
+<p>There is an explicit command that functions like a “sync and invalidate texture cache”. In the beginning I was hoping to rely on this to guide the hazard tracking, but oh how naive I was. In the end, I simply had to ignore TEXFLUSH. Basically, there are two styles of caching we could take with GS.</p>
+<p>With “maximal” caching, we can assume that frame buffer caches and texture caches are infinitely large. The only way a hazard needs to be considered is after an explicit flush. This … breaks hard. Either games forget to use TEXFLUSH (because it happened to work on real hardware), or they TEXFLUSH way too much.</p>
+<p>With “minimal” caching, we assume there is no caching and hazards are tracked directly. Some edge case handling is considered for feedback loops.</p>
+<p>I went with “minimal”, and I believe GSdx did too.</p>
+<h3>Poking registers with style – GIF</h3>
+<p>The way to interact with the GS hardware is through the GIF, which is basically a unit that reads data and pokes the correct hardware registers. At the start of a GIF packet, there is a header which configures which registers should be written to, and how many “loops” there are. This maps very well to mesh rendering. We can consider something like one “loop” being:</p>
+<ul>
+<li>Write RGBA vertex color</li>
+<li>Write texture coordinate</li>
+<li>Write position with draw kick</li>
+</ul>
+<p>And if we have 300 vertices to render, we’d use 300 loops. State registers can be poked through the Address + Data pair, which just encodes target register + 64-bit payload. It’s possible to render this way too of course, but it’s just inefficient.</p>
+<p>Textures are uploaded through the same mechanism. Various state registers are written to set up transfer destinations, formats, etc, and a special register is nudged to transfer 64-bit at a time to VRAM.</p>
+<h2>Hello Trongle – GS</h2>
+<p>If you missed the brain-dead simplicity of OpenGL 1.0, this is the API for you! 😀</p>
+<p>For testing purposes, I added a tool to generate a .gs dump format that PCSX2 can consume. This is handy for comparing implementation behavior.</p>
+<p>First, we program the frame buffer and scissor:</p>
+<pre>TESTBits test = {};
+test.ZTE = TESTBits::ZTE_ENABLED;
+test.ZTST = TESTBits::ZTST_GREATER; // Inverse Z, LESS is not supported.
+iface.write_register(RegisterAddr::TEST_1, test);
+
+FRAMEBits frame = {};
+frame.FBP = 0x0 / PAGE_ALIGNMENT_BYTES;
+frame.PSM = PSMCT32;
+frame.FBW = 640 / BUFFER_WIDTH_SCALE;
+iface.write_register(RegisterAddr::FRAME_1, frame);
+
+ZBUFBits zbuf = {};
+zbuf.ZMSK = 0; // Enable Z-write
+zbuf.ZBP = 0x118000 / PAGE_ALIGNMENT_BYTES;
+iface.write_register(RegisterAddr::ZBUF_1, zbuf);
+
+SCISSORBits scissor = {};
+scissor.SCAX0 = 0;
+scissor.SCAY0 = 0;
+scissor.SCAX1 = 640 - 1;
+scissor.SCAY1 = 448 - 1;
+iface.write_register(RegisterAddr::SCISSOR_1, scissor);</pre>
+<p>Then we nudge some registers to draw:</p>
+<pre>struct Vertex
+{
+    PackedRGBAQBits rgbaq;
+    PackedXYZBits xyz;
+} vertices[3] = {};
+
+for (auto &amp;vert : vertices)
+{
+   vert.rgbaq.A = 0x80;
+   vert.xyz.Z = 1;
+}
+
+vertices[0].rgbaq.R = 0xff;
+vertices[1].rgbaq.G = 0xff;
+vertices[2].rgbaq.B = 0xff;
+
+vertices[0].xyz.X = p0.x &lt;&lt; SUBPIXEL_BITS;
+vertices[0].xyz.Y = p0.y &lt;&lt; SUBPIXEL_BITS;
+vertices[1].xyz.X = p1.x &lt;&lt; SUBPIXEL_BITS;
+vertices[1].xyz.Y = p1.y &lt;&lt; SUBPIXEL_BITS;
+vertices[2].xyz.X = p2.x &lt;&lt; SUBPIXEL_BITS;
+vertices[2].xyz.Y = p2.y &lt;&lt; SUBPIXEL_BITS;
+
+PRIMBits prim = {};
+prim.TME = 0; // Turn off texturing.
+prim.IIP = 1; // Interpolate RGBA (Gouraud shading)
+prim.PRIM = int(PRIMType::TriangleList);
+
+static const GIFAddr addr[] = { GIFAddr::RGBAQ, GIFAddr::XYZ2 };
+constexpr uint32_t num_registers = sizeof(addr) / sizeof(addr[0]);
+constexpr uint32_t num_loops = sizeof(vertices) / sizeof(vertices[0]);
+iface.write_packed(prim, addr, num_registers, num_loops, vertices);</pre>
+<p>This draws a triangle. We provide coordinates directly in screen-space.</p>
+<p>And finally, we need to program the CRTC. Most of this is just copy-pasta from whatever games tend to do.</p>
+<pre>auto &amp;priv = iface.get_priv_register_state();
+
+priv.pmode.EN1 = 1;
+priv.pmode.EN2 = 0;
+priv.pmode.CRTMD = 1;
+priv.pmode.MMOD = PMODEBits::MMOD_ALPHA_ALP;
+priv.smode1.CMOD = SMODE1Bits::CMOD_NTSC;
+priv.smode1.LC = SMODE1Bits::LC_ANALOG;
+priv.bgcolor.R = 0x0;
+priv.bgcolor.G = 0x0;
+priv.bgcolor.B = 0x0;
+priv.pmode.SLBG = PMODEBits::SLBG_ALPHA_BLEND_BG;
+priv.pmode.ALP = 0xff;
+priv.smode2.INT = 1;
+
+priv.dispfb1.FBP = 0;
+priv.dispfb1.FBW = 640 / BUFFER_WIDTH_SCALE;
+priv.dispfb1.PSM = PSMCT32;
+priv.dispfb1.DBX = 0;
+priv.dispfb1.DBY = 0;
+priv.display1.DX = 636; // Magic values that center the screen.
+priv.display1.DY = 50; // Magic values that center the screen.
+priv.display1.MAGH = 3; // scaling factor = MAGH + 1 = 4 -&gt; 640 px wide.
+priv.display1.MAGV = 0;
+priv.display1.DW = 640 * 4 - 1;
+priv.display1.DH = 448 - 1;
+
+dump.write_vsync(0, iface);
+dump.write_vsync(1, iface);</pre>
+<p>When the GS is dumped, we can load it up in PCSX2 and voila:</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump.png"><img fetchpriority="high" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump-1024x674.png" alt="" width="660" height="434" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump-1024x674.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump-300x198.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump-768x506.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump-1536x1012.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/gs_dump.png 1775w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>And here’s the same .gs dump is played through parallel-gs-replayer with RenderDoc. For debugging, I’ve spent a lot of time making it reasonably convenient. The images are debug storage images where I can store before and after color, depth, debug values for interpolants, depth testing state, etc, etc. It’s super handy to narrow down problem cases. The render pass can be split into 1 or more triangle chunks as needed.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/rdoc.png"><img decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-1024x596.png" alt="" width="660" height="384" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-1024x596.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-300x175.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-768x447.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-1536x894.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/rdoc-2048x1192.png 2048w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>To add some textures, and flex the capabilities of the CRTC a bit, we can try uploading a texture:</p>
+<pre>int chan;
+auto *buf = stbi_load("/tmp/test.png", &amp;w, &amp;h, &amp;chan, 4);
+iface.write_image_upload(0x300000, PSMCT32, w, h, buf,
+                         w * h * sizeof(uint32_t));
+stbi_image_free(buf);
+
+TEX0Bits tex0 = {};
+tex0.PSM = PSMCT32;
+tex0.TBP0 = 0x300000 / BLOCK_ALIGNMENT_BYTES;
+tex0.TBW = (w + BUFFER_WIDTH_SCALE - 1) / BUFFER_WIDTH_SCALE;
+tex0.TW = Util::floor_log2(w - 1) + 1;
+tex0.TH = Util::floor_log2(h - 1) + 1;
+tex0.TFX = COMBINER_DECAL;
+tex0.TCC = 1; // Use texture alpha as blend alpha
+iface.write_register(RegisterAddr::TEX0_1, tex0);
+
+TEX1Bits tex1 = {};
+tex1.MMIN = TEX1Bits::LINEAR;
+tex1.MMAG = TEX1Bits::LINEAR;
+iface.write_register(RegisterAddr::TEX1_1, tex1);
+
+CLAMPBits clamp = {};
+clamp.WMS = CLAMPBits::REGION_CLAMP;
+clamp.WMT = CLAMPBits::REGION_CLAMP;
+clamp.MINU = 0;
+clamp.MAXU = w - 1;
+clamp.MINV = 0;
+clamp.MAXV = h - 1;
+iface.write_register(RegisterAddr::CLAMP_1, clamp);</pre>
+<p>While PS2 requires POT sizes for textures, REGION_CLAMP is handy for NPOT. Super useful for texture atlases.</p>
+<pre>struct Vertex
+{
+    PackedUVBits uv;
+    PackedXYZBits xyz;
+} vertices[2] = {};
+
+for (auto &amp;vert : vertices)
+    vert.xyz.Z = 1;
+
+vertices[0].xyz.X = p0.x &lt;&lt; SUBPIXEL_BITS;
+vertices[0].xyz.Y = p0.y &lt;&lt; SUBPIXEL_BITS;
+vertices[1].xyz.X = p1.x &lt;&lt; SUBPIXEL_BITS;
+vertices[1].xyz.Y = p1.y &lt;&lt; SUBPIXEL_BITS;
+vertices[1].uv.U = w &lt;&lt; SUBPIXEL_BITS;
+vertices[1].uv.V = h &lt;&lt; SUBPIXEL_BITS;
+
+PRIMBits prim = {};
+prim.TME = 1; // Turn on texturing.
+prim.IIP = 0;
+prim.FST = 1; // Use unnormalized coordinates.
+prim.PRIM = int(PRIMType::Sprite);
+
+static const GIFAddr addr[] = { GIFAddr::UV, GIFAddr::XYZ2 };
+constexpr uint32_t num_registers = sizeof(addr) / sizeof(addr[0]);
+constexpr uint32_t num_loops = sizeof(vertices) / sizeof(vertices[0]);
+iface.write_packed(prim, addr, num_registers, num_loops, vertices);</pre>
+<p>Here we render a sprite with un-normalized coordinates.</p>
+<p>Finally, we use the CRTC to do blending against white background.</p>
+<pre>priv.pmode.EN1 = 1;
+priv.pmode.EN2 = 0;
+priv.pmode.CRTMD = 1;
+priv.pmode.MMOD = PMODEBits::MMOD_ALPHA_CIRCUIT1;
+priv.smode1.CMOD = SMODE1Bits::CMOD_NTSC;
+priv.smode1.LC = SMODE1Bits::LC_ANALOG;
+priv.bgcolor.R = 0xff;
+priv.bgcolor.G = 0xff;
+priv.bgcolor.B = 0xff;
+priv.pmode.SLBG = PMODEBits::SLBG_ALPHA_BLEND_BG;
+priv.smode2.INT = 1;
+
+priv.dispfb1.FBP = 0;
+priv.dispfb1.FBW = 640 / BUFFER_WIDTH_SCALE;
+priv.dispfb1.PSM = PSMCT32;
+priv.dispfb1.DBX = 0;
+priv.dispfb1.DBY = 0;
+priv.display1.DX = 636; // Magic values that center the screen.
+priv.display1.DY = 50; // Magic values that center the screen.
+priv.display1.MAGH = 3; // scaling factor = MAGH + 1 = 4 -&gt; 640 px wide.
+priv.display1.MAGV = 0;
+priv.display1.DW = 640 * 4 - 1;
+priv.display1.DH = 448 - 1;</pre>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/vk.png"><img decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/vk-1024x590.png" alt="" width="660" height="380" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/vk-1024x590.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/vk-300x173.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/vk-768x443.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/vk-1536x886.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/vk.png 2005w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>Glorious 256×179 logo 😀</p>
+<h2>Implementation details</h2>
+<h3>The rendering pipeline</h3>
+<p>Before we get into the page tracker, it’s useful to define a rendering pipeline where synchronization is implied between each stage.</p>
+<ul>
+<li>Synchronize CPU copy of VRAM to GPU. This is mostly unused, but happens for save state load, or similar</li>
+<li>Upload data to VRAM (or perform local-to-local copy)</li>
+<li>Update CLUT cache from VRAM</li>
+<li>Unswizzle VRAM into VkImages that can be sampled directly, and handle palettes as needed, sampling from CLUT cache</li>
+<li>Perform rendering</li>
+<li>Synchronize GPU copy of VRAM back to CPU. This will be useful for readbacks. Then CPU should be able to unswizzle directly from a HOST_CACHED_BIT buffer as needed</li>
+</ul>
+<p>This pipeline matches what we expect a game to do over and over:</p>
+<ul>
+<li>Upload texture to VRAM</li>
+<li>Upload palette to VRAM</li>
+<li>Update CLUT cache</li>
+<li>Draw with texture
+<ul>
+<li>Trigger unswizzle from VRAM into VkImage if needed</li>
+<li>Begins building a “render pass”, a batch of primitives</li>
+</ul>
+</li>
+</ul>
+<p>When there are no backwards hazards here, we can happily keep batching and defer any synchronization. This is critical to get any performance out of this style of renderer.</p>
+<p>Some common hazards here include:</p>
+<h4>Copy to VRAM which was already written by copy</h4>
+<p>This is often a false positive, but we cannot track per-byte. This becomes a simple copy barrier and we move on.</p>
+<h4>Copy to VRAM where a texture was sampled from, or CLUT cache read from</h4>
+<p>Since the GS has a tiny 4 MiB VRAM, it’s very common that textures are continuously streamed in, sampled from, and thrown away. When this is detected, we have to submit all vram copy work, all texture unswizzle work and then begin a new batch. Primitive batches are not disrupted.</p>
+<p>This means we’ll often see:</p>
+<ul>
+<li>Copy xN</li>
+<li>Barrier</li>
+<li>Unswizzle xN</li>
+<li>Barrier</li>
+<li>Copy xN</li>
+<li>Barrier</li>
+<li>Unswizzle xN</li>
+<li>Barrier</li>
+<li>Rendering</li>
+</ul>
+<h4>Sample texture that was rendered to</h4>
+<p>Similar, but here we need to flush out everything. This basically breaks the render pass and we start another one. Too many of these is problematic for performance obviously.</p>
+<h4>Copy to VRAM where rendering happened</h4>
+<p>Basically same as sampling textures, this is a full flush.</p>
+<p>Other hazards are ignored, since they are implicitly handled by our pipeline.</p>
+<h3>Page tracker</h3>
+<p>Arguably, the hardest part of GS emulation is dealing with hazards. VRAM is read and written to with reckless abandon and any potential read-after-write or write-after-write hazard needs to be dealt with. We cannot rely on any game doing this for us, since PS2 GS just deals with sync in most cases, and TEXFLUSH is the only real command games will use (or forget to use).</p>
+<p>Tracking per byte is ridiculous, so my solution is to first subdivide the 4 MiB VRAM into pages. A page is the unit for frame buffers and depth buffers, so it is the most meaningful place to start.</p>
+<h4>PageState</h4>
+<p>On page granularity, we track:</p>
+<ul>
+<li>Pending frame buffer write?</li>
+<li>Pending frame buffer read? (read-only depth)</li>
+</ul>
+<p>Textures and VRAM copies have 256 byte alignment, and to avoid a ton of false positives, we need to track on a per-block basis. There are 32 blocks per page, so a u32 bit-mask is okay.</p>
+<ul>
+<li>VRAM copy writes</li>
+<li>VRAM copy reads</li>
+<li>Pending read into CLUT cache or VkImage</li>
+<li>Blocks which have been clobbered by any write, on next texture cache invalidate, throw away images that overlap</li>
+</ul>
+<p>As mentioned earlier, there are also cases where you can render to 24-bit color, while sampling from the upper 8-bits without hazard. We need to optimize for that case too, so there is also:</p>
+<ul>
+<li>A write mask for framebuffers</li>
+<li>A read mask for textures</li>
+</ul>
+<p>In the example above, FB write mask is 0xffffff and texture cache mask is 0xff000000. No overlap, no invalidate 😀</p>
+<p>For host access, there are also timeline semaphore values per page. These values state which sync point to wait for if the host desires mapped read or mapped write access. Mapped write access may require more sync than mapped read if there are pending reads on that page.</p>
+<h4>Caching textures</h4>
+<p>Every page contains a list of VkImages which have been associated with it. When a page’s textures has been invalidated, the image is destroyed and has to be unswizzled again from VRAM.</p>
+<p>There is a one-to-many relationship with textures and pages. A texture may span more than one page, and it’s enough that only one page is clobbered before the texture is invalidated.</p>
+<p>Overall, there are a lot of micro-details here, but the important things to note here is that conservative and simple tracking will not work on PS2 games. Tracking at a 256 byte block level and considering write/read masks is critical.</p>
+<h4>Special cases</h4>
+<p>There are various situations where we may have false positives due to how textures work. Since textures are POT sized, it’s fairly common for e.g. a 512×448 texture of a render target to be programmed as a 512×512 texture. The unused region should ideally be clamped out with REGION_CLAMP, but most games don’t. A render target might occupy those unused pages. As long as the game’s UV coordinates don’t extend into the unused red zone, there are no hazards, but this is very painful to track. We would have to analyze every single primitive to detect if it’s sampling into the red zone.</p>
+<p>As a workaround, we ignore any potential hazard in that red zone, and just pray that a game isn’t somehow relying on ridiculous spooky-action-at-a-distance hazards to work in the game’s favor.</p>
+<p>There are more spicy special cases, especially with texture sampling feedback, but that will be for later.</p>
+<h3>Updating CLUT in a batched way</h3>
+<p>Since we want to batch texture uploads, we have to batch CLUT uploads too. To make this work, we have 1024 copies of CLUT, a ring buffer of snapshots.</p>
+<p>One workgroup loops through the updates and writes them to an SSBO. I did a similar thing for N64 RDP’s TMEM update, where TMEM was instanced. Fortunately, CLUT update is <strong>far</strong> simpler than TMEM update.</p>
+<pre>shared uint tmp_clut[512];
+
+// ...
+
+// Copy from previous instance to allow a
+// CLUT entry to be partially overwritten and used later
+uint read_index = registers.read_index * CLUT_SIZE_16;
+tmp_clut[gl_LocalInvocationIndex] =
+    uint(clut16.data[read_index]);
+tmp_clut[gl_LocalInvocationIndex + 256u] =
+    uint(clut16.data[read_index + 256u]);
+barrier();
+
+for (uint i = 0; i &lt; registers.clut_count; i++)
+{
+  // ...
+  if (active_lane)
+  {
+    // update tmp_clut. If 256 color, all threads participate.
+    // 16 color update is a partial update.
+  }
+
+  // Flush current CLUT state to SSBO.
+  barrier();
+  clut16.data[gl_LocalInvocationIndex + clut.instance * CLUT_SIZE_16] =
+    uint16_t(tmp_clut[gl_LocalInvocationIndex]);
+  clut16.data[gl_LocalInvocationIndex + clut.instance * CLUT_SIZE_16 + 256u] =
+    uint16_t(tmp_clut[gl_LocalInvocationIndex + 256u]);
+  barrier();
+}</pre>
+<p>One potential optimization is that for 256 color / 32 bpp updates, we can parallelize the CLUT update, since nothing from previous iterations will be preserved, but the CLUT update time is tiny anyway.</p>
+<h3>Unswizzling textures from VRAM</h3>
+<p>Since this is Vulkan, we can just allocate a new VkImage, suballocate it from VkDeviceMemory and blast it with a compute shader.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/upload.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/upload-1024x576.png" alt="" width="660" height="371" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/upload-1024x576.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/upload-300x169.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/upload-768x432.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/upload-1536x864.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/upload-2048x1152.png 2048w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>Using Vulkan’s specialization constants, we specialize the texture format and all the swizzling logic becomes straight forward code.</p>
+<p>REGION_REPEAT shenanigans is also resolved here, so that the ubershader doesn’t have to consider that case and do manual bilinear filtering.</p>
+<p>Even for render targets, we roundtrip through the VRAM SSBO. There is not really a point going to the length of trying to forward render targets into textures. Way too many bugs to squash and edge cases to think about.</p>
+<h3>Triangle setup and binning</h3>
+<p>Like paraLLEl-RDP, paraLLEl-GS is a tile-based renderer. Before binning can happen, we need triangle setup. As inputs, we provide attributes in three arrays.</p>
+<h5>Position</h5>
+<pre>struct VertexPosition
+{
+  ivec2 pos;
+  float z;     // TODO: Should be uint for 32-bit Z.
+  int padding; // Free real-estate?
+};</pre>
+<h5>Per-Vertex attributes</h5>
+<pre>struct VertexAttribute
+{
+  vec2 st;
+  float q;
+  uint rgba; // unpackUnorm4x8
+  float fog; // overkill, but would be padding anyway
+  u16vec2 uv;
+};</pre>
+<h5>Per-primitive attributes</h5>
+<pre>struct PrimitiveAttribute
+{
+  i16vec4 bb; // Scissor
+  // Index into state UBO, as well as misc state bits.
+  uint state;
+  // Texture state which should be scalarized. Affects code paths.
+  // Also holds the texture index (for bindless).
+  uint tex;
+  // Texture state like lod scaling factors, etc.
+  // Does not affect code paths.
+  uint tex2;  
+  uint alpha; // AFIX / AREF
+  uint fbmsk;
+  uint fogcol;
+};</pre>
+<p>For rasterization, we have a straight forward barycentric-based rasterizer. It is heavily inspired by <a href="https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/">https://fgiesen.wordpress.com/2011/07/06/a-trip-through-the-graphics-pipeline-2011-part-6/</a>, which in turn is based on <a href="https://www.cs.drexel.edu/~david/Classes/Papers/comp175-06-pineda.pdf">A Parallel Algorithm for Polygon Rasterization (Paneda, 1988)</a> and describes the “standard” way to write a rasterizer with parallel hardware. Of course, the PS2 GS is DDA, i.e. a scanline rasterizer, but in practice, this is just a question of nudging ULPs of precision, and since I’m not aware of a bit-exact description of the GS’s DDA, this is fine. paraLLEl-RDP implements the raw DDA form for example. It’s certainly possible if we <strong>have</strong> to.</p>
+<p>As an extension to a straight-forward triangle rasterizer, I also need to support parallelograms. This is used to implement wide-lines and sprites. Especially wide-line is kinda questionable, but I’m not sure it’s possible to fully solve up-scaling + Bresenham in the general case. At least I haven’t run into a case where this really matters.</p>
+<p>Evaluating coverage and barycentric I/J turns into something like this:</p>
+<pre>bool evaluate_coverage_single(PrimitiveSetup setup,
+  bool parallelogram, 
+  ivec2 parallelogram_offset,
+  ivec2 coord, inout float i, inout float j)
+{
+  int a = idot3(setup.a, coord);
+  int b = idot3(setup.b, coord);
+  int c = idot3(setup.c, coord);
+
+  precise float i_result = float(b) * setup.inv_area + setup.error_i;
+  precise float j_result = float(c) * setup.inv_area + setup.error_j;
+  i = i_result;
+  j = j_result;
+
+  if (parallelogram &amp;&amp; a.x &lt; 0)
+  {
+    b += a + parallelogram_offset.x;
+    c += a + parallelogram_offset.y;
+    a = 0;
+  }
+
+  return all(greaterThanEqual(ivec3(a, b, c), ivec3(0)));
+}</pre>
+<p>inv_area is computed in a custom fixed-point RCP, which is ~24.0 bit accurate. Using the standard GPU RCP would be bad since it’s just ~22.5 bit accurate and not consistent across implementations. There is no reason to skimp on reproducibility and accuracy, since we’re not doing work per-pixel.</p>
+<p>error_i and error_j terms are caused by the downsampling of the edge equations and tie-break rules. As a side effect of the GS’s [-4k, +4k] pixel range, the range of the cross-product requires 33-bit in signed integers. By downsampling a bit, we can get 32-bit integer math to work just fine with 8 sub-pixel accuracy for super-sampling / multi-sampling. Theoretically, this means our upper up-sampling limit is 8×8, but that’s ridiculous anyway, so we’re good here.</p>
+<p>The parallelogram offsets are very small numbers meant to nudge the tie-break rules in our favor as needed. The exact details of the implementation escape me. I wrote that code years ago. It’s not very hard to derive however.</p>
+<p>Every primitive gets a struct of transformed attributes as well. This is only read if we actually end up shading a primitive, so it’s important to keep this separate to avoid polluting caches with too much garbage.</p>
+<pre>struct TransformedAttributes
+{
+  vec4 stqf0;
+  vec4 stqf1;
+  vec4 stqf2;
+  uint rgba0;
+  uint rgba1;
+  uint rgba2;
+  uint padding;
+  vec4 st_bb;
+};</pre>
+<p>Using I/J like this will lead to small inaccuracies when interpolating primitives which expect to land exactly on the top-left corner of a texel with NEAREST filtering. To combat this, a tiny epsilon offset is used when snapping texture coordinates. Very YOLO, but what can you do. As far as I know, hardware behavior is sub-texel floor, not sub-texel round.</p>
+<pre>precise vec2 uv_1 = uv * scale_1;
+
+// Want a soft-floor here, not round behavior.
+const float UV_EPSILON_PRE_SNAP = 1.0 / 16.0;
+// We need to bias less than 1 / 512th texel, so that linear filter will RTE to correct subpixel.
+// This is a 1 / 1024th pixel bias to counter-act any non-POT inv_scale_1 causing a round-down event.
+const float UV_EPSILON_POST_SNAP = 16.0 / 1024.0;
+
+if (sampler_clamp_s)
+  uv_1.x = texture_clamp(uv_1.x, region_coords.xz, LOD_1);
+if (sampler_clamp_t)
+  uv_1.y = texture_clamp(uv_1.y, region_coords.yw, LOD_1);
+
+// Avoid micro-precision issues with UV and flooring + nearest.
+// Exact rounding on hardware is somwhat unclear.
+// SotC requires exact rounding precision and is hit particularly bad.
+// If the epsilon is too high, then FF X save screen is screwed over,
+// so ... uh, ye.
+// We likely need a more principled approach that is actually HW accurate in fixed point.
+uv_1 = (floor(uv_1 * 16.0 + UV_EPSILON_PRE_SNAP) + UV_EPSILON_POST_SNAP) *
+       inv_scale_1 * 0.0625;</pre>
+<h3>Binning</h3>
+<p>This is mostly uninteresting. Every NxN pixel block gets an array of u16 primitive indices to shade. This makes the maximum number of primitives per render pass 64k, but that’s enough for PS2 games. Most games I’ve seen so far tend to be between 10k and 30k primitives for the “main” render pass, but I haven’t tested the real juggernauts of primitive grunt yet, but even so, having to do a little bit of incremental rendering isn’t a big deal.</p>
+<p>NxN is usually 32×32, but it can be dynamically changed depending on how heavy the geometry load is. For large resolutions and high primitive counts, the binning and memory cost is unacceptable if the resolution is just 16×16 for example. One subgroup is responsible for iterating through all primitives in a block.</p>
+<p>Since binning and triangle is state-less, triangle-setup and binning for back-to-back passes are batched up nicely to avoid lots of silly barriers.</p>
+<h3>The ubershader</h3>
+<p>A key difference between N64 and PS2 is fill-rate and per-pixel complexity. For N64, the ideal approach is to specialize the rasterizing shader, write out per-pixel color + depth + coverage + etc, then merge that data in a much simpler ubershader that only needs to consider depth and blend state rather than full texturing state and combiner state. This is very bandwidth intensive on the GPU, but the alternative is the slowest ubershader written by man. We’re saved by the fact that N64 fill-rate is abysmal. <a href="https://www.youtube.com/watch?v=GC_jLsxZ7nw">Check out this video by Kaze to see how horrible it is</a>.</p>
+<p>The GS is a quite different beast. Fill-rate is very high, and per-pixel complexity is fairly low, so a pure ubershader is viable. We can also rely on bindless this time around too, so texturing complexity becomes a fraction of what I had to deal with on N64.</p>
+<h4>Fine-grained binning</h4>
+<p>Every tile is 4×4, 4×8 and 8×8 for subgroup sizes 16, 32 and 64 respectively. For super-sampling it’s even smaller (it’s 4×4 / 4×8 / 8×8 in the higher resolution domain instead).</p>
+<p>In the outer loop, we pull in up to SubgroupSize’s worth of primitives, and bin them in parallel.</p>
+<pre>for (int i = 0; i &lt; tile.coarse_primitive_count;
+     i += int(gl_SubgroupSize))
+{
+  int prim_index = i + int(gl_SubgroupInvocationID);
+  bool is_last_iteration = i + int(gl_SubgroupSize) &gt;= 
+                           tile.coarse_primitive_count;
+
+  // Bin primitives to tile.
+  bool binned_to_tile = false;
+  uint bin_primitive_index;
+  if (prim_index &lt; tile.coarse_primitive_count)
+  {
+    bin_primitive_index = 
+      uint(coarse_primitive_list.data[
+           tile.coarse_primitive_list_offset + prim_index]);
+    binned_to_tile = primitive_intersects_tile(bin_primitive_index);
+  }
+
+  // Iterate per binned primitive, do per pixel work now.
+  // Scalar loop.
+  uvec4 work_ballot = subgroupBallot(binned_to_tile);</pre>
+<p>In the inner loop, we can do a scalarized loop which checks coverage per-pixel, one primitive at a time.</p>
+<pre>// Scalar data
+uint bit = subgroupBallotFindLSB(work_ballot);
+
+if (gl_SubgroupSize == 64)
+{
+  if (bit &gt;= 32)
+    work_ballot.y &amp;= work_ballot.y - 1;
+  else
+    work_ballot.x &amp;= work_ballot.x - 1;
+}
+else
+{
+  work_ballot.x &amp;= work_ballot.x - 1;
+}
+
+shade_primitive_index = subgroupShuffle(bin_primitive_index, bit);</pre>
+<h4>Early Z</h4>
+<p>We can take advantage of early-Z testing of course, but we have to be careful if there are rasterized pixels we haven’t resolved yet, and there are Z-writes in flight. In this case we have to defer to late Z to perform test.</p>
+<pre>// We might have to remove opaque flag.
+bool pending_z_write_can_affect_result =
+  (pixel.request.z_test || !pixel.request.z_write) &amp;&amp;
+  pending_shade_request.z_write;
+
+if (pending_z_write_can_affect_result)
+{
+  // Demote the pixel to late-Z,
+  // it's no longer opaque and we cannot discard earlier pixels.
+  // We need to somehow observe the previous results.
+  pixel.opaque = false;
+}</pre>
+<h4>Deferred on-tile shading</h4>
+<p>Since we’re an uber-shader, all pixels are “on-chip”, i.e. in registers, so we can take advantage of culling pixels that won’t be visible anyway. The basic idea here is that after rasterization, if a pixel is considered opaque, it will simply replace the shading request that exists for that framebuffer coordinate. It won’t be visible at all anyway.</p>
+<h4>Lazy pixel shading</h4>
+<p>We only need to perform shading when we really have to, i.e., we’re shading a pixel that depends on the previous pixel’s results. This can happen for e.g. alpha test (if test fails, we preserve existing data), color write masks, or of course, alpha blending.</p>
+<p>If our pixel remains opaque, we can just kill the pending pixel shade request. Very nice indeed. The gain here wasn’t as amazing as I had hoped since PS2 games love blending, but it helps culling out a lot of shading work.</p>
+<pre>if (pixel.request.coverage &gt; 0)
+{
+  need_flush = !pixel.opaque &amp;&amp; pending_shade_request.coverage &gt; 0;
+
+  // If there is no hazard, we can overwrite the pending pixel.
+  // If not, defer the update until we run a loop iteration.
+  if (!need_flush)
+  {
+    set_pending_shade_request(pixel.request, shade_primitive_index);
+    pixel.request.coverage = 0;
+    pixel.request.z_write = false;
+  }
+}</pre>
+<p>If we have flushes that need to happen, we do so if one pixel needs it. It’s just as fast to resolve all pixels anyway.</p>
+<pre>// Scalar branch
+if (subgroupAny(need_flush))
+{
+  shade_resolve();
+  if (has_work &amp;&amp; pixel.request.coverage &gt; 0)
+    set_pending_shade_request(pixel.request, shade_primitive_index);
+}</pre>
+<p>The resolve is a straight forward waterfall loop that stays in uniform control flow to be well defined on devices without maximal reconvergence support.</p>
+<pre>while (subgroupAny(has_work))
+{
+  if (has_work)
+  {
+    uint state_index =
+      subgroupBroadcastFirst(pending_shade_request.state);
+    uint tex = subgroupBroadcastFirst(prim_tex);
+    if (state_index == pending_shade_request.state &amp;&amp; prim_tex == tex)
+    {
+      has_work = false;
+      shade_resolve(pending_primitive_index, state_index, tex);
+    }
+  }
+}</pre>
+<p>This scalarization ensures that all branches on things like alpha test mode, blend modes, etc, are purely scalar, and GPUs like that. Scalarizing on the texture index is technically not that critical, but it means we end up hitting the same branches for filtering modes, UBOs for scaling factors are loaded uniformly, etc.</p>
+<p>When everything is done, the resulting framebuffer color and depth is written out to SSBO. GPU bandwidth is kept to a minimum, just like a normal TBDR renderer.</p>
+<h3>Super-sampling</h3>
+<p>Just implementing single sampled rendering isn’t enough for this renderer to be really useful. The software renderer is certainly quite fast, but not fast enough to keep up with intense super-sampling. We can fix that now.</p>
+<p>For e.g. 8x SSAA, we keep 10 versions of VRAM on the GPU.</p>
+<ul>
+<li>1 copy represents the single-sampled VRAM. It is super-sampled.</li>
+<li>1 copy represents the reference value for single-sampled VRAM. This allows us to track when we should discard the super-samples and splat the single sample to all. This can happen if someone copies to VRAM over a render target for whatever reason.</li>
+<li>8 copies which each represent the super-samples. Technically, we can reconstruct a higher resolution image from these samples if we really want to, but only the CRTC could easily do that.</li>
+</ul>
+<p>When rendering super-sampled, we load the single-sampled VRAM and reference. If they match, we load the super-sampled version. This is important for cases where we’re doing incremental rendering.</p>
+<p>On tile completion we use clustered subgroup ops to do multi-sample resolve, then write out the super-samples, and the two single-sampled copies.</p>
+<pre>uvec4 ballot_color = subgroupBallot(fb_color_dirty);
+uvec4 ballot_depth = subgroupBallot(fb_depth_dirty);
+
+// No need to mask, we only care about valid ballot for the
+// first sample we write-back.
+if (NUM_SAMPLES &gt;= 16)
+{
+  ballot_color |= ballot_color &gt;&gt; 8u;
+  ballot_depth |= ballot_depth &gt;&gt; 8u;
+}
+
+if (NUM_SAMPLES &gt;= 8)
+{
+  ballot_color |= ballot_color &gt;&gt; 4u;
+  ballot_depth |= ballot_depth &gt;&gt; 4u;
+}
+
+if (NUM_SAMPLES &gt;= 4)
+{
+  ballot_color |= ballot_color &gt;&gt; 2u;
+  ballot_depth |= ballot_depth &gt;&gt; 2u;
+}
+
+ballot_color |= ballot_color &gt;&gt; 1u;
+ballot_depth |= ballot_depth &gt;&gt; 1u;
+
+// GLSL does not accept cluster reduction as spec constant.
+if (NUM_SAMPLES == 16)
+  fb_color = packUnorm4x8(subgroupClusteredAdd(
+    unpackUnorm4x8(fb_color), 16) / 16.0);
+else if (NUM_SAMPLES == 8)
+  fb_color = packUnorm4x8(subgroupClusteredAdd(
+    unpackUnorm4x8(fb_color), 8) / 8.0);
+else if (NUM_SAMPLES == 4)
+  fb_color = packUnorm4x8(subgroupClusteredAdd(
+    unpackUnorm4x8(fb_color), 4) / 4.0);
+else
+  fb_color = packUnorm4x8(subgroupClusteredAdd(
+    unpackUnorm4x8(fb_color), 2) / 2.0);
+
+fb_color_dirty = subgroupInverseBallot(ballot_color);
+fb_depth_dirty = subgroupInverseBallot(ballot_depth);</pre>
+<p>The main advantage of super-sampling over straight up-scaling is that up-scaling will still have jagged edges, and super-sampling retains a coherent visual look where 3D elements have similar resolution as UI elements. One of my pet peeves is when UI elements have a significantly different resolution from 3D objects and textures. HD texture packs can of course alleviate that, but that’s a very different beast.</p>
+<p>Super-sampling also lends itself very well to CRT post-processing shading, which is also a nice bonus.</p>
+<h3>Dealing with super-sampling artifacts</h3>
+<p>It’s a fact of life that super-sampling always introduces horrible artifacts if not handled with utmost care. Mitigating this is arguably easier with software renderers over traditional graphics APIs, since we’re not limited by the fixed function interpolators. These tricks won’t make it perfect by any means, but it greatly mitigates jank in my experience, and I already fixed many upscaling bugs that GSdx Vulkan backend does not solve as we shall see later.</p>
+<h4>Sprite primitives should always render at single-rate</h4>
+<p>Sprites are always UI elements or similar, and games do not expect us to up-scale them. Doing so either results in artifacts where we sample outside the intended rect, or we risk overblurring the image if bilinear filtering is used.</p>
+<p>The trick here is just to force-snap the pixel coordinate we use when rasterizing and interpolating. This is very inefficient of course, but UI shouldn’t take up the entire screen. And if it does (like in a menu), the GPU load is tiny anyway.</p>
+<pre>const uint SNAP_RASTER_BIT = (1u &lt;&lt; STATE_BIT_SNAP_RASTER);
+const uint SNAP_ATTR_BIT = (1u &lt;&lt; STATE_BIT_SNAP_ATTRIBUTE);
+
+if (SUPER_SAMPLE &amp;&amp; (prim_state &amp; SNAP_RASTER_BIT) != 0)
+  fb_pixel = tile.fb_pixel_single_rate;
+
+res.request.coverage = evaluate_coverage(
+  prim, fb_pixel, i, j,
+  res.request.multisample, SAMPLING_RATE_DIM_LOG2);</pre>
+<h4>Flat primitives should interpolate at single-pixel coordinate</h4>
+<p>Going further, we can demote SSAA interpolation to MSAA center interpolation dynamically. Many UI elements are unfortunately rendered with normal triangles, so we have to be a bit more careful. This snap only affects attribute interpolation, not Z of course.</p>
+<pre>res.request.st_bb = false;
+if (SUPER_SAMPLE &amp;&amp;
+    (prim_state &amp; (SNAP_RASTER_BIT | SNAP_ATTR_BIT)) == SNAP_ATTR_BIT)
+{
+  vec2 snap_ij = evaluate_barycentric_ij(
+    prim.b, prim.c, prim.inv_area,
+    prim.error_i, prim.error_j, tile.fb_pixel_single_rate,
+    SAMPLING_RATE_DIM_LOG2);
+
+  i = snap_ij.x;
+  j = snap_ij.y;
+  res.request.st_bb = true;
+}</pre>
+<p>Here, we snap interpolation to the top-left pixel. This fixes any artifacts for primitives which align their rendering to a pixel center, but some games are mis-aligned, so this snapping can cause texture coordinates to go outside the expected area. To clean this up, we compute a bounding box of final texture coordinates. Adding bounding boxes can technically cause notorious block-edge artifacts, but that was mostly a thing on PS1 since emulators like to convert nearest sampling to bilinear.</p>
+<p>The heuristic for this is fairly simple. If perspective is used, if all vertices in a triangle have exact same Q, we assume it’s a flat UI primitive. The primitive’s Z coordinates must also match. This is done during triangle setup on the GPU. There can of course be false positives here, but it should be rare. In my experience this hack works well enough in the games I tried.</p>
+<h2>Results</h2>
+<p>Here’s a good example of up-sampling going awry in PCSX2. This is with Vulkan backend:</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts.jpg"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts-1024x674.jpg" alt="" width="660" height="434" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts-1024x674.jpg 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts-300x198.jpg 300w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts-768x506.jpg 768w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts-1536x1012.jpg 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-artifacts.jpg 1775w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch-1024x664.png" alt="" width="660" height="428" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch-1024x664.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch-300x194.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch-768x498.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch-1536x995.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-glitch.png 1753w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>Notice the bloom on the glass being mis-aligned and a subtle (?) rectangular pattern being overlaid over the image. This is caused by a post-processing pass rendering in a page-like pattern, presumably to optimize for GS caching behavior.</p>
+
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs-1024x687.png" alt="" width="660" height="443" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs-1024x687.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs-300x201.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs-768x515.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/abyss-gs.png 1280w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>With 8x SSAA in paraLLEl-GS it looks like this instead. There is FSR1 post-upscale in effect here which changes the look a bit, but the usual trappings of bad upscale cannot be observed here. This is another reason to do super-sample; texture mis-alignment has a tendency to fix itself.</p>
+<p>Also, if you’re staring at the perf numbers, this is RX 7600 in a low power state :’)</p>
+<p>Typical UI issues can be seen in games as well. Here’s native resolution:</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-1024x664.png" alt="" width="660" height="428" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-1024x664.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-300x194.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-768x498.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-1536x995.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx.png 1753w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>and 4x upscale, which … does not look acceptable.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x-1024x664.png" alt="" width="660" height="428" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x-1024x664.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x-300x194.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x-768x498.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x-1536x995.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-ffx-4x.png 1753w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>This UI is tricky to render in upscaled mode, since it uses triangles, but the MSAA snap trick above works well and avoids all artifacts. With straight upscale, this is hard to achieve in normal graphics APIs since you’d need interpolateAtOffset beyond 0.5 pixels, which isn’t supported. Perhaps you could do custom interpolation with derivatives or something like that, but either way, this glitch can be avoided. The core message is basically to never upscale UI beyond plain nearest neighbor integer scale. It just looks bad.</p>
+<p>There are cases where PCSX2 asks for high blending accuracy. One example is MGS2, and I found a spot where GPU perf is murdered. My desktop GPU cannot keep 60 FPS here at 4x upscale. PCSX2 asks you to turn up blend-accuracy for this game, but …</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2.jpg"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-1024x621.jpg" alt="" width="660" height="400" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-1024x621.jpg 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-300x182.jpg 300w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-768x466.jpg 768w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-1536x932.jpg 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2.jpg 1747w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>What happens here is we hit the programmable blending path with barrier between every primitive. Ouch! This wouldn’t be bad for the tiler mobile GPUs, but for a desktop GPU, it is where perf goes to die. The shader in question does subpassLoad and does programmable blending as expected. Barrier, tiny triangle, barrier, tiny triangle, hnnnnnnng.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/ouch.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/ouch-1024x576.png" alt="" width="660" height="371" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/ouch-1024x576.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/ouch-300x169.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/ouch-768x432.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/ouch-1536x864.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/ouch-2048x1152.png 2048w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>paraLLEl-GS on the other hand always runs with 100% blend accuracy (assuming no bugs of course). Here’s 16xSSAA (equivalent to 4x upscale). This is just 25 W and 17% GPU utilization on RX 7600. Not bad.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa-1024x687.png" alt="" width="660" height="443" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa-1024x687.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa-300x201.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa-768x515.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-16xssaa.png 1280w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>Other difficult cases include texture sampling feedback. One particular case I found was in Valkyrie Profile 2.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2.jpg"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2-1024x621.jpg" alt="" width="660" height="400" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2-1024x621.jpg 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2-300x182.jpg 300w, https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2-768x466.jpg 768w, https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2-1536x932.jpg 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/valprofile2.jpg 1747w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>This game has a case where it’s sampling it’s own pixel’s alpha as a palette index. Quirky as all hell, and similar to MGS2 there’s a barrier between every pixel.</p>
+<p>In paraLLEl-GS, this case is detected, and we emit a magical texture index, which resolved to just looking at in-register framebuffer color instead. Programmable blending go brr. These cases have to be checked per primitive, which is quite rough on CPU time, but it is what it is. If we don’t hit the good path, GPU performance completely tanks.</p>
+<p>The trick here is to analyze the effective UV coordinates, and see if UV == framebuffer position. If we fall off this path, we have to go via texture uploads, which is bad.</p>
+<pre>ivec2 uv0_delta = uv0 - pos[0].pos;
+ivec2 uv1_delta = uv1 - pos[1].pos;
+ivec2 min_delta = min(uv0_delta, uv1_delta);
+ivec2 max_delta = max(uv0_delta, uv1_delta);
+
+if (!quad)
+{
+  ivec2 uv2_delta = uv2 - pos[2].pos;
+  min_delta = min(min_delta, uv2_delta);
+  max_delta = max(max_delta, uv2_delta);
+}
+
+int min_delta2 = min(min_delta.x, min_delta.y);
+int max_delta2 = max(max_delta.x, max_delta.y);
+
+// The UV offset must be in range of [0, 2^SUBPIXEL_BITS - 1].
+// This guarantees snapping with NEAREST.
+// 8 is ideal. That means pixel centers during interpolation
+// will land exactly in the center of the texel.
+// In theory we could allow LINEAR if uv delta was
+// exactly 8 for all vertices.
+if (min_delta2 &lt; 0 || max_delta2 &gt;= (1 &lt;&lt; SUBPIXEL_BITS))
+  return ColorFeedbackMode::Sliced;
+
+// Perf go brrrrrrr.
+return ColorFeedbackMode::Pixel;</pre>
+<pre>if (feedback_mode == ColorFeedbackMode::Pixel)
+{
+  mark_render_pass_has_texture_feedback(ctx.tex0.desc);
+  // Special index indicating on-tile feedback.
+  // We could add a different sentinel for depth feedback.
+  // 1024k CLUT instances and 32 sub-banks. Fits in 15 bits.
+  // Use bit 15 MSB to mark feedback texture.
+  return (1u &lt;&lt; (TEX_TEXTURE_INDEX_BITS - 1u)) |
+         (render_pass.clut_instance * 32 + uint32_t(ctx.tex0.desc.CSA));
+}</pre>
+<p>It’s comfortably full-speed on PCSX2 here, despite the copious number of barriers, but paraLLEl-GS is reasonably close perf-wise, actually. At 8x SSAA.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs.jpg"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs-1024x709.jpg" alt="" width="660" height="457" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs-1024x709.jpg 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs-300x208.jpg 300w, https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs-768x532.jpg 768w, https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs-1536x1064.jpg 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/valkyrie-gs.jpg 1708w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>Overall, we get away with 18 render pass barriers instead of 500+ which was the case without this optimization. You may notice the interlacing artifacts on the swirlies. Silly game has a progressive scan output, but downsamples it on its own to a field before hitting CRTC, hnnnnng 🙁 Redirecting framebuffer locations in CRTC might work as a per-game hack, but either way, I still need to consider a better de-interlacer. Some games actually render explicitly in fields (640×224), which is very annoying.</p>
+<p>This scene in the MGS2 intro also exposes some funny edge cases with sampling.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro-1024x687.png" alt="" width="660" height="443" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro-1024x687.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro-300x201.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro-768x515.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/mgs2-intro.png 1280w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>To get the camo effect, it’s sampling its own framebuffer as a texture, with overlapping coordinates, but not pixel aligned, so this raises some serious questions about caching behavior. PCSX2 doesn’t seem to add any barriers here, and I kinda had to do the same thing. It looks fine to me compared to software renderer at least.</p>
+<pre>if (feedback_mode == ColorFeedbackMode::Sliced)
+{
+  // If game explicitly clamps the rect to a small region,
+  // it's likely doing well-defined feedbacks.
+  // E.g. Tales of Abyss main menu ping-pong blurs.
+  // This code is quite flawed,
+  // and I'm not sure what the correct solution is yet.
+  if (desc.clamp.desc.WMS == CLAMPBits::REGION_CLAMP &amp;&amp;
+      desc.clamp.desc.WMT == CLAMPBits::REGION_CLAMP)
+  {
+    ivec4 clamped_uv_bb(
+      int(desc.clamp.desc.MINU),
+      int(desc.clamp.desc.MINV),
+      int(desc.clamp.desc.MAXU),
+      int(desc.clamp.desc.MAXV));
+
+    ivec4 hazard_bb(
+      std::max&lt;int&gt;(clamped_uv_bb.x, bb.x),
+      std::max&lt;int&gt;(clamped_uv_bb.y, bb.y),
+      std::min&lt;int&gt;(clamped_uv_bb.z, bb.z),
+      std::min&lt;int&gt;(clamped_uv_bb.w, bb.w));
+
+    cache_texture = hazard_bb.x &gt; hazard_bb.z ||
+                    hazard_bb.y &gt; hazard_bb.w;
+  }
+  else
+  {
+    // Questionable,
+    // but it seems almost impossible to do this correctly and fast.
+    // Need to emulate the PS2 texture cache exactly,
+    // which is just insane.
+    // This should be fine.
+    cache_texture = false;
+  }
+}</pre>
+<p>If we’re in a mode where texture points directly to the frame buffer we should relax the hazard tracking a bit to avoid 2000+ barriers. This is clearly spooky since Tales of Abyss’s bloom effect as shown earlier depends on this to be well behaved, but in that case, at least it uses REGION_CLAMP to explicitly mark the ping-pong behavior. I’m not sure what the proper solution is here.</p>
+<p>The only plausible solution to true bit-accuracy with real hardware is to emulate the caches directly, one pixel at a time. You can kiss performance good bye in that case.</p>
+<p>One of the worst stress tests I’ve found so far has to be Shadow of the Collosus. Just in the intro, we can make the GPU kneel down to 24 FPS with maximum blend accuracy on PCSX2, at just 2x upscale! Even with normal blending accuracy, it is extremely heavy during the intro cinematic.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy-1024x674.png" alt="" width="660" height="434" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy-1024x674.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy-300x198.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy-768x506.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy-1536x1012.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/pcsx2-max-blend-accuracy.png 1775w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>At 8x SSAA, perf is still looking pretty good for paraLLEl-GS, but it’s clearly sweating now.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc.jpg"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc-1024x717.jpg" alt="" width="660" height="462" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc-1024x717.jpg 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc-300x210.jpg 300w, https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc-768x538.jpg 768w, https://themaister.net/blog/wp-content/uploads/2024/07/parallel-sotc.jpg 1280w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<p>We’re actually still CPU bound on the geometry processing. Optimizing the CPU code hasn’t been a huge priority yet. There’s unfortunately a lot of code that has to run per-primitive, where hazards can happen around every corner that has to be dealt with somehow. I do some obvious optimizations, but it’s obviously not as well-oiled as PCSX2 in that regard.</p>
+<p><a href="https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600.png"><img loading="lazy" decoding="async" src="https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600-1024x611.png" alt="" width="660" height="394" srcset="https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600-1024x611.png 1024w, https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600-300x179.png 300w, https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600-768x458.png 768w, https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600-1536x917.png 1536w, https://themaister.net/blog/wp-content/uploads/2024/07/rgp-rx7600.png 1766w" sizes="(max-width: 660px) 100vw, 660px"></a></p>
+<h3>Deck?</h3>
+<p>It seems fast enough to comfortably do 4x SSAA. Maybe not in SotC, but … hey. 😀</p>
+<h2>What now?</h2>
+<p>For now, the only real way to test this is through GS dumps. <a href="https://github.com/Arntzen-Software/parallel-gs/blob/main/misc/0001-Add-an-ad-hoc-GS-stream-format.patch">There’s a hack-patch for PCSX2</a> that lets you dump out a raw GS trace, which can be replayed. This works via mkfifo as a crude hack to test in real-time, but some kind of integration into an emulator needs to happen at some point if this is to turn into something that’s useful for end users.</p>
+<p>There’s guaranteed to be a million bugs lurking since the PS2 library is ridiculously large and there’s only so much I can be arsed to test myself. At least, paraLLEl-GS has now become my preferred way to play PS2 games, so I can say mission complete.</p>
+<p>A potential use case for this is due to its standalone library nature, it may be useful as very old-school rendering API for the old greybeards around that still yearn for the day of PS2 programming for whatever reason :p</p>
+	</div><!-- .entry-content -->
+
+	
+	<!-- .entry-footer -->
+
+</article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Taming the beast that is the Django ORM – An introduction (107 pts)]]></title>
+            <link>https://www.davidhang.com/blog/2024-09-01-taming-the-django-orm/</link>
+            <guid>41413641</guid>
+            <pubDate>Sun, 01 Sep 2024 02:07:34 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.davidhang.com/blog/2024-09-01-taming-the-django-orm/">https://www.davidhang.com/blog/2024-09-01-taming-the-django-orm/</a>, See on <a href="https://news.ycombinator.com/item?id=41413641">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>  <p><img src="https://www.davidhang.com/_astro/1.UiFfZ6wR_IHH0Y.webp" alt="man fighting dragon which represents the django orm" width="1024" height="1024" loading="lazy" decoding="async"></p>
+<p>The material this blog post was originally developed from was a bunch of slides
+used for a skill share presentation I gave at my workplace <span>@</span> <a href="https://coreplan.io/">coreplan.io</a>.</p>
+<p>I have 3+ years of experience with Django, with it being the main framework that
+underpins the backend of CorePlan’s main SaaS product. It is a mature, batteries
+included framework that has been around for a while now. One particular powerful
+yet dangerous feature of Django is the ORM. This is a Django specific ORM which
+cannot be separated from the rest of the framework. The other major python ORM
+is SQLAlchemy which can be used with other python web frameworks, but is an
+independent tool.</p>
+<p>Below are some of the things that I have learned about the Django ORM, how it
+compares to raw SQL and gotchas that you should be aware of when using it.</p>
+<hr>
+<h2 id="what-is-an-orm-object-relational-mapper">What is an ORM (Object Relational Mapper)?</h2>
+<ul>
+<li>Abstraction over SQL to interact with databases</li>
+</ul>
+<p>Code -&gt; SQL</p>
+<pre tabindex="0" data-language="python"><code><span><span>Hole.objects.all()</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> *</span><span> FROM</span><span> drilling_hole;</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="why-use-an-orm---pros">Why use an ORM? - Pros</h2>
+<ul>
+<li>Abstraction over SQL, no need to write raw SQL (plus and minus)</li>
+<li>Portability - Can change out database engines easily !?
+<ul>
+<li>Probably not true, often will rely on db specific features e.g. postgres jsonb, triggers, etc</li>
+</ul>
+</li>
+<li>Direct mapping from db to models</li>
+<li>Automatic schema generation
+<ul>
+<li>Migrations are automatically generated</li>
+</ul>
+</li>
+<li>Security
+<ul>
+<li>abstracts away enough that sql injection is less likely</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="why-use-an-orm---cons">Why use an ORM? - Cons</h2>
+<ul>
+<li>Abstraction over SQL…
+<ul>
+<li>Hides the underlying SQL</li>
+<li>Can be difficult to debug</li>
+<li>Lazy loading can cause N+1 queries without the developer realising</li>
+<li>Harder to onboard new developers if they haven’t used Django before</li>
+</ul>
+</li>
+<li>Performance
+<ul>
+<li>Generated sql be slower than crafted SQL</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="fundamentals">Fundamentals</h2>
+<ul>
+<li>Models = Tables</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span># drilling/models.py</span></span>
+<span></span>
+<span><span>from</span><span> django.db </span><span>import</span><span> models</span></span>
+<span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>    name </span><span>=</span><span> models.TextField()</span></span>
+<span></span></code></pre>
+<pre tabindex="0" data-language="sql"><code><span><span>CREATE</span><span> TABLE</span><span> drilling_hole</span><span> (</span></span>
+<span><span>    id </span><span>SERIAL</span><span> PRIMARY KEY</span><span>,</span></span>
+<span><span>    name</span><span> VARCHAR</span><span>(</span><span>100</span><span>)</span></span>
+<span><span>);</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="migrations">Migrations</h2>
+<pre tabindex="0" data-language="bash"><code><span><span>python</span><span> manage.py</span><span> makemigrations</span><span> # generate migration files</span></span>
+<span><span>python</span><span> manage.py</span><span> migrate</span><span> # apply migrations</span></span>
+<span></span>
+<span><span>python</span><span> manage.py</span><span> drilling</span><span> --empty</span><span> # generate empty file for data migration</span></span>
+<span></span></code></pre>
+<p><a href="https://docs.djangoproject.com/en/dev/topics/migrations/">https://docs.djangoproject.com/en/dev/topics/migrations/</a></p>
+<hr>
+
+<h2 id="querying">Querying</h2>
+<ul>
+<li><code>ActiveRecord</code> pattern - ala Ruby on Rails style</li>
+<li>QuerySets (<code>Hole.objects.all()</code>)
+<ul>
+<li>lazy</li>
+<li>chainable</li>
+<li>cached when iterated over multiple times <a href="https://docs.djangoproject.com/en/dev/topics/db/queries/#caching-and-querysets">!?</a>
+<ul>
+<li>I would not recommend relying on this because it hard to comprehend when it is cached and when it is not when you are reading code</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>holes_qs </span><span>=</span><span> Hole.objects.filter(</span><span>name</span><span>=</span><span>"cheese"</span><span>) </span><span># not evaluated yet</span></span>
+<span><span>holes_qs </span><span>=</span><span> holes_qs.filter(</span><span>depth__gt</span><span>=</span><span>100</span><span>) </span><span># still not evaluated</span></span>
+<span></span>
+<span><span>list</span><span>(holes_qs) </span><span># evaluated</span></span>
+<span><span>list</span><span>(holes_qs) </span><span># cached</span></span>
+<span></span>
+<span><span>holes_qs[</span><span>2</span><span>] </span><span># not cached</span></span>
+<span><span>holes_qs.first() </span><span># not cached</span></span>
+<span><span>holes_qs.get(</span><span>id</span><span>=</span><span>1</span><span>) </span><span># not cached</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="where">WHERE</h2>
+<ul>
+<li><code>WHERE</code> clause ≈ <code>filter()</code></li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>holes_qs </span><span>=</span><span> Hole.objects.filter(</span><span>name</span><span>=</span><span>"cheese"</span><span>)</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> *</span><span> </span></span>
+<span><span>FROM</span><span> drilling_hole;</span></span>
+<span><span>WHERE</span><span> drilling_hole</span><span>.</span><span>name</span><span> =</span><span> 'cheese'</span><span>;</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="where-across-tables">WHERE across tables?</h2>
+<ul>
+<li>But how do you do a left/inner join? With the ORM it isn’t done declaratively, but implicitly</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  pad </span><span>=</span><span> models.ForeignKey(Pad, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span>class</span><span> Pad</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>holes_qs </span><span>=</span><span> Hole.objects.filter(</span><span>pad__name</span><span>=</span><span>"cheese board"</span><span>)</span></span>
+<span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> *</span><span> </span></span>
+<span><span>FROM</span><span> drilling_hole;</span></span>
+<span><span>INNER JOIN</span><span> drilling_pad </span><span>ON</span><span> drilling_hole</span><span>.</span><span>pad_id</span><span> =</span><span> drilling_pad</span><span>.</span><span>id</span></span>
+<span><span>WHERE</span><span> drilling_pad</span><span>.</span><span>name</span><span> =</span><span> 'cheese board'</span><span>;</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="where-other-conditionals">WHERE other conditionals</h2>
+<ul>
+<li><code>filter(name="cheese")</code> -&gt; <code>filter(name__exact="cheese")</code> -&gt; <code>WHERE name = 'cheese'</code></li>
+<li><code>filter(name__iexact="cheese")</code> -&gt; <code>WHERE name ILIKE 'cheese'</code></li>
+<li><code>filter(name__contains="cheese")</code> -&gt; <code>WHERE name LIKE '%cheese%'</code></li>
+<li><code>filter(name__icontains="cheese")</code> -&gt; <code>WHERE name ILIKE '%cheese%'</code></li>
+<li><code>filter(name__in=["cheese", "board"])</code> -&gt; <code>WHERE name IN ('cheese', 'board')</code></li>
+<li><code>filter(name__gt=100)</code> -&gt; <code>WHERE name &gt; 100</code> etc</li>
+<li><code>filter(name__isnull=True)</code> -&gt; <code>WHERE name IS NULL</code>
+<ul>
+<li>At least for postgres shouldn’t <code>name = None</code>, <a href="https://www.postgresql.org/docs/current/functions-comparison.html">null != null</a></li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="as">AS</h2>
+<ul>
+<li><code>annotate</code> ≈ <code>AS</code></li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>holes_qs </span><span>=</span><span> Hole.objects.annotate(</span><span>this_thang</span><span>=</span><span>F(</span><span>"pad__name"</span><span>))</span></span>
+<span><span>hole </span><span>=</span><span> holes_qs.first()</span></span>
+<span><span>print</span><span>(hole.this_thang)</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> </span></span>
+<span><span>  *</span><span> , </span></span>
+<span><span>  drilling_pad</span><span>.</span><span>name</span><span> AS</span><span> this_thang</span></span>
+<span><span>FROM</span><span> drilling_hole;</span></span>
+<span><span>INNER JOIN</span><span> "drilling_pad"</span><span> ON</span><span> (</span><span>"drilling_hole"</span><span>.</span><span>"pad_id"</span><span> =</span><span> "drilling_pad"</span><span>.</span><span>"id"</span><span>)</span></span>
+<span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="subqueries">Subqueries</h2>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Project</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>class</span><span> Pad</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  pad </span><span>=</span><span> models.ForeignKey(Pad, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span><span>  project </span><span>=</span><span> models.ForeignKey(Project, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span># find pads that are on project_id=1</span></span>
+<span><span>hole_subquery </span><span>=</span><span> Hole.objects.filter(</span><span>project_id</span><span>=</span><span>1</span><span>).values(</span><span>"pk"</span><span>)</span></span>
+<span><span>pad_qs </span><span>=</span><span> Pad.objects.filter(</span><span>hole__in</span><span>=</span><span>Subquery(hole_subquery))</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> "drilling_pad"</span><span>.</span><span>"id"</span><span>,</span></span>
+<span><span> "drilling_pad"</span><span>.</span><span>"name"</span></span>
+<span><span>FROM</span><span> "drilling_pad"</span></span>
+<span><span> INNER JOIN</span><span> "drilling_hole"</span><span> ON</span><span> (</span><span>"drilling_pad"</span><span>.</span><span>"id"</span><span> =</span><span> "drilling_hole"</span><span>.</span><span>"pad_id"</span><span>)</span></span>
+<span><span>WHERE</span><span> "drilling_hole"</span><span>.</span><span>"id"</span><span> IN</span><span> (</span></span>
+<span><span>  SELECT</span><span> U0.</span><span>"id"</span></span>
+<span><span>  FROM</span><span> "drilling_hole"</span><span> U0</span></span>
+<span><span>  WHERE</span><span> U0.</span><span>"project_id"</span><span> =</span><span> 1</span></span>
+<span><span> )</span></span>
+<span></span></code></pre>
+<hr>
+
+<p>Correlated subqueries are where the inner query depends on outer query</p>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Pad</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  pad </span><span>=</span><span> models.ForeignKey(Pad, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span># include the hole id of any hole that has a foreign key to the pad</span></span>
+<span><span>hole_subquery </span><span>=</span><span> Hole.objects.filter(</span><span>pad_id</span><span>=</span><span>OuterRef(</span><span>"pk"</span><span>)).values(</span><span>"pk"</span><span>)</span></span>
+<span><span>pad_qs </span><span>=</span><span> Pad.objects.annotate(</span><span>hole_id</span><span>=</span><span>Subquery(hole_subquery))</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> "drilling_pad"</span><span>.</span><span>"id"</span><span>,</span></span>
+<span><span> "drilling_pad"</span><span>.</span><span>"name"</span><span>,</span></span>
+<span><span> (</span></span>
+<span><span>  SELECT</span><span> U0.</span><span>"id"</span></span>
+<span><span>  FROM</span><span> "drilling_hole"</span><span> U0</span></span>
+<span><span>  WHERE</span><span> U0.</span><span>"pad_id"</span><span> =</span><span> (</span><span>"drilling_pad"</span><span>.</span><span>"id"</span><span>)</span></span>
+<span><span> ) </span><span>AS</span><span> "hole_id"</span></span>
+<span><span>FROM</span><span> "drilling_pad"</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="performance-improvements">Performance improvements</h2>
+<ul>
+<li>Reduce N+1
+<ul>
+<li>You typically want to reduce N+1 queries because they have communication
+overhead</li>
+<li><code>select_related</code></li>
+<li><code>prefetch_related</code></li>
+<li>You also might choose to use <code>annotate()</code> instead of <code>select_related</code>
+because select related pulls all the data for the associated table when you
+might only need one column. That associated might have a jsonb column which
+contains a lot of unnecessary data that you don’t need.</li>
+</ul>
+</li>
+</ul>
+<hr>
+
+<pre tabindex="0" data-language="python"><code><span><span>holes </span><span>=</span><span> Hole.objects.all()</span></span>
+<span><span>for</span><span> hole </span><span>in</span><span> holes:</span></span>
+<span><span>  print</span><span>(hole.pad.name) </span><span># N+1 queries</span></span>
+<span></span>
+<span><span>holes </span><span>=</span><span> Hole.objects.select_related(</span><span>"pad"</span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> hole </span><span>in</span><span> holes:</span></span>
+<span><span>  print</span><span>(hole.pad.name) </span><span># no extra query</span></span>
+<span></span>
+<span></span></code></pre>
+<hr>
+
+<p>You would use prefetch related when you are not pulling a direct foreign key
+such a many-to-many relationship like below.</p>
+<p><img src="https://www.davidhang.com/_astro/2.Cd5VA_n2_Z22TJnn.svg" alt="width:400px" width="340" height="465" loading="lazy" decoding="async"></p>
+<pre tabindex="0" data-language="python"><code><span></span>
+<span><span>class</span><span> Faculty</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>class</span><span> Course</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  faculty </span><span>=</span><span> models.ForeignKey(Faculty, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span>class</span><span> Student</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  courses </span><span>=</span><span> models.ManyToManyField(Course, </span><span>through</span><span>=</span><span>"Enrolment"</span><span>)</span></span>
+<span></span>
+<span><span>class</span><span> Enrolment</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  course </span><span>=</span><span> models.ForeignKey(Course, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span><span>  student </span><span>=</span><span> models.ForeignKey(Student, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span><span>  grade </span><span>=</span><span> models.FloatField()</span></span>
+<span></span>
+<span><span>students </span><span>=</span><span> Student.objects.prefetch_related(</span><span>"courses"</span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> student </span><span>in</span><span> students:</span></span>
+<span><span>  for</span><span> course </span><span>in</span><span> student.courses.all():</span></span>
+<span><span>    print</span><span>(course.name) </span><span># no extra query</span></span>
+<span><span>    print</span><span>(course.faculty.name) </span><span># extra query</span></span>
+<span></span>
+<span><span>students </span><span>=</span><span> Student.objects.prefetch_related(</span></span>
+<span><span>  Prefetch(</span></span>
+<span><span>    "courses"</span><span>, </span></span>
+<span><span>    queryset</span><span>=</span><span>Course.objects.select_related(</span><span>"faculty"</span><span>)</span></span>
+<span><span>  )</span></span>
+<span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> student </span><span>in</span><span> students:</span></span>
+<span><span>  for</span><span> course </span><span>in</span><span> student.courses.all():</span></span>
+<span><span>    print</span><span>(course.name) </span><span># no extra query</span></span>
+<span><span>    print</span><span>(course.faculty.name) </span><span># no extra query</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="to_attr">to_attr</h2>
+<p><code>to_attr</code> can be used to make “filtered” relationships available on the instance.</p>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Enrolment</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  course </span><span>=</span><span> models.ForeignKey(Course, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span><span>  student </span><span>=</span><span> models.ForeignKey(Student, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span><span>  grade </span><span>=</span><span> models.FloatField()</span></span>
+<span></span>
+<span><span>students </span><span>=</span><span> Student.objects.prefetch_related(</span></span>
+<span><span>  Prefetch(</span></span>
+<span><span>    "course"</span><span>, </span></span>
+<span><span>    queryset</span><span>=</span><span>Course.objects.filter(</span><span>grade__gt</span><span>=</span><span>80.0</span><span>).select_related(</span><span>"faculty"</span><span>), </span><span>to_attr</span><span>=</span><span>"hd_courses"</span></span>
+<span><span>  )</span></span>
+<span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> student </span><span>in</span><span> students:</span></span>
+<span><span>  for</span><span> course </span><span>in</span><span> student.hd_courses.all():</span></span>
+<span><span>    ...</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="multiple-instances-when-filtering-across-many-to-many">Multiple instances when filtering across many-to-many</h2>
+<p>One gotcha is selecting across a many-to-many relationship can return multiple of the same instances.</p>
+<p><img src="https://www.davidhang.com/_astro/3.DMAdguVG_TLkyj.webp" alt="data model showing many to many relationship" width="530" height="810" loading="lazy" decoding="async"></p>
+<pre tabindex="0" data-language="python"><code><span><span>Student.objects.filter(</span><span>courses__faculty__name</span><span>=</span><span>"Science"</span><span>) </span><span># inner join returns duplicated rows</span></span>
+<span><span>&lt;</span><span>QuerySet [</span><span>&lt;</span><span>Student: Student </span><span>object</span><span> (</span><span>1</span><span>)</span><span>&gt;</span><span>, </span><span>&lt;</span><span>Student: Student </span><span>object</span><span> (</span><span>1</span><span>)</span><span>&gt;</span><span>]</span><span>&gt;</span></span>
+<span></span>
+<span><span>Student.objects.filter(</span><span>courses__faculty__name</span><span>=</span><span>"Science"</span><span>).distinct()</span></span>
+<span><span>&lt;</span><span>QuerySet [</span><span>&lt;</span><span>Student: Student </span><span>object</span><span> (</span><span>1</span><span>)</span><span>&gt;</span><span>]</span><span>&gt;</span></span>
+<span></span>
+<span></span></code></pre>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span></span>
+<span><span>  "testing_student"</span><span>.</span><span>"id"</span><span>, </span></span>
+<span><span>  "testing_student"</span><span>.</span><span>"name"</span><span> </span></span>
+<span><span>FROM</span><span> </span></span>
+<span><span>  "testing_student"</span><span> </span></span>
+<span><span>INNER JOIN</span><span> </span></span>
+<span><span>  "testing_enrolment"</span><span> </span></span>
+<span><span>ON</span><span> </span></span>
+<span><span>  (</span><span>"testing_student"</span><span>.</span><span>"id"</span><span> =</span><span> "testing_enrolment"</span><span>.</span><span>"student_id"</span><span>) </span></span>
+<span><span>INNER JOIN</span><span> </span></span>
+<span><span>  "testing_course"</span><span> </span></span>
+<span><span>ON</span><span> </span></span>
+<span><span>  (</span><span>"testing_enrolment"</span><span>.</span><span>"course_id"</span><span> =</span><span> "testing_course"</span><span>.</span><span>"id"</span><span>) </span></span>
+<span><span>INNER JOIN</span><span> </span></span>
+<span><span>  "testing_faculty"</span><span> </span></span>
+<span><span>ON</span><span> </span></span>
+<span><span>  (</span><span>"testing_course"</span><span>.</span><span>"faculty_id"</span><span> =</span><span> "testing_faculty"</span><span>.</span><span>"id"</span><span>)</span></span>
+<span><span>WHERE</span><span> </span></span>
+<span><span>  "testing_faculty"</span><span>.</span><span>"name"</span><span> =</span><span> 'Science'</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="gotchas-and-other-funky-stuff">Gotchas and other Funky stuff</h2>
+<ul>
+<li>Model instances when retrieved will try to populate all columns, if column
+removed in migration, and the worker still up exception occurs
+<ul>
+<li><code>get()</code> or <code>first()</code></li>
+<li><code>for hole in Hole.objects.all()</code></li>
+</ul>
+</li>
+<li>This can make migrations hard, as older workers will be requesting columns that might have been removed or renamed which will cause errors</li>
+<li>There are ways to do down-timeless migrations but are bit <a href="https://hackernoon.com/deleting-a-column-from-a-django-model-on-production">funky and multi
+step</a></li>
+<li>Recommendation is to avoid deleting or renaming columns</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  pad </span><span>=</span><span> models.ForeignKey(Pad, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span>class</span><span> Pad</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>holes_qs </span><span>=</span><span> Hole.objects.annotate(</span><span>this_thang</span><span>=</span><span>F(</span><span>"pad__name"</span><span>)).get()</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> </span></span>
+<span><span>  drilling_hole</span><span>.</span><span>name</span><span>, </span><span>-- pulls all columns </span></span>
+<span><span>  drilling_hole</span><span>.</span><span>pad_id</span><span>,</span></span>
+<span><span>  drilling_pad</span><span>.</span><span>name</span><span> AS</span><span> this_thang</span></span>
+<span><span>FROM</span><span> drilling_hole;</span></span>
+<span><span>WHERE</span><span> drilling_pad</span><span>.</span><span>name</span><span> =</span><span> 'cheese board'</span><span>;</span></span>
+<span><span>LIMIT</span><span> 1</span><span>;</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="values">Values</h2>
+<ul>
+<li>So how do you to only retrieve certain columns?</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span><span>  pad </span><span>=</span><span> models.ForeignKey(Pad, </span><span>on_delete</span><span>=</span><span>models.</span><span>CASCADE</span><span>)</span></span>
+<span></span>
+<span><span>holes_qs </span><span>=</span><span> Hole.objects.values(</span><span>"name"</span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> hole </span><span>in</span><span> holes_qs:</span></span>
+<span><span>  print</span><span>(</span><span>type</span><span>(hole)) </span><span># dict</span></span>
+<span><span>  # not `Hole` object, hence no class functions, no lazy loading e.g. can't access `hole.pad.name`</span></span>
+<span></span></code></pre>
+<p>⬇️</p>
+<pre tabindex="0" data-language="sql"><code><span><span>SELECT</span><span> </span></span>
+<span><span>  drilling_hole</span><span>.</span><span>name</span><span>, </span><span>-- only pulls name and maps it to a python dictionary object</span></span>
+<span><span>FROM</span><span> drilling_hole;</span></span>
+<span></span></code></pre>
+<ul>
+<li>Less data sent down the wire, but no lazy loading and no class functions as
+the data is a python dictionary</li>
+</ul>
+<hr>
+<h2 id="other-options">Other options</h2>
+<ul>
+<li><code>only()</code> and <code>defer()</code></li>
+<li>Will retrieve model instances, but won’t retrieve all fields</li>
+<li>Values not declared when accessed on the model are lazy loaded</li>
+<li>Would not recommend to be used regularly, very high chance of N+1</li>
+</ul>
+<pre tabindex="0" data-language="python"><code><span><span>holes_qs </span><span>=</span><span> Hole.objects.only(</span><span>"pad_id"</span><span>)</span></span>
+<span></span>
+<span><span>for</span><span> hole </span><span>in</span><span> holes_qs:</span></span>
+<span><span>  print</span><span>(hole.pad_id) </span><span># no extra query</span></span>
+<span><span>  print</span><span>(hole.name) </span><span># name will be lazy loaded, N+1 queries</span></span>
+<span></span></code></pre>
+<hr>
+<h3 id="how-do-you-know-what-sql-is-being-generated">How do you know what SQL is being generated?</h3>
+<ul>
+<li><code>print(queryset.query)</code></li>
+<li><a href="https://github.com/jazzband/django-debug-toolbar">Django Debug Toolbar</a></li>
+<li><a href="https://kolo.app/">Kolo</a></li>
+</ul>
+<hr>
+<h2 id="updating-rows">Updating rows</h2>
+<p>There are three typical ways to update a row in the database.</p>
+<pre tabindex="0" data-language="python"><code><span><span>class</span><span> Hole</span><span>(</span><span>models</span><span>.</span><span>Model</span><span>):</span></span>
+<span><span>  name </span><span>=</span><span> models.TextField()</span></span>
+<span></span>
+<span><span>instance </span><span>=</span><span> Hole.objects.create(</span><span>name</span><span>=</span><span>"cheese"</span><span>)</span></span>
+<span></span>
+<span><span># save()</span></span>
+<span><span>instance.name </span><span>=</span><span> "board"</span></span>
+<span><span>instance.save()</span></span>
+<span></span>
+<span><span># update()</span></span>
+<span><span>Model.objects.filter(</span><span>name</span><span>=</span><span>"board"</span><span>).update(</span><span>name</span><span>=</span><span>"board2"</span><span>)</span></span>
+<span></span>
+<span><span># bulk_update()</span></span>
+<span><span>instance.name </span><span>=</span><span> "board3"</span></span>
+<span><span>instances_to_update </span><span>=</span><span> [instance]</span></span>
+<span><span>Model.objects.bulk_update(instances_to_update, [</span><span>"name"</span><span>])</span></span>
+<span></span></code></pre>
+<hr>
+<h2 id="problems-with-updates">Problems with updates</h2>
+<ul>
+<li><code>update()</code> and <code>bulk_update()</code> do not trigger <code>save()</code> method on the model</li>
+<li>built in django signals (publish/subscribe pattern), there are post_save and pre_save signals which can be triggered when calling <code>save()</code>
+<ul>
+<li><code>update()</code> and <code>bulk_update()</code> do not trigger those signals…</li>
+</ul>
+</li>
+<li><code>updated_at</code> column would not normally be updated when calling <code>update()</code> or
+<code>bulk_update()</code> but if queryset is a descendant of <code>CoreplanQuerySet</code> then it will.</li>
+</ul>
+<hr>
+
+<ul>
+<li>Pagination / order_by
+<ul>
+<li>Not a Django ORM thing, but a Django ORM hides the implementation detail,
+which may lead to unexpected result</li>
+<li>Page pagination is default in DRF list views and implemented with <code>LIMIT</code> and <code>OFFSET</code> in SQL</li>
+</ul>
+</li>
+</ul>
+<p><code>?page_size=10&amp;page=3</code></p>
+<pre tabindex="0" data-language="plaintext"><code><span><span>SELECT * </span></span>
+<span><span>FROM drilling_hole </span></span>
+<span><span>LIMIT 10 </span></span>
+<span><span>OFFSET 20;</span></span>
+<span><span></span></span></code></pre>
+<p>Anything wrong with this query?</p>
+<ul>
+<li>There is no deterministic guarantee that the same 10 rows will be returned each time.</li>
+<li>A plain <code>SELECT</code> in postgres (may be different in different dbs) provides no
+guarantee of order, unless <code>ORDER BY</code> is specified</li>
+<li>It often appears to return in insertion/<code>id</code> order, but that is not guaranteed
+in postgres</li>
+<li>Model Meta <code>ordering</code> may set a default order, but sometimes tht is <a href="https://docs.djangoproject.com/en/dev/releases/2.2/#features-deprecated-in-2-2">ignored</a></li>
+<li>For list views you should to provide a deterministic order_by</li>
+<li><code>order_by(name)</code> is not enough if name is not unique
+<ul>
+<li><code>order_by(name, id)</code> is required, because id is unique</li>
+</ul>
+</li>
+<li>This can been the the cause of some flaky tests issues where lists are
+returned seemingly in insertion order and asserted to return in id order</li>
+</ul>
+<hr>
+<p>Thanks for reading! I hope this has been useful to you. There are definitely
+more particularities and gotchas to be aware of when using the Django ORM and
+Django in general but I think these are the most common ones.</p>  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[AirTags key to discovery of Houston's plastic recycling deception (131 pts)]]></title>
             <link>https://appleinsider.com/articles/24/08/31/airtags-key-to-discovery-of-houstons-plastic-recycling-deception</link>
             <guid>41413174</guid>
             <pubDate>Sun, 01 Sep 2024 00:38:33 GMT</pubDate>
@@ -38,7 +1339,7 @@
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Building LLMs from the Ground Up: A 3-Hour Coding Workshop (556 pts)]]></title>
+            <title><![CDATA[Building LLMs from the Ground Up: A 3-Hour Coding Workshop (588 pts)]]></title>
             <link>https://magazine.sebastianraschka.com/p/building-llms-from-the-ground-up</link>
             <guid>41412256</guid>
             <pubDate>Sat, 31 Aug 2024 21:45:59 GMT</pubDate>
@@ -54,7 +1355,7 @@
 Couldn't get https://www.wsj.com/tech/ai/ai-chatgpt-nvidia-apple-facebook-383943d1: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[WatchYourLAN: Lightweight Network IP Scanner (131 pts)]]></title>
+            <title><![CDATA[WatchYourLAN: Lightweight Network IP Scanner (136 pts)]]></title>
             <link>https://github.com/aceberg/WatchYourLAN</link>
             <guid>41411281</guid>
             <pubDate>Sat, 31 Aug 2024 19:32:12 GMT</pubDate>
@@ -369,7 +1670,7 @@ Run with Docker:</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Nearly half of Nvidia's revenue comes from four mystery whales each buying $3B+ (220 pts)]]></title>
+            <title><![CDATA[Nearly half of Nvidia's revenue comes from four mystery whales each buying $3B+ (221 pts)]]></title>
             <link>https://fortune.com/2024/08/29/nvidia-jensen-huang-ai-customers/</link>
             <guid>41410450</guid>
             <pubDate>Sat, 31 Aug 2024 17:42:45 GMT</pubDate>
@@ -461,7 +1762,15 @@ Run with Docker:</p>
 <p>Nvidia didn’t immediately respond to a request from&nbsp;<em>Fortune</em>&nbsp;for comment.</p></div><div data-cy="subscriptionPlea"><p><strong>Recommended reading:</strong><br>In our new special issue, a Wall Street legend gets a radical makeover, a tale of crypto iniquity, misbehaving poultry royalty, and more.<br><a href="https://fortune.com/packages/digital-issue-kkr/?&amp;itm_source=fortune&amp;itm_medium=article_tout&amp;itm_campaign=kkr_issue" target="_self" aria-label="Go to https://fortune.com/packages/digital-issue-kkr/?&amp;itm_source=fortune&amp;itm_medium=article_tout&amp;itm_campaign=kkr_issue">Read the stories.</a></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[My fake job in Y2K preparedness (125 pts)]]></title>
+            <title><![CDATA[Client-side QR code generator with SVG output (103 pts)]]></title>
+            <link>https://fietkau.software/qr</link>
+            <guid>41410442</guid>
+            <pubDate>Sat, 31 Aug 2024 17:42:14 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://fietkau.software/qr">https://fietkau.software/qr</a>, See on <a href="https://news.ycombinator.com/item?id=41410442">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="main" tabindex="-1"><div><p>QRSVG is a small JavaScript project to render a two-dimensional bitmask (mostly assumed to be a QR code) to an SVG element as a collection of SVG paths with defined purposes.</p></div><section><h2>Project Description</h2><p><a href="https://en.wikipedia.org/wiki/QR_code">QR codes</a> have established themselves as a popular way to provide a chunk of digital information (most commonly a web address to jump to) via physical media. I myself occasionally use them in flyers, posters, or presentation slides.</p><p>They are not too complicated to generate and a variety of free websites exist for this purpose. Sadly none of them appear to have all of the customization options that I want, plus most of them use some manner of ads and/or data tracking. The demo on this page combines <a href="https://www.nayuki.io/page/qr-code-generator-library">Project Nayuki’s QR Code generator library</a> (a multi-language open source project that can, among other things, perform the conversion of text into raw QR code data) with my own QRSVG project, which can turn a QR-like two-dimensional boolean data map into an efficient vector description of its own visualization by tracing the contours of contiguous shapes. Or in simpler terms: it turns a QR code into a straightforward and customizable SVG file. The demo up top showcases a number of stylistic customizations enabled by QRSVG. Its strengths include:</p><ul><li>Conversion of QR code data into efficient SVG markup</li><li>Shape and color customization</li><li>QR codes can be made downloadable in SVG and PNG formats</li><li>Entirely client-side, hostable as static files (i.e. making this available to you costs me nothing)</li></ul><p>If the demo QR code generator at the top of this page is convenient for you too, please feel free to spread the word!</p></section></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[My fake job in Y2K preparedness (131 pts)]]></title>
             <link>https://www.nplusonemag.com/issue-48/essays/the-contingency-contingent/</link>
             <guid>41409891</guid>
             <pubDate>Sat, 31 Aug 2024 16:23:13 GMT</pubDate>
@@ -469,7 +1778,7 @@ Run with Docker:</p>
 <div id="readability-page-1" class="page"><div><p><span>I<span>n rare moments</span></span> within the history of capitalism, too few workers exist. Not as an absolute, of course: in total, workers always outnumber paid possibilities for work; that’s how our economy functions. But in a specific industry, a shortage may emerge, if only for a brief time. In 1998, on my first day of work as an analyst with the accounting and consulting firm Arthur Andersen LLP, it was clear that some aberration in accumulation had placed me in the twenty-fourth-floor conference room of a Manhattan skyscraper, overlooking the Museum of Modern Art’s sculpture garden, staring at a PowerPoint presentation for new hires. On one slide was a cartoon duck, bespectacled and presented in profile, standing on the tiptoes of its webbed feet. In its hands was a sledgehammer, held overhead, ready to smash a desktop computer.</p><p>I would learn soon enough that this—my first professional and only corporate work experience—was a fake job. It was fake because although I worked with Arthur Andersen, I never worked <span><i>for</i></span> them. (Their shade of blue-chip firm would never have hired the likes of me: they recruited from places like Harvard; I’d recently graduated from Hampshire College. They required new hires to have impeccable GPAs; my school didn’t confer grades.) Instead, I was employed by a global advertising conglomerate that had hired Andersen on a consultancy project and then placed me alongside the Andersen team—the result of a confluence of staffing shortages.</p><p>It was, moreover, a fake job because Andersen was faking it. The firm spent the late 1990s certifying fraudulent financial statements from Enron, the Texas-based energy company that made <span><i>financial</i></span> <span><i>derivatives</i></span> a household phrase, until that company went bankrupt in a cloud of scandal and suicide and Andersen was convicted of obstruction of justice, surrendered its accounting licenses, and shuttered. But that was later.</p><p>Finally, it was a fake job because the problem that the Conglomerate had hired Andersen to solve was not real, at least not in the sense that it needed to be solved or that Andersen could solve it. The problem was known variously as Y2K, or the Year 2000, or the Y2K Bug, and it prophesied that on January 1, 2000, computers the world over would be unable to process the thousandth-digit change from 19 to 20 as 1999 rolled into 2000 and would crash, taking with them whatever technology they were operating, from email to television to air-traffic control to, really, the entire technological infrastructure of global modernity. Hospitals might have emergency power generators to stave off the worst effects (unless the generators, too, succumbed to the Y2K Bug), but not advertising firms.</p><p>With a world-ending scenario on the horizon, employment standards were being relaxed. The end of the millennium had produced a tight labor market in knowledge workers, and new kinds of companies, called dot-coms, were angling to dominate the emergent world of e-commerce. Flush with cash, these companies were hoovering up any possessors of knowledge they could find. Friends from my gradeless college whose only experience in business had been parking-lot drug deals were talking stock options.</p><p>The employment agency through which I got my fake job made no epistemological distinction between knowing something and knowing about something. JavaScript, for example, a computer programming language: I knew about it but did not know it. Fine. Was I aware that the modern world might go on a catastrophic hiatus of unknown duration at the end of 1999? I had heard of something to that effect, although if pressed I couldn’t have explained. The Conglomerate was not much more stringent. My interview consisted of about twelve minutes with a laconic, mustachioed, middle-aged Arthur Andersen manager named Dick. (One of the services Andersen had been asked to provide was to help hire the Conglomerate’s Y2K team.) “On a scale of one to ten, what’s your knowledge of computer software?” he began. I paused for a moment, unsure of whether our interview would include a demonstrative component, as had so many previous interviews for jobs I had not gotten. But his office was empty. I couldn’t see how he would test me. I said <span><i>eight</i></span>.</p><blockquote><p><b>At a certain point all that had happened yesterday was our documenting, so then we documented that.</b></p><b> <a onclick="return popitup('https://twitter.com/share?text=At+a+certain+point+all+that+had+happened+yesterday+was+our+documenting%2C+so+then+we+documented+that.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624')" href="https://twitter.com/share?text=At+a+certain+point+all+that+had+happened+yesterday+was+our+documenting%2C+so+then+we+documented+that.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624">Tweet</a></b></blockquote><p>“And what’s your knowledge of computer hardware, on a scale of one to ten?” Dick continued. The moment called for both boldness and modesty. I felt committed to eight, a number I had long appreciated for its intimations of infinity when turned sideways. So I repeated myself: “Eight.” It was true that one of my campus work-study jobs had been as a computer lab monitor. I could restart a PC or refill a printer’s paper tray if the situation demanded it, although it rarely did. I’d had the weekend evening shifts.</p><p>Dick’s next question would determine the development of my nascent career. “And what’s your level of problem-solving, on a scale of one to ten?” I sensed, suddenly, an opportunity to pass through a corporate loophole, to surmount my lack of credentials, training, and touch-typing skills and lean into my historical moment. “Nine,” I replied.</p><p>“That was it?” my girlfriend chirped when I reported to her the climax of my interview. The Conglomerate had hired me on the spot.</p><hr><p><span>I </span><span><span>was placed</span> on</span><span> the quality assurance team, assisting with work the Conglomerate had contracted to be carried out exclusively by the Arthur Andersen contingent. They weren’t called “a contingent” around the Y2K office. The consultants were referred to as the Andersen people, a term that exaggerated the partition between them and other Conglomerate employees, from whom they commanded both bewilderment and respect and, as often follows from the first two, a certain amount of resentment. These contradictory feelings stemmed from the fact that management consultants constituted then—and still do now—the vanguard of corporate work. They flit between companies and industries, parachuting in to diagnose problems and suggest, although rarely implement, “best-practice” solutions. It’s management consulting lingo, </span><span><i>best-practice</i></span><span>, and it indicates that the good is not enough: this isn’t Winnicott’s consulting room. Instead, management consultants aim for superlatives. They hire the best. They practice the best. They claim Pete Buttigieg among their alumni ranks. At the Conglomerate they had their own offices, their own meetings, their own schedules. They worked from the Conglomerate’s office space while they were on its project, but when they “rolled off” (they had their own terminology, too) they would take up residence within the ambit of another Andersen client. </span></p><p>“You’ve been selected because you’re Andersen quality but not Andersen price,” explained Cindy, the chipper data-warehousing expert who served as the quality assurance team’s Andersen-employed leader, on my second day of work. I felt like a piece of organic fruit found in the conventional produce bin. Cindy also told me that, as with wolves, pack solidarity was intense within Andersen groupings. So was a wariness toward intruders.</p><p>In the first meeting with my lupine team, I did stand out, though not for lack of credentials. In fact I was the only person not massaging a fistful of Play-Doh. The Conglomerate’s office was beige, the carpet beige, the people beige, too. But from each of the four quality assurance team members’ hands exploded a most brilliant collection of colors: neon greens and yellows, hot pink, siren red, an almost psychedelic scene. Team members twirled and juggled their own handfuls, separated their globs and recombined them. “It’s a new management technique,” Cindy said, before I could ask. “It helps relieve stress.”</p><blockquote><p><b>Most team members had their own Y2K doomsday clock on their desk, tracking the years, months, days, hours, minutes, seconds, and milliseconds until techno-rapture.</b></p><b> <a onclick="return popitup('https://twitter.com/share?text=Most+team+members+had+their+own+Y2K+doomsday+clock+on+their+desk%2C+tracking+the+years%2C+months%2C+days%2C+hours%2C+minutes%2C+seconds%2C+and+milliseconds+until+techno-rapture.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624')" href="https://twitter.com/share?text=Most+team+members+had+their+own+Y2K+doomsday+clock+on+their+desk%2C+tracking+the+years%2C+months%2C+days%2C+hours%2C+minutes%2C+seconds%2C+and+milliseconds+until+techno-rapture.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624">Tweet</a></b></blockquote><p><span>Cindy herself did not seem stressed, but the situation she laid out for our team was certainly overwhelming. The Conglomerate held more than a thousand advertising, public relations, and communication companies worldwide, with possessions in both emerging markets and well-established ones. These cumulatively raked in billions of dollars per year. But any or all of these “shops,” in industry lexicon, might collapse as one millennium ended and another began, preventing the Conglomerate from executing its global advertising operations and compromising its earnings and thus its stock price. Perhaps a radio station in Finland would go haywire and be unable to run a Conglomerate-booked spot; conceivably, a television station in Western Australia could disappear and, along with it, a Conglomerate-produced commercial; maybe a billboard would tumble off a highway in Rio de Janeiro amid social chaos, destroying a Conglomerate-created visual. If such events were to transpire, revenue loss would be a best-case scenario; one could imagine far worse. There had been a slide in the new-hire presentation, the one with the duck, that spelled out the possibilities: a stick figure with a thought bubble hovering above its perfectly circular head wondered: “On Jan. 1, 2000 will I still have: electricity, food, telephone, transportation</span><span> </span><span>.</span><span> </span><span>.</span><span> </span><span>. ?” Each life-sustaining noun was contained in its own thought bubble, and the final thought bubble offered only a series of anxiety-producing question marks (“?????”). </span></p><p><span>That same tremulous atmosphere permeated the office, where a thumbtacked photocopy of a </span><span><i>Computerworld</i></span><span> article entitled “Economist Predicts Y2K-Based Recession” greeted team members on their daily arrival at the elevator bay. In the windowless kitchenette, several copies of the book </span><span><i>Time Bomb 2000</i></span><span> were available for employees to peruse while they warmed their instant coffee or selected a Pepsi product—Pepsi being a client—from the mini fridge. Most team members had their own Y2K doomsday clock on their desk, tracking the years, months, days, hours, minutes, seconds, and milliseconds until techno-rapture. </span></p><p>The first segment of the Conglomerate’s Y2K project, “Phase I: Inventory,” involved retrieving technological inventories from the Conglomerate’s various agencies and recording them in a database. The lesser, non-Andersen network analysts entered data about the number of PCs, routers, fax machines, and printers any given Conglomerate shop had in its possession, copying the material from a spreadsheet said shop had emailed them. The superior Andersen quality assurance analysts (and I) provided the oversight, identifying the mistakes our colleagues had made. Someone had hit the <span><i>0</i></span> instead of its keyboard neighbor, the <span><i>9</i></span>; another team member, her mind wandering perhaps, had neglected to check the “entry completed” box. Little errors, but the general sense was that history would not judge them kindly. My team set out to rectify them before it had the chance.</p><p>The verb under whose sign the quality assurance team labored was a new one for me: to <span><i>QA</i></span>, past tense <span><i>QAed</i></span>. All mistakes our QAing located were recorded by hand; all handwritten records of our QAing were photocopied; the copies were kept in Cindy’s office while the originals were bound for a secure document warehouse in New Jersey. Necessarily, our records would be kept on paper. If the predicted Doomsday 2000 did arrive, the digital world would be inaccessible, maybe gone forever. Computer technology had gotten us into this millennial quagmire and could not be trusted to extricate us from it. Perhaps that’s why my problem-solving abilities had mattered more than my knowledge of computer software and hardware on Dick’s scale of one to ten. The fact that the scale itself remained undefined, and that neither interviewer nor interviewee agreed to its coordinates, suggested both the fake nature of the whole endeavor as well as the desperation the Conglomerate felt, its keen awareness that it was running out of time.</p><hr><p><span>T<span>he Andersen position</span></span> was that “Y2K is a documentation problem, not a technology problem.” One could not know the magnitude of the technical problems we would face on January 1, 2000, with complete certainty until that revelatory day arrived, and so 1/1/2000 functioned as a kind of horizon of contingency: would we all be launched, <span><i>Back to the Future</i></span>–like, into a new stone age, or would a few rest-area vending machines conk out and everyone get on with it? To contend with this range of possible futures, we focused on the past. Instead of fixing things with the hope that they would function later, we would document the anti-Y2K efforts the Conglomerate had already undertaken, necessarily more knowable than those events not yet in existence. We would not, for legal reasons, promise things to come; we would certify that things that had already transpired had been appropriately recorded. To the alarming claim of the Y2K town criers—modern life after 12/31/1999 cannot be guaranteed—the quality assurance team responded retrospectively: whatever happened yesterday would be consigned to a database. At a certain point all that had happened yesterday was our documenting, so then we documented that. Then, exponentially, we had to document ourselves documenting our own documentation.</p><blockquote><p><b>Months of reading and populating spreadsheets turned me spreadsheet-like myself.</b></p><b> <a onclick="return popitup('https://twitter.com/share?text=Months+of+reading+and+populating+spreadsheets+turned+me+spreadsheet-like+myself.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624')" href="https://twitter.com/share?text=Months+of+reading+and+populating+spreadsheets+turned+me+spreadsheet-like+myself.+%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624">Tweet</a></b></blockquote><p>These efforts—designed to avoid the liabilities of selling a project that offered a Y2K fix, because what if Y2K wasn’t “fixable”?—were part of a floating corporate-compliance rubric referred to only as the Process. Proprietary, capitalized, and always prefaced with that exclusive definite article, the Process could only be implemented by Arthur Andersen LLP. When a business engaged Andersen in a consultancy project, they purchased the Process. The Process seemed to have no printed home. To the extent that it existed, it passed between the minds and speech of Cindy and Dick. It was both accessible enough to be constantly appealed to—“the Process says,” “How would we apply the Process here?” “I’m not sure this syncs with the Process”—and inaccessible enough never to be grasped with Play-Doh–like tangibility. In keeping with the Process, the quality assurance team scoured hundreds of thousands, millions even, of Excel spreadsheet lines. My day began and ended with comparing database entry to inventory spreadsheet and writing in my own script <span><i>Column 4, row 14: “18 routers” should be corrected to read “8 routers.” Column 9, row 10, empty. Indicate yes or no.</i></span> This was dissociative, diminutive work, and time passed vertiginously, minutes and seconds overlapping on my teammates’ unsynchronized doomsday clocks until the day concluded with a final collective effort at preservation. All quality assurance analysts—not Cindy, for hierarchical reasons—would convene in the photocopy room to ensure that, come what may on December 31, 1999, the deliverables from our day’s labor would be archived, in print, in perpetuity. The only times we really spoke to each other in an uncurated fashion were over the blinding flashes and tray clicks of the Minolta copy machine. There we would discuss our commuting woes, roommate dramas, awkward dates, student loan repayment plans, as well as a rather unarticulated feeling of: What?</p><hr><p><span>W<span>ho managed</span> the management consultants?</span> Cindy, shepherd of the Process, conducted random checks of all QAed spreadsheets and kept the results in her own spreadsheet. Dick and an elusive cabal of Andersen upper-tier management QAed Cindy. Once a rotund Andersen partner named Benjamin, outfitted in a yarmulke, a three-piece suit, and those unfortunate slipper-like Merrell suede shoes just making their way into the world in the late 1990s, spent an hour in the office, presumably to QA Dick.</p><p>The Conglomerate’s Y2K managing director, Justin, had constructed a makeshift smoking lounge in the utility closet across the hall from my cubicle. It was there that Justin and Dick would liaise and swap status updates, and Justin often hosted other visitors in his windowless, walk-in humidor. Invariably these were older, suited white men, a world of Dicks. I’d try to eavesdrop, to pry bits of information from the clouds of secondhand smoke that escaped under the door and hovered momentarily about my cubicle before being absorbed into the carpet. A few gems did waft out. I learned, for example, that I wasn’t the only team member to whom Cindy had described Arthur Andersen LLP as a pack of wolves: slender, agile, fangs bared, lips curled, marking their territory with urine (complimentary). When Justin heard this interspecies analogy, he balked. “More like bloodsucking leeches. They overcharge. Bullshit their billable hours. They want my employees to fuck up so I’ll fire them and they can bring in more Andersen people.<span> </span>.<span> </span>.<span> </span>. Of course they’re part of our team.”</p><p>But what, really, was there to hear? That the Process was vertically integrated apocrypha? That Dick had knowledge of his firm’s various fraudulent endeavors at Enron and was up to something similar here? In fact, Dick and Cindy could not have been more devoted, insistent as they were on evangelizing the Process to the Conglomerate’s office. “Y2K is a documentation problem, not a technology problem,” Cindy repeated at our weekly analyst meetings, and she invited us to say it with her.</p><p>Several months into my employment, in November 1998, a group of Andersen and Conglomerate elite visited our Y2K office to see what the $4 million Andersen project had produced in terms of Y2K preparedness. CEOs, COOs, CFOs, CTOs, an alphabet of executives, all men and some with aides-de-camp, filed through our office into a closed meeting. After their departure, Justin invited all team members into the conference room, where a Roman banquet of muffins and fruit pyramids, a well-appointed coffee cart, and the usual assortment of Pepsi products greeted us. None of these provisions had been touched, and team members were invited to pick through the refuse. “We just had over one hundred million dollars’ worth of executives in here,” Justin began. “They wanted updates.”</p><p>We were encouraged to review for ourselves a paper copy of the executive council presentation, many of which lay scattered about the oblong conference table. I was perplexed to see that it was essentially a rehash of the new-hire presentation. The cartoon duck holding the sledgehammer. The stick figure wondering, “On Jan. 1, 2000 will I still have<span> </span>.<span> </span>.<span> </span>. ?” The floating text box, conceptual art–like in display, “Y2K is a documentation” et cetera. But the mood in the conference room was ebullient and self-assured. Even the always starched and monogrammed Dick looked pleased. The man seldom spoke outside of closed-door klatches, but as a measure of the morning’s importance, he was invited by Justin to address the team. He rose and delivered a brief, litigious soliloquy:</p><p>“When January first of the year 2000 hits and a floodgate of Y2K lawsuits descends, and [we’re] being sued by everyone, and the firms who aren’t suing us, we’re suing, the indemnification issues, the claims of fiduciary responsibility and accusations of abandonment thereof. What are we going to need? Proof. They’re going to want to know what we did and how we did it. So that’s what this Council is concerned with, proof, paper, documentation. And that’s why our battle plan is simple: keep documenting, team.”</p><hr><p><span>M<span>onths of reading</span></span> and populating spreadsheets turned me spreadsheet-like myself: capacious but conceptless, able to record, to list, and to organize and sort, but according to an unthought, unthinkable orientation. After six weeks or so, and without much consideration, I began producing my own documentation, a kind of casual corporate ethnography. I noted the distribution of titles and nicknames at the Conglomerate. All the managers were men; all the analysts were women. Cindy was referred to as “the den mother.” Dick had an alliterative title that recognized his central place: “Dick, the documentation expert.” Justin, our commander, was hailed as “the general.” I, along with another young woman and quality assurance analyst, an engineer by training who shared my hair color, were given the clunky moniker “the blond QA twins.”</p><p>My favorite team member was a Viennese network analyst named Magdalena, who went by the German diminutive Leni. Tall and thin, accented and bespectacled, she hailed from fallen Austrian nobility. Her family had lost seven-eighths of their estate in World War I, but they nonetheless remained comfortable enough not to have to concern themselves with bourgeois trifles like work or mortgages. Had her father been a Nazi? Indeed, he had. Imagine a Captain von Trapp–like personality who had never softened under the melodious ensorcellment of a Fraulein Maria. Leni had fled her father’s eastern Reich not by yodeling her way over the Alps but through an American husband who got her a green card, then a transnational law firm that got her experience, and then, finally, an analyst position at the Conglomerate. When she interviewed with Dick, she had been asked to rate her foreign language abilities on his mysterious scale. Fluent in German, English, and French, proficient in Spanish, she had given herself a ten.</p><p>Each Wednesday we gathered for a general meeting with all team members: the database programmers, who never spoke; the disheveled but crucial IT coterie; all the Andersen people; Conglomerate managers; Dick. Sometimes the receptionist even set the phone to an automated answer function and popped by. By January 1999, after five months on the job, I’d come to find some comfort in the routine coordinates of the general meeting. At 2 <span>PM</span>, everyone except Justin would be seated in the conference room, Pepsi product in one hand, Cindy-authored agenda in the other, waiting for the meeting’s commencement, at which point Justin would announce through the all-office intercom that the meeting would begin five minutes late. Those minutes would pass and he would trudge in, a cloud of smoke all but trailing him.</p><p>General meetings involved an anonymous all-team exercise called “What’s Good? What Needs Improving?” Team members were instructed to rip a piece off some desolate corner of their 8 x 11 agenda and compose two reflections on these stated questions. The compositions were then passed to the table’s head for Justin to read.</p><p>Justin read aloud one Wednesday from the shrinking pile of anonymous comments. “What’s good: getting a lot done. Needs improving: kitchen out of Sweet’n Low.” And then: “What’s good: enjoyed my office Secret Santa gift. Needs improving: I don’t understand what the media team does and I will not accept ‘ask a member of the media team’ for an answer.” As he read, Justin’s countenance shifted from curiosity to uncertain disdain. He became aware—as did all team members—that his managerial style, his habit of punting, was being subtly mocked. Not only that: his antagonist was sitting among us. With a sly smile, somewhere between intrigued and embarrassed, he asked: “Who wrote this?” This query caused a swift reaction in Cindy, who responded, “This is an anonymous exercise.” Justin interrupted with <span><i>Thank you, Cindy</i></span>, who, so chastened, let Justin continue: “I asked—who wrote this?”</p><p>Dead silence of the urban kind only a skyscraper can provide, where a soft machinic din emits from the building itself. Team members, careful to avoid potentially implicating eye contact with each other, fixed their downcast stares on their Pepsi beverages. “You don’t want to tell me?” said Justin. “Fine. We’ll sit here all goddamn day. We’ll sit here till Y2K. Because I’m going to find out who wrote this fucking note.”</p><p><span>Sitting to the right of Cindy, an Andersen analyst named Tracy reached over, took the offending paper scrap, and meekly announced to the nervous audience, “It’s a girl’s handwriting.” I couldn’t have felt more relieved. My script is scraggly and angular, the furthest thing from that of a girl. Tracy too must have felt some relief, having just exculpated herself. And Cindy—who would suspect her? As team members began scanning the conference table, privately searching for someone whose handwriting was bubbly and who menstruated, the silence broke.</span></p><p>“I did it—I wrote the note.” Leni! Daughter of a Nazi. “It’s just that you never answer questions and I thought—well, I thought: You’re the boss, you will know.”</p><p>Justin ended the meeting by ordering her to stay alone with him in the conference room. Later I asked what Justin had said to her in private. “That I’m ‘on his shit list,’” she told me. And what did she say? “Fine.”</p><hr><p><span>I<span>n February,</span></span> with ten months left until the possible techno-finale of modernity, the Conglomerate decided to expand its Y2K preparedness operations and bring more Andersen people into the office. The new consultants also seemed to be wondering what the media team did. Located in an office directly behind my cubicle, they appeared to occupy themselves in the same way we did: printing spreadsheets, photocopying them, faxing them, and placing them in binders. Where the media team distinguished itself was in its leadership: it was the one team in the Conglomerate’s Y2K shop run by a manager of color. Perhaps the only bit of knowledge I had of this manager was that he had somehow managed to board a plane to Brazil without having secured the necessary entrance visa. When he arrived in São Paulo he was detained, denied passage, and put on a flight back to NYC. He’d blamed the corporate travel agent, the gay and moody Carlos, and demanded his firing.</p><p>Instead, the Andersen axe fell on him. In a presentation to the Conglomerate higher-ups, Dick and a group of Andersen top brass declared that the media team was floundering. Their recommendation: the Conglomerate should fire its one Black Y2K manager, clear out any of his remaining loyalists on what came to be known as the old media team, bring yet more Andersen consultants into the office, and let them staff a new media team. Heather, the Andersen person who had conceived this coup de grâce, naturally took the reins. Her first move was into the old media team’s office; her second charge was to populate her team. She needed someone familiar with the Process, someone of Andersen quality but not Andersen price. “You’d actually be helping with critical management considerations,” Cindy said, after she’d invited me, for the first time since my hiring, into her office. “Think of it as a promotion.”</p><p><span>I didn’t know what the media team did, and Leni had been placed on a private shit list for even asking. And the quality assurance team was almost finished with our QA of the inventory database—we had located around 6,700 typos, many of which had been remediated and all of which had been documented as the result of our efforts. After such a collective accomplishment, it felt like an odd time to jump ship. In talking to Cindy, however, I realized that just as the offer to join the media team was to be </span><span><i>thought of</i></span><span> as a promotion, it was also to be </span><span><i>thought of</i></span><span> as a choice. </span></p><p>Changing teams meant learning the ways of a new Cindy, namely a Heather, whose ward I became and whose office I now shared. In contrast to Cindy’s genuine enthusiasm for everything about management consulting, from the Play-Doh to the Process, Heather had a hardened corporate cynicism about her. She daily took calls from her interior decorator, Yves, who always seemed to be fifteen blocks away selecting upholstery and end-table pairings at Upper East Side boutiques. In those days before smartphone image-sharing, Yves would engage in elaborate ekphrastic descriptions of this piece or that. Heather put these conversations on speakerphone so she could continue typing with both hands, her manicured nails dancing above the keyboard with such intensity that often she had to ask Yves to repeat himself.</p><blockquote><p><b>It was one of those out-of-body, disassociated experiences, so often provoked by trauma but here provoked by management consulting.</b></p><b> <a onclick="return popitup('https://twitter.com/share?text=It+was+one+of+those+out-of-body%2C+disassociated+experiences%2C+so+often+provoked+by+trauma+but+here+provoked+by+management+consulting.++%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624')" href="https://twitter.com/share?text=It+was+one+of+those+out-of-body%2C+disassociated+experiences%2C+so+often+provoked+by+trauma+but+here+provoked+by+management+consulting.++%7C+n%2B1+%7C&amp;lang=en&amp;url=https%3A%2F%2Fwww.nplusonemag.com%2F%3Fp%3D54624">Tweet</a></b></blockquote><p><span>She overheard me, too, of course. Leni had learned that our Y2K office had a toll-free number that, in the case of an advertising-oriented Y2K emergency, Conglomerate employees could call to solicit expert advice: 1-800-Y2K-SAVE. But it was March—hardly time for the world’s advertisers to panic about a Time Bomb 2000 detonation—and the line was usually quiet. In the meantime, team members in the know had begun giving out the office 800 number. Friends anywhere in the world could chat with any team member toll free. For me, free long-distance telephony was an enjoyable extracurricular perk, a way to talk to my girlfriend in Massachusetts, ideally when Heather wasn’t around to listen. </span></p><p>The objective of the media team was to inquire into the state of Y2K preparedness for the radio stations, television stations, and newspapers that were the Conglomerate’s most important global media vending partners. We would do this by mailing them a Y2K questionnaire. Within a few weeks of our dour partnership, Heather had condensed our team’s trajectory into a single PowerPoint slide featuring so many capitalized common nouns that, looking back over my notes from the time today, I get the anachronistic sense of reading late-18th-century English.</p><blockquote><p>New Media Team:</p><ul><li>Media is Y2K mission critical</li><li>Is designing Y2K Questionnaire</li><li>Will be contacting Media Vendors</li><li>Will suggest Y2K Contingency Guidelines</li></ul></blockquote><p>The first bullet point was a bit of a non sequitur, more atmospheric than definitional, and I’m surprised it won Dick’s approval. The second? An outright fabrication—Heather downloaded our team’s generic questionnaire from a fly-by-night website called Y2K.com. The third bullet point, at least, was not entirely fake. The new media team had inherited from the old media team a bulging, imposing binder full of vendors’ mailing addresses. A data dump would transfer those addresses from the binder to a database, and those addresses would be used to send the questionnaire—but first, a QA of the media vendor database was required. Someone needed to identify the bugs and infelicities, the doubles and deletions, that even the cleanest data always seems to include. That someone would be me.</p><p>It fell to Leni to reveal what I should have already known: that mine had been a fake promotion. Perhaps I had been moved laterally, or perhaps even that was too optimistic of an assessment. Some clues were obvious: I hadn’t received a raise, for example. Others, more subtle. <span><i>Quality assurance analyst</i></span> has a certain corporate gravitas to it, but what would <span><i>media vendor analyst</i></span> mean on my resume if I wanted to leverage my Conglomerate time into a future Fortune 500 life or defect to Deloitte? She observed my simmering angst and provided a German term: <span><i>Weltschmerz</i></span>, or world-weariness. Leni said I was suffering from it. She advised me to open an E*TRADE account and to orient my portfolio toward biotech. She had staked out a position in Amgen and had, within some months, doubled her money.</p><hr><p><span>I<span>t’s a tricky</span> risk proposition</span> to mail unsolicited and legally implicating requests to corporate partners all over the world, but the Process demanded it. What, the questionnaire asked, were they doing to prepare for Y2K? For example, were they contacting third-party suppliers to inquire about their Y2K readiness? We knew very well that those five thousand media vendors wouldn’t respond to our questionnaire, because the Conglomerate itself didn’t respond to the thousands of questionnaires it received from its own business partners asking basically the same question. Heather explained that the Process wouldn’t allow a response, due to the legal vulnerability created by the disclosure of such information to another company.</p><p>By summer, perhaps our final one, the Andersen people decided that in addition to documentation, personal contact with the Conglomerate agencies was needed to stress the importance of Y2K. Many team members began trotting the globe to conduct Y2K site visits, and the office took on a transient, desolate quality. The speckled dropped ceiling seemed to sag under the weight of the HVAC infrastructure. The Diet Pepsi began to leave a sour aftertaste. Leni decamped to Asia for two weeks to support a series of Y2K regional meetings. Cindy headed for Vancouver to instruct the Conglomerate’s Pacific Rim shops in the ways of the Process. Even Justin left his smoking lounge to take a pre-millennial working tour of Paris, Brussels, and London.</p><p>“This is your chance, LC,” Cindy informed me at the commencement of my own Y2K grand tour. My ambitious itinerary included cities I had long fantasized about visiting: Tokyo, Hong Kong, urban constellations along the eastern coast of Australia. There would be time for surreptitious tourism, too: the café in Buenos Aires where Marcel Duchamp played chess, the Zócalo and its murals in Mexico City. None of this is what Cindy meant, however. She told me of one team member who “earned so many frequent flier miles, he took his whole family to Sydney business class. They got a club-level suite at the harbor Hyatt.” Other team members had redeemed miles for Hawaii junkets, or converted them into points for cruise bookings, vouchers for rental-car upgrades, discounts on duty-free alcohol and tobacco purchases. Around me, I realized, had whirred an opaque economy whose currency was only now becoming apparent. Suddenly, the number of mission-critical Y2K situations throughout the Asia-Pacific region made sense: first-class tickets generate triple frequent flier miles. So did team members’ preoccupation with South Africa, a fourteen-hour flight from NYC, and not just Johannesburg: Durban and Cape Town, too, had become improbable locations of Y2K concern. Meanwhile, Canada, our proximal neighbor and English-speaking sibling, home to multiple Conglomerate shops but no long-haul flights, was judged to be fairly Y2K-prepared.</p><p>I became as greedy a reward accumulator as the next team member. But during many of my international media site visits, I felt the reliable tug of impostor syndrome. On a trip to Tokyo, in place of the usual audience of one or two media-vendor colleagues in a dingy conference room, two analysts and I were led into the agency’s unexpected auditorium to find that a sea of suited businessmen awaited us. Perhaps they had taken our intra-Conglomerate communications seriously: we had after all sent word that the world—or at least the advertising industry—might be ending in short order.</p><p>I had always taken some comfort in knowing I was speaking to people whose fluency in English could not be guaranteed. That distance in communication, real or perceived, had been crucial for me as I asked my series of absurd questions. If global technology ceased 1/1/2000, how would your agency continue its operations? The Tokyo shop, however, had arranged for a translator. In an English accent, she asked me to enunciate slowly so she could select her words with the kind of care a world-ending situation demanded.</p><p>“On January 1, 2000, will you still have<span> </span>.<span> </span>.<span> </span>.” I began. Concerns were shared about the Tokyo media market: “No Japanese media vendors responded to our Y2K preparedness questionnaire.” It was one of those out-of-body, disassociated experiences, so often provoked by trauma but here provoked by management consulting. As Leigh Claire the media-vendor analyst held forth, paused for translation, and then continued, a second, depersonalized Leigh Claire wandered off the stage, collected herself, and took notes. I was disturbed at my own ability to make millenarian pronouncements. Exponentially, like a QAer documenting her own documentation, I began to doubt my own self-doubt.</p><p>Many of my Japanese colleagues’ responses to my presentation concerned my appearance. My Conglomerate confrères noted how unusual it was to have a young woman with blond hair in their presence, the translator, a brunette woman herself, seemed somewhat embarrassed to convey. “It’s exciting for them,” she editorialized, “you know, the difference.” My blond hair color, the highlights—were these a naturally occurring phenomenon, they wondered. One male media hand after another went up: How old was I and what was my marital status? How long would I be in Tokyo and what were my plans? What were my recreational interests?</p><p>This attention to my person was not without benefit: it did distract from Y2K. If someone had asked about servers, routers, why the response rates to our questionnaire mailing in Japan were so low, what advice I had for Y2K compliance, I would have likely taken recourse to my own contingency plan, one developed just then—I would have spoken about the contingency of knowledge itself. Perhaps I had become a convert to the Process: the future could not be known until its moment arrived, and at that point it was no longer the future.</p><hr><p><span>L<span>ate in that anxious</span> August</span> of 1999, a freak midnight flood struck New York City. Small puddles dotted the paving stones of Brooklyn’s sidewalks and the asphalt had that technicolor, water-mixed-with-gasoline slickness about it. The trains were delayed enough that I didn’t leave for Midtown until 10:30. I emerged from the damp morning into a transformed corporate world.</p><p>Cindy was perched with hawklike intensity inside a kind of bivouac she’d created between the office door and the elevator. She had a clipboard in one hand and a pen in the other. I had barely crossed the threshold when she broadcast clear across the stand of cubicles: “LC made it!” A different voice rang back: “Check.” Cindy had meant to affect a tone of relief at my arrival, but her excitement won out. The woman had spent more than a year preparing the office for a crisis, and now we had one: a flash flood. She herself had walked to work, she said. From the Upper West Side! She said this as though reporting on an alpine trek. A swift and unexpected nocturnal rain had swept through the city, Cindy related. “Some team members won’t make it,” she said, and, without any sense of her own drama, let a pause take hold before finishing her sentence: “into the office today.”</p><p>At Wednesday’s general meeting, Justin gave Cindy all kinds of commendations for her swift crisis management. The phone tree she had set up practically out of the ether. A collection of alternate transportation routes she’d compiled that team members could consult to solicit guidance on getting into the office in the event of a natural or—dare one say it—technological disaster. A buddy system she organized in which team members could locate a partner, alphabetically or by neighborhood. Already she had initiated the process of assembling the materials into a binder. Dick, her mentor and her boss, gave off a silent but approving glow. Cindy had saved the office, but the flood had exposed a striking irony: the Y2K office, so busy advising others on contingency plans, hadn’t developed its own.</p><p><span>“We all knew to expect the unexpected,” said Justin. It seemed like he might verge into contemplation and consider the idea of contingency in and of itself: can one really plan for something truly unknown? Instead, he took a more imperative course. “It’s balls to the wall from here on out. We’ve got four months.” His charge occasioned a flurry of activity, as team members sought to seize the day while it still existed to be seized. We had lived through a flash flood, and things had gone berserk in a dozen different ways. What would an actual millennial meltdown occasion?</span></p><hr><p><span>B</span><span><span>y December 1999,</span> </span>the feeling at the Conglomerate’s Y2K office was that nothing more could really be done. This is a common enough cliché on the approach of any moment of finality, but was particularly apt in our case, since nothing really <span><i>had</i></span> been done. The travel diminished, and colleagues I’d last seen lounging under a shaded terrace in Milan were again denizens whom I passed in the office kitchenette, Pepsi product in hand. To mark the progress of the calendar and to demarcate our work, team members did what we did best: preside over the expenditure of large sums of corporate cash. With most air travel suspended, we trained our focus on accruing hotel reward points. A series of suites were booked at hotels around Midtown so team members could monitor the developing Y2K situation across the collection of global time zones with which so many of us had become familiar. These graveyard shifts did not require remaining awake, only sleeping within a several-block radius of the office—and with whomever one pleased. Christmas and New Year’s vacations were revoked, of course, but that meant that team members could enjoy a series of multicourse dinners on the Conglomerate’s tab, including those inflated prix fixe menus that always seem to pop up around the holidays.</p><p>Limited time remained, certainly in the office and possibly in the world. But the mood around Midtown seemed the furthest thing from that of end times, unless end times are distinguished by towering Christmas stockings and holiday wreaths the size of tractor tires. At a holiday party, we drank drinks named after 1980s financial instruments: a Poison Pill, an LBO, a Killer Bees, a Bear Hug. Not that those dated terms of corporate chicanery concerned team members: the Conglomerate’s stock price was as buoyant as the atmosphere, and team members who had taken some of their salary in options were feeling festive indeed.</p><p>Then, as in a modernist novel whose conclusion one knows will not provide an ending, our mission-critical moment, our finale—composed of the scaffolded segments of temporality that team members took such pleasure in delineating: second, minute, hour, day, week, month, year, decade, century, and, yes, millennium—came and went, as any other had and many others would. It seems both necessary and anticlimactic to state what everyone now knows: we survived, with minimal difficulties. Cindy dutifully reported that some automatic toilets in Singapore hadn’t flushed properly, stuck as they were in an expired world order. Other team members scoured news sources for tales of Y2K glitches and compiled a modest list. There was an electric garage door opener whose open and close buttons had become reversed; a selection of already-odd Sharper Image gadgets that had no discernible clock control but that had nonetheless broken down somewhere on the momentary midnight bridge between 12/31/1999 and 1/1/2000; and an industrial blender at a cattle-culling facility in Alberta whose whirl wouldn’t cease even when unplugged from a power source.</p><p>By the time team members reconvened in the conference room on the bright, crisp morning of Monday, January 3, 2000, even these millennial malfunctions seemed little more than a set of curious examples, representatives of a larger case of something whose dimensions had already begun to recede from the Conglomerate’s collective consciousness. The sensation of collapse would return, of course, with the two scandalous bankruptcies that would signal the end of the ’90s economy, the first great financial bubble of our era. Both Enron and WorldCom had had Andersen as their auditor, and on both projects, it turned out, Andersen had been operating far short of best practices. It had been systematically shredding records for Enron and faking others entirely at WorldCom—documentation problems for the ages. But in the first days of the millennium, I was surprised by how quickly Y2K disappeared from office discourse as though censored, and by how team members adopted an almost amnesiac approach to a period so many of us had let so eventfully structure our lives. There was no self-consciousness: Why did we do that? More one felt a sense of process: This happened.</p></div><p>If you like this article, please <a href="https://www.nplusonemag.com/subscribe/?affid=article">subscribe</a> or leave a tax-deductible tip below to support n+1.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Did your car witness a crime? Bay Area police may be coming for your Tesla (208 pts)]]></title>
+            <title><![CDATA[Did your car witness a crime? Bay Area police may be coming for your Tesla (217 pts)]]></title>
             <link>https://www.sfchronicle.com/crime/article/tesla-sentry-mode-police-evidence-19731000.php</link>
             <guid>41409882</guid>
             <pubDate>Sat, 31 Aug 2024 16:21:27 GMT</pubDate>
@@ -477,7 +1786,7 @@ Run with Docker:</p>
 Couldn't get https://www.sfchronicle.com/crime/article/tesla-sentry-mode-police-evidence-19731000.php: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Seeing America by train (108 pts)]]></title>
+            <title><![CDATA[Seeing America by train (110 pts)]]></title>
             <link>https://www.washingtonpost.com/travel/interactive/2024/amtrak-train-travel-diary/</link>
             <guid>41409776</guid>
             <pubDate>Sat, 31 Aug 2024 16:03:00 GMT</pubDate>
@@ -485,7 +1794,7 @@ Couldn't get https://www.sfchronicle.com/crime/article/tesla-sentry-mode-police-
 Couldn't get https://www.washingtonpost.com/travel/interactive/2024/amtrak-train-travel-diary/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Texas State Police Gear Up for Expansion of Surveillance Tech (107 pts)]]></title>
+            <title><![CDATA[Texas State Police Gear Up for Expansion of Surveillance Tech (108 pts)]]></title>
             <link>https://www.texasobserver.org/texas-dps-surveillance-tangle-cobwebs/</link>
             <guid>41409522</guid>
             <pubDate>Sat, 31 Aug 2024 15:23:50 GMT</pubDate>
@@ -530,7 +1839,7 @@ Couldn't get https://www.washingtonpost.com/travel/interactive/2024/amtrak-train
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Harder Drive: hard drives we didn't want, or need [video] (2022) (331 pts)]]></title>
+            <title><![CDATA[Harder Drive: hard drives we didn't want, or need [video] (2022) (336 pts)]]></title>
             <link>http://tom7.org/harder/</link>
             <guid>41409503</guid>
             <pubDate>Sat, 31 Aug 2024 15:21:30 GMT</pubDate>
@@ -583,7 +1892,7 @@ Good luck trying to use the impenetrable <a href="https://sourceforge.net/p/tom7
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Buy, Borrow, Die – Explained (429 pts)]]></title>
+            <title><![CDATA[Buy, Borrow, Die – Explained (445 pts)]]></title>
             <link>https://old.reddit.com/r/BuyBorrowDieExplained/comments/1f26rsf/buy_borrow_die_explained/</link>
             <guid>41408772</guid>
             <pubDate>Sat, 31 Aug 2024 13:35:05 GMT</pubDate>
@@ -676,7 +1985,7 @@ Good luck trying to use the impenetrable <a href="https://sourceforge.net/p/tom7
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Brazil's X ban is sending lots of people to Bluesky (225 pts)]]></title>
+            <title><![CDATA[Brazil's X ban is sending lots of people to Bluesky (243 pts)]]></title>
             <link>https://www.theverge.com/2024/8/30/24232561/brazil-x-ban-sending-people-bluesky</link>
             <guid>41408738</guid>
             <pubDate>Sat, 31 Aug 2024 13:28:25 GMT</pubDate>
@@ -699,7 +2008,7 @@ Good luck trying to use the impenetrable <a href="https://sourceforge.net/p/tom7
  <p>The Mediterranean Sea near Sicily and Tunisia was a popular maritime corridor during the Roman Empire—or at least it seems so based on recent archaeological findings. Last year, a UNESCO-coordinated mission found three shipwrecks off the treacherous Keith Reef between Sicily and Tunisia, one of which was dated to between 200 BCE and 100 BCE. That research team also studied three Roman wrecks off the Italian coast, two of which were 1st-century merchant vessels and one of which dated to the 1st-century BCE.</p> <p>The recently recovered rostrum is older than those wrecks, however, and is a remarkably vivid window into an ancient battle, and the fierce naval conflicts that shaped the ancient world.&nbsp;The Battle of the Aegates saw most of the Carthaginian fleet sunk or captured, and resulted in Roman supremacy on the Mediterranean. All told, there were three Punic Wars between Carthage and Rome, which resulted in the destruction of Carthage.</p>                          </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Typeform alternative, turns Markdown to forms (149 pts)]]></title>
+            <title><![CDATA[Show HN: Typeform alternative, turns Markdown to forms (155 pts)]]></title>
             <link>https://blocks.md</link>
             <guid>41407993</guid>
             <pubDate>Sat, 31 Aug 2024 11:19:08 GMT</pubDate>
@@ -1378,14 +2687,6 @@ email<span>*</span> = EmailInput(
             <pubDate>Sat, 31 Aug 2024 10:22:10 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://jonathancarter.org/2024/08/29/orphaning-bcachefs-tools-in-debian/">https://jonathancarter.org/2024/08/29/orphaning-bcachefs-tools-in-debian/</a>, See on <a href="https://news.ycombinator.com/item?id=41407768">Hacker News</a></p>
 <div id="readability-page-1" class="page"><article><div><p>Around a decade ago, I was happy to learn about bcache – a Linux block cache system that implements tiered storage (like a pool of hard disks with SSDs for cache) on Linux. At that stage, ZFS on Linux was nowhere close to where it is today, so any progress on gaining more ZFS features in general Linux systems was very welcome. These days we care a bit less about tiered storage, since any cost benefit in using anything else than nvme tends to quickly evaporate compared to time you eventually lose on it.</p><p>In 2015, it was announced that bcache would grow into its own filesystem. This was particularly exciting and it caused quite a buzz in the Linux community, because it brought along with it more features that compare with <a href="https://en.wikipedia.org/wiki/ZFS">ZFS</a> (and also <a href="https://en.wikipedia.org/wiki/Btrfs">btrfs</a>), including built-in compression, built-in encryption, check-summing and RAID implementations.</p><p>Unlike ZFS, it didn’t have a dkms module, so if you wanted to test bcachefs back then, you’d have to pull the entire upstream bcachefs kernel source tree and compile it. Not ideal, but for a promise of a new, shiny, full-featured filesystem, it was worth it.</p><p>In 2019, it seemed that the <a href="https://lkml.org/lkml/2019/6/10/762">time has come for bcachefs to be merged into Linux</a>, so I thought that it’s about time we have the userspace tools (bcachefs-tools) packaged in Debian. Even if the Debian kernel wouldn’t have it yet by the time the bullseye (Debian 11) release happened, it might still have been useful for a future backported kernel or users who roll their own.</p><p>By total coincidence, the first git snapshot that I got into Debian (version 0.1+git20190829.aa2a42b) was committed exactly 5 years ago today.</p><p>It was quite easy to package it, since it was written in C and shipped with a makefile that just worked, and it made it past NEW into unstable in 19 January 2020, just as I <a href="https://jonathancarter.org/2020/02/07/random-bits-from-fosdem-2020/">was about to head off to FOSDEM</a> as the pandemic started, but that’s of course a whole other story.</p><p>Fast-forwarding towards the end of 2023, version 1.2 shipped with some utilities written in <a href="https://en.wikipedia.org/wiki/Rust_(programming_language)">Rust</a>, this caused a little delay, since I wasn’t at all familiar with Rust packaging yet, so I shipped an update that didn’t yet include those utilities, and saw this as an opportunity to learn more about how the Rust eco-system worked and Rust in Debian.</p><p>So, back in April the Rust dependencies for bcachefs-tools in Debian didn’t at all match the build requirements. I got some help from the Rust team who says that the common practice is to relax the dependencies of Rust software so that it builds in Debian. So errno, which needed the exact version 0.2, was relaxed so that it could build with version 0.4 in Debian, udev 0.7 was relaxed for 0.8 in Debian, memoffset from 0.8.5 to 0.6.5, paste from 1.0.11 to 1.08 and bindgen from 0.69.9 to 0.66.</p><p>I found this a bit disturbing, but it seems that some Rust people have lots of confidence that if something builds, it will run fine. And at least it did build, and the resulting binaries did work, although I’m personally still not very comfortable or confident about this approach (<em>perhaps</em> that might change as I learn more about Rust).</p><p>With that in mind, at this point you may wonder how any distribution could sanely package this. The problem is that they can’t. Fedora and other distributions with stable releases take a similar approach to what we’ve done in Debian, while distributions with much more relaxed policies (like Arch) include all the dependencies as they are vendored upstream.</p><p>As it stands now, bcachefs-tools is impossible to maintain in Debian stable. While my primary concerns when packaging, are for Debian unstable and the next stable release, I also keep in mind people who have to support these packages long after I stopped caring about them (like <a href="https://www.freexian.com/lts/debian/details/">Freexian who does LTS support for Debian</a> or <a href="https://ubuntu.com/about/release-cycle">Canonical who has long-term Ubuntu support</a>, and probably other organisations that I’ve never even heard of yet). And of course, if bcachfs-tools don’t have any usable stable releases, it doesn’t have any LTS releases either, so anyone who needs to support bcachefs-tools long-term has to carry the support burden on their own, and if they bundle it’s dependencies, then those as well.</p><p>I’ll admit that I don’t have any solution for fixing this. I suppose if I were upstream I might look into the possibility of at least supporting a larger range of recent dependencies (<em>usually</em> easy enough if you don’t hop onto the newest features right away) so that distributions with stable releases only need to concern themselves with providing some minimum recent versions, but even if that could work, the upstream author is 100% against any solution other than vendoring all its dependencies with the utility and insisting that it must only be built using these bundled dependencies. I’ve made 6 uploads for this package so far this year, but still I constantly get complaints that it’s out of date and that it’s ancient. If a piece of software is considered so old that it’s useless by the time it’s been published for two or three months, then there’s no way it can survive even a usual stable release cycle, nevermind any kind of long-term support.</p><p>With this in mind (not even considering some hostile emails that I recently received from the upstream developer or his public rants on lkml and reddit), I decided to remove bcachefs-tools from Debian completely. Although after discussing this with another DD, I was convinced to <a href="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1078599" data-type="link" data-id="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1078599">orphan it instead, which I have now done</a>. I made an upload to experimental so that it’s still available if someone wants to work on it (without having to go through NEW again), it’s been <a href="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1079375">removed from unstable</a> so that it doesn’t migrate to testing, and the ancient (especially by bcachefs-tools standards) versions that are in <a href="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1078543">stable and oldstable will be removed too</a>, since they are very likely to cause damage with any recent kernel versions that support bcachefs.</p><p>And so, my adventure with bcachefs-tools comes to an end. I’d advise that if you consider using bcachefs for any kind of production use in the near future, you first consider how supportable it is long-term, and whether there’s really anyone at all that is succeeding in providing stable support for it.</p></div></article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[EU ChatControl is back on the agenda (273 pts)]]></title>
-            <link>https://digitalcourage.social/@echo_pbreyer/113055345076289453</link>
-            <guid>41407562</guid>
-            <pubDate>Sat, 31 Aug 2024 09:25:03 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://digitalcourage.social/@echo_pbreyer/113055345076289453">https://digitalcourage.social/@echo_pbreyer/113055345076289453</a>, See on <a href="https://news.ycombinator.com/item?id=41407562">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
         </item>
     </channel>
 </rss>
