@@ -4,12 +4,187 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 14 Sep 2024 16:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 14 Sep 2024 17:30:01 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The data on extreme human ageing is rotten from the inside out (132 pts)]]></title>
+            <title><![CDATA[Valkey achieved one million RPS 6 months after forking from Redis (102 pts)]]></title>
+            <link>https://valkey.io/blog/unlock-one-million-rps-part2/</link>
+            <guid>41539294</guid>
+            <pubDate>Sat, 14 Sep 2024 12:09:44 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://valkey.io/blog/unlock-one-million-rps-part2/">https://valkey.io/blog/unlock-one-million-rps-part2/</a>, See on <a href="https://news.ycombinator.com/item?id=41539294">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        
+
+<p>
+  2024-09-13
+  
+    · 
+    
+      
+      
+      <em>Dan Touitou</em>,
+    
+      
+      
+      <em>Uri Yagelnik</em>
+    
+  
+</p>
+
+<p>In the <a href="https://valkey.io/blog/unlock-one-million-rps/">first part</a> of this blog, we described how we offloaded almost all I/O operations to I/O threads, thereby freeing more CPU cycles in the main thread to execute commands. When we profiled the execution of the main thread, we found that a considerable amount of time was spent waiting for external memory. This was not entirely surprising, as when accessing random keys, the probability of finding the key in one of the processor caches is relatively low.  Considering that external memory access latency is approximately 50 times higher than L1 cache, it became clear that despite showing 100% CPU utilization, the main process was mostly “waiting”. In this blog, we describe the technique we have been using to increase the number of parallel memory accesses, thereby reducing the impact that external memory latency has on performance.</p>
+<h3 id="speculative-execution-and-linked-lists">Speculative execution and linked lists</h3>
+<p>Speculative execution is a performance optimization technique used by modern processors, where the processor guesses the outcome of conditional operations and executes in parallel subsequent instructions ahead of time. Dynamic data structures, such as linked lists and search trees, have many advantages over static data structures: they are economical in memory consumption, provide fast insertion and deletion mechanisms, and can be resized efficiently. However, some dynamic data structures have a major drawback: they hinder the processor's ability to speculate on future memory load instructions that could be executed in parallel. This lack of concurrency is especially problematic in very large dynamic data structures, where most pointer accesses result in high-latency external memory access.</p>
+<p>In this blog, Memory Access Amortization, a method that facilitates speculative execution to improve performance, is introduced along with how it is applied in Valkey. The basic idea behind the method is that by interleaving the execution of operations that access random memory locations, one can achieve significantly better performance than by executing them serially.</p>
+<p>To depict the problem we are trying to solve consider the following <a href="https://valkey.io/assets/C/list_array.c">function</a> which gets an array of linked list and returns sum of all values in the lists:</p>
+<pre data-lang="c"><code data-lang="c"><span>unsigned long </span><span>sequentialSum</span><span>(size_t </span><span>arr_size</span><span>, list **</span><span>la</span><span>) {
+</span><span>    list *lp;
+</span><span>    </span><span>unsigned long</span><span>  res = </span><span>0</span><span>; 
+</span><span>
+</span><span>    </span><span>for </span><span>(</span><span>int</span><span> i = </span><span>0</span><span>; i &lt; arr_size; i++) { 
+</span><span>        lp = la[i]; 
+</span><span>        </span><span>while </span><span>(lp) { 
+</span><span>            res += lp-&gt;val;
+</span><span>            lp = lp-&gt;next;
+</span><span>        }
+</span><span>    }
+</span><span>
+</span><span>    </span><span>return</span><span> res; 
+</span><span>}
+</span></code></pre>
+<p>Executing this function on an array of 16 lists containing 10 million elements each takes approximately 20.8 seconds on an ARM processor (Graviton 3). Now consider the following alternative implementation which instead of scanning the lists separately,  interleaves the executions of the lists scans:</p>
+<pre data-lang="c"><code data-lang="c"><span>unsigned long </span><span>interleavedSum</span><span>(size_t </span><span>arr_size</span><span>, list **</span><span>la</span><span>) {
+</span><span>    list **lthreads = </span><span>malloc</span><span>(arr_size * sizeof(list *)); 
+</span><span>    </span><span>unsigned long</span><span> res = </span><span>0</span><span>; 
+</span><span>    </span><span>int</span><span> n = arr_size; 
+</span><span>
+</span><span>    </span><span>for </span><span>(</span><span>int</span><span> i = </span><span>0</span><span>; i &lt; arr_size; i++) {
+</span><span>        lthreads[i] = la[i]; 
+</span><span>        </span><span>if </span><span>(lthreads[i] == </span><span>NULL</span><span>) 
+</span><span>            n--; 
+</span><span>    } 
+</span><span>
+</span><span>    </span><span>while</span><span>(n) {
+</span><span>        </span><span>for </span><span>(</span><span>int</span><span> i = </span><span>0</span><span>; i &lt; arr_size; i++) { 
+</span><span>            </span><span>if </span><span>(lthreads[i] == </span><span>NULL</span><span>) 
+</span><span>                </span><span>continue</span><span>; 
+</span><span>            res += lthreads[i]-&gt;val;
+</span><span>            lthreads[i] = lthreads[i]-&gt;next; 
+</span><span>            </span><span>if </span><span>(lthreads[i] == </span><span>NULL</span><span>) 
+</span><span>                n--;
+</span><span>        }  
+</span><span>    }
+</span><span>
+</span><span>    </span><span>free</span><span>(lthreads);
+</span><span>    </span><span>return</span><span> res; 
+</span><span>}
+</span></code></pre>
+<p>Running this new version with the same input as previously described takes less than 2 seconds, achieving a 10x speedup! The explanation for this significant improvement lies in the processor's speculative execution capabilities. In a standard sequential traversal of a linked list, as seen in the first version of the function, the processor cannot 'speculate' on future memory access instructions. This limitation becomes particularly costly with large lists, where each pointer access likely results in a expensive external memory access. In contrast, the alternative implementation, which interleaves list traversals, allows the processor to issue more memory accesses in parallel. This leads to an overall reduction in memory access latency through amortization.</p>
+<p>One way to maximize the amount of parallel memory access issued is to add prefetch instructions. Replacing</p>
+<pre data-lang="c"><code data-lang="c"><span>             </span><span>if </span><span>(lthreads[i] == </span><span>NULL</span><span>) 
+</span><span>                n--;
+</span></code></pre>
+<p>with</p>
+<pre data-lang="c"><code data-lang="c"><span>            </span><span>if </span><span>(lthreads[i]) 
+</span><span>                </span><span>__builtin_prefetch</span><span>(lthreads[i]);
+</span><span>            </span><span>else 
+</span><span>                n--;
+</span></code></pre>
+<p>reduces the execution time further to 1.8 sec.</p>
+<h3 id="back-to-valkey">Back to Valkey</h3>
+<p>In the first part, we described how we updated the existing I/O threads implementation to increase parallelism and reduce the amount of I/O operations executed by the main thread to a minimum. Indeed, we observed an increase in the number of requests per second, reaching up to 780K SET commands per second. Profiling the execution revealed that Valkey's main thread was spending more than 40% of its time in a single function: lookupKey, whose goal is to locate the command keys in Valkey's main dictionary. This dictionary is implemented as a straightforward chained hash, as shown in the picture below:
+<img src="https://valkey.io/assets/media/pictures/lookupKey.jpg" alt="dict find">
+On a large enough set of keys, almost every memory address accessed while searching the dictionary will not be found in any of the processor caches, resulting in costly external memory accesses. Also, similarly as with the linked list from above, since the addresses in the table→dictEntry→...dictEntry→robj sequence are serially dependent, it is not possible to determine the next address to be accessed before the previous address in the chain has been resolved.</p>
+<h3 id="batching-and-interleaving">Batching and interleaving</h3>
+<p>To overcome this inefficiency, we adopted the following approach. Every time a batch of incoming commands from the I/O threads is ready for execution, Valkey’s main thread efficiently prefetches the memory addresses needed for future lookupKey invocations for the keys involved in the commands  before executing the commands. This prefetch phase is achieved by dictPrefetch, which, similarly as with the linked list example from above, interleaves the table→dictEntry→...dictEntry→robj search sequences for all keys. This reduces the time spent on lookupKey by more than 80%. Another issue we had to address was that all the incoming parsed commands from the I/O threads were not present in the L1/L2 caches of the core running Valkey’s main thread. This was also resolved using the same method.  All the relevant code can be found in <a href="https://github.com/valkey-io/valkey/blob/unstable/src/memory_prefetch.c">memory_prefetch.c</a>. In total the impact of the memory access amortization on Valkey performance is almost 50% and it increased the requests per second to more than 1.19M rps.</p>
+<h3 id="how-to-reproduce-valkey-8-0-performance-numbers">How to reproduce Valkey 8.0 performance numbers</h3>
+<p>This section will walk you through the process of reproducing our performance results, where we achieved 1.19 million requests per second using Valkey 8.</p>
+<h3 id="hardware-setup">Hardware Setup</h3>
+<p>We conducted our tests on an AWS EC2 c7g.4xlarge instance, featuring 16 cores on an ARM-based (aarch64) architecture.</p>
+<h3 id="system-configuration">System Configuration</h3>
+<blockquote>
+<p>Note: The core assignments used in this guide are examples. Optimal core selection may vary depending on your specific system configuration and workload.</p>
+</blockquote>
+<p>Interrupt affinity - locate the network interface with <code>ifconfig</code> (let's assume it is <code>eth0</code>) and its associated IRQs with</p>
+<pre data-lang="bash"><code data-lang="bash"><span>grep</span><span> eth0 /proc/interrupts | </span><span>awk </span><span>'</span><span>{print $1}</span><span>' | </span><span>cut -d</span><span> :</span><span> -f</span><span> 1
+</span></code></pre>
+<p>In our setup, lines <code>48</code> to <code>55</code> are allocated for <code>eth0</code> interrupts. Allocate one core per 4 IRQ lines:</p>
+<pre data-lang="bash"><code data-lang="bash"><span>for</span><span> i </span><span>in </span><span>{48..50}; </span><span>do </span><span>echo</span><span> 1000 &gt; /proc/irq/$</span><span>i</span><span>/smp_affinity; </span><span>done
+</span><span>for</span><span> i </span><span>in </span><span>{51..55}; </span><span>do </span><span>echo</span><span> 2000 &gt; /proc/irq/$</span><span>i</span><span>/smp_affinity; </span><span>done  
+</span></code></pre>
+<p>Server configuration - launch the Valkey server with these minimal configurations:</p>
+<pre data-lang="bash"><code data-lang="bash"><span>./valkey-server --io-threads</span><span> 9</span><span> --save --protected-mode</span><span> no
+</span></code></pre>
+<p><code>--save</code> disables dumping to RDB file and <code>--protected-mode no </code>  allows connections from external hosts. <code>--io-threads</code> number includes the main thread and the IO threads, meaning that in our case 8 I/O threads are launched in addition to the main thread.</p>
+<p>Main thread affinity - pin the main thread to a specific CPU core, avoiding the cores handling IRQs. Here we use core #3:</p>
+<pre data-lang="bash"><code data-lang="bash"><span>sudo</span><span> taskset</span><span> -cp</span><span> 3 `</span><span>pidof</span><span> valkey-server`
+</span></code></pre>
+<blockquote>
+<p>Important: We suggest experimenting with different core pinning strategies to find the optimal performance while avoiding conflicts with IRQ-handling cores.</p>
+</blockquote>
+<h3 id="benchmark-configuration">Benchmark Configuration</h3>
+<p>Run the benchmark from a separate instance using the following parameters:</p>
+<ul>
+<li>Value size: 512 bytes</li>
+<li>Number of keys: 3 million</li>
+<li>Number of clients: 650</li>
+<li>Number of threads: 50 (may vary for optimal results)</li>
+</ul>
+<pre data-lang="bash"><code data-lang="bash"><span>./valkey-benchmark -t</span><span> set</span><span> -d</span><span> 512</span><span> -r</span><span> 3000000</span><span> -c</span><span> 650</span><span> --threads</span><span> 50</span><span> -h </span><span>"</span><span>host-name</span><span>"</span><span> -n</span><span> 100000000000
+</span></code></pre>
+<blockquote>
+<p>Important: When running the benchmark, it may take a few seconds for the database to get populated and for the performance to stabilize. You can adjust the <code>-n</code> parameter to ensure the benchmark runs long enough to reach optimal throughput.</p>
+</blockquote>
+<h3 id="testing-and-availability">Testing and Availability</h3>
+<p><a href="https://github.com/valkey-io/valkey/releases/tag/8.0.0-rc2">Valkey 8.0 RC2</a> is available now for evaluation with I/O threads and memory access amortization.</p>
+
+<div>
+  <h2>About the authors</h2>
+  
+    
+      
+      
+      <div>
+  <p><img src="https://valkey.io/assets/media/authors/dantouitou.jpeg" alt="photo of Dan Touitou">
+    
+  </p>
+  <div>
+    <h2><a href="https://valkey.io/authors/dantouitou/">Dan Touitou</a></h2>
+    <p>Dan is a software engineer at AWS</p>
+<p>In his spare time, Dan loves solving complex partial differential equations with his family and telling fairy tales about himself.</p>
+
+    
+  </div>
+</div>
+    
+      
+      
+      <div>
+  <p><img src="https://valkey.io/assets/media/authors/uriyagelnik.png" alt="photo of Uri Yagelnik">
+    
+  </p>
+  <div>
+    <h2><a href="https://valkey.io/authors/uriyagelnik/">Uri Yagelnik</a></h2>
+    <p>Uri Yagelnik is a Software Engineer at AWS with over a decade of experience, Uri is passionate about distributed systems, databases, and performance optimization. In his spare time, he enjoys hiking with his family and reading.</p>
+
+    
+  </div>
+</div>
+    
+  
+</div>
+<hr>
+<!-- This file was imported from jekyllcodex.org following this guide: https://jekyllcodex.org/without-plugin/share-buttons/. We want to thank jekyllcodex.org for providing this file and guide. -->
+
+
+
+
+
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The data on extreme human ageing is rotten from the inside out (151 pts)]]></title>
             <link>https://theconversation.com/the-data-on-extreme-human-ageing-is-rotten-from-the-inside-out-ig-nobel-winner-saul-justin-newman-239023</link>
             <guid>41539235</guid>
             <pubDate>Sat, 14 Sep 2024 11:57:29 GMT</pubDate>
@@ -87,7 +262,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Show HN: Meet.hn – Meet the Hacker News community in your city (269 pts)]]></title>
+            <title><![CDATA[HNInternal: Show HN: Meet.hn – Meet the Hacker News community in your city (306 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=41539125</link>
             <guid>41539125</guid>
             <pubDate>Sat, 14 Sep 2024 11:36:00 GMT</pubDate>
@@ -259,7 +434,7 @@ wait a minute for the API. User since 2020 (with this account)</p></div></td></t
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Void captures over a million Android TV boxes (126 pts)]]></title>
+            <title><![CDATA[Void captures over a million Android TV boxes (130 pts)]]></title>
             <link>https://news.drweb.com/show/?i=14900</link>
             <guid>41536961</guid>
             <pubDate>Sat, 14 Sep 2024 02:12:41 GMT</pubDate>
@@ -363,7 +538,7 @@ wait a minute for the API. User since 2020 (with this account)</p></div></td></t
 <p>More details on <a href="https://vms.drweb.com/search/?q=Android.Vo1d.5&amp;lng=en"><b>Android.Vo1d.5</b></a></p>    </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Stolen iPhones Will Be Even More Useless from iOS 18 Onwards (105 pts)]]></title>
+            <title><![CDATA[Stolen iPhones Will Be Even More Useless from iOS 18 Onwards (106 pts)]]></title>
             <link>https://www.macobserver.com/ios/stolen-iphones-will-be-even-more-useless-from-ios-18-onwards/</link>
             <guid>41536232</guid>
             <pubDate>Fri, 13 Sep 2024 23:48:08 GMT</pubDate>
@@ -420,7 +595,7 @@ Offer available here until 24th October.</span></p></div></div><div id="recommen
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[My 71 TiB ZFS NAS After 10 Years and Zero Drive Failures (361 pts)]]></title>
+            <title><![CDATA[My 71 TiB ZFS NAS After 10 Years and Zero Drive Failures (372 pts)]]></title>
             <link>https://louwrentius.com/my-71-tib-zfs-nas-after-10-years-and-zero-drive-failures.html</link>
             <guid>41536088</guid>
             <pubDate>Fri, 13 Sep 2024 23:21:10 GMT</pubDate>
@@ -485,7 +660,7 @@ Somebody recommended to use a "<a href="https://en.wikipedia.org/wiki/Proportion
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Legend of Holy Sword: An Immersive Experience for Concentration Enhancement (115 pts)]]></title>
+            <title><![CDATA[The Legend of Holy Sword: An Immersive Experience for Concentration Enhancement (118 pts)]]></title>
             <link>https://arxiv.org/abs/2408.16782</link>
             <guid>41536003</guid>
             <pubDate>Fri, 13 Sep 2024 23:07:24 GMT</pubDate>
@@ -709,7 +884,7 @@ Somebody recommended to use a "<a href="https://en.wikipedia.org/wiki/Proportion
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Lisp implemented in Rust macros (260 pts)]]></title>
+            <title><![CDATA[Lisp implemented in Rust macros (267 pts)]]></title>
             <link>https://github.com/RyanWelly/lisp-in-rs-macros</link>
             <guid>41535354</guid>
             <pubDate>Fri, 13 Sep 2024 21:31:13 GMT</pubDate>
@@ -916,7 +1091,7 @@ APPLY"><pre><span>DEFINE</span>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[CrowdStrike ex-employees: 'Quality control was not part of our process' (495 pts)]]></title>
+            <title><![CDATA[CrowdStrike ex-employees: 'Quality control was not part of our process' (501 pts)]]></title>
             <link>https://www.semafor.com/article/09/12/2024/ex-crowdstrike-employees-detail-rising-technical-errors-before-july-outage</link>
             <guid>41534716</guid>
             <pubDate>Fri, 13 Sep 2024 20:17:18 GMT</pubDate>
@@ -924,7 +1099,7 @@ APPLY"><pre><span>DEFINE</span>
 Couldn't get https://www.semafor.com/article/09/12/2024/ex-crowdstrike-employees-detail-rising-technical-errors-before-july-outage: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Janet Jackson had the power to crash laptop computers (2022) (190 pts)]]></title>
+            <title><![CDATA[Janet Jackson had the power to crash laptop computers (2022) (192 pts)]]></title>
             <link>https://devblogs.microsoft.com/oldnewthing/20220816-00/?p=106994</link>
             <guid>41534483</guid>
             <pubDate>Fri, 13 Sep 2024 19:44:45 GMT</pubDate>
@@ -932,7 +1107,7 @@ Couldn't get https://www.semafor.com/article/09/12/2024/ex-crowdstrike-employees
 Couldn't get https://devblogs.microsoft.com/oldnewthing/20220816-00/?p=106994: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenAI threatens to revoke o1 access for asking it about its chain of thought (480 pts)]]></title>
+            <title><![CDATA[OpenAI threatens to revoke o1 access for asking it about its chain of thought (482 pts)]]></title>
             <link>https://twitter.com/SmokeAwayyy/status/1834641370486915417</link>
             <guid>41534474</guid>
             <pubDate>Fri, 13 Sep 2024 19:43:34 GMT</pubDate>
@@ -946,30 +1121,6 @@ Couldn't get https://devblogs.microsoft.com/oldnewthing/20220816-00/?p=106994: E
             <pubDate>Fri, 13 Sep 2024 18:47:20 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://notes.kateva.org/2024/09/the-end-times-have-come-for-pinboardin.html">https://notes.kateva.org/2024/09/the-end-times-have-come-for-pinboardin.html</a>, See on <a href="https://news.ycombinator.com/item?id=41533958">Hacker News</a></p>
 Couldn't get https://notes.kateva.org/2024/09/the-end-times-have-come-for-pinboardin.html: Error: timeout of 10000ms exceeded]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Meta fed its AI on everything adults have publicly posted since 2007 (239 pts)]]></title>
-            <link>https://www.theverge.com/2024/9/12/24242789/meta-training-ai-models-facebook-instagram-photo-post-data</link>
-            <guid>41533060</guid>
-            <pubDate>Fri, 13 Sep 2024 17:05:04 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.theverge.com/2024/9/12/24242789/meta-training-ai-models-facebook-instagram-photo-post-data">https://www.theverge.com/2024/9/12/24242789/meta-training-ai-models-facebook-instagram-photo-post-data</a>, See on <a href="https://news.ycombinator.com/item?id=41533060">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>Meta has acknowledged that all text and photos that adult Facebook and Instagram users have publicly published since 2007 have been fed into its artificial intelligence models. <a href="https://www.abc.net.au/news/2024-09-11/facebook-scraping-photos-data-no-opt-out/104336170">Australia’s ABC News reports</a> that Meta’s global privacy director, Melinda Claybaugh, initially rejected claims about user data from 2007 being leveraged for AI training during a local government inquiry about AI adoption before relenting after additional questioning.</p><p>“The truth of the matter is that unless you have consciously set those posts to private since 2007, Meta has just decided that you will scrape all of the photos and all of the texts from every public post on Instagram or Facebook since 2007 unless there was a conscious decision to set them on private,” Green Party senator David Shoebridge pushed in the inquiry. “That’s the reality, isn’t it?”</p><p>“Correct,” Claybaugh responded.</p><p>Meta’s <a href="https://www.facebook.com/privacy/guide/generative-ai/">privacy center</a> and <a href="https://about.fb.com/news/2023/09/privacy-matters-metas-generative-ai-features/">blog posts</a> acknowledge hoovering up public posts and comments from Facebook and Instagram to train generative AI:</p><div><blockquote><p>We use public posts and comments on Facebook and Instagram to train generative AI models for these features and for the open source community.</p><p>We don’t use posts or comments with an audience other than Public for these purposes.</p></blockquote></div><p>But the company has been vague about how data is used, when it started scraping, and how far back its collection goes. Asked by <em>The New York Times</em> in June, Meta didn’t answer, other than to confirm that setting posts <a href="https://www.nytimes.com/2024/06/07/technology/meta-ai-scraping-policy.html">to anything besides “public” will prevent future scraping</a>. That still won’t delete data that has already been collected — and people posting back in 2007 (who may have been minors at the time) wouldn’t have known their photos and posts would be used in this way.</p><p>Claybaugh said that Meta doesn’t scrape data from users who are under the age of 18. When Labor Party senator Tony Sheldon asked if Meta would scrape the public photos of his children on his own account, Claybaugh confirmed it would and was unable to clarify if the company also scraped adult accounts that were created when the user was still a child.</p><p>European users can opt out <a href="https://www.theverge.com/2024/6/14/24178591/meta-ai-assistant-europe-ireland-privacy-objections">due to local privacy regulations</a>, and Meta was recently <a href="https://www.theverge.com/2024/7/3/24191405/meta-anpd-stop-training-ai-on-brazilian-facebook-instagram-data">banned from using Brazilian personal data</a> for AI training, but the billions of Facebook and Instagram users in other regions can’t opt out if they want to keep their posts public. Claybaugh was unable to say if Australian users (or anyone else) would be given a choice to opt out in the future, arguing that the option was given to European users because of <a href="https://www.theverge.com/2024/7/18/24201041/meta-multimodal-llama-ai-model-launch-eu-regulations">uncertainty regarding its regulatory landscape</a>.</p><p>“Meta made it clear today that if Australia had these same laws Australians’ data would also have been protected,” Shoebridge said to ABC News. “The government’s failure to act on privacy means companies like Meta are continuing to monetize and exploit pictures and videos of children on Facebook.”</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[I Added SVG Maps to My Travel Posts (106 pts)]]></title>
-            <link>https://cyberb.space/notes/2024/how-i-added-maps-to-my-travel-posts/</link>
-            <guid>41532958</guid>
-            <pubDate>Fri, 13 Sep 2024 16:51:46 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://cyberb.space/notes/2024/how-i-added-maps-to-my-travel-posts/">https://cyberb.space/notes/2024/how-i-added-maps-to-my-travel-posts/</a>, See on <a href="https://news.ycombinator.com/item?id=41532958">Hacker News</a></p>
-Couldn't get https://cyberb.space/notes/2024/how-i-added-maps-to-my-travel-posts/: Error: timeout of 10000ms exceeded]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Zero-Click Calendar invite – Critical zero-click vulnerability chain in macOS (426 pts)]]></title>
-            <link>https://mikko-kenttala.medium.com/zero-click-calendar-invite-critical-zero-click-vulnerability-chain-in-macos-a7a434fc887b</link>
-            <guid>41532946</guid>
-            <pubDate>Fri, 13 Sep 2024 16:50:26 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://mikko-kenttala.medium.com/zero-click-calendar-invite-critical-zero-click-vulnerability-chain-in-macos-a7a434fc887b">https://mikko-kenttala.medium.com/zero-click-calendar-invite-critical-zero-click-vulnerability-chain-in-macos-a7a434fc887b</a>, See on <a href="https://news.ycombinator.com/item?id=41532946">Hacker News</a></p>
-Couldn't get https://mikko-kenttala.medium.com/zero-click-calendar-invite-critical-zero-click-vulnerability-chain-in-macos-a7a434fc887b: Error: timeout of 10000ms exceeded]]></description>
         </item>
     </channel>
 </rss>
