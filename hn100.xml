@@ -4,12 +4,176 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 28 Sep 2024 19:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 28 Sep 2024 20:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Role of Deliberate Practice in the Development of Creativity (2014) (124 pts)]]></title>
+            <title><![CDATA[The perils of transition to 64-bit time_t (119 pts)]]></title>
+            <link>https://blogs.gentoo.org/mgorny/2024/09/28/the-perils-of-transition-to-64-bit-time_t/</link>
+            <guid>41681266</guid>
+            <pubDate>Sat, 28 Sep 2024 16:31:04 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blogs.gentoo.org/mgorny/2024/09/28/the-perils-of-transition-to-64-bit-time_t/">https://blogs.gentoo.org/mgorny/2024/09/28/the-perils-of-transition-to-64-bit-time_t/</a>, See on <a href="https://news.ycombinator.com/item?id=41681266">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article id="post-2218">
+	<!-- .entry-header -->
+
+	
+	
+	<div>
+		<p>In the <a href="https://blogs.gentoo.org/mgorny/2024/09/23/overview-of-cross-architecture-portability-problems/">Overview of cross-architecture portability problems</a>, I have dedicated a section to the problems resulting from use of 32-bit <kbd>time_t</kbd> type.  This design decision, still affecting Gentoo systems using glibc, means that 32-bit applications will suddenly start failing in horrible ways in 2038: they will be getting <kbd>-1</kbd> error instead of the current time, they won’t be able to <kbd>stat()</kbd> files.  In one word: complete mayhem will emerge.</p>
+<p>There is a general agreement that the way forward is to change <kbd>time_t</kbd> to a 64-bit type.  Musl has already switched to that, glibc supports it as an option.  A number of other distributions such as Debian have taken the leap and switched.  Unfortunately, source-based distributions such as Gentoo don’t have it that easy.  So we are still debating the issue and experimenting, trying to figure out a maximally safe upgrade path for our users.</p>
+<p>Unfortunately, that’s nowhere near trivial.  Above all, we are talking about a breaking ABI change.  It’s all-or-nothing.  If a library uses <kbd>time_t</kbd> in its API, everything linking to it needs to use the same type width.  In this post, I’d like to explore the issue in detail — why is it so bad, and what we can do to make it safer.<br>
+<span id="more-2218"></span></p>
+<h2>Going back to Large File Support</h2>
+<p>Before we get into the time64 change, as I’m going to shortly call it, we need to go back in history a bit and consider another similar problem: Large File Support.</p>
+<p>Long story short, originally 32-bit architectures specify two important file-related types that were 32 bits wide: <kbd>off_t</kbd> used to specify file offsets (signed to support relative offsets) and <kbd>ino_t</kbd> used to specify inode numbers.  This had two implications: you couldn’t open files larger than 2&nbsp;GiB, and you couldn’t open files whose inode numbers exceeded 32-bit unsigned integer range.</p>
+<p>To resolve this problem, Large File Support was introduced.  It involved replacing these two types with 64-bit variants, and on glibc it is still optional today.  In its case, we didn’t take the leap and transitioned globally.  Instead, packages generally started enabling LFS support upstream — also taking care to resolve any ABI breakage in the process.  While many packages did that, we shouldn’t consider the problem solved.</p>
+<p>The important point here is that time64 support in glibc requires LFS to be used.  This makes sense — if we are going to break stuff, we may as well solve both problems.</p>
+<h2>What ABIs are we talking about?</h2>
+<p>To put it simply, we have three possible sub-ABIs here:</p>
+<ol>
+<li>the original ABI with 32-bit types,</li>
+<li>LFS: 64-bit <kbd>off_t</kbd> and <kbd>ino_t</kbd>, 32-bit <kbd>time_t</kbd>,</li>
+<li>time64: LFS + 64-bit <kbd>time_t</kbd>.</li>
+</ol>
+<p>What’s important here is that a single glibc build remains compatible with all three variants.  However, libraries that use these types in their API are not.</p>
+<p>Today, 32-bit systems roughly use a mix of the first and second ABI — the latter including packages that enabled LFS explicitly.  For the future, our goal is to focus on the third option.  We are not concerned about providing full-LFS systems with 32-bit <kbd>time_t</kbd>.</p>
+<h2>Why the ABI change is so bad?</h2>
+<p>Now, the big deal is that we are replacing a 32-bit type with a 64-bit type, in place.  Unlike with LFS, glibc does not provide any transitional API that could be used to enable new functions while preserving backwards compatibility — it’s all-or-nothing.</p>
+<p>Let’s consider structures.  If a structure contains <kbd>time_t</kbd> with its natural 32-bit alignment, then there’s no padding for the type to extend to.  Inevitable, all fields will have to shift to make room for the new type.  Let’s consider a trivial example:</p>
+<pre>struct {
+    int a;
+    time_t b;
+    int c;
+};</pre>
+<p>With 32-bit <kbd>time_t</kbd>, the offset of <kbd>c</kbd> is 8.  With the 64-bit type, it’s 12.  If you mix binaries using different <kbd>time_t</kbd> width, they’re inevitably are going to read or wrong the wrong fields!  Or perhaps even read or write out of bounds!</p>
+<p>Let’s just look at the size of <kbd>struct stat</kbd>, as an example of structure that uses both file and time-related types.  On plain 32-bit x86 glibc it’s 88 byte long.  With LFS, it’s 96 byte long (size and inode number fields are expanded).  With LFS + time64, it’s 108 byte long (three timestamps are expanded).</p>
+<p>However, you don’t even need to use structures.  After all, we are talking about x86 where function parameters are passed on stack.  If one of the parameters is <kbd>time_t</kbd>, then positions of all parameters on stack change, and we find ourselves seeing the exact same problem!  Consider the following prototype:</p>
+<pre>extern void foo(int a, time_t b, int c);</pre>
+<p>Let’s say we’re calling it as <kbd>foo(1, 2, 3)</kbd>.  With 32-bit types, the call looks like the following:</p>
+<pre>	pushl	$3
+	pushl	$2
+	pushl	$1
+	call	foo@PLT</pre>
+<p>However, with 64-bit <kbd>time_t</kbd>, it changes to:</p>
+<pre>	pushl	$3
+	pushl	$0
+	pushl	$2
+	pushl	$1
+	call	foo@PLT</pre>
+<p>An additional 32-bit value (zero) is pushed between the “old” <kbd>b</kbd> and <kbd>c</kbd>.  Once again, if we mix both kinds of binaries, they are going to fail to read the parameters correctly!</p>
+<p>So yeah, it’s a big deal.  And right now, there are no real protections in place to prevent mixing these ABIs.  So what you actually may get is runtime breakage, potentially going as far as to create security issues.</p>
+<p>You don’t have to take my word for it.  You can reproduce it yourself on x86/amd64 easily enough.  Let’s take the more likely case of a time32 program linked against a library that has been rebuilt for time64:</p>
+<pre>$ cat &gt;libfoo.c &lt;&lt;EOF
+#include &lt;stdio.h&gt;
+#include &lt;time.h&gt;
+
+void foo(int a, time_t b, int *c) {
+   printf("a = %d\n", a);
+   printf("b = %lld", (long long) b);
+   printf("%s", ctime(&amp;b));
+   printf("c = %d\n", *c);
+}
+EOF
+$ cat &gt;foo.c &lt;&lt;EOF
+#include &lt;stddef.h&gt;
+#include &lt;time.h&gt;
+
+extern void foo(int a, time_t b, int *c);
+
+int main() {
+    int three = 3;
+    foo(1, time(NULL), &amp;three);
+    return 0;
+}
+EOF
+$ cc -m32 libfoo.c -shared -o libfoo.so
+$ cc -m32 foo.c -o foo -Wl,-rpath,. libfoo.so
+$ ./foo
+a = 1
+b = 1727154919
+Tue Sep 24 07:15:19 2024
+c = 3
+$ cc -m32 -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64 \
+  libfoo.c -shared -o libfoo.so
+$ ./foo 
+a = 1
+b = -34556652301432063
+Thu Jul 20 06:16:17 -1095054749
+c = 771539841</pre>
+<p>On top of that, the source-first nature of Gentoo amplifies these problems.  An average binary distribution rebuilds all binary packages — and then the user upgrades the system in a single, relatively atomic step.  Sure, if someone uses third-party repositories or has locally built programs that link to system libraries, problems can emerge but the process is relatively safe.</p>
+<p>On the other hand, in Gentoo we are talking about rebuilding <kbd>@world</kbd> while breaking ABI in place.  For a start, we are talking around prolonged periods of time between two packages being rebuilt when they would actually be mixing incompatible ABI.  Then, there is a fair risk that some rebuild will fail and leave your system half-transitioned with no easy way out.  Then, there is a real risk that cyclic dependencies will actually make rebuild impossible — rebuilding a dependency will break build-time tools, preventing stuff from being rebuilt.  It’s a true horror.</p>
+<h2>What can we do to make it safer?</h2>
+<p>Our deliberations currently revolve about three ideas, that are semi-related, though not inevitably dependent one upon another:</p>
+<ol>
+<li>Changing the platform tuple (<kbd>CHOST</kbd>) for the new ABIs, to clearly distinguish them from the baseline 32-bit ABI.</li>
+<li>Changing the libdir for the new ABIs, effectively permitting the rebuilt libraries to be installed independently of the original versions.</li>
+<li>Introducing an binary-level ABI distinction that could prevent binaries using different sub-ABI to be linked to one another.</li>
+</ol>
+<p>The subsequent sections will focus on each of these changes in detail.  Note that all the values used there are just examples, and not necessarily the strings used in a final solution.</p>
+<h2>The platform tuple change</h2>
+<p>The platform tuple (generally referenced through the <kbd>CHOST</kbd> variable) identifies the platform targeted by the toolchain.  For example, it is used as a part of GCC/binutils install paths, effectively allowing toolchains for multiple targets to be installed simultaneously.  In clang, it can be used to switch between supported cross-compilation targets, and can control the defaults to match the specified ABI.  In Gentoo, it is also used to uniquely identify ABIs for the purpose of multilib support.  Because of that, we require that no two co-installable ABIs share the same tuple.</p>
+<p>A tuple consists of four parts, separated by hyphens: architecture, vendor, operating system and libc.  Of these, vendor is generally freeform but the other three are restricted to some degree.  A few semi-equivalent examples of tuples used for 32-bit x86 platform include:</p>
+<pre>i386-pc-linux-gnu
+i686-pc-linux-gnu
+i686-unknown-linux-gnu</pre>
+<p>Historically, two approaches were used to introduce new ABIs.  Either the vendor field was changed, or an additional ABI specification was appended to the libc field.  For example, Gentoo historically used two different kind of tuples for ARM ABIs with hardware floating-point unit:</p>
+<pre>armv7a-hardfloat-linux-gnueabi
+armv7a-unknown-linux-gnueabihf</pre>
+<p>The former approach was used earlier, to avoid incompatibility problems resulting from altering other tuple fields.  However, as these were fixed and upstreams normalized on the latter solution, Gentoo followed suit.</p>
+<p>Similarly, the discussion of time64 ABIs resurfaced the same dilemma: should we just “abuse” the vendor field for this, or instead change libc field and fix packages?  The main difference is that the former is “cleaner” as a downstream solution limited to Gentoo, while the latter generally opens up discussions about interoperability.  Therefore, the options look like:</p>
+<pre>i686-gentoo_t64-linux-gnu
+i686-pc-linux-gnut64
+armv7a-gentoo_t64-linux-gnueabihf
+armv7a-unknown-linux-gnueabihft64</pre>
+<p>Fortunately, changing the tuple should not require much patching.  The GNU toolchain and GNU build system both ignore everything following “gnu” in the libc field.  Clang will require patching — but upstream is likely to accept our patches, and we will want to make patches anyway, as they will permit clang to automatically choose the right ABI based on the tuple.</p>
+<h2>The libdir change</h2>
+<p>The term “libdir” refers to the base name of the library install directory.  Having different libdirs, and therefore separate library install directories, makes it possible to build multilib systems, i.e. installing multiple ABI variations of libraries on a single system, and making it possible to run executables for different ABIs.  For example, this is what makes it possible to run 32-bit x86 executables on amd64 systems.</p>
+<p>The libdir values are generally specified in the ABI.  Naturally, the baseline value is plain <kbd>lib</kbd>.  As a historical convention (since 32-bit architectures were first), usually 32-bit platforms (arm, ppc, x86) use <kbd>lib</kbd>, whereas their more modern 64-bit counterparts (amd64, arm64, ppc64) use <kbd>lib64</kbd> — even if a particular architecture never really supported multilib on Gentoo.</p>
+<p>Architectures that support multiple ABIs also define different libdirs.  For example, the additional x32 ABI on x86 uses <kbd>libx32</kbd>.  MIPS n32 ABI uses <kbd>lib32</kbd> (with plain <kbd>lib</kbd> defining the o32 ABI).</p>
+<p>Now, we are considering changing the libdir value for time64 variants of 32-bit ABIs, for example from <kbd>lib</kbd> to <kbd>libt64</kbd>.  This would make it possible to install the rebuilt libraries separately from the old libraries, effectively bringing three advantages:</p>
+<ol>
+<li>reducing the risk of time64 executables accidentally linking to time32 libraries,</li>
+<li>enabling Portage’s <kbd>preserved-libs</kbd> feature to preserve time32 libraries once the respective packages have been rebuilt for time64, and before their reverse dependencies have been rebuilt,</li>
+<li>optionally, making it possible to use a time32 + time64 multilib profiles, that could be used to preserve compatibility with prebuilt time32 applications linking to system libraries.</li>
+</ol>
+<p>In my opinion, the second point is a killer feature.  As I’ve mentioned before, we are talking about the kind of migration that would break executables for a prolonged time on production systems, and possibly break build-time tools, preventing the rebuild from proceeding further.  By preserving original libraries, we are minimizing the risk of actual breakage, since the existing executables will keep using the time32 libraries until they are rebuilt and linked to the time64 libraries.</p>
+<p>The libdir change is definitely going to require some toolchain patching.  We may want to also consider special-casing glibc, as the same set of glibc libraries is valid for all of the sub-ABIs we were considering.  However, we will probably want a separate <kbd>ld.so</kbd> executable, as it would need to load libraries from the correct libdir, and then we will want to set <kbd>.interp</kbd> in time64 executables to reference the time64 <kbd>ld.so</kbd>.</p>
+<p>Note that due to how multilib is designed in Gentoo, a proper multilib support for this (i.e. the third point) requires a unique platform tuple for the ABI as well — so that specific aspect is dependent on the tuple change.</p>
+<h2>Ensuring binary incompatibility</h2>
+<p>In general, you can’t mix binaries using different ABIs.  For example, if you try to link a 64-bit program to a 32-bit library, the linker will object:</p>
+<pre>$ cc foo.c libfoo.so 
+/usr/lib/gcc/x86_64-pc-linux-gnu/14/../../../../x86_64-pc-linux-gnu/bin/ld: libfoo.so: error adding symbols: file in wrong format
+collect2: error: ld returned 1 exit status</pre>
+<p>Similarly, the dynamic loader will refuse to use a 32-bit library with 64-bit program:</p>
+<pre>$ ./foo 
+./foo: error while loading shared libraries: libfoo.so: wrong ELF class: ELFCLASS32</pre>
+<p>There a few mechanisms that are used for this.  As demonstrated above, architectures with 32-bit and 64-bit ABIs use two distinct ELF classes (<kbd>ELFCLASS32</kbd> and <kbd>ELFCLASS64</kbd>).  Additionally, some architectures use different machine identifiers (<kbd>EM_386</kbd> vs. <kbd>EM_X86_64</kbd>, <kbd>EM_PPC</kbd> vs. <kbd>EM_PPC64</kbd>).  The x32 bit ABI on x86 “abuses” this by declaring its binaries as <kbd>ELFCLASS32 + EM_X86_64</kbd> (and therefore distinct from <kbd>ELFCLASS32 + EM_386</kbd> and from <kbd>ELFCLASS64 + EM_X86_64</kbd>).</p>
+<p>Both ARM and MIPS use the flags field (it is a bit-field with architecture-specific flags) to distinguish different ABIs (hardfloat vs. softfloat, n32 ABI on MIPS…).  Additionally, both feature a dedicated attribute section — and again, the linker refuses to link incompatible object files.</p>
+<p>It may be desirable to implement a similar mechanism for time32 and time64 systems.  Unfortunately, it’s not a trivial task.  It doesn’t seem that there is a reusable generic mechanism that could be used for that.  On top of that, we need a solution that would fit a fair number of different architectures.  It seems that the most reasonably solution right now would be to add a new ELF note section dedicated to this feature, and implement complete toolchain support for it.</p>
+<p>However, whatever we decide to do, we need to take into consideration that the user may want to disable it.  Particularly, there is a fair number of prebuilt software that have no sources available, and it may continue working correctly against system libs, provided it does not call into any API using <kbd>time_t</kbd>.  The cure of unconditionally preventing them from working might be worse than the disease.</p>
+<p>On the bright side, it should be possible to create a non-fatal QA check for this without much hacking, provided that we go with separate libdirs.  We can distinguish time64 executables by their <kbd>.interp</kbd> section, pointing to the dynamic loader in the appropriate libdir, and then verify that time32 programs will not load any libraries from <kbd>libt64</kbd>, and that time64 programs will not load any libraries directly from <kbd>lib</kbd>.</p>
+<h2>What about old prebuilt applications?</h2>
+<p>So far we were concerned about packages that are building from sources.  However, there is still a fair number of old applications, usually proprietary, that are available only as prebuilt binaries — particularly for x86 and PowerPC architectures.  These packages are going to face two problems: firstly, compatibility issues with system libraries, and secondly, the y2k38 problem itself.</p>
+<p>For the compatibility problem, we have a reasonably good solution already.  Since we already had to make them work on amd64, we have a multilib layout in place, along with necessary machinery to build multiple library versions.  In fact, given that the primary purpose of multilib is compatibility with old software, it’s not even clear if there is much of a point in switching amd64 multilib to use time64 for 32-bit binaries.  Either way, we can easily extend our multilib machinery to distinguish the regular <kbd>abi_x86_32</kbd> target from <kbd>abi_x86_t64</kbd> (and we probably should do that anyway), and then create new multilib x86 profiles that would support both ABIs.</p>
+<p>The second part is much harder.  Obviously, as soon as we’re past the 2038 cutoff date, all 32-bit programs — using system libraries or not — will simply start failing in horrible ways.  One possibility is to work with <a rel="external" href="https://github.com/wolfcw/libfaketime">faketime</a> to control the system clock.  Another is to run a whole VM that’s moved back in time.</p>
+<h2>Summary</h2>
+<p>As 2038 is approaching, 32-bit applications exercising 32-bit <kbd>time_t</kbd> are up to stop working.  At this point, it is pretty clear that the only way forward is to rebuild these applications with 64-bit <kbd>time_t</kbd> (and while at it, force <abbr title="Large File Support">LFS as well).  Unfortunately, that’s not a trivial task since it involves an ABI change, and mixing time32 and time64 programs and libraries can lead to horrible runtime bugs.</abbr></p>
+<p>While the exact details are still in the making, the proposed changes revolve around three ideas that can be implemented independently to some degree: changing the platform tuple (<kbd>CHOST</kbd>), changing libdir and preventing accidentally mixing time32 and time64 binaries.</p>
+<p>The tuple change is mostly a more formal way of distinguishing builds for the regular time32 ABI (e.g. <kbd>i686-pc-linux-gnu</kbd>) from ones specifically targeting time64 (e.g. <kbd>i686-pc-linux-gnut64</kbd>).  It should be relatively harmless and easy to carry out, with minimal amount of fixing necessary.  For example, clang will need to be updated to accept new tuples.</p>
+<p>The libdir change is probably the most important of all, as it permits a breakage-free transition, thanks to Portage’s <kbd>preserved-libs</kbd> feature.  Long story short, time64 libraries get installed to a new libdir (e.g. <kbd>libt64</kbd>), and the original time32 libraries remain in <kbd>lib</kbd> until the applications using them are rebuilt.  Unfortunately, it’s a bit harder to implement — it requires toolchain changes, and ensuring that all software correctly respects libdir.  The extra difficulty is that with this change alone, the dynamic loader won’t ignore time32 libraries if e.g. <kbd>-Wl,-rpath,/usr/lib</kbd> is injected somewhere.</p>
+<p>The incompatibility part is quite important, but also quite difficult.  Ideally, we’d like to stop the linker from trying to accidentally link time32 libraries with time64 programs, and likewise the dynamic loader from trying to load them.  Unfortunately, so far we weren’t able to come up with a realistic way of doing that, short of actually making some intrusive changes to the toolchain.  On the positive side, writing a QA check to detect accidental mixing at build time shouldn’t be that hard.</p>
+<p>Doing all three should enable us to provide a clean and relatively safe transition path for 32-bit Gentoo systems using glibc.  However, these only solve problems for packages built from source.  Prebuilt 32-bit applications, particularly proprietary software like old games, can’t be helped that way.  And even if time64 changes won’t break them via breaking the ABI compatibility with system libraries, then year 2038 will.  Unfortunately, there does not seem to be a good solution to that, short of actually running them with faked system time, one way or another.</p>
+<p>Of course, all of this is still only a rough draft.  A lot may still change, following experiments, discussion and patch submission.</p>
+<h2>Acknowledgements</h2>
+<p>I would like to thank the following people for proof-reading and suggestions, and for their overall work towards time64 support in Gentoo: Arsen Arsenović, Andreas K. Hüttel, Sam James and Alexander Monakov.</p>
+	</div><!-- .entry-content -->
+
+	<!-- .entry-footer -->
+</article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Role of Deliberate Practice in the Development of Creativity (2014) (132 pts)]]></title>
             <link>https://repositories.lib.utexas.edu/server/api/core/bitstreams/c8cc4a4f-e641-462b-9a72-654e60f71485/content</link>
             <guid>41680156</guid>
             <pubDate>Sat, 28 Sep 2024 13:35:48 GMT</pubDate>
@@ -25,7 +189,7 @@
 <div id="readability-page-1" class="page"><article><header data-event-module="hero"><div><div><p>The company is in trouble, and anyone who has spit into one of the company’s test tubes should be concerned.</p></div><div><figure><div data-flatplan-lead_figure_media="true"><picture><img alt="Color illustration of a giant double helix in a shopping basket" sizes="(min-width: 976px) 976px, 100vw" srcset="https://cdn.theatlantic.com/thumbor/dwhsnYACFAvfTQqvJU1jM0Wf33E=/0x0:2000x1125/750x422/media/img/mt/2024/09/DNA_worth_final/original.jpg 750w, https://cdn.theatlantic.com/thumbor/MLFiD4XYUzOY1K7S38OlTGj-uiM=/0x0:2000x1125/828x466/media/img/mt/2024/09/DNA_worth_final/original.jpg 828w, https://cdn.theatlantic.com/thumbor/WwkP2L9X1IgqS4qdxVv8Q3N_b40=/0x0:2000x1125/960x540/media/img/mt/2024/09/DNA_worth_final/original.jpg 960w, https://cdn.theatlantic.com/thumbor/M2GrcZbd_Bu2ZtfNk2Dj8vNTPKc=/0x0:2000x1125/976x549/media/img/mt/2024/09/DNA_worth_final/original.jpg 976w, https://cdn.theatlantic.com/thumbor/RhYugbaHCEY3uJ7BVHhLlEx1-i4=/0x0:2000x1125/1952x1098/media/img/mt/2024/09/DNA_worth_final/original.jpg 1952w" src="https://cdn.theatlantic.com/thumbor/WwkP2L9X1IgqS4qdxVv8Q3N_b40=/0x0:2000x1125/960x540/media/img/mt/2024/09/DNA_worth_final/original.jpg" id="article-lead-image" width="960" height="540"></picture></div><figcaption data-flatplan-lead_figure_caption="true">Illustration by Akshita Chandra / The Atlantic. Source: Getty.</figcaption></figure></div></div><div><p><time datetime="2024-09-27T19:38:43Z" data-flatplan-timestamp="true">September 27, 2024, 3:38 PM ET</time> </p></div><gpt-ad format="injector" sizes-at-0="mobile-wide" targeting-pos="injector-article-start" sizes-at-976="desktop-wide"></gpt-ad></header><div data-view-action="view - audio player - start" data-view-label="680057" data-event-module="audio player" data-event-content-type="narrated" data-event-module-state="start" data-event-view="true"><div><p><img alt="Color illustration of a giant double helix in a shopping basket" sizes="80px" srcset="https://cdn.theatlantic.com/thumbor/rwZx92FyPVT1ymZXOiILr4G0yhI=/468x0:1593x1125/80x80/media/img/mt/2024/09/DNA_worth_final/original.jpg 80w, https://cdn.theatlantic.com/thumbor/565G5BewAZ5UlhVeki_2SFXer4s=/468x0:1593x1125/96x96/media/img/mt/2024/09/DNA_worth_final/original.jpg 96w, https://cdn.theatlantic.com/thumbor/Si6PbOzrASQN205HpG0efjDuUFk=/468x0:1593x1125/128x128/media/img/mt/2024/09/DNA_worth_final/original.jpg 128w, https://cdn.theatlantic.com/thumbor/UVKXXysPaBSYqrDpsrqe0iH82HI=/468x0:1593x1125/160x160/media/img/mt/2024/09/DNA_worth_final/original.jpg 160w, https://cdn.theatlantic.com/thumbor/rhx86PEA9BXeL5Iw7gasrTkgSrQ=/468x0:1593x1125/192x192/media/img/mt/2024/09/DNA_worth_final/original.jpg 192w, https://cdn.theatlantic.com/thumbor/JBZed8stnKCET-WqjFwspCXJitE=/468x0:1593x1125/256x256/media/img/mt/2024/09/DNA_worth_final/original.jpg 256w, https://cdn.theatlantic.com/thumbor/c3TQ4Kv3aJ35PrqkiFwJaJptexc=/468x0:1593x1125/384x384/media/img/mt/2024/09/DNA_worth_final/original.jpg 384w, https://cdn.theatlantic.com/thumbor/TMpuUFZOmyFXWaQgM47TfQQY_Wg=/468x0:1593x1125/512x512/media/img/mt/2024/09/DNA_worth_final/original.jpg 512w" src="https://cdn.theatlantic.com/thumbor/rwZx92FyPVT1ymZXOiILr4G0yhI=/468x0:1593x1125/80x80/media/img/mt/2024/09/DNA_worth_final/original.jpg" width="80" height="80"></p></div><p>Produced by ElevenLabs and News Over Audio (NOA) using AI narration.</p></div><section data-event-module="article body" data-flatplan-body="true"><p data-flatplan-paragraph="true">23andMe is <a data-event-element="inline link" href="https://www.bloomberg.com/news/articles/2024-08-08/23andme-s-quarterly-sales-miss-estimates-as-ceo-seeks-control?srnd=undefined">not doing well</a>. Its stock is on the verge of being delisted. It shut down its in-house drug-development unit last month, only the latest in several rounds of layoffs. Last week, the <a data-event-element="inline link" href="https://www.theguardian.com/technology/2024/sep/18/23andme-directors-resign">entire board of directors</a> quit, save for Anne Wojcicki, a co-founder and the company’s CEO. Amid this downward spiral, Wojcicki <a data-event-element="inline link" href="https://www.reuters.com/markets/deals/23andme-ceo-wojcicki-open-third-party-takeover-proposals-firm-filing-shows-2024-09-11/">has said</a> she’ll consider selling 23andMe—which means the DNA of 23andMe’s 15 million customers would be up for sale, too.</p><p data-flatplan-paragraph="true">23andMe’s trove of genetic data might be its most valuable asset. For about two decades now, since human-genome analysis became quick and common, the A’s, C’s, G’s, and T’s of DNA have allowed long-lost relatives to connect, <a data-event-element="inline link" href="https://www.theatlantic.com/health/archive/2024/03/dna-tests-incest/677791/">revealed family secrets</a>, and helped police catch serial killers. Some people’s genomes contain clues to what’s making them sick, or even, <a data-event-element="inline link" href="https://www.bloomberg.com/news/features/2024-05-15/23andme-s-dna-test-drama-shows-limits-of-what-genetics-can-do">occasionally</a>, how their disease should be treated. For most of us, though, consumer tests don’t have much to offer beyond a snapshot of our ancestors’ roots and confirmation of the traits we already know about. (Yes, 23andMe, my eyes <em>are</em> blue.) 23andMe is floundering in part because it hasn’t managed to prove the value of collecting all that sensitive, personal information. And potential buyers may have very different ideas about how to use the company’s DNA data to raise the company’s bottom line. This should concern anyone who has used the service.</p><p data-flatplan-paragraph="true">DNA might contain health information, but unlike a doctor’s office, 23andMe is not bound by the health-privacy law HIPAA. And the company’s <a data-event-element="inline link" href="https://www.23andme.com/legal/privacy/full-version/">privacy policies</a> make clear that in the event of a merger or an acquisition, customer information is a salable asset. 23andMe promises to ask its customers’ permission before using their data for research or targeted advertising, but that doesn’t mean the next boss will do the same. It says so right there in the fine print: The company reserves the right to update its policies at any time. A spokesperson acknowledged to me this week that the company can’t fully guarantee the sanctity of customer data, but said in a statement that “any scenario which impacts our customer's data would need to be carefully considered. We take the privacy and trust of our customers very seriously, and would strive to maintain commitments outlined in our Privacy Statement.”</p><p data-flatplan-paragraph="true"><a data-event-element="inline link" href="https://www.bloomberg.com/news/articles/2023-12-05/the-risks-of-sharing-your-dna-with-genetic-testing-firms-like-23andme?embedded-checkout=true">Certain parties</a> might take an obvious interest in the secrets of Americans’ genomes. Insurers, for example, would probably like to know about any genetic predispositions that might make you more expensive to them. In the United States, a <a data-event-element="inline link" href="http://www.ginahelp.org/">2008 law</a> called the Genetic Information Nondiscrimination Act protects against discrimination by employers and health insurers on the basis of genetic data, but <a data-event-element="inline link" href="https://www.fastcompany.com/3055710/if-you-want-life-insurance-think-twice-before-getting-genetic-testing">gaps in it</a> exempt providers of life, disability, and long-term-care insurance from such restrictions. That means that if you have, say, a genetic marker that can be correlated with a heart condition, a life insurer could find that out and legally deny you a policy—even if you never actually develop that condition. Law-enforcement agencies rely on DNA data to solve many difficult cases, and although 23andMe says it requires a warrant to share data, <a data-event-element="inline link" href="https://www.gedmatch.com/join-the-genetic-witness-program/">some other companies</a> <a data-event-element="inline link" href="https://www.bloomberg.com/news/articles/2019-02-01/major-dna-testing-company-is-sharing-genetic-data-with-the-fbi">have granted</a> broad access to police. You don’t have to commit a crime to be affected: Because we share large chunks of our genome with relatives, your DNA could be used to implicate a close family member or even a third cousin whom you’ve never met. Information about your ethnicity can also be sensitive, and that’s encoded in your genome, too. That’s all part of why, in 2020, the U.S. military <a data-event-element="inline link" href="https://www.army.mil/article/232314/osd_advises_service_members_against_using_dtc_genetic_testing">advised</a> its personnel against using consumer tests.</p><p id="injected-recirculation-link-0" data-view-action="view link - injected link - item 1" data-event-element="injected link" data-event-position="1"><a href="https://www.theatlantic.com/science/archive/2018/07/big-pharma-dna/566240/">Read: Big Pharma would like your DNA</a></p><p data-flatplan-paragraph="true">Spelling out all the potential consequences of an unknown party accessing your DNA is impossible, because scientists’ understanding of the genome is still evolving. Imagine drugmakers trolling your genome to find out what ailments you’re at risk for and then targeting you with ads for drugs to treat them. “There’s a lot of ways that this data might be misused or used in a way that the consumers couldn’t anticipate when they first bought 23andMe,” Suzanne Bernstein, counsel at the Electronic Privacy Information Center, told me. And unlike a password that can be changed after it leaks, once your DNA is out in the wild, it’s out there for good.</p><p data-flatplan-paragraph="true">Some states, <a data-event-element="inline link" href="https://privacyrights.org/resources/genetic-information-privacy-act-california#:~:text=The%20Genetic%20Information%20Privacy%20Act,with%20access%20and%20deletion%20rights.">such as California,</a> give consumers additional genetic-privacy rights and might allow DNA data to be deleted ahead of a sale. The 23andMe spokesperson told me that “customers have the ability to download their data and delete their personal accounts.” Companies are also required to notify customers of any changes to terms of service and give them a chance to opt out, though typically such changes take effect automatically after a certain amount of time, whether or not you’ve read through the fine print.</p><p data-flatplan-paragraph="true">Consumers have assumed this risk without getting much in return. When the first draft of the human genome was unveiled, it was billed as a panacea, hiding within its code secrets that would help each and every one of us unlock a personalized health plan. But <a data-event-element="inline link" href="https://www.bloomberg.com/news/features/2024-05-15/23andme-s-dna-test-drama-shows-limits-of-what-genetics-can-do">most diseases</a>, it turns out, can't be pinned on a single gene. And most people have a boring genome, free of red-flag mutations, which means DNA data just <a data-event-element="inline link" href="https://www.bloomberg.com/news/features/2024-05-15/23andme-s-dna-test-drama-shows-limits-of-what-genetics-can-do">aren’t that useful</a> to them—at least not in this form. And if a DNA test reveals elevated risk for a more common health condition, such as diabetes and heart disease, you probably already know the interventions: eating well, exercising often, getting a solid eight hours of sleep. (To an insurer, though, even a modicum of risk might make someone an unattractive candidate for coverage.) That’s likely a big part of why 23andMe’s sales have slipped. There are only so many people who want to know about their Swedish ancestry, and that, it turns out, is consumer DNA testing’s biggest sell.</p><p id="injected-recirculation-link-1" data-view-action="view link - injected link - item 2" data-event-element="injected link" data-event-position="2"><a href="https://www.theatlantic.com/health/archive/2024/03/dna-tests-incest/677791/">Read: DNA tests are uncovering the true prevalence of incest</a></p><p data-flatplan-paragraph="true">Wojcicki has pulled 23andMe back from the brink before, after the Food and Drug Administration ordered the company to <a data-event-element="inline link" href="https://www.bloomberg.com/news/articles/2013-11-27/do-genetic-tests-need-doctors-fda-defends-its-challenge-to-23andme">stop selling</a> its health tests in 2013 until they could be proved safe and effective. In recent months, Wojcicki has explored a variety of options to save the company, including splitting it to separate the cash-burning drug business from the consumer side. Wojcicki has <a data-event-element="inline link" href="https://investors.23andme.com/node/9936/html">still expressed interest</a> in trying to take the company private herself, but the board rejected her initial offer. 23andMe has until November 4 to raise its shares to at least $1, or be delisted. As that date approaches, a sale looks more and more likely—whether to Wojcicki or someone else.</p><p data-flatplan-paragraph="true">The risk of DNA data being misused has existed since DNA tests first became available. When customers opt in to participate in drug-development research, third parties already get access to their de-identified DNA data, which can in some cases be <a data-event-element="inline link" href="https://www.bloomberg.com/news/articles/2018-06-15/deleting-your-online-dna-data-is-brutally-difficult">linked back to people’s identities</a> after all. Plus, 23andMe has failed to protect its customers’ information in the past—it just agreed to pay <a data-event-element="inline link" href="https://www.reuters.com/technology/cybersecurity/23andme-settles-data-breach-lawsuit-30-million-2024-09-13/">$30 million</a> to settle a lawsuit resulting from an October 2023 data breach. But for nearly two decades, the company had an incentive to keep its customers’ data private: 23andMe is a consumer-facing business, and to sell kits, it also needed to win trust. Whoever buys the company’s data may not operate under the same constraints.</p></section><div data-event-module="footer"><p><h3>About the Author</h3></p></div><gpt-ad format="injector" sizes-at-0="mobile-wide,native,house" targeting-pos="injector-most-popular" sizes-at-976="desktop-wide,native,house"></gpt-ad></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[SunVox: Powerful Modular Synthesizer and DAW (101 pts)]]></title>
+            <title><![CDATA[SunVox: Powerful Modular Synthesizer and DAW (109 pts)]]></title>
             <link>https://www.warmplace.ru/soft/sunvox/</link>
             <guid>41679972</guid>
             <pubDate>Sat, 28 Sep 2024 13:00:27 GMT</pubDate>
@@ -180,7 +344,43 @@ Please mark your songs with the #SunVox hashtag, so that anyone can easily find 
     </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Meta fined $102M for storing passwords in plain text (154 pts)]]></title>
+            <title><![CDATA[MtCellEdit – Lightweight Spreadsheet Program (104 pts)]]></title>
+            <link>https://www.marktyler.org/ced/</link>
+            <guid>41679471</guid>
+            <pubDate>Sat, 28 Sep 2024 11:10:56 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.marktyler.org/ced/">https://www.marktyler.org/ced/</a>, See on <a href="https://news.ycombinator.com/item?id=41679471">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+<h2>About</h2>
+<p>
+mtCellEdit is a lightweight spreadsheet program that I created from scratch. It is a small, no frills program which is designed to handle simple day to day spreadsheet tasks. I have put the most important facilities I want into a small customized program which means I can avoid the problems of larger programs such as slow operating speeds and overcomplicated user interfaces. The GUI is presented using Qt5.
+</p>
+
+<p>
+The core of the program is a shared C/C++ library which can be used by any C/C++ program to read, write and manipulate spreadsheets. The source code suite also contains other example programs that use this library, such as command line tools to allow scripts to access the API.
+</p>
+
+<p>
+The default file format mtCellEdit uses is portable and transparent as it is a ZIP file containing TSV text files. I deliberately designed it this way so that data can be extracted and read by any modern spreadsheet program on any operating system without requiring mtCellEdit. Over the years I have been frustrated by binary and XML formats that make data only accessible via a single program (or by me wasting time manually converting each file, or by me writing a file format conversion program). This format ensures that my data never becomes stranded, and can be manipulated by whichever tool I choose for a particular job (i.e. spreadsheet programs, text editors, command line tools, etc).
+</p>
+
+<h2>System Requirements</h2>
+<p>
+mtCellEdit is designed for GNU/Linux operating systems.  Hardware wise it
+has been tested on x86_32, x86_64, and ARM_32 platforms.
+</p>
+
+
+<h2>License</h2>
+<p>
+The source code is distributed under the GNU General Public License version 3
+or later.  Read more about this here
+<a href="https://www.gnu.org/copyleft/gpl.html">https://www.gnu.org/copyleft/gpl.html</a>
+</p>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Meta fined $102M for storing passwords in plain text (155 pts)]]></title>
             <link>https://www.engadget.com/big-tech/meta-fined-102-million-for-storing-passwords-in-plain-text-110049679.html</link>
             <guid>41678840</guid>
             <pubDate>Sat, 28 Sep 2024 08:38:04 GMT</pubDate>
@@ -188,7 +388,18 @@ Please mark your songs with the #SunVox hashtag, so that anyone can easily find 
 <div id="readability-page-1" class="page"><div><p>The Irish Data Protection Commission (DPC) has slapped Meta with a $101.5 million (€91 million) fine after wrapping up an investigation into a security breach in 2019, wherein the company mistakenly <a data-i13n="cpos:1;pos:1" href="https://www.engadget.com/2019-03-21-facebook-user-passwords-plain-text.html" data-ylk="slk:stored users' passwords in plain text;cpos:1;pos:1;elm:context_link;itc:0;sec:content-canvas">stored users' passwords in plain text</a>. Meta's original announcement only talked about how it found some user passwords stored in plain text on its servers in January that year. But a month later, it updated its announcement to reveal that <a data-i13n="cpos:2;pos:1" href="https://www.engadget.com/2019-04-18-facebook-stored-instagram-passwords-plain-text.html" data-ylk="slk:millions of Instagram passwords;cpos:2;pos:1;elm:context_link;itc:0;sec:content-canvas">millions of Instagram passwords</a> were also stored in easily readable format.</p><p>While Meta didn't say how many accounts were affected, a senior employee told <a data-i13n="cpos:3;pos:1" href="https://krebsonsecurity.com/2019/03/facebook-stored-hundreds-of-millions-of-user-passwords-in-plain-text-for-years/" rel="nofollow noopener" target="_blank" data-ylk="slk:Krebs on Security;cpos:3;pos:1;elm:context_link;itc:0;sec:content-canvas"><em>Krebs on Security </em></a>back then that the incident involved up to 600 million passwords. Some of the passwords had been stored in easily readable format in the company's servers since 2012. They were also reportedly searchable by over 20,000 Facebook employees, though the DPC has clarified in its decision that they were at least not made available to external parties.</p><p>The DPC found that Meta violated several GDPR rules related to the breach. It determined that the company failed to "notify the DPC of a personal data breach concerning storage of user passwords in plaintext" without undue delay and failed to "document personal data breaches concerning the storage of user passwords in plaintext." It also said that Meta violated the GDPR by not using appropriate technical measures to ensure the security of users' passwords against unauthorized processing.</p><p>"It is widely accepted that user passwords should not be stored in plaintext, considering the risks of abuse that arise from persons accessing such data. It must be borne in mind, that the passwords the subject of consideration in this case, are particularly sensitive, as they would enable access to users’ social media accounts," DPC's Deputy Commissioner, Graham Doyle, said in a statement.</p><p>The DPC has also given the company a reprimand in addition to the penalty. We may know more about what that means for Meta exactly when the commission publishes its full final decision and other related information in the future.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FFT-based ocean-wave rendering, implemented in Godot (541 pts)]]></title>
+            <title><![CDATA[I Made a Rubbish Clock (103 pts)]]></title>
+            <link>https://blog.jgc.org/2024/09/i-made-rubbish-clock.html</link>
+            <guid>41678600</guid>
+            <pubDate>Sat, 28 Sep 2024 07:36:27 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.jgc.org/2024/09/i-made-rubbish-clock.html">https://blog.jgc.org/2024/09/i-made-rubbish-clock.html</a>, See on <a href="https://news.ycombinator.com/item?id=41678600">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="post-body-522901623747231800" itemprop="description articleBody">
+<p>With separate plastic, metal, paper, and glass recycling, composting, and pick up of all the rest, knowing which days to put out which bins can be complicated. Some have turned to high-tech solutions like Darren Tarbard's wonderful "<a href="https://x.com/tarbard/status/1002464120447397888">bindicator</a>".</p><p><a href="https://x.com/tarbard/status/1002464120447397888"><img data-original-height="835" data-original-width="900" height="371" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEisozadvkoI9CxySkzJNcnOY_o2vZNWnv2gonXZ-K3eYn24dsIy5j7DoEHNxNShAVd-OBqk1PUMGRqJvSdmOs10lTHYGTlCgYz7uqOjXD_vf57eKTbMPeedRuCETBjUWnp-Sh9mIDxK0vMqp_va2txelYdG8f_9Yem8IweeCIQlhclFQi7HwOIlNA/w400-h371/Del3rp-WsAES2IE.jpg" width="400"></a></p><p>There's even a&nbsp;<a href="https://www.bindicator.net/">commercial version</a>&nbsp;of that.</p><p>I thought about making something similar, but decided that a high-tech solution isn't always the right one. Instead I made a clock, or rather a clock face. My rationale was as follows: the bin days don't change frequently so no need to call an API to get them, and anyway most councils don't have an API for this sort of thing. Also, I really didn't want yet another thing with a wall wart, or WiFi to configure, or code to debug (there comes a time in every programmer's life when they can't face debugging yet another thing that should be simple and just work).&nbsp;</p><p>Not everything needs to be Turing Complete! But you can buy cheap clock mechanisms where the hands go full circle in seven days instead of 12 hours. Something like <a href="https://www.youngtownco.com/en/product-496882/7-Days-Week-Clock-Movement-12888SDWK.html">this</a>.&nbsp;</p><p><a href="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgsdpeNHoK98X_LNj45s4b71ULFC-yEBbTAAC5Dt3Mp6jfwfE6FnMHw80boTFqBF1pbTeDye9C8S6fY-UAQfjlk0uxJj_o7-9RsoB5psG_mMfG5EhI7H5QpwQ4w_cPgtL95VIpBKSzb75r3aXV7BBPcPAbuqUzUwif5uxm-LFQZJofvnmctDB9uVQ/s508/lixo-2.jpg"><img data-original-height="500" data-original-width="508" height="315" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgsdpeNHoK98X_LNj45s4b71ULFC-yEBbTAAC5Dt3Mp6jfwfE6FnMHw80boTFqBF1pbTeDye9C8S6fY-UAQfjlk0uxJj_o7-9RsoB5psG_mMfG5EhI7H5QpwQ4w_cPgtL95VIpBKSzb75r3aXV7BBPcPAbuqUzUwif5uxm-LFQZJofvnmctDB9uVQ/s320/lixo-2.jpg" width="320"></a></p><p>So, I wrote a bunch of code to produce an SVG (and PDF and PNG) for the clock face. The code is <a href="https://github.com/jgrahamc/lixo">here</a>. You end up with something like this which can be printed.</p><p><a href="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEi50DJtFU-77BZVN0Zidd-1XHQNnQqwL2EDdX6sPvxlJgWOj2OvrzHjcoNZk7-GoxbPrFlcoTH6ijQ7Jrtp5vk3v7Vedt9JAH-3Rd7yzPGY427oDsqkrinfduN0NJb02z2dDsM91tR-xxAianznNcIVOr50eIedZmBL_XVlhVpwApRi2PEPPU7i4g/s2362/lixo.png"><img data-original-height="2362" data-original-width="2362" height="400" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEi50DJtFU-77BZVN0Zidd-1XHQNnQqwL2EDdX6sPvxlJgWOj2OvrzHjcoNZk7-GoxbPrFlcoTH6ijQ7Jrtp5vk3v7Vedt9JAH-3Rd7yzPGY427oDsqkrinfduN0NJb02z2dDsM91tR-xxAianznNcIVOr50eIedZmBL_XVlhVpwApRi2PEPPU7i4g/w400-h400/lixo.png" width="400"></a></p><p>The colours and wording are all determined by the <span>schd</span> and <span>bins</span> variables. The code should be easy to customize for your location's schedule. It supports up to two different bin types per day. If you need more you'll have to modify the code.</p><div><p><span><span>&nbsp;&nbsp; &nbsp;</span>bins = {</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>"none": ["white", ""],</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>"lixo": ["#72859E", "Lixo"],</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>"papl": ["#255FC9", "Papel"],</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>"embl": ["#DED044", "Embalagens"],</span></p><p><span><span>&nbsp;&nbsp; &nbsp;</span>}</span></p><p><span><span>&nbsp;&nbsp; &nbsp;</span>days = ["Sun", "Mon", "Tues", "Wednes", "Thurs", "Fri", "Satur"]</span></p><p><span><span>&nbsp;&nbsp; &nbsp;</span>schd = [["none"],</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>&nbsp; &nbsp; ["lixo"],</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>["papl", "embl"],</span></p><p><span>&nbsp; &nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>&nbsp; ["lixo"],</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp;<span>&nbsp;&nbsp; &nbsp;</span> ["papl"],</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>["lixo", "embl"],</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>["papl"]]</span></p><p>There's no need for you to use Portuguese; I have because I'm dealing with Portuguese rubbish collection.</p><p>The only interesting piece of code is the generation of the curves for the seven daily segments (and also for the curved wording). This is done by the function <span>path</span>:</p><div><p><span><span>&nbsp;&nbsp; &nbsp;</span>def getXY(p, r, s):</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>a = 2.0 * math.pi * (p * pps + rot)</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>return s % (r * math.cos(a),</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>&nbsp; &nbsp; &nbsp; &nbsp; r * math.sin(a))</span></p><p><span><span>&nbsp;&nbsp; &nbsp;</span>def path(p, r):</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>s = " %.2f %.2f "</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>pa = "M"</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>pa += getXY(p, r, s)</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>pa += "A %.2f %.2f 0 0 1" % (r, r)</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>pa += getXY((p+1), r, s)</span></p><p><span>&nbsp; &nbsp; <span>&nbsp;&nbsp; &nbsp;</span>return pa</span></p><p>In SVG you can define a <a href="https://developer.mozilla.org/en-US/docs/Web/SVG/Tutorial/Paths">path</a> element which can be used to make all sorts of curves, arcs, and lines. My <span>path</span> function takes two parameters: <span>p</span> is a number between zero and six representing the seven daily segments needed on the clock; <span>r</span> is the radius of the arc. The function uses <span>getXY</span> to find the position of a point on the arc. It does this twice to find the start and end point.&nbsp;</p><p>So, path ends up returning something like <span>M x0 y0 A r r 0 0 1 x1 y1</span> where <span>x0</span>, <span>y0</span>, <span>x1</span>, <span>y1</span> are the calculated end points of the arc and <span>r</span> is the radius of the arc. The <span>M x0 y0</span> means "move to (<span>x0</span>, <span>y0</span>)" The&nbsp;<span>A r r 0 0 1 x1 y1</span>&nbsp;means "draw an <a href="https://www.w3.org/TR/SVG/paths.html#PathDataEllipticalArcCommands">arc</a> of radius r to the point (<span>x1</span>, <span>y1</span>)". The <span>0 0 1</span> in the middle correspond to three parameters:&nbsp;x-axis-rotation, large-arc-flag, and sweep-flag; it's best to refer to the documentation for those because they determine the direction in which the arc points and whether it is rotated.</p><div><p>The final part of the path SVG element, <span>L 0 0</span>, is added elsewhere in the code. It sets the centre of the arc at (<span>0</span>, <span>0</span>). I used the <span>viewBox</span> attribute of the SVG to make the SVG geometry be between (<span>-1</span>, <span>-1</span>) and (<span>1</span>, <span>1</span>) thus making the centre of the image (<span>0</span>, <span>0</span>).&nbsp;&nbsp;</p><p><span><span>&nbsp;&nbsp; &nbsp;</span>print('&lt;svg xmlns="http://www.w3.org/2000/svg" viewBox="-1 -1 2 2" width="%s" height="%s"&gt;' % (wh, wh))</span></p></div><p>Armed with a suitable printed clock face, I got a simple square picture frame, a few bits of wood for spacers, and put it all together into a "rubbish clock".</p></div><div><p><a href="https://flyingtiger.com/pt-pt/products/black-picture-frame-20x20-cm-3034806"><img data-original-height="1200" data-original-width="1200" height="640" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgjLt5yQO3Yskdk8xTXFjHTL_PwvbRm5PmqrTMMXHrTnaEuCPRsnqrvgGzb_qs6pPHiK_pfsHZSgzQoYuPfbu1mUZoLuhyphenhyphenDGyedf_kURe3UIPm1TRJPhewAKwHSRTWWw9pLQwtn0XJspWp_m-ogVQv0oPDMvs9le2MBGPkKglSaXkSzlpuYV7oXcA/w640-h640/lixo-4.webp" width="640"></a></p><p><a href="https://flyingtiger.com/pt-pt/products/black-picture-frame-20x20-cm-3034806"><img data-original-height="1200" data-original-width="1200" height="640" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEixHHRXpURAEsmK_bYXaQyR8iLSGK14efmCSbFsmie4tRUsvd9kZzzk9ZiOy79k9TDl5t4PRcRhyqwFXU0qlhdmnMfiWLguPb8mszXhjrcpMxhtBvp0ecFu7GPL7UiPDq8Xzl8usb0LuKuJIQzZd7a08DYdPJvNIdK2fub3Fixs09_G0CqPAMG8JA/w640-h640/lixo-3.webp" width="640"></a></p></div><table><tbody><tr><td><a href="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEhpj8fOLwk9PArF_K9sUwkYhSCZVRmwC7xmI-wvs32RetBhwFdTOzRdFOzDg6gXEn-taEu3SQW5hJz78Zrkryl5x5ReEr9iexphsiMabORQfh4BqLzNWzkgVhbcF5zNMWeTbWikEwyPkhbaZwFtQBy6_TMFOz-ZH48-owPvbaUZaeyGWnrWACnR1g/s1200/lixo-5.jpg"><img data-original-height="1200" data-original-width="1200" height="640" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEhpj8fOLwk9PArF_K9sUwkYhSCZVRmwC7xmI-wvs32RetBhwFdTOzRdFOzDg6gXEn-taEu3SQW5hJz78Zrkryl5x5ReEr9iexphsiMabORQfh4BqLzNWzkgVhbcF5zNMWeTbWikEwyPkhbaZwFtQBy6_TMFOz-ZH48-owPvbaUZaeyGWnrWACnR1g/w640-h640/lixo-5.jpg" width="640"></a></td></tr><tr><td><br></td></tr></tbody></table><br></div><p><a href="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEjvTpcZoantZ16120z-lQK12YKhHkbb_lXVQEdznDiWKicX4J4EoD4yaibwH_iROLsHVCkeh4qti2xmslW-u5Qy96-5OkdfmK_l4-bpLHcezEPtQyNkR-9NuW9ZNDwVHRSO91S1kQZTHPtXZdQdcaFCxWSQFLwLz8y-NFx5oT2AMLi3SqVEzQ0_KQ/s1200/lixo-7.jpg"><img data-original-height="953" data-original-width="1200" height="509" src="https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEjvTpcZoantZ16120z-lQK12YKhHkbb_lXVQEdznDiWKicX4J4EoD4yaibwH_iROLsHVCkeh4qti2xmslW-u5Qy96-5OkdfmK_l4-bpLHcezEPtQyNkR-9NuW9ZNDwVHRSO91S1kQZTHPtXZdQdcaFCxWSQFLwLz8y-NFx5oT2AMLi3SqVEzQ0_KQ/w640-h509/lixo-7.jpg" width="640"></a></p><br>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[FFT-based ocean-wave rendering, implemented in Godot (565 pts)]]></title>
             <link>https://github.com/2Retr0/GodotOceanWaves</link>
             <guid>41678412</guid>
             <pubDate>Sat, 28 Sep 2024 06:51:41 GMT</pubDate>
@@ -292,7 +503,7 @@ s_\xi &amp;= 16 \tanh\big(\tfrac{\omega_p}{\omega}\big)\xi^2
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Amusing Ourselves to Death (308 pts)]]></title>
+            <title><![CDATA[Amusing Ourselves to Death (324 pts)]]></title>
             <link>https://otpok.com/2014/01/03/amusing-ourselves-to-death/</link>
             <guid>41678208</guid>
             <pubDate>Sat, 28 Sep 2024 05:56:37 GMT</pubDate>
@@ -373,7 +584,7 @@ s_\xi &amp;= 16 \tanh\big(\tfrac{\omega_p}{\omega}\big)\xi^2
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Everything you need to know about Python 3.13 – JIT and GIL went up the hill (297 pts)]]></title>
+            <title><![CDATA[Everything you need to know about Python 3.13 – JIT and GIL went up the hill (310 pts)]]></title>
             <link>https://drew.silcock.dev/blog/everything-you-need-to-know-about-python-3-13/</link>
             <guid>41677131</guid>
             <pubDate>Sat, 28 Sep 2024 01:23:01 GMT</pubDate>
@@ -504,7 +715,7 @@ s_\xi &amp;= 16 \tanh\big(\tfrac{\omega_p}{\omega}\big)\xi^2
 </section>   </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[If WordPress is to survive, Matt Mullenweg must be removed (235 pts)]]></title>
+            <title><![CDATA[If WordPress is to survive, Matt Mullenweg must be removed (236 pts)]]></title>
             <link>https://joshcollinsworth.com/blog/fire-matt</link>
             <guid>41676653</guid>
             <pubDate>Fri, 27 Sep 2024 23:49:15 GMT</pubDate>
@@ -766,7 +977,7 @@ s_\xi &amp;= 16 \tanh\big(\tfrac{\omega_p}{\omega}\big)\xi^2
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Arch Linux and Valve Collaboration (141 pts)]]></title>
+            <title><![CDATA[Arch Linux and Valve Collaboration (143 pts)]]></title>
             <link>https://lists.archlinux.org/archives/list/arch-dev-public@lists.archlinux.org/thread/RIZSKIBDSLY4S5J2E2STNP5DH4XZGJMR/</link>
             <guid>41676646</guid>
             <pubDate>Fri, 27 Sep 2024 23:47:51 GMT</pubDate>
@@ -997,30 +1208,6 @@ Couldn't get https://www.reuters.com/legal/litigation/us-trademark-office-cancel
 
 
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Obsessed with Cuttle: Parametric CAD for prototyping, producing, and procrastin (158 pts)]]></title>
-            <link>https://hannahilea.com/blog/cuttle-obsession/</link>
-            <guid>41674677</guid>
-            <pubDate>Fri, 27 Sep 2024 19:35:32 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://hannahilea.com/blog/cuttle-obsession/">https://hannahilea.com/blog/cuttle-obsession/</a>, See on <a href="https://news.ycombinator.com/item?id=41674677">Hacker News</a></p>
-<div id="readability-page-1" class="page">
-  <p>
-    <nav role="navigation">
-      @hannahilea:
-      <a href="https://hannahilea.com/">home</a> |
-      <a href="https://hannahilea.com/projects">projects</a> |
-      <a href="https://hannahilea.com/blog/">blog</a> |
-      <a href="mailto:hannah.ilea.robertson+site@gmail.com">contact</a>
-    </nav>
-    <md-block src="./src.md" hlinks="">
-      
-    </md-block>
-  </p>
-
-
-
-</div>]]></description>
         </item>
     </channel>
 </rss>
