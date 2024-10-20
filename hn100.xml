@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 20 Oct 2024 19:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 20 Oct 2024 20:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Drasi: Microsoft's open source data processing platform for event-driven systems (118 pts)]]></title>
+            <title><![CDATA[Drasi: Microsoft's open source data processing platform for event-driven systems (130 pts)]]></title>
             <link>https://github.com/drasi-project/drasi-platform</link>
             <guid>41896297</guid>
             <pubDate>Sun, 20 Oct 2024 16:07:43 GMT</pubDate>
@@ -59,7 +59,117 @@ This streamlined setup ensures drivers are promptly informed, optimizing the del
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Internet Archive breached again through stolen access tokens (217 pts)]]></title>
+            <title><![CDATA[The Part of PostgreSQL We Hate the Most (2023) (118 pts)]]></title>
+            <link>https://www.cs.cmu.edu/~pavlo/blog/2023/04/the-part-of-postgresql-we-hate-the-most.html</link>
+            <guid>41895951</guid>
+            <pubDate>Sun, 20 Oct 2024 15:30:29 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.cs.cmu.edu/~pavlo/blog/2023/04/the-part-of-postgresql-we-hate-the-most.html">https://www.cs.cmu.edu/~pavlo/blog/2023/04/the-part-of-postgresql-we-hate-the-most.html</a>, See on <a href="https://news.ycombinator.com/item?id=41895951">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        
+        <p>There are a lot of choices in databases (<a onclick="javascript:pageTracker._trackPageview('/outgoing/dbdb.io');" href="https://dbdb.io/" target="_blank">897</a> as of April 2023). With so many systems, it’s hard to know what to pick! But there is an interesting phenomenon where the Internet collectively decides on the default choice for new applications. In the 2000s, the conventional wisdom selected MySQL because rising tech stars like Google and Facebook were using it. Then in the 2010s, it was MongoDB because <a onclick="javascript:pageTracker._trackPageview('/outgoing/stackoverflow.com');" href="https://stackoverflow.com/a/3737121" target="_blank">non-durable writes</a> made it “<a onclick="javascript:pageTracker._trackPageview('/outgoing/youtu.be');" href="https://youtu.be/b2F-DItXtZs" target="_blank">webscale</a>“. In the last five years, PostgreSQL has become the Internet’s darling DBMS. And for good reasons! It’s dependable, feature-rich, extensible, and well-suited for most operational workloads.</p>
+<p>But as much as we <a onclick="javascript:pageTracker._trackPageview('/downloads/papers/2017/p781-wu.pdf');" href="https://twitter.com/andy_pavlo/status/1534225032179814403" target="_blank">love PostgreSQL at OtterTune</a>, certain aspects of it are not great. So instead of writing yet another blog article like everyone else touting the awesomeness of everyone’s favorite elephant-themed DBMS, we want to discuss the one major thing that sucks: how PostgreSQL implements <a onclick="javascript:pageTracker._trackPageview('/outgoing/en.wikipedia.org');" href="https://en.wikipedia.org/wiki/Multiversion_concurrency_control" target="_blank">multi-version concurrency control</a> (MVCC). Our <a onclick="javascript:pageTracker._trackPageview('/downloads/papers/2017/p781-wu.pdf');" href="https://db.cs.cmu.edu/papers/2017/p781-wu.pdf" target="_blank">research</a> at Carnegie Mellon University and experience optimizing PostgreSQL database instances on Amazon RDS have shown that its MVCC implementation is the <u><b>worst</b></u> among the other widely used relational DBMSs, including MySQL, Oracle, and Microsoft SQL Server. And yes, Amazon’s PostgreSQL Aurora still has these problems.</p>
+<p>In this article, we’ll dive into MVCC: what it is, how PostgreSQL does it, and why it is terrible. Our goal at OtterTune is to give you <i>fewer</i> things to worry about with your databases, so we’ve thought a lot about dealing with this problem. We’ll cover OtterTune’s solution for managing PostgreSQL’s MVCC issues automatically for RDS and Aurora databases in a follow-up article next week.</p>
+<h2 id="what-is-mvcc">What is Multi-Version Concurrency Control?</h2>
+<p>The goal of MVCC in a DBMS is to allow multiple queries to read and write to the database simultaneously without interfering with each other when possible. The basic idea of MVCC is that the DBMS never overwrites existing rows. Instead, for each (logical) row, the DBMS maintains multiple (physical) versions. When the application executes a query, the DBMS determines which version to retrieve to satisfy the request according to some version ordering (e.g., creation timestamp). The benefit of this approach is that multiple queries can read older versions of rows without getting blocked by another query updating it. Queries observe a snapshot of the database as it existed when the DBMS started that query’s transaction (snapshot isolation). This approach eliminates the need for explicit <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.postgresql.org');" href="https://www.postgresql.org/docs/current/explicit-locking.html" target="_blank">record locks</a> that block readers from accessing data while writers modify the same item.</p>
+<p>David Reed’s 1978 MIT Ph.D. dissertation, “<a onclick="javascript:pageTracker._trackPageview('/outgoing/dspace.mit.edu');" href="https://dspace.mit.edu/handle/1721.1/16279" target="_blank">Concurrency Control in Distributed Database Systems</a>,” was, we believe, the first publication to describe MVCC. The first commercial DBMS implementation of MVCC was <a onclick="javascript:pageTracker._trackPageview('/outgoing/en.wikipedia.org');" href="https://en.wikipedia.org/wiki/InterBase#History" target="_blank">InterBase</a> in the 1980s. Since then, nearly every new DBMS created in the last two decades that supports transactions implements MVCC.</p>
+<p>A systems engineer has to make several design decisions when building a DBMS that supports MVCC. At a high level, it comes down to the following:</p>
+<ol>
+  <li aria-level="1">How to store updates to existing rows.</li>
+  <li aria-level="1">How to find the correct version of a row for a query at runtime.</li>
+  <li aria-level="1">How to remove expired versions that are no longer visible.</li>
+</ol>
+
+<p>These decisions are not mutually exclusive. In the case of PostgreSQL, it’s how they decided to handle the first question in the 1980s that caused problems with the other two that we still have to deal with today.</p>
+<p>For our discussion, we will use the following example of a table containing movie information. Each row in the table includes the movie name, release year, director, and a unique ID serving as the primary key, with secondary indexes on the movie name and director. Here is the DDL command to create this table:</p>
+<pre><code>CREATE TABLE movies (
+  id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+  name VARCHAR(256) NOT NULL,
+  year SMALLINT NOT NULL,
+  director VARCHAR(128)
+);
+CREATE INDEX idx_name ON movies (name);
+CREATE INDEX idx_director ON movies (director);</code></pre>
+
+<p>The table contains a primary index (<code>movies_pkey</code>) and two secondary B+Tree indexes (<code>idx_name</code>, <code>idx_director</code>).</p>
+<h2 id="postgresql-mvcc">PostgreSQL’s Multi-Version Concurrency Control</h2>
+
+<p>As discussed in Stonebraker’s <a onclick="javascript:pageTracker._trackPageview('/outgoing/apps.dtic.mil');" href="https://apps.dtic.mil/sti/citations/ADA187244" target="_blank">system design document from 1987</a>, PostgreSQL was designed from the beginning to support multi-versioning. The core idea of PostgreSQL’s MVCC scheme is seemingly straightforward: when a query updates an existing row in a table, the DBMS makes a copy of that row and applies the changes to this new version instead of overwriting the original row. We refer to this approach as the <b>append-only</b> version storage scheme. But as we now describe, this approach has several non-trivial implications in the rest of the system.</p>
+<h3>Multi-Versioned Storage</h3>
+<p>PostgreSQL stores all row versions in a table in the same storage space. To update an existing tuple, the DBMS first acquires an empty slot from the table for the new row version. It then copies the row content of the current version to the new version, and applies the modifications to the row in the newly allocated version slot. You can see this process in the example below when an application executes an update query on the movies database to change the release year of “<a onclick="javascript:pageTracker._trackPageview('/outgoing/en.wikipedia.org');" href="https://en.wikipedia.org/wiki/Shaolin_and_Wu_Tang" target="_blank">Shaolin and Wu Tang</a>” from 1985 to 1983:</p>
+<figure>
+  <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example1.svg"><img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example1.svg"></a>
+  <figcaption>When an UPDATE query changes a tuple in the table, PostgreSQL copies the original version of the tuple and then applies the change to the new version. In this example, there is no more space in Table Page #1, so PostgreSQL creates the new version in Table Page #2.</figcaption>
+</figure>
+
+<p>Now with two physical versions representing the same logical row, the DBMS needs to record the lineage of these versions so that it knows how to find them in the future. MVCC DBMSs achieve this by creating a <b>version chain</b> via a singly linked-list. The version chain only goes in one direction to reduce storage and maintenance overhead. This means that the DBMS has to decide what order to use: <i>newest-to-oldest</i> (N2O) order or <i>oldest-to-newest</i> (O2N). For the N2O order, each tuple version points to its previous version and the version chain’s head is always the latest version. For the O2N order, each tuple version points to its new version, and the head is the oldest tuple version. The O2N approach avoids the need for the DBMS to update indexes to point to a newer version of the tuple each time it’s modified. However, it may take longer for the DBMS to find the latest version during query processing, potentially traversing a long version chain. Most DBMSs, including Oracle and MySQL, implement N2O. But PostgreSQL stands alone in using O2N (except for Microsoft’s <a onclick="javascript:pageTracker._trackPageview('/outgoing/learn.microsoft.com');" href="https://learn.microsoft.com/en-us/sql/relational-databases/in-memory-oltp/introduction-to-memory-optimized-tables?view=sql-server-ver16" target="_blank">In-Memory OLTP engine</a> for SQL Server).</p>
+<p>The next issue is how PostgreSQL determines what to record for these version pointers. The header for each row in PostgreSQL contains a tuple id field ( <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.postgresql.org');" href="https://www.postgresql.org/docs/current/storage-page-layout.html#STORAGE-TUPLE-LAYOUT" target="_blank">t_tcid</a>) of the next version (or its own tuple id if it is the latest version). Thus, as shown in this next example, when a query requests the latest version of a row, the DBMS traverses the index, lands on the oldest version, and then follows the pointer until it finds a version that it needs.</p>
+<figure>
+  <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example3.svg"><img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example3.svg"> </a>
+  <figcaption>The SELECT query traverses the index to find tuple with requested movie name. The index entry points to the oldest version of the tuple, which means PostgreSQL follows the version chain embedded in the original version to find the new version.</figcaption>
+</figure>
+
+<p>PostgreSQL developers realized early on that there are two problems with its MVCC scheme. First, making a new copy of an entire tuple every time it is updated is expensive. And second, traversing the entire version chain just to find the latest version (which is what most queries want) is wasteful. Of course there is also the problem of cleaning up old versions, but we’ll cover that below.</p>
+<p>To avoid traversing the entire version chain, PostgreSQL adds an entry to a table’s indexes for each physical version of a row. That means if there are five physical versions of a logical row, there will be (at most) five entries for that tuple in the index! In the example below, we see that the <code>idx_name</code> index contains entries for each of the “Shaolin and Wu Tang” rows that are on separate pages. This enables direct access to the latest version of the tuple, without the need to traverse the long version chain.</p>
+<figure>
+  <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example4.svg">
+    <img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example4.svg">
+    </a>
+    <figcaption>In this example, the index contains multiple entries for the “Shaolin and Wu Tang” tuple (one for each version). Now PostgreSQL uses the index to find the latest version and then immediately retrieves it from Table Page #2 without having to traverse the version chain starting at Table Page #1.</figcaption>
+</figure>
+
+<p>PostgreSQL tries to avoid having to install multiple index entries and storing related versions over multiple pages by creating a new copy in the same disk page (block) as the old version to reduce disk I/O. This optimization is known as <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.postgresql.org');" href="https://www.postgresql.org/docs/current/storage-hot.html" target="_blank">heap-only tuple (HOT)</a> updates. The DBMS uses the HOT approach if an update does not modify any columns referenced by a table’s indexes and the new version is stored on the same data page as the old version (if there is space in that page). Now in our example, after the update the index still points to the old version and queries retrieve the latest version by traversing the version chain. During normal operation, PostgreSQL further optimizes this process by removing old versions to prune the version chain.</p>
+<h3>Version Vacuum</h3>
+<p>We’ve established that PostgreSQL makes a copy of rows whenever an application updates them. The next question is how the system removes older versions (called “dead tuples”). The original version of PostgreSQL from the 1980s did not remove dead tuples. The idea was that keeping all the older versions allowed applications to execute “time-travel” queries to examine the database at a particular point in time (e.g., run a <code>SELECT</code> query on the state of the database as it existed at the end of last week). But never removing dead tuples means tables never shrink in size if the application deletes tuples. It also means long version chains for frequently updated tuples, which would slow down queries, except that PostgreSQL adds index entries that allow queries to quickly jump to the correct version instead of traversing the chain. But now, this means the indexes are larger, making them slower and adding additional memory pressure. Hopefully, you can understand now why all these issues are interconnected.</p>
+<p>To overcome these problems, PostgreSQL uses a vacuum procedure to clean up dead tuples from tables. The vacuum performs a sequential scan on table pages modified since its last run and find expired versions. The DBMS considers a version “<b>expired</b>” if it is not visible to any active transaction. This means no current transaction is accessing that version, and future transactions will use the latest “<b>live</b>” version instead. Thus, removing the expired version and reclaiming the space for reuse is safe.</p>
+<p>PostgreSQL automatically executes this vacuum procedure (autovacuum) at regular intervals based on its configuration settings. In addition to the global settings that affect the vacuum frequency for all tables, PostgreSQL provides the flexibility to configure autovacuum at the table level to fine-tune the process for specific tables. Users can also trigger the vacuum manually to optimize database performance via the <code>VACUUM</code> SQL command.</p>
+<h2 id="why-postgresqls-mvcc-is-the-worst">Why PostgreSQL’s MVCC is the Worst</h2>
+<p>We will be blunt: if someone is going to build a new MVCC DBMS today, they should <u> <b>not</b> </u> do it the way PostgreSQL does (e.g., append-only storage with autovacuum). In our <a onclick="javascript:pageTracker._trackPageview('/downloads/papers/2017/p781-wu.pdf');" href="https://db.cs.cmu.edu/papers/2017/p781-wu.pdf" target="_blank">2018 VLDB paper</a> (aka “ <a onclick="javascript:pageTracker._trackPageview('/outgoing/twitter.com');" href="https://twitter.com/andy_pavlo/status/902863242774634496" target="_blank">the best paper ever on MVCC</a>“), we did not find another DBMS doing MVCC the way PostgreSQL does it. Its design is a relic of the 1980s and before the proliferation of <a onclick="javascript:pageTracker._trackPageview('/outgoing/en.wikipedia.org');" href="https://en.wikipedia.org/wiki/Log-structured_merge-tree" target="_blank">log-structured</a> system patterns from the 1990s.</p>
+<p>Let’s talk about four problems that arise with PostgreSQL’s MVCC. We will also talk about why other MVCC DBMSs like Oracle and MySQL avoid these problems.</p>
+<h3>Problem #1: Version Copying</h3>
+<p>With the append-only storage scheme in MVCC, if a query updates a tuple, the DBMS copies all its columns into the new version. This copying occurs no matter if the query updates a single or all of its columns. As you can imagine, append-only MVCC results in massive data duplication and increased storage requirements. This approach means that PostgreSQL requires more memory and disk storage to store a database than other DBMS, which means slower queries and higher cloud costs. Instead of copying an entire tuple for a new version, MySQL and Oracle store a compact delta between the new and current versions (think of it like a git diff). Using deltas means that if a query only updates a single column in a tuple for a table with 1000 columns, then the DBMS only stores a delta record with the change to that one column. On the other hand, PostgreSQL creates a new version with the one column that the query changed and the 999 other untouched columns. We will ignore TOAST attributes because PostgreSQL <a onclick="javascript:pageTracker._trackPageview('/outgoing/dba.stackexchange.com');" href="https://dba.stackexchange.com/a/308779" target="_blank">handles them differently</a>.</p>
+<p>There was an attempt to modernize PostgreSQL’s version storage implementation. EnterpriseDB started the <a onclick="javascript:pageTracker._trackPageview('/outgoing/wiki.postgresql.org');" href="https://wiki.postgresql.org/wiki/Zheap" target="_blank">zheap project</a> in 2013 to replace the append-only storage engine to use delta versions. Unfortunately the <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.cybertec-postgresql.com');" href="https://www.cybertec-postgresql.com/en/postgresql-zheap-current-status/" target="_blank">last official update was in 2021</a>, and to the best of our knowledge the effort has fizzled out.</p>
+<h3>Problem #2: Table Bloat</h3>
+<p>Expired versions in PostgreSQL (i.e., dead tuples) also occupy more space than delta versions. Although PostgreSQL’s autovacuum will eventually remove these dead tuples, write-heavy workloads can cause them to accumulate faster than the vacuum can catch up, resulting in continuous database growth. The DBMS has to load dead tuples into memory during query execution since the system intermingles dead tuples with live tuples in pages. Unfettered bloat slows query performance by causing the DBMS to incur more IOPS and consume more memory than necessary during table scans. Additionally, inaccurate optimizer statistics caused by dead tuples can lead to poor query plans.</p>
+<p>Suppose our movies table has 10 million live and 40 million dead tuples, making 80% of the table obsolete data. Assume also that the table also has many more columns than what we are showing and that the average size of each tuple is 1KB. With this scenario, the live tuples occupy 10GB of storage space while the dead tuples occupy ~40GB of storage; the total size of the table is 50GB. When a query performs a full table scan on this table, PostgreSQL has to retrieve all 50GB from the disk and store it in memory, even if most of it is obsolete. Although Postgres has a <a onclick="javascript:pageTracker._trackPageview('/outgoing/madusudanan.com');" href="https://madusudanan.com/blog/understanding-postgres-caching-in-depth/#SeqScans" target="_blank">protection mechanism</a> to avoid polluting its buffer pool cache from sequential scans, it does not help prevent IO costs.</p>
+<p>Even if you make sure that PostgreSQL’s autovacuum is running at regular intervals and able to keep up with your workload (which is not always easy to do, see below), the autovacuum cannot reclaim storage space. The autovacuum only removes dead tuples and relocates live tuples within each page, but it does not reclaim empty pages from the disk.</p>
+<p>When the DBMS truncates the last page due to the absence of any tuple, other pages remain on disk. In our example above, even if PostgreSQL removed the 40GB of dead tuples from the movies table, it still retains the 50GB of allocated storage space from the operating system (or, in the case of RDS, from Amazon). To reclaim and return such unused space, one must use <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.postgresql.org');" href="https://www.postgresql.org/docs/current/sql-vacuum.html#:~:text=VACUUM%20FULL%20rewrites%20the%20entire,while%20it%20is%20being%20processed." target="_blank"><code>VACUUM FULL</code></a> or the <a onclick="javascript:pageTracker._trackPageview('/outgoing/reorg.github.io');" href="https://reorg.github.io/pg_repack/" target="_blank">pg_repack</a> extension to rewrite the entire table to a new space with no wasted storage. Running either of these operations is not an easy endeavor that one should take without considering the performance implications for production databases; they are resource-intensive and time-consuming operations that will crush query performance. The following figure shows how <code>VACUUM</code> and <code>VACUUM FULL</code> work.</p>
+<figure>
+    <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-vacuum.svg"><img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-vacuum.svg"> </a>
+    <figcaption>With PostgreSQL’s regular VACUUM operation, the DBMS only removes dead tuples from each table page and reorganizes it to put all the live tuples at the end of the page. With VACUUM FULL, PostgreSQL removes the dead tuples from each page, coalesces and compacts the remaining live tuples to a new page (Table Page #3), and then deletes the unneeded pages (Table Pages #1 / #2).</figcaption>
+</figure>
+
+<h3>Problem #3: Secondary Index Maintenance</h3>
+<p>A single update to a tuple requires PostgreSQL to update all the indexes for that table. Updating all the indexes is necessary because PostgreSQL uses the exact physical locations of a version in both primary and secondary indexes. Unless the DBMS stores the new version in the same page as the previous version (HOT update), the system does this for every update.</p>
+<p>Returning to our <code>UPDATE</code> query example, PostgreSQL creates a new version by copying the original version into a new page just like before. But it also inserts entries pointing to the new version in table’s primary key index ( <code>movies_pkey</code>) and the two secondary indexes ( <code>idx_director</code>, <code>idx_name</code>).</p>
+<figure>
+  <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example5.svg"><img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-example5.svg"> </a>
+  <figcaption>Example of PostgreSQL index maintenance operations with a non-HOT update. The DBMS creates the new version of the tuple in Table Page #2, and then inserts new entries that point to that version in all the table’s indexes.</figcaption>
+</figure>
+
+<p>The need for PostgreSQL to modify all of a table’s indexes for each update has several performance implications. Obviously, this makes update queries slower because the system has to do more work. The DBMS incurs additional I/O to traverse each index and insert the new entries. Accessing an index introduces lock/latch contention in both the index and the DBMS’s internal data structures (e.g., buffer pool’s page table). Again, PostgreSQL does this maintenance work for all a table’s indexes, even if queries are never going to use them (by the way, OtterTune <a onclick="javascript:pageTracker._trackPageview('/outgoing/docs.ottertune.com');" href="https://docs.ottertune.com/documentation/database-instance-dashboard-and-recommendations/recommendations/index-recommendations">automatically finds unused indexes in your database</a>). These extra reads and writes are problematic in DBMSs that charge users based on IOPS, like Amazon Aurora.</p>
+<p>As described above, PostgreSQL avoids updating indexes each time if it can perform a HOT write where the new version is on the same page as the current version. Our analysis of OtterTune customers’ PostgreSQL databases shows that roughly 46% of updates use the HOT optimization on average. Although that’s an impressive number, it still means more than 50% of the updates are paying this penalty.</p>
+<p>There are many examples of users struggling with this aspect of PostgreSQL’s MVCC implementation. The most famous testament of this is Uber’s 2016 blog article about why they <a onclick="javascript:pageTracker._trackPageview('/outgoing/www.uber.com');" href="https://www.uber.com/blog/postgres-to-mysql-migration/" target="_blank">switched from Postgres to MySQL</a>. Their write-heavy workload was experiencing significant performance problems on tables with many secondary indexes.</p>
+<p>Oracle and MySQL do not have this problem in their MVCC implementation because their secondary indexes do not store the physical addresses of new versions. Instead, they store a logical identifier (e.g., tuple id, primary key) that the DBMS then uses to look up the current version’s physical address. Now this may make secondary index reads slower since the DBMS has to resolve a logical identifier, but these DBMS have other advantages in their MVCC implementation to reduce overhead.</p>
+
+
+<h3>Problem #4: Vacuum Management</h3>
+<p>PostgreSQL’s performance relies heavily on the effectiveness of the autovacuum to remove obsolete data and reclaim space (this is why OtterTune immediately checks the health status of the autovacuum when you first connect your database). It does not matter if you are running RDS, Aurora, or Aurora Serverless; all variants of PostgreSQL have the same autovacuum issues. But making sure that PostgreSQL’s autovacuum is running as best as possible is difficult due to its complexity. PostgreSQL’s default settings for tuning the autovacuum are not ideal for all tables, particularly for large ones. For example, the default setting for the configuration knob that controls what percentage of a table PostgreSQL has to update before the autovacuum kicks in (<a onclick="javascript:pageTracker._trackPageview('/outgoing/www.postgresql.org');" href="https://www.postgresql.org/docs/15/runtime-config-autovacuum.html#GUC-AUTOVACUUM-VACUUM-SCALE-FACTOR" target="_blank">autovacuum_vacuum_scale_factor</a>) is 20%. This threshold means that if a table has 100 million tuples, the DBMS does not trigger the autovacuum until queries update at least 20 million tuples. As such, PostgreSQL may unnecessarily keep around a lot of dead tuples in a table (thereby incurring IO and memory costs) for a long time.</p>
+<p>Another problem with the autovacuum in PostgreSQL is that it may get blocked by long-running transactions, which can result in the accumulation of more dead tuples and stale statistics. Failing to clean expired versions in a timely manner leads to numerous performance problems, causing more long-running transactions that block the autovacuum process. It becomes a vicious cycle, requiring humans to intervene manually by killing long-running transactions. Consider the graph below that shows the number of dead tuples in an OtterTune customer’s database over two weeks:</p>
+<figure>
+  <a href="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-deadtuples.svg"><img decoding="async" src="https://www.cs.cmu.edu/~pavlo/images/blog/020/ottertune-mvcc-deadtuples.svg"></a>
+  <figcaption>The number of dead tuples over time in a PostgreSQL Amazon RDS database.</figcaption>
+</figure>
+
+<p>The sawtooth pattern in the chart shows that the autovacuum performs a major clean-up about once every day. For example, on February 14th, the DBMS cleaned up 3.2 million dead tuples. This graph is actually an example of an unhealthy PostgreSQL database. The chart clearly shows an upward trend in the number of dead tuples because the autovacuum cannot keep up.</p>
+<p>At OtterTune, we see this problem often in our customers’ databases. One PostgreSQL RDS instance had a long-running query caused by stale statistics after bulk insertions. This query blocked the autovacuum from updating the statistics, resulting in more long-running queries. OtterTune’s automated health checks identified the problem, but the administrator still had to kill the query manually and run <a onclick="javascript:pageTracker._trackPageview('/outgoing/ottertune.com');" href="https://ottertune.com/blog/run-postgresql-analyze-to-fix-a-slowdow-in-db/">ANALYZE after bulk insertions</a>. The good news is that the long query’s execution time went from 52 minutes to just 34 seconds.</p>
+
+<p>There are always hard design decisions one has to make when building a DBMS. And these decisions will cause any DBMS to perform differently on varying workloads. For Uber’s specific write-intensive workload, PostgreSQL’s index write amplification due to MVCC is why they switched to MySQL. But please don’t misunderstand our diatribe to mean that we don’t think you should ever use PostgreSQL. Although its MVCC implementation is the wrong way to do it, PostgreSQL is still our favorite DBMS. To love something is to be willing to work with its flaws (see Dan Savage’s <a onclick="javascript:pageTracker._trackPageview('/outgoing/youtu.be');" href="https://youtu.be/r1tCAXVsClw" target="_blank">“The Price of Admission”</a>).</p>
+<p>So how does one work around PostgreSQL’s quirks? Well, you can spend an enormous amount of time and effort tuning it yourself. <a onclick="javascript:pageTracker._trackPageview('/outgoing/philbooth.me');" href="https://philbooth.me/blog/nine-ways-to-shoot-yourself-in-the-foot-with-postgresql" target="_blank">Good luck with that</a>.</p>
+<p>We’ll cover more about what we can do in our next article.</p>
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Internet Archive breached again through stolen access tokens (243 pts)]]></title>
             <link>https://www.bleepingcomputer.com/news/security/internet-archive-breached-again-through-stolen-access-tokens/</link>
             <guid>41895764</guid>
             <pubDate>Sun, 20 Oct 2024 15:00:06 GMT</pubDate>
@@ -108,7 +218,7 @@ This streamlined setup ensures drivers are promptly informed, optimizing the del
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Syncthing Android App Discontinued (216 pts)]]></title>
+            <title><![CDATA[Syncthing Android App Discontinued (243 pts)]]></title>
             <link>https://old.reddit.com/r/Syncthing/comments/1g7zpvm/syncthing_android_app_discontinued/</link>
             <guid>41895718</guid>
             <pubDate>Sun, 20 Oct 2024 14:51:05 GMT</pubDate>
@@ -116,7 +226,7 @@ This streamlined setup ensures drivers are promptly informed, optimizing the del
 Couldn't get https://old.reddit.com/r/Syncthing/comments/1g7zpvm/syncthing_android_app_discontinued/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Energy-based model explains how chronic stress transforms into disease over time (102 pts)]]></title>
+            <title><![CDATA[Energy-based model explains how chronic stress transforms into disease over time (116 pts)]]></title>
             <link>https://www.sciencedirect.com/science/article/pii/S030645302200292X</link>
             <guid>41895609</guid>
             <pubDate>Sun, 20 Oct 2024 14:32:29 GMT</pubDate>
@@ -124,7 +234,7 @@ Couldn't get https://old.reddit.com/r/Syncthing/comments/1g7zpvm/syncthing_andro
 <div id="readability-page-1" class="page"><div id="root" data-aa-name="root"><header id="gh-cnt"></header><div id="mathjax-container" role="main"><div role="region" aria-label="Download options and search"><ul aria-label="PDF Options"><li><a target="_blank" aria-label="View PDF. Opens in a new window."><svg focusable="false" viewBox="0 0 35 32" height="20"><path d="M7 .362h17.875l6.763 6.1V31.64H6.948V16z" stroke="#000" stroke-width=".703" fill="#fff"></path><path d="M.167 2.592H22.39V9.72H.166z" fill="#da0000"></path><path fill="#fff9f9" d="M5.97 3.638h1.62c1.053 0 1.483.677 1.488 1.564.008.96-.6 1.564-1.492 1.564h-.644v1.66h-.977V3.64m.977.897v1.34h.542c.27 0 .596-.068.596-.673-.002-.6-.32-.667-.596-.667h-.542m3.8.036v2.92h.35c.933 0 1.223-.448 1.228-1.462.008-1.06-.316-1.45-1.23-1.45h-.347m-.977-.94h1.03c1.68 0 2.523.586 2.534 2.39.01 1.688-.607 2.4-2.534 2.4h-1.03V3.64m4.305 0h2.63v.934h-1.657v.894H16.6V6.4h-1.56v2.026h-.97V3.638"></path><path d="M19.462 13.46c.348 4.274-6.59 16.72-8.508 15.792-1.82-.85 1.53-3.317 2.92-4.366-2.864.894-5.394 3.252-3.837 3.93 2.113.895 7.048-9.25 9.41-15.394zM14.32 24.874c4.767-1.526 14.735-2.974 15.152-1.407.824-3.157-13.72-.37-15.153 1.407zm5.28-5.043c2.31 3.237 9.816 7.498 9.788 3.82-.306 2.046-6.66-1.097-8.925-4.164-4.087-5.534-2.39-8.772-1.682-8.732.917.047 1.074 1.307.67 2.442-.173-1.406-.58-2.44-1.224-2.415-1.835.067-1.905 4.46 1.37 9.065z" fill="#f91d0a"></path></svg><span><span><span>View&nbsp;<strong>PDF</strong></span></span></span></a></li><li></li></ul></div><div><article lang="en"><div id="publication"><p><a href="https://www.sciencedirect.com/journal/psychoneuroendocrinology" title="Go to Psychoneuroendocrinology on ScienceDirect"><span><span><img src="https://sdfestaticassets-eu-west-1.sciencedirectassets.com/prod/17220c80f4e09945173d394db9fa2f4c6a17b614/image/elsevier-non-solus.png" alt="Elsevier"></span></span></a></p><p><a href="https://www.sciencedirect.com/journal/psychoneuroendocrinology/vol/146/suppl/C"><span><span><img src="https://ars.els-cdn.com/content/image/1-s2.0-S0306453022X00103-cov150h.gif" alt="Psychoneuroendocrinology"></span></span></a></p></div><div><p><span>Under a Creative Commons </span><a href="http://creativecommons.org/licenses/by-nc-nd/4.0/" target="_blank" rel="noreferrer noopener"><span><span>license</span><svg focusable="false" viewBox="0 0 8 8" height="20" aria-label="Opens in new window"><path d="M1.12949 2.1072V1H7V6.85795H5.89111V2.90281L0.784057 8L0 7.21635L5.11902 2.1072H1.12949Z"></path></svg></span></a></p><p><span></span>open access</p></div><div id="abstracts"><div id="ab0015"><h2>Highlights</h2><div id="abs0015"><ul><li><span>•</span><span><p>Allostasis and allostatic load cost energy</p></span></li><li><span>•</span><span><p>The organism’s energy consumption capacity is biologically limited</p></span></li><li><span>•</span><span><p>The transition from allostasis to allostatic load is defined by an energetic tradeoff where allostasis and stress-related energy costs compete with growth, maintenance, and repair</p></span></li><li><span>•</span><span><p>The energetic model of allostatic load (EMAL) makes testable predictions requiring further research</p></span></li></ul></div></div><div id="ab0010"><h2>Abstract</h2><div id="abs0010"><p>Chronic psychosocial stress increases disease risk and mortality, but the underlying mechanisms remain largely unclear. Here we outline an energy-based model for the transduction of chronic stress into disease over time. The energetic model of allostatic load (EMAL) emphasizes the energetic cost of allostasis and allostatic load, where the “load” is the additional energetic burden required to support allostasis and stress-induced energy needs. Living organisms have a limited capacity to consume energy. Overconsumption of energy by allostatic brain-body processes leads to <em>hypermetabolism</em>, defined as excess energy expenditure above the organism’s optimum. In turn, hypermetabolism accelerates physiological decline in cells, laboratory animals, and humans, and may drive biological aging. Therefore, we propose that the transition from adaptive allostasis to maladaptive allostatic states, allostatic load, and allostatic overload arises when the added energetic cost of stress competes with longevity-promoting growth, maintenance, and repair. Mechanistically, the energetic restriction of growth, maintenance and repair processes leads to the progressive wear-and-tear of molecular and organ systems. The proposed model makes testable predictions around the physiological, cellular, and sub-cellular energetic mechanisms that transduce chronic stress into disease risk and mortality. We also highlight new avenues to quantify allostatic load and its link to health across the lifespan, via the integration of systemic and cellular energy expenditure measurements together with classic allostatic load biomarkers.</p></div></div></div><ul id="issue-navigation"><li></li><li></li></ul><div id="keys0005"><h2>Keywords</h2><p><span>Allostatic load</span></p><p><span>Energy</span></p><p><span>Hypermetabolism</span></p><p><span>Coping resources</span></p><p><span>Energetic model of allostatic load (EMAL)</span></p><p><span>Allostasis and stress-induced energy expenditure (ASEE)</span></p><p><span>Brain</span></p><p><span>Mitochondria</span></p></div><section aria-label="Cited by" id="section-cited-by"><header id="citing-articles-header"><h2>Cited by (0)</h2></header></section><p><span>© 2022 The Author(s). Published by Elsevier Ltd.</span></p></article></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How to do distributed locking (2016) (134 pts)]]></title>
+            <title><![CDATA[How to do distributed locking (2016) (140 pts)]]></title>
             <link>https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html</link>
             <guid>41894451</guid>
             <pubDate>Sun, 20 Oct 2024 10:38:17 GMT</pubDate>
@@ -551,7 +661,7 @@ Second Edition. Springer, February 2011. ISBN: 978-3-642-15259-7,
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Using Euro coins as weights (2004) (115 pts)]]></title>
+            <title><![CDATA[Using Euro coins as weights (2004) (120 pts)]]></title>
             <link>https://www.rubinghscience.org/surv/euroweights1.html</link>
             <guid>41894359</guid>
             <pubDate>Sun, 20 Oct 2024 10:18:13 GMT</pubDate>
@@ -896,7 +1006,7 @@ relatively larger part from lower-value coins, is cheaper than the
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bitwarden is no longer free software (159 pts)]]></title>
+            <title><![CDATA[Bitwarden is no longer free software (162 pts)]]></title>
             <link>https://github.com/bitwarden/clients/issues/11611</link>
             <guid>41893994</guid>
             <pubDate>Sun, 20 Oct 2024 08:51:29 GMT</pubDate>
@@ -1800,7 +1910,15 @@ Thanks for sharing your concerns here.&nbsp;We have been progressing use of our 
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Origin of 'Daemon' in Computing (170 pts)]]></title>
+            <title><![CDATA[The Best Darn Grid Shader (Yet) (2023) (107 pts)]]></title>
+            <link>https://bgolus.medium.com/the-best-darn-grid-shader-yet-727f9278b9d8</link>
+            <guid>41893987</guid>
+            <pubDate>Sun, 20 Oct 2024 08:50:18 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://bgolus.medium.com/the-best-darn-grid-shader-yet-727f9278b9d8">https://bgolus.medium.com/the-best-darn-grid-shader-yet-727f9278b9d8</a>, See on <a href="https://news.ycombinator.com/item?id=41893987">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><h2 id="93b2">The Competition</h2><h2 id="fce6">Con-text-ure (Texture Based Grid)</h2><figure></figure><p id="8e79">This is using Rotated Grid Super Sampling from<a rel="noopener" href="https://bgolus.medium.com/sharper-mipmapping-using-shader-based-supersampling-ed7aadb47bec"> my article on Sharper Mipmapping</a>, along with 16x Anisotropic filtering. This is basically as good as a simple texture based grid can look while still being reasonably performant.</p><p id="8f1c">And it seems simple enough to write a grid shader. Making grid lines in a shader is one of those early things you see in shader tutorials. So why have I been obsessed with this for so long? Because it’s harder than it might look to get right, and I <em>know </em>a shader based solution could look even better. Really that’s it. I just wanted to understand the problem space better.</p><p id="e3d1">Lets look a little closer at the above texture based grid to see some of the problem areas that still show up.</p><figure></figure><p id="8d35">As you can see some of the thin lines still end up aliasing, in the far mid range there’s some aliasing and Moiré patterns, and in the far distance the lines end up getting fatter and then cutting off early as the anisotropic filtering runs out of steam. They’re also only stay sharp close up if you have a large enough texture, otherwise they start to get a little blurry.</p><figure><figcaption>RGSS Texture Grid blurring on extreme closeup</figcaption></figure><h2 id="2311">MyFirstGrid.shader (Common Grid Shaders)</h2><p id="3bff">So what about one of those tutorial grid shaders? Start with a repeating UV. Draw some lines using a <code>smoothstep()</code> and <code>fwidth()</code>. And we’re done!</p><p id="fac1">Right? <em>(Don’t worry, I’ll show the code later.)</em></p><figure></figure><p id="adfb">But there’s a catch. Most example grid shaders, like this one, use screen space width lines. That can be preferred over a texture based grid in a lot of use cases, and honestly probably what most people want. But it’s not what I’m trying to achieve. As the lines of that kind of grid go into the distance, eventually the each grid cell is less than a pixel wide, and thus the lines converge into a solid color that’s the same color as the lines.</p><p id="99e8">That’s not what happens with a texture based grid. With a texture based grid, the lines themselves have perspective and get thinner the further away they are. Eventually fading out once below pixel wide.</p><figure></figure><p id="3a6c">They both converge solid color, but the texture based grid converges to a color that’s relative to the line coverage of the grid cell area.</p><figure></figure><p id="4bc3">Not to mention the obvious Moiré patterns once the grid gets smaller than a pixel across.</p><p id="2ad9">Most of the example shaders I’ve seen in the past that do try to do lines that are constant world space or UV space width don’t really handle this properly. They usually use a UV space faded edge or no line anti-aliasing at all, both of which end up aliasing horribly in the distance. Or they cheat and fade out the lines at some arbitrary distance to hide the artifacts. And the ones that <em>don’t</em> fade the lines out just end up looking similar to constant pixel width line grids in the distance. Only with worse aliasing and more pronounced Moiré patterns.</p><figure></figure><p id="bc32">None of this matches what a texture based grid looks like. Though it does at least mostly match the perspective on the individual lines themselves.</p><figure></figure><h2 id="24f7">Choo Choo! (Filtered Pulsetrain)</h2><p id="2315">But there are some existing examples that look to solve it properly. One was pointed out to me recently, but has been around for far longer than I’ve been writing shaders. This technique was published in <a href="https://books.google.com/books?id=6_4VaJiOx7EC&amp;q=Pulsetrain#v=onepage&amp;q&amp;f=false" rel="noopener ugc nofollow" target="_blank">Apodaca, Anthony A., and Larry Gritz, eds. 1999. Advanced RenderMan: Creating CGI for Motion Pictures</a>. And later in <a href="https://web.archive.org/web/20220629212902/http://weber.itn.liu.se/~stegu/TNM084-2016/RenderMan_20/basicAntialiasing.html" rel="noopener ugc nofollow" target="_blank">RenderMan’s documentation</a>. The filtered pulsetrain.</p><figure></figure><p id="6909">This technique is intended to solve the exact issue I’ve been trying to. They analytically solved the integral for a convolved pulsetrain. Which, if you’re like me and didn’t finish their college level math courses, means absolutely nothing. I dropped out of art school, so it’s mostly over my head.</p><p id="bfa9">The short version is the function returns the ratio of line to not line within an arbitrary range. And it works <em>incredibly </em>well. Compared to the texture based grid it’s nearly a perfect match in terms of how it handles fading into the distance.</p><figure></figure><p id="f30b">At least at first glance. Closer inspection shows some issues.</p><figure></figure><p id="bebc">While it matches the perceptual brightness of a texture based grid, and there’s no aliasing in the foreground, the aliasing and Moiré in the mid to far distances are significantly worse. Essentially all visible line anti-aliasing disappears. It’s better than no anti-aliasing at all, and the Moiré patterns are less apparent than the pixel and UV width line grids. But this is still not as clean as I was expecting it to be.</p><p id="a8bd">Interestingly there’s this note in the book:</p><figure></figure><blockquote><p id="3c59">… the most egregious aliasing is gone.</p></blockquote><p id="6051">The most <em>egregious</em>, but not <em>all</em>. I have to assume the original authors knew it didn’t remove all aliasing, but were happy enough with the results to not go further with it. And subsequent people using it also didn’t care, or just didn’t look close enough to notice?</p><h2 id="0ae8">Hi IQ (Box Filtered Grid)</h2><p id="636c">There’s also the example from Inigo Quilez in his article on <a href="https://iquilezles.org/articles/filterableprocedurals/" rel="noopener ugc nofollow" target="_blank">filterable procedurals</a>, the box filtered grid.</p><figure></figure><p id="ebec">The box filtered grid function <em>does </em>solve some issues with the filtered pulsetrain, mainly the fact it is highly sensitive to precision and thus starts showing noise artifacts not far away from the origin. But they otherwise behave roughly the same. That includes the same aliasing problems in the mid to far distance.</p><figure></figure><p id="d44a">Though they are <em>slightly </em>different in the aliasing and Moiré patterns each show.</p><figure></figure><p id="a19a">Now while I understand from a high level how both shaders work, I’m simply not smart enough at mathing to understand how to modify them to get what I wanted.</p><h2 id="0b25">The Contender</h2><p id="fc1e">Actually, what <em>do </em>I want from a grid shader? I want:</p><ul><li id="e063">User configurable line widths.</li><li id="54b1">Lines that have perspective thickness, not just a constant pixel width.</li><li id="1d3f">No aliasing at all, at any distance or view orientation.</li><li id="346e">A line width of 0.0 or 1.0 should show completely hidden or filled.</li><li id="fe86">Limited Moiré interference patterns.</li><li id="16a0">Blends to the same value in the distance that texture based grids do.</li><li id="9184">Usable for real time rendering in place of alternative techniques.</li></ul><p id="d150">So, I went back to the shaders I <em>do </em>know well, the pixel and UV width line grids. And then decided to start poking at those to see what I could change to make it work how I wanted. Or rather, start with a single line and build up from there.</p><p id="9419">Lets do a very quick overview of what makes for a basic grid shader with user configurable line widths.</p><p id="9617">First we need to draw a single line.</p><h2 id="3e73">Line One, Begin(ner Line Shader)</h2><p id="aa09">The way I like to draw lines is using the <code>smoothstep()</code> function.</p><pre><span id="1054">float lineUV = abs(uv.x * 2.0);<br>float line = smoothstep(lineWidth + lineAA, lineWidth - lineAA, lineUV);</span></pre><p id="bd39">The UV is used as a gradient. I then use an <code>abs()</code> on the UV so the gradient is positive on both sides of 0.0, and thus the <code>smoothstep()</code> is applied to both sides and we get a line instead of just an edge. Why do I multiply the UV by 2? This is so the <code>lineWidth</code> and <code>lineAA</code> can be specified in total width instead of half widths, or needing to divide them by 2.</p><p id="7d3d">For now lets use the world position as the UV, and some arbitrary values for lineWidth and lineAA. And that gets us this:</p><figure><figcaption>basic line</figcaption></figure><p id="1b51">The problem with this is the anti-aliasing fails in the distance, and gets blurry in the foreground. Why? Because the width of the edge gradient needs to change depending on the angle and distance from the camera. To do that we can use one of my favorite tools, screen space partial derivatives. Something I’ve written about a <a rel="noopener" href="https://bgolus.medium.com/anti-aliased-alpha-test-the-esoteric-alpha-to-coverage-8b177335ae4f">few</a> <a rel="noopener" href="https://bgolus.medium.com/normal-mapping-for-a-triplanar-shader-10bf39dca05a">times</a> <a rel="noopener" href="https://bgolus.medium.com/sharper-mipmapping-using-shader-based-supersampling-ed7aadb47bec">in</a> <a rel="noopener" href="https://bgolus.medium.com/progressing-in-circles-13452434fdb9">my</a> <a rel="noopener" href="https://bgolus.medium.com/rendering-a-sphere-on-a-quad-13c92025570c">previous</a> <a rel="noopener" href="https://bgolus.medium.com/distinctive-derivative-differences-cce38d36797b">articles</a>. The short explanation is you can get how much a value changes between one pixel and the one next to it, either vertically or horizontally. And by getting the partial derivatives of the starting UV, we can know how wide the <code>smoothstep()</code> needs to be in UV space to appear 1 pixel wide.</p><pre><span id="268d">float lineAA = fwidth(uv.x); //<br>float lineUV = abs(uv.x * 2.0);<br>float line = smoothstep(lineWidth + lineAA, lineWidth - lineAA, lineUV); //</span></pre><figure><figcaption>anti-aliased line</figcaption></figure><p id="07ee">And now the line’s edges are nice and sharp. Note, I’m getting the derivatives of the UV <em>before</em> doing any modifications to them. This keeps them in the “full width” scale, and also avoids some issues in the next step.</p><p id="89cd">Lets make this a repeating line instead of just a single line.</p><pre><span id="018e">float lineAA = fwidth(uv.x);<br>float lineUV = 1.0 - abs(frac(uv.x) * 2.0 - 1.0); //<br>float line = smoothstep(lineWidth + lineAA, lineWidth - lineAA, lineUV);</span></pre><figure><figcaption>anti-aliased repeating line</figcaption></figure><p id="67d0">To explain that funky bit of code I’m doing to the UV, this is transforming a sawtooth wave into a triangle wave, and then making sure the zero points align with where they were before.</p><p id="b1f5">We’re starting with a <code>lineUV</code> like this:</p><figure><figcaption>abs(uv.x * 2.0)</figcaption></figure><p id="3529">Using <code>frac(uv.x)</code> instead gets you this:</p><figure><figcaption>frac(uv.x)</figcaption></figure><p id="81f3">Then the <code>abs(frac(uv.x) * 2.0 - 1.0)</code> gets you this:</p><figure><figcaption>abs(frac(uv.x) * 2.0–1.0)</figcaption></figure><p id="3185">But that has the “0.0" position starting at 1.0 instead of 0.0, so when we draw the lines they’ll be offset by half a period. So we add that <code>1.0 -</code> at the start to get this:</p><figure><figcaption>1.0-abs(frac(uv.x) * 2.0–1.0)</figcaption></figure><p id="55aa">And now when we draw the lines the “first” line’s position matches that single line we had before.</p><p id="8d78">Now, lets make it into a full grid. To do that we just need to do these steps to both axis of the UV, and combine the results.</p><pre><span id="1041">float2 lineAA = fwidth(uv);<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(lineWidth + lineAA, lineWidth - lineAA, gridUV);<br>float grid = lerp(grid2.x, 1.0, grid2.y); //</span></pre><p id="04cc">And that gets us a basic UV width line grid shader!</p><p id="5c3b">That <code>lerp(grid2.x, 1.0, grid2.y)</code> should probably get a little explaining. How to combine the two axis of repeating lines for a grid shader has something I was long confused about. I’d use <code>max(x, y)</code>, or <code>saturate(x + y)</code>, or a few other ways to combine them and they never quite felt right to me. It took me quite a while before I thought about it in terms of “how would I overlap two transparent things normally?” I’d use an alpha blend. In this case, that <code>lerp()</code> is equivalent to a premulitplied alpha blend, which you could also write like this:</p><pre><span id="0a53">float grid = grid2.x * (1.0 - grid2.y) + grid2.y;</span></pre><p id="b732">Alternatively, if you write the shader such that you have black lines on a white background, multiplying the axis together <em>also </em>produces the equivalent of a premultiplied blend. Note the + and - in the <code>smoothstep()</code> are swapped in the below example compared to the first one.</p><pre><span id="752a">float2 lineAA = fwidth(uv);<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(lineWidth - lineAA, lineWidth + lineAA, gridUV); //<br>float grid = 1.0 - grid2.x * grid2.y; //</span></pre><p id="fb0c">However I’ll be continuing to use the original code sample as they end up exactly the same in the end.</p><p id="5747">In retrospect using a premultiplied blend felt incredibly obvious, but it took over a decade for it to click for some reason. This is after I’ve written countless shaders that have done exactly this for other use cases. I even wrote an <a rel="noopener" href="https://bgolus.medium.com/the-team-color-problem-b70ec69d109f">entire article</a> on this exact topic.</p><p id="aadd">Anyhoo, with that bit of code, we get this:</p><figure><figcaption>anti-aliased grid</figcaption></figure><p id="1181">Looks pretty good, apart from the Moiré patterns. But we were expecting that. Now lets reduce the line widths down a bit to something closer to what one might actually use.</p><figure><figcaption>“anti-aliased” grid</figcaption></figure><p id="a79c">Uh oh. It looks good when the lines are close to the camera. But the lines start to alias pretty quickly. We saw these issues earlier in this article when I showed the constant UV width line grid before, but this looks <em>slightly</em> darker and more aliased than that original example. Why?</p><figure><figcaption>latest vs previous examples</figcaption></figure><p id="5092">Well, because there’s one minor difference between the code used between the two. I use a 1.5 pixel wide AA when using <code>smoothstep()</code>. The reason for this is is because <code>smoothstep()</code> sharpens the edge gradient being used for anti-aliasing such that a 1.5 pixel wide smoothstep has a roughly similar slope to a 1 pixel wide linear gradient.</p><figure><figcaption>linear slope vs 1.5 unit wide smoothstep</figcaption></figure><p id="1c60">A 1 pixel wide smoothstep can then be <em>too</em> sharp. The reason for using a smoothstep at all is because when using a 1.5 pixel wide smoothstep adds just a small bit of extra anti-aliasing without affecting the perceived sharpness of the line vs a 1 pixel wide linear gradient.</p><figure></figure><p id="0869">To be fair, this is an <em>increadibly </em>small difference. But HLSL’s<code>smoothstep()</code> is still nice because it additionally acts as an inverse lerp (aka remap) and clamping the value between 0.0 and 1.0. So it helps with simplifying the code. It also doesn’t entirely remove the perceived aliasing still, but we’ll come back to that.</p><p id="af72">In the end we have this shader code for our constant UV width grid:</p><pre><span id="2bbf">float2 uvDeriv = fwidth(uv); //<br>float2 lineAA = uvDeriv * 1.5; //<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(lineWidth + lineAA, lineWidth - lineAA, gridUV);<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><p id="3df8">What about a constant <em>pixel</em> width line grid? Well, that’s a trivial change. Multiply the line width by the derivatives! (Just remember,<code>lineWidth</code> is now the number of pixels wide the line is and not a value between 0.0 and 1.0.)</p><pre><span id="b6b3">float2 uvDeriv = fwidth(uv);<br>float2 drawWidth = uvDeriv * lineWidth; //<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV); //<br>float grid = lerp(grid2.x, 1.0, grid2.y)</span></pre><figure></figure><p id="dba0">Now we’re back to where we were earlier in the article. And have two shaders that fulfil at least two of my requirements. But we haven’t solved any of the problems we didn’t already know how to solve and one only has the perspective lines and the other solves most of the aliasing.</p><p id="d572">So lets focus on a single line for the moment instead of a whole grid. How can we make a single line have both the perspective thickness and no aliasing?</p><h2 id="e8a6">Phoning It In (Phone-wire AA)</h2><p id="5aa2">One of my favorite tricks for anti-aliasing lines comes from Emil Persson. Specifically his Phone-wire AA example.</p><p id="0929">The basic idea behind this technique is don’t let something get thinner than one pixel. Instead clamp the size of the thing so it stays at least one pixel wide and then fade it out. This ends up looking much better than just letting a line get thinner than one pixel as if you do that it will always end up aliasing. The two bits of magic are how you keep things one pixel wide, and more importantly how <em>much</em> you fade them out by.</p><p id="c634">In Emil Persson’s example, he uses knowledge about how wide the wire geometry is, the distance from the camera each vertex is, and camera’s projection matrix to keep the wires one pixel thick. But for this shader, we can use those partial derivatives again! We just need to limit how thin line gets in screen space. Basically, we combine the two shaders we already have, and take the max of the UV line width and UV derivatives.</p><pre><span id="3985">float uvDeriv = fwidth(uv.x);<br>float drawWidth = max(lineWidth, uvDeriv); //<br>float lineAA = uvDeriv * 1.5;<br>float lineUV = abs(uv.x * 2.0);<br>float line = smoothstep(drawWidth + lineAA, drawWidth - lineAA, lineUV);</span></pre><figure><figcaption>Pixel Width Limited Line</figcaption></figure><p id="01e5">That’s the first trick. But the second one is the big one. We fade out the line based on how thick we <em>wanted</em> them divided by how thick we’re <em>drawing</em> them.</p><pre><span id="b915">float uvDeriv = fwidth(uv.x);<br>float drawWidth = max(lineWidth, uvDeriv);<br>float lineAA = uvDeriv * 1.5;<br>float lineUV = abs(uv.x * 2.0);<br>float line = smoothstep(drawWidth + lineAA, drawWidth - lineAA, lineUV);<br>line *= saturate(lineWidth / drawWidth); //</span></pre><figure><figcaption>Phone-wire AA Line</figcaption></figure><p id="0e64">Looking good! You can actually see the perspective of that line even when it’s thin. And there’s no aliasing in the distance!</p><figure><figcaption>Phone-wire AA Line</figcaption></figure><p id="e121">Of note, this <em>also</em> solves the issue of having the line not fully disappear when the intended line width is zero! It’ll gracefully fade the line out the thinner and thinner it gets, just like it does as it recedes into the distance, eventually fading out entirely when it gets to zero.</p><p id="a61e">With that working, lets go back to a full grid again.</p><pre><span id="243e">float2 uvDeriv = fwidth(uv);<br>float2 drawWidth = max(lineWidth, uvDeriv); //<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV);<br>grid2 *= saturate(lineWidth / drawWidth); //<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><p id="0de2">Much better! … sort of. That doesn’t look quite right. It’s fading to black at the horizon! As a reminder, the texture based grid fades to a grey, <em>not </em>black.</p><figure></figure><p id="c072">The problem is in a grid a single line can only get so wide before it’s wider than an entire grid cell width. When it’s a single line by itself, this isn’t an issue. But when it’s drawn as a grid, in the areas it’s going black a single pixel is wider than multiple overlapping grid widths. But we’re still only drawing a single set of lines in each pixel, not multiple grid cells worth.</p><p id="1a60">Where I got stuck for a long time in writing these shaders is what to do next. And I focused far too long on trying to figure out how to properly calculate the value to fade the line by, but nothing really seemed to fix it properly. I’m sure this is solvable, but remember how I said I was an art school drop out? Yeah, I’m not the one who’s going to figure that out. I’m going down this path because I’m not mathy enough to do it the “right” way.</p><p id="36a1">The closest I got going down that path was trying to clamp the value I was dividing the line width by to a max of 1.0. My theory being if the line can’t be wider than one pixel, don’t divide by more than 1. And while this is <em>better</em>, it’s still not correct.</p><pre><span id="b4a9">grid2 *= saturate(lineWidth / max(1.0, drawWidth));</span></pre><figure></figure><p id="a15c">It’s very subtle, but this results in there being a bit of a dark “gutter” at the transition between the individually distinguishable lines and the mostly solid color at the horizon.</p><figure></figure><p id="b9a2">As shown before, the filtered pulsetrain and box filtered grid <em>do </em>solve this problem. Not by fading lines exactly, but by always calculating the total coverage of all possible lines within the current pixel’s coverage. But as I’ve shown, neither properly handle <em>anti-aliasing</em> of those lines! And again, art school drop out here. I don’t have the knowledge to do it the way they did.</p><p id="9941">So now what?</p><h2 id="31a7">Right At The Wrong Place</h2><p id="9fdf">After a few years of getting about this far and not really getting any further, I recently sat down and tried to think through it more. Why didn’t that code work? It <em>feels</em> like it should, so what was I missing?</p><p id="857d">Well, it turns out I was doing the right thing. I just in the wrong place in the code. If I limited the <em>actual</em> <code>drawWidth</code>, it works!</p><pre><span id="65f6">float2 uvDeriv = fwidth(uv);<br>float2 drawWidth = clamp(lineWidth, uvDeriv, 0.5); //<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV);<br>grid2 *= saturate(lineWidth / drawWidth);<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><p id="b067">Yes, the Moiré is a bit more pronounced, but the overall brightness is finally correct!</p><p id="b90e">A curious thing is I’m clamping the draw width to 0.5, <em>not</em> 1.0. If I use 1.0 it’s too dark on the horizon again.</p><pre><span id="8f7f">float2 drawWidth = clamp(lineWidth, uvDeriv, 1.0);</span></pre><figure></figure><p id="8c8c">If your thought is “well, maybe you just needed to use 0.5 in the previous attempt?” Nope, that’s too bright!</p><pre><span id="dd2c">grid2 *= saturate(lineWidth / max(0.5, drawWidth));</span></pre><figure></figure><p id="e387">Why is 0.5 the correct value to clamp the draw width? Well, it has to do with the way the line anti-aliasing works.</p><p id="2e5e">If we look at some width limited lines without any fading code. If the we manually override the <code>uvDeriv</code> used, we can see how the lines expand and smooth out as they would getting further from the camera.</p><figure></figure><p id="d4a6">When limited to a width of 0.5, like above, it means there’s an equal amount of area that’s above and below 0.5 (the red line). Meaning the average value across the whole vertical is 0.5 beyond a <code>uvDeriv</code> of 0.5.</p><p id="d7c1">This average of 0.5 means when we fade the line out, and also dividing by 0.5, that’s dividing by the same (average) intensity we know those pixels will be.</p><p id="3ac3">If limited to a width of 1.0, we get this instead.</p><figure></figure><p id="3039">Now anywhere past a <code>uvDeriv</code> of 1.0 is <em>above</em> an average of 0.5, with how much above depending on how large the <code>uvDeriv</code> is. But it’s also <em>not </em>an average of 1.0! This is important because the math fading it out assumes it is, resulting in it getting too dark, which is what we saw in the failed example 2.</p><p id="a855">If we <em>don’t </em>limit the line width, and only limit the value we divide by, the “0.5” point disappears entirely as it’s being cut off by the edge of the grid cell, meaning the average brightness is even <em>more</em> above 0.5, but also still not 1.0! And that means if we clamp only the value we divide by in the fade calculation to 0.5 it stays too bright, which is what we saw in the failed example 3.</p><p id="44e3">This is probably the hardest aspect of this whole thing to explain, so I apologize if it’s still confusing.</p><h2 id="1d80">It’s A Moiré (Interference Pattern Suppression)</h2><p id="490f">However we’re still left with those more pronounced Moiré patterns. This is because we still don’t handle when the grid cells are smaller than a single pixel. It correctly averages to the appropriate value, but that’s not really the only issue. And this is where I decided to cheat a little. Remember how one of my main goals is to limit Moiré patterns as much as possible? Well, this is one place where I want to diverge heavily from how a texture based grid, or even ground truth, would look. Those will always have some Moiré artifacts because that’s really what happens when viewing a fine grid.</p><p id="38f4">So instead of figuring out how to do all the math to calculate it the correctly, why not fade to a solid color? Yes, I know it was one of the things I lambasted about a lot of other implementations, but I’m not going to fade just based on some arbitrary distance. I’m going to fade out based on when I know those Moiré patterns are going to appear. And how do you do that? Easy! Using the same UV derivatives we’re already using for anti-aliasing!</p><pre><span id="8634">float2 uvDeriv = fwidth(uv);<br>float2 drawWidth = clamp(lineWidth, uvDeriv, 0.5);<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = 1.0 - abs(frac(uv) * 2.0 - 1.0);<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV);<br>grid2 *= saturate(lineWidth / drawWidth);<br>grid2 = lerp(grid2, lineWidth, saturate(uvDeriv * 2.0 - 1.0)); //<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><p id="8a89">The idea here is once the derivatives are greater than 1.0, the grid cells are smaller than a pixel, which is when the Moiré patterns start to appear more noticeably. So this starts to fade to a solid color when the derivatives are 0.5, which is when the anti-aliased lines start to merge. And finishes fading when the derivatives are 1.0.</p><p id="6501">And that’s it! All six of the items on my list for a “perfect” grid shader are satisfied! So we’re done, right?</p><h2 id="ee31">Flipping Out (Line Inversion)</h2><p id="752f">Well, sort of. What happens when you try to make the grid lines wider than 0.5? Nothing, because we clamped the line width to 0.5. This is obviously for a very niche use case, but technically I’ve only succeeded in half of the requirement of “0.0 or 1.0 should show completely hidden or filled”. A line width of 0.0 will hide that axis entirely, but a 1.0 will cap out at a width of 0.5. But if we let lines get wider than that, things go wonky with the above math.</p><p id="637e">The final trick is we never actually draw lines more than half a grid width wide. Instead if the line width is over 0.5, we flip a few things around and effectively draw black lines on white offset by half a grid width. This means most of the math doesn’t have to change.</p><pre><span id="ebba">float2 uvDeriv = fwidth(uv);<br>bool2 invertLine = lineWidth &gt; 0.5; //<br>float2 targetWidth = invertLine ? 1.0 - lineWidth : lineWidth; //<br>float2 drawWidth = clamp(targetWidth, uvDeriv, 0.5); //<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = abs(frac(uv) * 2.0 - 1.0);<br>gridUV = invertLine ? gridUV : 1.0 - gridUV; //<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV);<br>grid2 *= saturate(targetWidth / drawWidth);<br>grid2 = lerp(grid2, targetWidth, saturate(uvDeriv * 2.0 - 1.0));<br>grid2 = invertLine ? 1.0 - grid2 : grid2; //<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><h2 id="bba3">One More Thing (Partial Derivative Length)</h2><p id="b538">There’s one last very small tweak to this shader that I make use of. That is that I don’t use <code>fwidth()</code>. The <code>fwidth()</code> function is an approximation for getting the length of the derivatives. That function looks something like this:</p><pre><span id="7d9e">float fwidth(float a)<br>{<br>  return abs(ddx(a)) + abs(ddy(a));<br>}</span></pre><p id="8d52">That’s <em>not</em> how you calculate the length of something. It’s accurate enough when things align to the screen axis, but on diagonals they’re always going to be too wide. The <em>correct</em> way to calculate the length of the derivatives is like this:</p><pre><span id="0683">float ddLength(float a)<br>{<br>  return length(float2(ddx(a), ddy(a)));<br>}</span></pre><p id="d806">Or is it? Inigo Quilez’s article on <a href="https://iquilezles.org/articles/checkerfiltering/" rel="noopener ugc nofollow" target="_blank">checkerboard filtering</a> contends the correct way to do it is to get the absolute max of the derivatives.</p><pre><span id="bfff">float ddMax(float a)<br>{<br>  return max(abs(ddx(a), abs(ddy(a)));<br>}</span></pre><p id="2a7f">Well, lets compare them and see which one looks better. This is going to require zooming in real close because the differences are minimal.</p><figure><figcaption>comparison of the derivative length calculations</figcaption></figure><p id="902f">And here I would say the <code>length()</code> option is the correct one. It strikes the right balance of sharpness without aliasing compared to the other two. It should be noted that <code>fwidth()</code> was never meant to be correct, just a fast approximation. And it <em>is</em> faster, but for modern GPUs the difference is negligible. And the <code>max()</code> method isn’t “wrong” either, just wrong for this use case. The way Inigo Quilez’s filtered procedurals work is different than this shader, so it’s likely correct for <em>that</em> use case. Though his Shader Toy examples all use a slightly different calculation with an arbitrary fudge factor added, so maybe it’s not correct for that use case either?</p><p id="51f7">Ultimately, it’s mostly subjective as to which looks best, and the <code>max()</code> method is just as cheap as <code>fwidth()</code> while being a potentially slightly better approximation. And it’s always good to check your assumptions on things like this by actually trying them out and doing direct comparisons.</p><p id="afe8">But, with that last tweak, the code looks like this:</p><pre><span id="1de1"><br>float4 uvDDXY = float4(ddx(uv), ddy(uv)); //<br>float2 uvDeriv = float2(length(uvDDXY.xz), length(uvDDXY.yw)); //<br>bool2 invertLine = lineWidth &gt; 0.5;<br>float2 targetWidth = invertLine ? 1.0 - lineWidth : lineWidth;<br>float2 drawWidth = clamp(targetWidth, uvDeriv, 0.5);<br>float2 lineAA = uvDeriv * 1.5;<br>float2 gridUV = abs(frac(uv) * 2.0 - 1.0);<br>gridUV = invertLine ? gridUV : 1.0 - gridUV;<br>float2 grid2 = smoothstep(drawWidth + lineAA, drawWidth - lineAA, gridUV);<br>grid2 *= saturate(targetWidth / drawWidth);<br>grid2 = lerp(grid2, targetWidth, saturate(uvDeriv * 2.0 - 1.0));<br>grid2 = invertLine ? 1.0 - grid2 : grid2;<br>float grid = lerp(grid2.x, 1.0, grid2.y);</span></pre><figure></figure><p id="c190">And lets compare this to to the other best looking options, the texture based grid and box filtered grid.</p><figure></figure><figure></figure><figure></figure><h2 id="5ef5">Conclusion</h2><p id="0289">I hope you’ll agree that we finally have the smoothest, most alias free, least Moiré patterned, most <em>pristine</em> gird shader you could possibly have. And one that in my eyes visually beats both texture based grids, and the previously best in class options.</p></div><div><p id="1cfa">At least until Mr. Quilez writes a shader that beats this one.</p></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Origin of 'Daemon' in Computing (176 pts)]]></title>
             <link>https://www.takeourword.com/TOW146/page4.html</link>
             <guid>41891953</guid>
             <pubDate>Sun, 20 Oct 2024 00:35:21 GMT</pubDate>
@@ -2289,7 +2407,7 @@ Thanks for sharing your concerns here.&nbsp;We have been progressing use of our 
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[QUIC Is Not Quick Enough over Fast Internet (287 pts)]]></title>
+            <title><![CDATA[QUIC Is Not Quick Enough over Fast Internet (289 pts)]]></title>
             <link>https://arxiv.org/abs/2310.09423</link>
             <guid>41890784</guid>
             <pubDate>Sat, 19 Oct 2024 21:04:52 GMT</pubDate>
@@ -2319,287 +2437,6 @@ Thanks for sharing your concerns here.&nbsp;We have been progressing use of our 
             <pubDate>Sat, 19 Oct 2024 21:00:35 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://frondly.app/">https://frondly.app/</a>, See on <a href="https://news.ycombinator.com/item?id=41890762">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div><div><main><div><div><div><p><span>Our offer</span></p><p><span>Pay only for what you use.</span></p></div><div><h2>AI-Powered Plant<!-- --> <span><svg width="320" height="70" viewBox="0 0 320 70" fill="none" xmlns="http://www.w3.org/2000/svg" opacity="0.7"><path d="M5,55 Q160,30 315,55" stroke="#CCFF00" stroke-width="30" fill="none"></path></svg>Identification</span><br> and<!-- --> <span><svg width="360" height="80" viewBox="0 0 360 80" fill="none" xmlns="http://www.w3.org/2000/svg" opacity="0.7"><path d="M5,63 L355,63" stroke="#CCFF00" stroke-width="34" fill="none"></path></svg>Community</span></h2><p>Identify plants, get expert care advice, and connect with fellow plant enthusiasts. Your ultimate plant companion app and community.</p><p>No credit card required. Free community access.</p></div></div><div><p><img alt="Frondly App" fetchpriority="high" loading="eager" width="415" height="800" decoding="async" data-nimg="1" srcset="https://frondly.app/_next/image?url=%2Fhero_image.png&amp;w=640&amp;q=85 1x, https://frondly.app/_next/image?url=%2Fhero_image.png&amp;w=1080&amp;q=85 2x" src="https://frondly.app/_next/image?url=%2Fhero_image.png&amp;w=1080&amp;q=85"></p></div></div></main></div><div id="pricing"><section><h2>Choose your plant journey</h2><p>Start for free or power up with credits. No fixed commitment period. Pay as you go.</p><br></section><section><div><div><h2>Free Tier</h2><p><h2>€0</h2></p><p>Get started with our community features</p></div><div><div><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z"></path></svg><p>Access to free plant communities</p></div><div><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z"></path></svg><p>3 free credits to try premium features</p></div></div></div><div><div><h2>Credit System</h2><p><h2>Starting at €1</h2></p><p>Pay only for what you use</p></div><div><div><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z"></path></svg><p>Plant identification scans</p></div><div><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" viewBox="0 0 256 256"><path d="M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z"></path></svg><p>Full access to all features</p></div></div></div></section><p>New users receive 3 free credits upon registration. Minimum purchase is €1 for 10 credits.</p></div><div id="faq"><h2>FAQs</h2></div></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Italy's Piracy Shield just blocked one of Google's CDN (109 pts)]]></title>
-            <link>https://mil04s43-in-f1.1e100.net</link>
-            <guid>41890460</guid>
-            <pubDate>Sat, 19 Oct 2024 20:18:54 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://mil04s43-in-f1.1e100.net">https://mil04s43-in-f1.1e100.net</a>, See on <a href="https://news.ycombinator.com/item?id=41890460">Hacker News</a></p>
-Couldn't get https://mil04s43-in-f1.1e100.net: Error: timeout of 10000ms exceeded]]></description>
-        </item>
-        <item>
-            <title><![CDATA[The Languages of English, Math, and Programming (125 pts)]]></title>
-            <link>https://github.com/norvig/pytudes/blob/main/ipynb/Triplets.ipynb</link>
-            <guid>41890158</guid>
-            <pubDate>Sat, 19 Oct 2024 19:39:19 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://github.com/norvig/pytudes/blob/main/ipynb/Triplets.ipynb">https://github.com/norvig/pytudes/blob/main/ipynb/Triplets.ipynb</a>, See on <a href="https://news.ycombinator.com/item?id=41890158">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-          <nav aria-label="Global">
-            <ul>
-                <li>
-      
-      <div>
-                <ul>
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;github_copilot&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;github_copilot_link_product_navbar&quot;}" href="https://github.com/features/copilot">
-      
-      <div>
-        <p>GitHub Copilot</p><p>
-        Write better code with AI
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;security&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;security_link_product_navbar&quot;}" href="https://github.com/features/security">
-      
-      <div>
-        <p>Security</p><p>
-        Find and fix vulnerabilities
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;actions&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;actions_link_product_navbar&quot;}" href="https://github.com/features/actions">
-      
-      <div>
-        <p>Actions</p><p>
-        Automate any workflow
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;codespaces&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;codespaces_link_product_navbar&quot;}" href="https://github.com/features/codespaces">
-      
-      <div>
-        <p>Codespaces</p><p>
-        Instant dev environments
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;issues&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;issues_link_product_navbar&quot;}" href="https://github.com/features/issues">
-      
-      <div>
-        <p>Issues</p><p>
-        Plan and track work
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;code_review&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;code_review_link_product_navbar&quot;}" href="https://github.com/features/code-review">
-      
-      <div>
-        <p>Code Review</p><p>
-        Manage code changes
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;discussions&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;discussions_link_product_navbar&quot;}" href="https://github.com/features/discussions">
-      
-      <div>
-        <p>Discussions</p><p>
-        Collaborate outside of code
-      </p></div>
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;code_search&quot;,&quot;context&quot;:&quot;product&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;code_search_link_product_navbar&quot;}" href="https://github.com/features/code-search">
-      
-      <div>
-        <p>Code Search</p><p>
-        Find more, search less
-      </p></div>
-
-    
-</a></li>
-
-                </ul>
-              </div>
-</li>
-
-                  <li>
-      
-      
-</li>
-
-                  <li>
-      
-      <div>
-                    <p><span id="resources-explore-heading">Explore</span></p><ul aria-labelledby="resources-explore-heading">
-                    <li>
-  <a target="_blank" data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;learning_pathways&quot;,&quot;context&quot;:&quot;resources&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;learning_pathways_link_resources_navbar&quot;}" href="https://resources.github.com/learn/pathways">
-      Learning Pathways
-
-    
-</a></li>
-
-                    <li>
-  <a target="_blank" data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;white_papers_ebooks_webinars&quot;,&quot;context&quot;:&quot;resources&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;white_papers_ebooks_webinars_link_resources_navbar&quot;}" href="https://resources.github.com/">
-      White papers, Ebooks, Webinars
-
-    
-</a></li>
-
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;customer_stories&quot;,&quot;context&quot;:&quot;resources&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;customer_stories_link_resources_navbar&quot;}" href="https://github.com/customer-stories">
-      Customer Stories
-
-    
-</a></li>
-
-                    <li>
-  <a target="_blank" data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;partners&quot;,&quot;context&quot;:&quot;resources&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;partners_link_resources_navbar&quot;}" href="https://partner.github.com/">
-      Partners
-
-    
-</a></li>
-
-                </ul>
-              </div>
-</li>
-
-
-                <li>
-      
-      <div>
-              <div>
-                <ul>
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;github_sponsors&quot;,&quot;context&quot;:&quot;open_source&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;github_sponsors_link_open_source_navbar&quot;}" href="https://github.com/sponsors">
-      
-      <div>
-        <p>GitHub Sponsors</p><p>
-        Fund open source developers
-      </p></div>
-
-    
-</a></li>
-
-                </ul>
-              </div>
-              <div>
-                <ul>
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;the_readme_project&quot;,&quot;context&quot;:&quot;open_source&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;the_readme_project_link_open_source_navbar&quot;}" href="https://github.com/readme">
-      
-      <div>
-        <p>The ReadME Project</p><p>
-        GitHub community articles
-      </p></div>
-
-    
-</a></li>
-
-                </ul>
-              </div>
-              
-          </div>
-</li>
-
-
-                <li>
-      
-      <div>
-                <ul>
-                    <li>
-  <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;enterprise_platform&quot;,&quot;context&quot;:&quot;enterprise&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;enterprise_platform_link_enterprise_navbar&quot;}" href="https://github.com/enterprise">
-      
-      <div>
-        <p>Enterprise platform</p><p>
-        AI-powered developer platform
-      </p></div>
-
-    
-</a></li>
-
-                </ul>
-              </div>
-</li>
-
-
-                <li>
-    <a data-analytics-event="{&quot;location&quot;:&quot;navbar&quot;,&quot;action&quot;:&quot;pricing&quot;,&quot;context&quot;:&quot;global&quot;,&quot;tag&quot;:&quot;link&quot;,&quot;label&quot;:&quot;pricing_link_global_navbar&quot;}" href="https://github.com/pricing">Pricing</a>
-</li>
-
-            </ul>
-          </nav>
-
-        <div>
-                
-
-
-<qbsearch-input data-scope="repo:norvig/pytudes" data-custom-scopes-path="/search/custom_scopes" data-delete-custom-scopes-csrf="uBXMRIJyf6NadVAQ_MirJcyCmM67Vynj7wRF1FBjPrJ_1yS9yaO44sWQirc_HtXh2GGHWtG7gtYJdEhM-zGeIQ" data-max-custom-scopes="10" data-header-redesign-enabled="false" data-initial-value="" data-blackbird-suggestions-path="/search/suggestions" data-jump-to-suggestions-path="/_graphql/GetSuggestedNavigationDestinations" data-current-repository="norvig/pytudes" data-current-org="" data-current-owner="norvig" data-logged-in="false" data-copilot-chat-enabled="false" data-nl-search-enabled="false" data-retain-scroll-position="true">
-  <div data-modal-dialog-overlay="" data-action="click:qbsearch-input#searchInputContainerClicked">
-  <modal-dialog data-action="close:qbsearch-input#handleClose cancel:qbsearch-input#handleClose" data-target="qbsearch-input.searchSuggestionsDialog" role="dialog" id="search-suggestions-dialog" aria-modal="true" aria-labelledby="search-suggestions-dialog-header" data-view-component="true">
-      <h2 id="search-suggestions-dialog-header">Search code, repositories, users, issues, pull requests...</h2>
-    
-</modal-dialog></div>
-  
-  <div>
-    
-<dialog-helper>
-  <dialog data-target="qbsearch-input.feedbackDialog" data-action="close:qbsearch-input#handleDialogClose cancel:qbsearch-input#handleDialogClose" id="feedback-dialog" aria-modal="true" aria-labelledby="feedback-dialog-title" aria-describedby="feedback-dialog-description" data-view-component="true">
-    <div data-view-component="true">
-    <p>
-      <h2 id="feedback-dialog-title">
-        Provide feedback
-      </h2>
-        
-    </p>
-    
-  </div>
-      <scrollable-region data-labelled-by="feedback-dialog-title">
-        
-      </scrollable-region>
-      
-</dialog></dialog-helper>
-
-    <custom-scopes data-target="qbsearch-input.customScopesManager">
-    
-<dialog-helper>
-  <dialog data-target="custom-scopes.customScopesModalDialog" data-action="close:qbsearch-input#handleDialogClose cancel:qbsearch-input#handleDialogClose" id="custom-scopes-dialog" aria-modal="true" aria-labelledby="custom-scopes-dialog-title" aria-describedby="custom-scopes-dialog-description" data-view-component="true">
-    <div data-view-component="true">
-    <p>
-      <h2 id="custom-scopes-dialog-title">
-        Saved searches
-      </h2>
-        <h2 id="custom-scopes-dialog-description">Use saved searches to filter your results more quickly</h2>
-    </p>
-    
-  </div>
-      <scrollable-region data-labelled-by="custom-scopes-dialog-title">
-        
-      </scrollable-region>
-      
-</dialog></dialog-helper>
-    </custom-scopes>
-  </div>
-</qbsearch-input>
-
-            
-
-              <p><a href="https://github.com/signup?ref_cta=Sign+up&amp;ref_loc=header+logged+out&amp;ref_page=%2F%3Cuser-name%3E%2F%3Crepo-name%3E%2Fblob%2Fshow&amp;source=header-repo&amp;source_repo=norvig%2Fpytudes" data-hydro-click="{&quot;event_type&quot;:&quot;authentication.click&quot;,&quot;payload&quot;:{&quot;location_in_page&quot;:&quot;site header menu&quot;,&quot;repository_id&quot;:null,&quot;auth_type&quot;:&quot;SIGN_UP&quot;,&quot;originating_url&quot;:&quot;https://github.com/norvig/pytudes/blob/main/ipynb/Triplets.ipynb&quot;,&quot;user_id&quot;:null}}" data-hydro-click-hmac="99f3b50deb5027a463f79cc3091eae0ead2de62758fde6168b03d13cf892a545" data-analytics-event="{&quot;category&quot;:&quot;Sign up&quot;,&quot;action&quot;:&quot;click to sign up for account&quot;,&quot;label&quot;:&quot;ref_page:/<user-name>/<repo-name>/blob/show;ref_cta:Sign up;ref_loc:header logged out&quot;}">
-                Sign up
-              </a>
-          
-        </p></div>
-      </div></div>]]></description>
         </item>
     </channel>
 </rss>
