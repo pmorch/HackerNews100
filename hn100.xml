@@ -4,12 +4,678 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 08 Feb 2025 21:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 08 Feb 2025 22:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The Deck: An open-source cross-platform multiplayer card game engine in Flutter (163 pts)]]></title>
+            <title><![CDATA[Writing a Simple Windows Driver in Rust (110 pts)]]></title>
+            <link>https://scorpiosoftware.net/2025/02/08/writing-a-simple-driver-in-rust/</link>
+            <guid>42984457</guid>
+            <pubDate>Sat, 08 Feb 2025 17:25:03 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://scorpiosoftware.net/2025/02/08/writing-a-simple-driver-in-rust/">https://scorpiosoftware.net/2025/02/08/writing-a-simple-driver-in-rust/</a>, See on <a href="https://news.ycombinator.com/item?id=42984457">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+		
+<p>The Rust language ecosystem is growing each day, its popularity increasing, and with good reason. It’s the only mainstream language that provides memory and concurrency safety at compile time, with a powerful and rich build system (cargo), and a growing number of packages (crates).</p>
+
+
+
+<p>My daily driver is still C++, as most of my work is about low-level system and kernel programming, where the Windows C and COM APIs are easy to consume. Rust is a system programming language, however, which means it plays, or at least can play, in the same playground as C/C++. The main snag is the verbosity required when converting C types to Rust. This “verbosity” can be alleviated with appropriate wrappers and macros. I decided to try writing a simple WDM driver that is not useless – it’s a Rust version of the “Booster” driver I demonstrate in my book (<a href="https://www.amazon.com/Windows-Kernel-Programming-Pavel-Yosifovich/dp/1977593372" target="_blank" rel="noreferrer noopener">Windows Kernel Programming</a>), that allows changing the priority of any thread to any value.</p>
+
+
+
+<h2>Getting Started</h2>
+
+
+
+<p>To prepare for building drivers, consult <a href="https://github.com/microsoft/windows-drivers-rs" target="_blank" rel="noreferrer noopener">Windows Drivers-rs</a>, but basically you should have a WDK installation (either normal or the <a href="https://learn.microsoft.com/en-us/legal/windows/hardware/enterprise-wdk-license-2022" target="_blank" rel="noreferrer noopener">EWDK</a>). Also, the docs require installing <a href="https://llvm.org/" target="_blank" rel="noreferrer noopener">LLVM</a>, to gain access to the <a href="https://clang.llvm.org/" target="_blank" rel="noreferrer noopener">Clang </a>compiler. I am going to assume you have these installed if you’d like to try the following yourself.</p>
+
+
+
+<p>We can start by creating a new Rust library project (as a driver is a technically a DLL loaded into kernel space):</p>
+
+
+
+
+
+<p>We can open the booster folder in VS Code, and begin are coding. First, there are some preparations to do in order for actual code to compile and link successfully. We need a <strong>build.rs</strong> file to tell cargo to link statically to the CRT. Add a <strong>build.rs</strong> file to the root booster folder, with the following code:</p>
+
+
+<div><pre title="">fn main() -&gt; Result&lt;(), wdk_build::ConfigError&gt; {
+    std::env::set_var("CARGO_CFG_TARGET_FEATURE", "crt-static");
+    wdk_build::configure_wdk_binary_build()
+}
+</pre></div>
+
+
+<p>(Syntax highlighting is imperfect because the WordPress editor I use does not support syntax highlighting for Rust)</p>
+
+
+
+<p>Next, we need to edit <strong>cargo.toml</strong> and add all kinds of dependencies. The following is the minimum I could get away with:</p>
+
+
+<div><pre title="">[package]
+name = "booster"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+
+[build-dependencies]
+wdk-build = "0.3.0"
+
+[dependencies]
+wdk = "0.3.0"       
+wdk-macros = "0.3.0"
+wdk-alloc = "0.3.0" 
+wdk-panic = "0.3.0" 
+wdk-sys = "0.3.0"   
+
+[features]
+default = []
+nightly = ["wdk/nightly", "wdk-sys/nightly"]
+
+[profile.dev]
+panic = "abort"
+lto = true
+
+[profile.release]
+panic = "abort"
+lto = true
+</pre></div>
+
+
+<p>The important parts are the WDK crates dependencies. It’s time to get to the actual code in <strong>lib.rs</strong>. </p>
+
+
+
+<h2>The Code</h2>
+
+
+
+<p>We start by removing the standard library, as it does not exist in the kernel:</p>
+
+
+
+
+
+<p>Next, we’ll add a few <code>use</code> statements to make the code less verbose:</p>
+
+
+<div><pre title="">use core::ffi::c_void;
+use core::ptr::null_mut;
+use alloc::vec::Vec;
+use alloc::{slice, string::String};
+use wdk::*;
+use wdk_alloc::WdkAllocator;
+use wdk_sys::ntddk::*;
+use wdk_sys::*;
+</pre></div>
+
+
+<p>The <code>wdk_sys</code> crate provides the low level interop kernel functions. the <code>wdk</code> crate provides higher-level wrappers. <code>alloc::vec::Vec</code> is an interesting one. Since we can’t use the standard library, you would think the types like <code>std::vec::Vec&lt;&gt;</code> are not available, and technically that’s correct. However, <code>Vec</code> is actually defined in a lower level module named <code>alloc::vec</code>, that can be used outside the standard library. This works because the only requirement for <code>Vec</code> is to have a way to allocate and deallocate memory. Rust exposes this aspect through a global allocator object, that anyone can provide. Since we have no standard library, there is no global allocator, so one must be provided. Then, <code>Vec</code> (and <code>String</code>) can work normally:</p>
+
+
+<div><pre title="">#[global_allocator]
+static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
+</pre></div>
+
+
+<p>This is the global allocator provided by the WDK crates, that use <a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exallocatepool2" target="_blank" rel="noreferrer noopener"><code>ExAllocatePool2</code> </a>and <a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-exfreepool" target="_blank" rel="noreferrer noopener"><code>ExFreePool</code> </a>to manage allocations, just like would do manually.</p>
+
+
+
+<p>Next, we add two <code>extern</code> crates to get the support for the allocator and a panic handler – another thing that must be provided since the standard library is not included. <strong>Cargo.toml</strong> has a setting to abort the driver (crash the system) if any code panics:</p>
+
+
+<div><pre title="">extern crate wdk_panic;
+extern crate alloc;
+</pre></div>
+
+
+<p>Now it’s time to write the actual code. We start with <code>DriverEntry</code>, the entry point to any Windows kernel driver:</p>
+
+
+<div><pre title="">#[export_name = "DriverEntry"]
+pub unsafe extern "system" fn driver_entry(
+    driver: &amp;mut DRIVER_OBJECT,
+    registry_path: PUNICODE_STRING,
+) -&gt; NTSTATUS {
+</pre></div>
+
+
+<p>Those familiar with kernel drivers will recognize the function signature (kind of). The function name is <code>driver_entry</code> to conform to the snake_case Rust naming convention for functions, but since the linker looks for <code>DriverEntry</code>, we decorate the function with the <code>export_name</code> attribute. You could use <code>DriverEntry</code> and just ignore or disable the compiler’s warning, if you prefer.</p>
+
+
+
+<p>We can use the familiar <code>println!</code> macro, that was reimplemented by calling <code>DbgPrint</code>, as you would if you were using C/C++. You can still call <code>DbgPrint</code>, mind you, but <code>println!</code> is just easier:</p>
+
+
+<div><pre title="">println!("DriverEntry from Rust! {:p}", &amp;driver);
+let registry_path = unicode_to_string(registry_path);
+println!("Registry Path: {}", registry_path);
+</pre></div>
+
+
+<p>Unfortunately, it seems <code>println!</code> does not yet support a <code>UNICODE_STRING</code>, so we can write a function named <code>unicode_to_string</code> to convert a <code>UNICODE_STRING</code> to a normal Rust string:</p>
+
+
+<div><pre title="">fn unicode_to_string(str: PCUNICODE_STRING) -&gt; String {
+    String::from_utf16_lossy(unsafe {
+        slice::from_raw_parts((*str).Buffer, (*str).Length as usize / 2)
+    })
+}
+</pre></div>
+
+
+<p>Back in <code>DriverEntry</code>, our next order of business is to create a device object with the name “\Device\Booster”:</p>
+
+
+<div><pre title="">let mut dev = null_mut();
+let mut dev_name = UNICODE_STRING::default();
+string_to_ustring("\\Device\\Booster", &amp;mut dev_name);
+
+let status = IoCreateDevice(
+    driver,
+    0,
+    &amp;mut dev_name,
+    FILE_DEVICE_UNKNOWN,
+    0,
+    0u8,
+    &amp;mut dev,
+);
+</pre></div>
+
+
+<p>The <code>string_to_ustring</code> function converts a Rust string to a <code>UNICODE_STRING</code>:</p>
+
+
+<div><pre title="">fn string_to_ustring&lt;'a&gt;(s: &amp;str, uc: &amp;'a mut UNICODE_STRING) -&gt; &amp;'a mut UNICODE_STRING {
+    let mut wstring: Vec&lt;_&gt; = s.encode_utf16().collect();
+    uc.Length = wstring.len() as u16 * 2;
+    uc.MaximumLength = wstring.len() as u16 * 2;
+    uc.Buffer = wstring.as_mut_ptr();
+    uc
+}
+</pre></div>
+
+
+<p>This may look more complex than we would like, but think of this as a function that is written once, and then just used all over the place. In fact, maybe there is such a function already, and just didn’t look hard enough. But it will do for this driver.</p>
+
+
+
+<p>If device creation fails, we return a failure status:</p>
+
+
+<div><pre title="">if !nt_success(status) {
+    println!("Error creating device 0x{:X}", status);
+    return status;
+}
+</pre></div>
+
+
+<p><code>nt_success</code> is similar to the <code>NT_SUCCESS</code> macro provided by the WDK headers.</p>
+
+
+
+<p>Next, we’ll create a symbolic link so that a standard <code>CreateFile</code> call could open a handle to our device:</p>
+
+
+<div><pre title="">let mut sym_name = UNICODE_STRING::default();
+string_to_ustring("\\??\\Booster", &amp;mut sym_name);
+let status = IoCreateSymbolicLink(&amp;mut sym_name, &amp;mut dev_name);
+if !nt_success(status) {
+    println!("Error creating symbolic link 0x{:X}", status);
+    IoDeleteDevice(dev);
+    return status;
+}
+</pre></div>
+
+
+<p>All that’s left to do is initialize the device object with support for Buffered I/O (we’ll use <code>IRP_MJ_WRITE</code> for simplicity), set the driver unload routine, and the major functions we intend to support:</p>
+
+
+<div><pre title="">    (*dev).Flags |= DO_BUFFERED_IO;
+
+    driver.DriverUnload = Some(boost_unload);
+    driver.MajorFunction[IRP_MJ_CREATE as usize] = Some(boost_create_close);
+    driver.MajorFunction[IRP_MJ_CLOSE as usize] = Some(boost_create_close);
+    driver.MajorFunction[IRP_MJ_WRITE as usize] = Some(boost_write);
+
+    STATUS_SUCCESS
+}
+</pre></div>
+
+
+<p>Note the use of the Rust <code>Option&lt;&gt;</code> type to indicate the presence of a callback.</p>
+
+
+
+<p>The unload routine looks like this:</p>
+
+
+<div><pre title="">unsafe extern "C" fn boost_unload(driver: *mut DRIVER_OBJECT) {
+    let mut sym_name = UNICODE_STRING::default();
+    string_to_ustring("\\??\\Booster", &amp;mut sym_name);
+    let _ = IoDeleteSymbolicLink(&amp;mut sym_name);
+    IoDeleteDevice((*driver).DeviceObject);
+}
+</pre></div>
+
+
+<p>We just call <code>IoDeleteSymbolicLink</code> and <code>IoDeleteDevice</code>, just like a normal kernel driver would. </p>
+
+
+
+<h2>Handling Requests</h2>
+
+
+
+<p>We have three request types to handle – <code>IRP_MJ_CREATE</code>, <code>IRP_MJ_CLOSE</code>, and <code>IRP_MJ_WRITE</code>. Create and close are trivial – just complete the IRP successfully:</p>
+
+
+<div><pre title="">unsafe extern "C" fn boost_create_close(_device: *mut DEVICE_OBJECT, irp: *mut IRP) -&gt; NTSTATUS {
+    (*irp).IoStatus.__bindgen_anon_1.Status = STATUS_SUCCESS;
+    (*irp).IoStatus.Information = 0;
+    IofCompleteRequest(irp, 0);
+    STATUS_SUCCESS
+}
+</pre></div>
+
+
+<p>The <code>IoStatus</code> is an <code>IO_STATUS_BLOCK</code> but it’s defined with a <code>union</code> containing <code>Status</code> and <code>Pointer</code>. This seems to be incorrect, as <code>Information</code> should be in a <code>union</code> with <code>Pointer</code> (not <code>Status</code>). Anyway, the code accesses the <code>Status</code> member through the “auto generated” union, and it looks ugly. Definitely something to look into further. But it works.</p>
+
+
+
+<p>The real interesting function is the <code>IRP_MJ_WRITE</code> handler, that does the actual thread priority change. First, we’ll declare a structure to represent the request to the driver:</p>
+
+
+<div><pre title="">#[repr(C)]
+struct ThreadData {
+    pub thread_id: u32,
+    pub priority: i32,
+}
+</pre></div>
+
+
+<p>The use of <code>repr(C)</code> is important, to make sure the fields are laid out in memory just as they would with C/C++. This allows non-Rust clients to talk to the driver. In fact, I’ll test the driver with a C++ client I have that used the C++ version of the driver. The driver accepts the thread ID to change and the priority to use. Now we can start with <code>boost_write</code>:</p>
+
+
+<div><pre title="">unsafe extern "C" fn boost_write(_device: *mut DEVICE_OBJECT, irp: *mut IRP) -&gt; NTSTATUS {
+    let data = (*irp).AssociatedIrp.SystemBuffer as *const ThreadData;
+</pre></div>
+
+
+<p>First, we grab the data pointer from the <code>SystemBuffer</code> in the IRP, as we asked for Buffered I/O support. This is a kernel copy of the client’s buffer. Next, we’ll do some checks for errors:</p>
+
+
+<div><pre title="">let status;
+loop {
+    if data == null_mut() {
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+    if (*data).priority &lt; 1 || (*data).priority &gt; 31 {
+        status = STATUS_INVALID_PARAMETER;
+        break;
+    }
+</pre></div>
+
+
+<p>The <code>loop</code> statement creates an infinite block that can be exited with a <code>break</code>. Once we verified the priority is in range, it’s time to locate the thread object:</p>
+
+
+<div><pre title="">let mut thread = null_mut();
+status = PsLookupThreadByThreadId(((*data).thread_id) as *mut c_void, &amp;mut thread);
+if !nt_success(status) {
+    break;
+}
+</pre></div>
+
+
+<p><code><a href="https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-pslookupthreadbythreadid" target="_blank" rel="noreferrer noopener">PsLookupThreadByThreadId</a></code> is the one to use. If it fails, it means the thread ID probably does not exist, and we break. All that’s left to do is set the priority and complete the request with whatever status we have:</p>
+
+
+<div><pre title="">        KeSetPriorityThread(thread, (*data).priority);
+        ObfDereferenceObject(thread as *mut c_void);
+        break;
+    }
+    (*irp).IoStatus.__bindgen_anon_1.Status = status;
+    (*irp).IoStatus.Information = 0;
+    IofCompleteRequest(irp, 0);
+    status
+}
+</pre></div>
+
+
+<p>That’s it!</p>
+
+
+
+<p>The only remaining thing is to sign the driver. It seems that the crates support signing the driver if an INF or INX files are present, but this driver is not using an INF. So we need to sign it manually before deployment. The following can be used from the root folder of the project:</p>
+
+
+<div><pre title="">signtool sign /n wdk /fd sha256 target\debug\booster.dll
+</pre></div>
+
+
+<p>The <code>/n wdk</code> uses a WDK test certificate typically created automatically by Visual Studio when building drivers. I just grab the first one in the store that starts with “wdk” and use it.</p>
+
+
+
+<p>The silly part is the file extension – it’s a DLL and there currently is no way to change it automatically as part of cargo build. If using an INF/INX, the file extension does change to SYS. In any case, file extensions don’t really mean that much – we can rename it manually, or just leave it as DLL. </p>
+
+
+
+<h2>Installing the Driver</h2>
+
+
+
+<p>The resulting file can be installed in the “normal” way for a software driver, such as using the <strong>sc.exe</strong> tool (from an elevated command window), on a machine with test signing on. Then <code>sc start</code> can be used to load the driver into the system:</p>
+
+
+<div><pre title="">sc.exe sc create booster type= kernel binPath= c:\path_to_driver_file
+sc.exe start booster
+</pre></div>
+
+
+<h2>Testing the Driver</h2>
+
+
+
+<p>I used an existing C++ application that talks to the driver and expects to pass the correct structure. It looks like this:</p>
+
+
+<div><pre title="">#include &lt;Windows.h&gt;
+#include &lt;stdio.h&gt;
+
+struct ThreadData {
+	int ThreadId;
+	int Priority;
+};
+
+int main(int argc, const char* argv[]) {
+	if (argc &lt; 3) {
+		printf("Usage: boost &lt;tid&gt; &lt;priority&gt;\n");
+		return 0;
+	}
+
+	int tid = atoi(argv[1]);
+	int priority = atoi(argv[2]);
+
+	HANDLE hDevice = CreateFile(L"\\\\.\\Booster",
+		GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+		nullptr);
+
+	if (hDevice == INVALID_HANDLE_VALUE) {
+		printf("Failed in CreateFile: %u\n", GetLastError());
+		return 1;
+	}
+
+	ThreadData data;
+	data.ThreadId = tid;
+	data.Priority = priority;
+	DWORD ret;
+	if (WriteFile(hDevice, &amp;data, sizeof(data),
+		&amp;ret, nullptr))
+		printf("Success!!\n");
+	else
+		printf("Error (%u)\n", GetLastError());
+
+	CloseHandle(hDevice);
+
+	return 0;
+}
+</pre></div>
+
+
+<p>Here is the result when changing a thread’s priority to 26 (ID 9408):</p>
+
+
+
+<figure><img data-attachment-id="2919" data-permalink="https://scorpiosoftware.net/2025/02/08/writing-a-simple-driver-in-rust/image-41/" data-orig-file="https://scorpiosoftware.net/wp-content/uploads/2025/02/image.png" data-orig-size="976,579" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="image" data-image-description="" data-image-caption="" data-medium-file="https://scorpiosoftware.net/wp-content/uploads/2025/02/image.png?w=300" data-large-file="https://scorpiosoftware.net/wp-content/uploads/2025/02/image.png?w=660" width="976" height="579" src="https://scorpiosoftware.net/wp-content/uploads/2025/02/image.png?w=976" alt=""></figure>
+
+
+
+<h2>Conclusion</h2>
+
+
+
+<p>Writing kernel drivers in Rust is possible, and I’m sure the support for this will improve quickly. The WDK crates are at version 0.3, which means there is still a way to go. To get the most out of Rust in this space, safe wrappers should be created so that the code is less verbose, does not have <code>unsafe</code> blocks, and enjoys the benefits Rust can provide. Note, that I may have missed some wrappers in this simple implementation.</p>
+
+
+
+<p>You can find a couple of more samples for KMDF Rust drivers <a href="https://github.com/microsoft/Windows-rust-driver-samples" target="_blank" rel="noreferrer noopener">here</a>.</p>
+
+
+
+<p>The code for this post can be found at <a href="https://github.com/zodiacon/Booster">https://github.com/zodiacon/Booster</a>.</p>
+
+
+
+
+	</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Show HN: FlashSpace – fast, open-source, macOS Spaces replacement (116 pts)]]></title>
+            <link>https://github.com/wojciech-kulik/FlashSpace</link>
+            <guid>42984420</guid>
+            <pubDate>Sat, 08 Feb 2025 17:19:23 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.com/wojciech-kulik/FlashSpace">https://github.com/wojciech-kulik/FlashSpace</a>, See on <a href="https://news.ycombinator.com/item?id=42984420">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div data-hpc="true"><article itemprop="text"><p dir="auto"><a href="https://github.com/wojciech-kulik/FlashSpace/releases"><img src="https://camo.githubusercontent.com/e6c6c47124a3c9f2cfff3a55803b80533c4271be3cd6ae50effacc5fb56baa26/68747470733a2f2f696d672e736869656c64732e696f2f6769746875622f762f72656c656173652f776f6a63696563682d6b756c696b2f466c61736853706163653f636f6c6f723d384132424532" alt="GitHub Release" data-canonical-src="https://img.shields.io/github/v/release/wojciech-kulik/FlashSpace?color=8A2BE2"></a>
+<a href="https://formulae.brew.sh/cask/flashspace" rel="nofollow"><img src="https://camo.githubusercontent.com/5b47e91f76e1b2557c38eb45c2b23890308e7e4a8522b311dcbda9323249969f/68747470733a2f2f696d672e736869656c64732e696f2f686f6d65627265772f6361736b2f762f666c6173687370616365" alt="Homebrew Cask Version" data-canonical-src="https://img.shields.io/homebrew/cask/v/flashspace"></a>
+<a href="#"><img src="https://camo.githubusercontent.com/15209e50423be67a97aa21bbd132ffc55c2a5752fc43ad1f94e57dfb8b7e8f1f/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f6d61634f532d31342e302b2d73696c766572" alt="min macOS" data-canonical-src="https://img.shields.io/badge/macOS-14.0+-silver"></a>
+<a href="https://github.com/wojciech-kulik/FlashSpace/actions/workflows/xcode-build-check.yml"><img src="https://camo.githubusercontent.com/3bcf4c0f8f2a61040df5a08d5710f9ff1b4bbab4bf480fffcb6fc3dad6cd9349/68747470733a2f2f696d672e736869656c64732e696f2f6769746875622f616374696f6e732f776f726b666c6f772f7374617475732f776f6a63696563682d6b756c696b2f466c61736853706163652f78636f64652d6275696c642d636865636b2e796d6c" alt="CI Status" data-canonical-src="https://img.shields.io/github/actions/workflow/status/wojciech-kulik/FlashSpace/xcode-build-check.yml"></a>
+<a href="#"><img src="https://camo.githubusercontent.com/8b88167a0ff625ca5c105e93603034c9a72880fdafd173433db4382fedf73953/68747470733a2f2f696d672e736869656c64732e696f2f62616467652f78636f64652d31362e322d626c7565" alt="Supported Xcode" data-canonical-src="https://img.shields.io/badge/xcode-16.2-blue"></a></p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">⚡ FlashSpace</h2><a id="user-content--flashspace" aria-label="Permalink: ⚡ FlashSpace" href="#-flashspace"></a></p>
+<p dir="auto">FlashSpace is a blazingly-fast virtual workspace manager for macOS, designed to
+enhance and replace native macOS Spaces. No more waiting for macOS animations.</p>
+<a target="_blank" rel="noopener noreferrer" href="https://private-user-images.githubusercontent.com/3128467/410695368-36f4933d-3711-4acf-9171-9137073010d7.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMDY5NTM2OC0zNmY0OTMzZC0zNzExLTRhY2YtOTE3MS05MTM3MDczMDEwZDcucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NjUwZWJjYzRmN2M4OTVkMjliNWY2NmY1NzMzYWY1MGFmYjRlY2M3MTY3ZjAyYmNjNDA4NmM3ODQ2MjE4ZjY4MiZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.nKneogrFNUPyMHwb9-lDzBFZjD3Cqz0CuxwvLVtlN3Y"><img width="797" alt="FlashSpace" src="https://private-user-images.githubusercontent.com/3128467/410695368-36f4933d-3711-4acf-9171-9137073010d7.png?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMDY5NTM2OC0zNmY0OTMzZC0zNzExLTRhY2YtOTE3MS05MTM3MDczMDEwZDcucG5nP1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9NjUwZWJjYzRmN2M4OTVkMjliNWY2NmY1NzMzYWY1MGFmYjRlY2M3MTY3ZjAyYmNjNDA4NmM3ODQ2MjE4ZjY4MiZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.nKneogrFNUPyMHwb9-lDzBFZjD3Cqz0CuxwvLVtlN3Y"></a>
+<p dir="auto"><h2 tabindex="-1" dir="auto">⚙️ Installation</h2><a id="user-content-️-installation" aria-label="Permalink: ⚙️ Installation" href="#️-installation"></a></p>
+<p dir="auto"><strong>Requirements:</strong> macOS 14.0 or later.</p>
+<p dir="auto"><h3 tabindex="-1" dir="auto">Homebrew</h3><a id="user-content-homebrew" aria-label="Permalink: Homebrew" href="#homebrew"></a></p>
+
+<p dir="auto"><h3 tabindex="-1" dir="auto">Download Binary</h3><a id="user-content-download-binary" aria-label="Permalink: Download Binary" href="#download-binary"></a></p>
+<p dir="auto">See: <a href="https://github.com/wojciech-kulik/FlashSpace/releases">Releases Page</a>.</p>
+<p dir="auto"><h3 tabindex="-1" dir="auto">Build From Source</h3><a id="user-content-build-from-source" aria-label="Permalink: Build From Source" href="#build-from-source"></a></p>
+<p dir="auto">See: <a href="#%EF%B8%8F-build-from-source">Build From Source</a>.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">🎥 Demo</h2><a id="user-content--demo" aria-label="Permalink: 🎥 Demo" href="#-demo"></a></p>
+<p dir="auto">The video shows a sample configuration where I use 3 workspaces and switch
+between them using hotkeys.</p>
+<details open="">
+  <summary>
+    
+    <span aria-label="Video description FlashSpace.mp4">FlashSpace.mp4</span>
+    <span></span>
+  </summary>
+
+  <video src="https://private-user-images.githubusercontent.com/3128467/411269408-03498386-7c3d-4d9e-8fbd-cd49dea36661.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMTI2OTQwOC0wMzQ5ODM4Ni03YzNkLTRkOWUtOGZiZC1jZDQ5ZGVhMzY2NjEubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ODc2MjZjMmI5MmMxOWJlZjBkZDUyZTI2NjViMTNhMDEyNDliMGM1OWU3OTkxYzMxZmUwMmIzMTYyMjc5Mjc5NyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.cw41Upce0DtEPZV0edTF_tlbUMdifjLn_bNHXVrlfJY" data-canonical-src="https://private-user-images.githubusercontent.com/3128467/411269408-03498386-7c3d-4d9e-8fbd-cd49dea36661.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMTI2OTQwOC0wMzQ5ODM4Ni03YzNkLTRkOWUtOGZiZC1jZDQ5ZGVhMzY2NjEubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9ODc2MjZjMmI5MmMxOWJlZjBkZDUyZTI2NjViMTNhMDEyNDliMGM1OWU3OTkxYzMxZmUwMmIzMTYyMjc5Mjc5NyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.cw41Upce0DtEPZV0edTF_tlbUMdifjLn_bNHXVrlfJY" controls="controls" muted="muted">
+
+  </video>
+</details>
+
+<p dir="auto"><h2 tabindex="-1" dir="auto">👉 How it works</h2><a id="user-content--how-it-works" aria-label="Permalink: 👉 How it works" href="#-how-it-works"></a></p>
+<p dir="auto">FlashSpace allows to define virtual workspaces and assign apps to them. Each workspace is
+also assigned to a specific display. When you switch to a workspace, the assigned apps are
+automatically presented and all other apps from the assigned display are hidden.</p>
+<p dir="auto">The app allows workspaces to be switched independently on each display.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">✨ Features</h2><a id="user-content--features" aria-label="Permalink: ✨ Features" href="#-features"></a></p>
+<ul>
+<li> Blazingly fast workspace switching</li>
+<li> Multiple displays support</li>
+<li> Activate workspace on app focus</li>
+<li> Move apps between workspaces with a hotkey</li>
+<li> Floating apps visible across all workspaces</li>
+<li> Focus manager - set hotkeys to switch between apps quickly</li>
+<li> Cursor manager - auto-center the cursor in the active window</li>
+<li> Profiles - quickly switch between different configurations</li>
+<li> Configurable Menu Bar icon &amp; text (per workspace)</li>
+<li> <a href="https://github.com/FelixKratz/SketchyBar">SketchyBar</a> integration</li>
+</ul>
+<p dir="auto"><h2 tabindex="-1" dir="auto">⚖️ Project Values</h2><a id="user-content-️-project-values" aria-label="Permalink: ⚖️ Project Values" href="#️-project-values"></a></p>
+<ul dir="auto">
+<li><strong>Performance</strong> - The app should be as fast as possible.</li>
+<li><strong>Simplicity</strong> - The app should be easy to use and configure.</li>
+<li><strong>Reliability</strong> - The app should work without glitches and unexpected behavior.</li>
+<li><strong>Invisible</strong> - The app should help, not disturb.</li>
+<li><strong>UNIX Philosophy</strong> - The app should do one thing and do it well - manage workspaces.</li>
+</ul>
+<p dir="auto"><h2 tabindex="-1" dir="auto">💬 How to use</h2><a id="user-content--how-to-use" aria-label="Permalink: 💬 How to use" href="#-how-to-use"></a></p>
+<ol dir="auto">
+<li>Create a workspace.</li>
+<li>Assign apps to the workspace.</li>
+<li>Assign the workspace to a display.</li>
+<li>Define a hotkey to switch to the workspace.</li>
+<li>Save the workspace.</li>
+</ol>
+<p dir="auto">Now you can switch to the workspace using the configured hotkey.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">🪟 Focus Manager</h2><a id="user-content--focus-manager" aria-label="Permalink: 🪟 Focus Manager" href="#-focus-manager"></a></p>
+<p dir="auto">FlashSpace enables fast switching of focus between windows. Use hotkeys to
+shift focus in any desired direction. It also allows you to jump between
+displays.</p>
+<details open="">
+  <summary>
+    
+    <span aria-label="Video description FocusManager.mp4">FocusManager.mp4</span>
+    <span></span>
+  </summary>
+
+  <video src="https://private-user-images.githubusercontent.com/3128467/411269421-9bc22b19-7cd7-48f8-a679-0adf4adc3aef.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMTI2OTQyMS05YmMyMmIxOS03Y2Q3LTQ4ZjgtYTY3OS0wYWRmNGFkYzNhZWYubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YWI1MWVhNzUxYTI5OGQyZWEzZDFhOGE5YTQxZGZmNzBmMjMxMGZhZGJjODBmNjc4OGQ4MmMzNjdlZDRiNmJiMyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.B8byTdySIp8drz6WdeKZxW05RKmiwaJOebw3XQXJt3E" data-canonical-src="https://private-user-images.githubusercontent.com/3128467/411269421-9bc22b19-7cd7-48f8-a679-0adf4adc3aef.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3MzkwNTQxMDMsIm5iZiI6MTczOTA1MzgwMywicGF0aCI6Ii8zMTI4NDY3LzQxMTI2OTQyMS05YmMyMmIxOS03Y2Q3LTQ4ZjgtYTY3OS0wYWRmNGFkYzNhZWYubXA0P1gtQW16LUFsZ29yaXRobT1BV1M0LUhNQUMtU0hBMjU2JlgtQW16LUNyZWRlbnRpYWw9QUtJQVZDT0RZTFNBNTNQUUs0WkElMkYyMDI1MDIwOCUyRnVzLWVhc3QtMSUyRnMzJTJGYXdzNF9yZXF1ZXN0JlgtQW16LURhdGU9MjAyNTAyMDhUMjIzMDAzWiZYLUFtei1FeHBpcmVzPTMwMCZYLUFtei1TaWduYXR1cmU9YWI1MWVhNzUxYTI5OGQyZWEzZDFhOGE5YTQxZGZmNzBmMjMxMGZhZGJjODBmNjc4OGQ4MmMzNjdlZDRiNmJiMyZYLUFtei1TaWduZWRIZWFkZXJzPWhvc3QifQ.B8byTdySIp8drz6WdeKZxW05RKmiwaJOebw3XQXJt3E" controls="controls" muted="muted">
+
+  </video>
+</details>
+
+<p dir="auto"><h2 tabindex="-1" dir="auto">📝 Notes</h2><a id="user-content--notes" aria-label="Permalink: 📝 Notes" href="#-notes"></a></p>
+<p dir="auto">FlashSpace doesn't manage windows, so if you switch to a workspace and call
+another app that is not assigned to the workspace, it will be shown on top of
+the workspace apps.</p>
+<p dir="auto">I consider this as a desired behavior because it allows you to quickly access other
+apps without glitches or switching between workspaces.</p>
+<p dir="auto">This is a common issue with tiling window managers that they often cause glitches
+when a small pop-up window is shown or some unexpected app is opened.</p>
+<p dir="auto">If you want to hide the new app, you can simply use the hotkey again.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">🖥️ SketchyBar Integration</h2><a id="user-content-️-sketchybar-integration" aria-label="Permalink: 🖥️ SketchyBar Integration" href="#️-sketchybar-integration"></a></p>
+<p dir="auto">FlashSpace can be integrated with <a href="https://github.com/FelixKratz/SketchyBar">SketchyBar</a> and other tools. The app runs a
+configurable script when the workspace is changed.</p>
+<p dir="auto">You can enable the integration in the app settings.</p>
+<details>
+  <summary>Configuration Example</summary>
+<p dir="auto"><h3 tabindex="-1" dir="auto">Only Active Workspace</h3><a id="user-content-only-active-workspace" aria-label="Permalink: Only Active Workspace" href="#only-active-workspace"></a></p>
+<p dir="auto"><h5 tabindex="-1" dir="auto"><code>sketchybarrc</code></h5><a id="user-content-sketchybarrc" aria-label="Permalink: sketchybarrc" href="#sketchybarrc"></a></p>
+<div dir="auto" data-snippet-clipboard-copy-content="sketchybar --add item flashspace left \
+  --set flashspace \
+  background.color=0x22ffffff \
+  background.corner_radius=5 \
+  label.padding_left=5 \
+  label.padding_right=5 \
+  script=&quot;$CONFIG_DIR/plugins/flashspace.sh&quot; \
+  --add event flashspace_workspace_change \
+  --subscribe flashspace flashspace_workspace_change"><pre>sketchybar --add item flashspace left \
+  --set flashspace \
+  background.color=0x22ffffff \
+  background.corner_radius=5 \
+  label.padding_left=5 \
+  label.padding_right=5 \
+  script=<span><span>"</span><span>$CONFIG_DIR</span>/plugins/flashspace.sh<span>"</span></span> \
+  --add event flashspace_workspace_change \
+  --subscribe flashspace flashspace_workspace_change</pre></div>
+<p dir="auto"><h5 tabindex="-1" dir="auto"><code>plugins/flashspace.sh</code></h5><a id="user-content-pluginsflashspacesh" aria-label="Permalink: plugins/flashspace.sh" href="#pluginsflashspacesh"></a></p>
+<div dir="auto" data-snippet-clipboard-copy-content="#!/bin/bash
+
+sketchybar --set $NAME label=&quot;$WORKSPACE - $DISPLAY&quot;"><pre><span><span>#!</span>/bin/bash</span>
+
+sketchybar --set <span>$NAME</span> label=<span><span>"</span><span>$WORKSPACE</span> - <span>$DISPLAY</span><span>"</span></span></pre></div>
+<p dir="auto"><h3 tabindex="-1" dir="auto">All Workspaces</h3><a id="user-content-all-workspaces" aria-label="Permalink: All Workspaces" href="#all-workspaces"></a></p>
+<p dir="auto"><h5 tabindex="-1" dir="auto"><code>sketchybarrc</code></h5><a id="user-content-sketchybarrc-1" aria-label="Permalink: sketchybarrc" href="#sketchybarrc-1"></a></p>
+<div dir="auto" data-snippet-clipboard-copy-content="sketchybar --add event flashspace_workspace_change
+
+SID=1
+SELECTED_PROFILE_ID=$(jq -r &quot;.selectedProfileId&quot; ~/.config/flashspace/profiles.json)
+WORKSPACES=$(jq -r --arg id &quot;$SELECTED_PROFILE_ID&quot; 'first(.profiles[] | select(.id == $id)) | .workspaces[].name' ~/.config/flashspace/profiles.json)
+
+for workspace in $WORKSPACES; do
+  sketchybar --add item flashspace.$SID left \
+    --subscribe flashspace.$SID flashspace_workspace_change \
+    --set flashspace.$SID \
+    background.color=0x22ffffff \
+    background.corner_radius=5 \
+    background.padding_left=5 \
+    label.padding_left=5 \
+    label.padding_right=5 \
+    label=&quot;$workspace&quot; \
+    script=&quot;$CONFIG_DIR/plugins/flashspace.sh $workspace&quot;
+
+  SID=$((SID + 1))
+done"><pre>sketchybar --add event flashspace_workspace_change
+
+SID=1
+SELECTED_PROFILE_ID=<span><span>$(</span>jq -r <span><span>"</span>.selectedProfileId<span>"</span></span> <span>~</span>/.config/flashspace/profiles.json<span>)</span></span>
+WORKSPACES=<span><span>$(</span>jq -r --arg id <span><span>"</span><span>$SELECTED_PROFILE_ID</span><span>"</span></span> <span><span>'</span>first(.profiles[] | select(.id == $id)) | .workspaces[].name<span>'</span></span> <span>~</span>/.config/flashspace/profiles.json<span>)</span></span>
+
+<span>for</span> <span>workspace</span> <span>in</span> <span>$WORKSPACES</span><span>;</span> <span>do</span>
+  sketchybar --add item flashspace.<span>$SID</span> left \
+    --subscribe flashspace.<span>$SID</span> flashspace_workspace_change \
+    --set flashspace.<span>$SID</span> \
+    background.color=0x22ffffff \
+    background.corner_radius=5 \
+    background.padding_left=5 \
+    label.padding_left=5 \
+    label.padding_right=5 \
+    label=<span><span>"</span><span>$workspace</span><span>"</span></span> \
+    script=<span><span>"</span><span>$CONFIG_DIR</span>/plugins/flashspace.sh <span>$workspace</span><span>"</span></span>
+
+  SID=<span><span>$((</span>SID <span>+</span> <span>1</span><span>))</span></span>
+<span>done</span></pre></div>
+<p dir="auto"><h5 tabindex="-1" dir="auto"><code>plugins/flashspace.sh</code></h5><a id="user-content-pluginsflashspacesh-1" aria-label="Permalink: plugins/flashspace.sh" href="#pluginsflashspacesh-1"></a></p>
+<div dir="auto" data-snippet-clipboard-copy-content="#!/bin/bash
+
+if [ &quot;$1&quot; = &quot;$WORKSPACE&quot; ]; then
+  sketchybar --set $NAME label.color=0xffff0000
+else
+  sketchybar --set $NAME label.color=0xffffffff
+fi"><pre><span><span>#!</span>/bin/bash</span>
+
+<span>if</span> [ <span><span>"</span><span>$1</span><span>"</span></span> <span>=</span> <span><span>"</span><span>$WORKSPACE</span><span>"</span></span> ]<span>;</span> <span>then</span>
+  sketchybar --set <span>$NAME</span> label.color=0xffff0000
+<span>else</span>
+  sketchybar --set <span>$NAME</span> label.color=0xffffffff
+<span>fi</span></pre></div>
+</details>
+<p dir="auto"><h2 tabindex="-1" dir="auto">🛠️ Build From Source</h2><a id="user-content-️-build-from-source" aria-label="Permalink: 🛠️ Build From Source" href="#️-build-from-source"></a></p>
+<p dir="auto">FlashSpace uses <a href="https://github.com/yonaskolb/XcodeGen">XcodeGen</a> to generate the Xcode project from the <code>project.yml</code>
+file.</p>
+<ol dir="auto">
+<li>Clone the repository.</li>
+<li>Navigate to the project directory.</li>
+<li>Run <code>brew bundle</code> to install dependencies.</li>
+<li>Run <code>xcodegen generate</code>.</li>
+<li>Open <code>FlashSpace.xcodeproj</code> in Xcode.</li>
+<li>Click on the <code>FlashSpace</code> target, click on the <code>Signing &amp; Capabilities</code> tab,
+and select your team.</li>
+<li>Build &amp; run the app.</li>
+</ol>
+<p dir="auto">Remember to run <code>xcodegen generate</code> every time you change branch or pull changes.</p>
+<p dir="auto">If you want to generate the project with configured signing, you can run:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="XCODE_DEVELOPMENT_TEAM=YOUR_TEAM_ID xcodegen generate"><pre>XCODE_DEVELOPMENT_TEAM=YOUR_TEAM_ID xcodegen generate</pre></div>
+<p dir="auto">You can also set this variable globally in your shell.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">💛&nbsp;&nbsp;Sponsors</h2><a id="user-content-sponsors" aria-label="Permalink: 💛&nbsp;&nbsp;Sponsors" href="#sponsors"></a></p>
+<p dir="auto">Big thanks to all the sponsors who support this project 🍻!</p>
+<p dir="auto"><h3 tabindex="-1" dir="auto">Monthly Sponsors</h3><a id="user-content-monthly-sponsors" aria-label="Permalink: Monthly Sponsors" href="#monthly-sponsors"></a></p>
+<p dir="auto"><a href="https://github.com/bjrmatos"><img src="https://avatars.githubusercontent.com/u/4262050" width="40" height="40" alt="@bjrmatos" title="bjrmatos"></a>
+<a href="https://github.com/notlus"><img src="https://avatars.githubusercontent.com/u/828989" width="40" height="40" alt="@notlus" title="notlus"></a></p>
+<p dir="auto"><h3 tabindex="-1" dir="auto">One Time Sponsors</h3><a id="user-content-one-time-sponsors" aria-label="Permalink: One Time Sponsors" href="#one-time-sponsors"></a></p>
+<p dir="auto"><a href="https://github.com/danscheer"><img src="https://avatars.githubusercontent.com/u/56642865" width="40" height="40" alt="@danscheer" title="danscheer"></a></p>
+
+</article></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The Deck: An open-source cross-platform multiplayer card game engine in Flutter (180 pts)]]></title>
             <link>https://github.com/xajik/thedeck</link>
             <guid>42983699</guid>
             <pubDate>Sat, 08 Feb 2025 15:47:36 GMT</pubDate>
@@ -173,7 +839,7 @@
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We are destroying software (326 pts)]]></title>
+            <title><![CDATA[We are destroying software (373 pts)]]></title>
             <link>https://antirez.com/news/145</link>
             <guid>42983275</guid>
             <pubDate>Sat, 08 Feb 2025 14:48:25 GMT</pubDate>
@@ -213,7 +879,7 @@ We are destroying software, and what will be left will no longer give us the joy
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Generating Voronoi Diagrams Using Fortune's Algorithm (With Odin) (142 pts)]]></title>
+            <title><![CDATA[Generating Voronoi Diagrams Using Fortune's Algorithm (With Odin) (147 pts)]]></title>
             <link>https://redpenguin101.github.io/html/posts/2025_01_21_voronoi.html</link>
             <guid>42982015</guid>
             <pubDate>Sat, 08 Feb 2025 10:41:17 GMT</pubDate>
@@ -221,7 +887,7 @@ We are destroying software, and what will be left will no longer give us the joy
 Couldn't get https://redpenguin101.github.io/html/posts/2025_01_21_voronoi.html: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[LINUX is obsolete (1992) (118 pts)]]></title>
+            <title><![CDATA[LINUX is obsolete (1992) (120 pts)]]></title>
             <link>https://groups.google.com/g/comp.os.minix/c/wlhw16QWltI</link>
             <guid>42980283</guid>
             <pubDate>Sat, 08 Feb 2025 04:05:28 GMT</pubDate>
@@ -465,7 +1131,7 @@ As an aside, deajnews only started in 1995 or 96.  Their archive is what
 </p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ghostwriter – use the reMarkable2 as an interface to vision-LLMs (177 pts)]]></title>
+            <title><![CDATA[Ghostwriter – use the reMarkable2 as an interface to vision-LLMs (179 pts)]]></title>
             <link>https://github.com/awwaiid/ghostwriter</link>
             <guid>42979986</guid>
             <pubDate>Sat, 08 Feb 2025 03:02:57 GMT</pubDate>
@@ -889,7 +1555,7 @@ convert \( evaluations/$evaluation_name/input.png -colorspace RGB \) \( tmp/resu
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Starlink in the Falkland Islands – A national emergency situation? (134 pts)]]></title>
+            <title><![CDATA[Starlink in the Falkland Islands – A national emergency situation? (136 pts)]]></title>
             <link>https://www.openfalklands.com/february-2025-starlink-in-the-falkland-islands-a-national-emergency-situation/</link>
             <guid>42979869</guid>
             <pubDate>Sat, 08 Feb 2025 02:41:35 GMT</pubDate>
@@ -897,7 +1563,7 @@ convert \( evaluations/$evaluation_name/input.png -colorspace RGB \) \( tmp/resu
 Couldn't get https://www.openfalklands.com/february-2025-starlink-in-the-falkland-islands-a-national-emergency-situation/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[VSCode's SSH Agent Is Bananas (612 pts)]]></title>
+            <title><![CDATA[VSCode's SSH Agent Is Bananas (622 pts)]]></title>
             <link>https://fly.io/blog/vscode-ssh-wtf/</link>
             <guid>42979467</guid>
             <pubDate>Sat, 08 Feb 2025 01:25:32 GMT</pubDate>
@@ -969,14 +1635,6 @@ Couldn't get https://www.openfalklands.com/february-2025-starlink-in-the-falklan
             </dd>
         </dl>
       </article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Obscure Islands I Find Interesting (217 pts)]]></title>
-            <link>https://amanvir.com/obscure-islands</link>
-            <guid>42978199</guid>
-            <pubDate>Fri, 07 Feb 2025 22:23:31 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://amanvir.com/obscure-islands">https://amanvir.com/obscure-islands</a>, See on <a href="https://news.ycombinator.com/item?id=42978199">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
         </item>
     </channel>
 </rss>
