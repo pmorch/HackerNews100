@@ -4,12 +4,556 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Mon, 24 Feb 2025 12:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 24 Feb 2025 13:30:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Microsoft Cancels Leases for AI Data Centers, Analyst Says (119 pts)]]></title>
+            <title><![CDATA[Building a BitTorrent client from the ground up in Go (128 pts)]]></title>
+            <link>https://blog.jse.li/posts/torrent/</link>
+            <guid>43157980</guid>
+            <pubDate>Mon, 24 Feb 2025 10:34:01 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.jse.li/posts/torrent/">https://blog.jse.li/posts/torrent/</a>, See on <a href="https://news.ycombinator.com/item?id=43157980">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+  <article>
+    
+
+    
+    <p><strong>tl;dr:</strong> What is the complete path between visiting thepiratebay and sublimating an mp3 file from thin air? In this post, we’ll implement enough of the BitTorrent protocol to download Debian. Look at the <a href="https://github.com/veggiedefender/torrent-client/">Source code</a> or skip to the <a href="https://blog.jse.li/posts/torrent#putting-it-all-together">last bit</a>.
+    </p>
+    
+
+    <section>
+      
+<p>This post is also available in <a href="https://web.archive.org/web/20200616163517if_/https://4gophers.ru/articles/bittorrent/#.Xuj0zivLerw">Russian</a>, <a href="https://markruler.github.io/posts/go/building-bittorrent-client/">Korean</a>, and <a href="https://blog.mynameisdhr.com/YongGOCongLingJianLiBitTorrentKeHuDuan/">Chinese</a>.</p>
+<p>BitTorrent is a protocol for downloading and distributing files across the Internet. In contrast with the traditional client/server relationship, in which downloaders connect to a central server (for example: watching a movie on Netflix, or loading the web page you’re reading now), participants in the BitTorrent network, called <strong>peers</strong>, download pieces of files from <em>each other</em>—this is what makes it a <strong>peer-to-peer</strong> protocol. We’ll investigate how this works, and build our own client that can find peers and exchange data between them.</p>
+<img src="https://blog.jse.li/torrent/client-server-p2p.png" alt="diagram showing the difference between client/server (all clients connecting to one server) and peer-to-peer (peers connecting to each other) relationships">
+<p>The protocol evolved organically over the past 20 years, and various people and organizations added extensions for features like encryption, private torrents, and new ways of finding peers. We’ll be implementing the <a href="https://www.bittorrent.org/beps/bep_0003.html">original spec</a> from 2001 to keep this a weekend-sized project.</p>
+<p>I’ll be using a <a href="https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/#indexlist">Debian ISO</a> file as my guinea pig because it’s big, but not huge, at 350MB. As a popular Linux distribution, there will be lots of fast and cooperative peers for us to connect to. And we’ll avoid the legal and ethical issues related to downloading pirated content.</p>
+
+<div><p>Consider donating to a local <a href="https://www.communityjusticeexchange.org/nbfn-directory">community bail fund</a>.
+</p><p>
+Your money will pay for legal aid and bail for protestors who have been arrested for standing up to police brutality, institutional racism, and the murder of Black men and women like George Floyd, Breonna Taylor, Ahmaud Arbery, and Nina Pop.
+</p><p>
+In the tech community, we talk a lot about inclusivity and diversity. Now is the time to take concrete action.
+</p><p>
+<a href="https://www.communityjusticeexchange.org/nbfn-directory">https://www.communityjusticeexchange.org/nbfn-directory</a></p></div>
+
+<h2 id="finding-peers">Finding peers</h2>
+<p>Here’s a problem: we want to download a file with BitTorrent, but it’s a peer-to-peer protocol and we have no idea where to find peers to download it from. This is a lot like moving to a new city and trying to make friends—maybe we’ll hit up a local pub or a meetup group! Centralized locations like these are the big idea behind <strong>trackers</strong>, which are central servers that introduce peers to each other. They’re just web servers running over HTTP<span>*<span>Some trackers use a <a href="http://bittorrent.org/beps/bep_0015.html">UDP</a> binary protocol to save bandwidth</span></span>
+, and you can find Debian’s at <a href="http://bttracker.debian.org:6969/">http://bttracker.debian.org:6969/</a></p>
+<img src="https://blog.jse.li/torrent/trackers.png" alt="illustration of a desktop computer and laptop sitting at a pub">
+<p>Of course, these central servers are liable to get raided by the feds if they facilitate peers exchanging illegal content. You may remember reading about trackers like TorrentSpy, Popcorn Time, and KickassTorrents getting seized and shut down. New methods cut out the middleman by making even <strong>peer discovery</strong> a distributed process. We won’t be implementing them, but if you’re interested, some terms you can research are <strong>DHT</strong>, <strong>PEX</strong>, and <strong>magnet links</strong>.</p>
+<h2 id="parsing-a-torrent-file">Parsing a .torrent file</h2>
+<p>A .torrent file describes the contents of a torrentable file and information for connecting to a tracker. It’s all we need in order to kickstart the process of downloading a torrent. Debian’s .torrent file looks like this:</p>
+<pre><code>d8:announce41:http://bttracker.debian.org:6969/announce7:comment35:"Debian CD from cdimage.debian.org"13:creation datei1573903810e9:httpseedsl145:https://cdimage.debian.org/cdimage/release/10.2.0//srv/cdbuilder.debian.org/dst/deb-cd/weekly-builds/amd64/iso-cd/debian-10.2.0-amd64-netinst.iso145:https://cdimage.debian.org/cdimage/archive/10.2.0//srv/cdbuilder.debian.org/dst/deb-cd/weekly-builds/amd64/iso-cd/debian-10.2.0-amd64-netinst.isoe4:infod6:lengthi351272960e4:name31:debian-10.2.0-amd64-netinst.iso12:piece lengthi262144e6:pieces26800:�����PS�^�� (binary blob of the hashes of each piece)ee
+</code></pre><p>That mess is encoded in a format called <strong>Bencode</strong> (pronounced <em>bee-encode</em>), and we’ll need to decode it.</p>
+<p>Bencode can encode roughly the same types of structures as JSON—strings, integers, lists, and dictionaries. Bencoded data is not as human-readable/writable as JSON, but it can efficiently handle binary data and it’s really simple to parse from a stream. Strings come with a length prefix, and look like <code>4:spam</code>. Integers go between <em>start</em> and <em>end</em> markers, so <code>7</code> would encode to <code>i7e</code>. Lists and dictionaries work in a similar way: <code>l4:spami7ee</code> represents <code>['spam', 7]</code>, while <code>d4:spami7ee</code> means <code>{spam: 7}</code>.</p>
+<p>In a prettier format, our .torrent file looks like this:</p>
+<div>
+  <pre><code><span>d</span>
+  <span>8</span>:<span>announce</span>
+    <span>41</span>:<span>http://bttracker.debian.org:6969/announce</span>
+  <span>7</span>:<span>comment</span>
+    <span>35</span>:<span>"Debian CD from cdimage.debian.org"</span>
+  <span>13</span>:<span>creation date</span>
+    <span>i</span><span>1573903810</span><span>e</span>
+  <span>4</span>:<span>info</span>
+    <span>d</span>
+      <span>6</span>:<span>length</span>
+        <span>i</span><span>351272960</span><span>e</span>
+      <span>4</span>:<span>name</span>
+        <span>31</span>:<span>debian-10.2.0-amd64-netinst.iso</span>
+      <span>12</span>:<span>piece length</span>
+        <span>i</span><span>262144</span><span>e</span>
+      <span>6</span>:<span>pieces</span>
+        <span>26800</span>:<span>�����PS�^�� (binary blob of the hashes of each piece)</span></code>
+    <span>e</span>
+<span>e</span></pre>
+</div>
+<p>In this file, we can spot the URL of the tracker, the creation date (as a Unix timestamp), the name and size of the file, and a big binary blob containing the SHA-1 hashes of each <strong>piece</strong>, which are equally-sized parts of the file we want to download. The exact size of a piece varies between torrents, but they are usually somewhere between 256KB and 1MB. This means that a large file might be made up of <em>thousands</em> of pieces. We’ll download these pieces from our peers, check them against the hashes from our torrent file, assemble them together, and boom, we’ve got a file!</p>
+<img src="https://blog.jse.li/torrent/pieces.png" alt="illustration of a file being cut with scissors into multiple pieces, starting with piece 0">
+<p>This mechanism allows us to verify the integrity of each piece as we go. It makes BitTorrent resistant to accidental corruption or intentional <strong>torrent poisoning</strong>. Unless an attacker is capable of breaking SHA-1 with a preimage attack, we will get exactly the content we asked for.</p>
+<p>It would be really fun to write a bencode parser, but parsing isn’t our focus today. But I found Fredrik Lundh’s <a href="https://web.archive.org/web/20200105114449/https://effbot.org/zone/bencode.htm">50 line parser</a> to be especially illuminating. For this project, I used <a href="https://github.com/jackpal/bencode-go">github.com/jackpal/bencode-go</a>:</p>
+<div>
+<div><pre><code data-lang="golang"><span>import</span> <span>(</span>
+    <span>"github.com/jackpal/bencode-go"</span>
+<span>)</span>
+
+<span>type</span> <span>bencodeInfo</span> <span>struct</span> <span>{</span>
+    <span>Pieces</span>      <span>string</span> <span>`bencode:"pieces"`</span>
+    <span>PieceLength</span> <span>int</span>    <span>`bencode:"piece length"`</span>
+    <span>Length</span>      <span>int</span>    <span>`bencode:"length"`</span>
+    <span>Name</span>        <span>string</span> <span>`bencode:"name"`</span>
+<span>}</span>
+
+<span>type</span> <span>bencodeTorrent</span> <span>struct</span> <span>{</span>
+    <span>Announce</span> <span>string</span>      <span>`bencode:"announce"`</span>
+    <span>Info</span>     <span>bencodeInfo</span> <span>`bencode:"info"`</span>
+<span>}</span>
+
+<span>// Open parses a torrent file
+</span><span></span><span>func</span> <span>Open</span><span>(</span><span>r</span> <span>io</span><span>.</span><span>Reader</span><span>)</span> <span>(</span><span>*</span><span>bencodeTorrent</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>bto</span> <span>:=</span> <span>bencodeTorrent</span><span>{}</span>
+    <span>err</span> <span>:=</span> <span>bencode</span><span>.</span><span>Unmarshal</span><span>(</span><span>r</span><span>,</span> <span>&amp;</span><span>bto</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+    <span>}</span>
+    <span>return</span> <span>&amp;</span><span>bto</span><span>,</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/torrentfile/torrentfile.go">view in context</a></p>
+</div>
+<p>Because I like to keep my structures relatively flat, and I like to keep my application structs separate from my serialization structs, I exported a different, flatter struct named <code>TorrentFile</code> and wrote a few helper functions to convert between the two.</p>
+<p>Notably, I split <code>pieces</code> (previously a string) into a slice of hashes (each <code>[20]byte</code>) so that I can easily access individual hashes later. I also computed the SHA-1 hash of the entire bencoded <code>info</code> dict (the one which contained the name, size, and piece hashes). We know this as the <strong>infohash</strong> and it uniquely identifies files when we talk to trackers and peers. More on this later.</p>
+<img src="https://blog.jse.li/torrent/info-hash.png" alt="a name tag saying 'Hello my name is 86d4c80024a469be4c50bc5a102cf71780310074'">
+<div>
+<div><pre><code data-lang="golang"><span>type</span> <span>TorrentFile</span> <span>struct</span> <span>{</span>
+    <span>Announce</span>    <span>string</span>
+    <span><span>InfoHash</span>    <span>[</span><span>20</span><span>]</span><span>byte</span></span>
+    <span><span>PieceHashes</span> <span>[][</span><span>20</span><span>]</span><span>byte</span></span>
+    <span>PieceLength</span> <span>int</span>
+    <span>Length</span>      <span>int</span>
+    <span>Name</span>        <span>string</span>
+<span>}</span>
+</code><p><code data-lang="golang"><span>func</span> <span>(</span><span>bto</span> <span><em></em></span><em><span>bencodeTorrent</span><span>)</span> <span>toTorrentFile</span><span>()</span> <span>(</span><span></span></em><span>TorrentFile</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+<span>// …
+</span><span></span><span>}</span></code></p></pre></div>
+<p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/torrentfile/torrentfile.go#L120-L138">view in context</a></p>
+</div>
+<h2 id="retrieving-peers-from-the-tracker">Retrieving peers from the tracker</h2>
+<p>Now that we have information about the file and its tracker, let’s talk to the tracker to <strong>announce</strong> our presence as a peer and to retrieve a list of other peers. We just need to make a GET request to the <code>announce</code> URL supplied in the .torrent file, with a few query parameters:</p>
+<div>
+<div><pre><code data-lang="golang"><span>func</span> <span>(</span><span>t</span> <span>*</span><span>TorrentFile</span><span>)</span> <span>buildTrackerURL</span><span>(</span><span>peerID</span> <span>[</span><span>20</span><span>]</span><span>byte</span><span>,</span> <span>port</span> <span>uint16</span><span>)</span> <span>(</span><span>string</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>base</span><span>,</span> <span>err</span> <span>:=</span> <span>url</span><span>.</span><span>Parse</span><span>(</span><span>t</span><span>.</span><span>Announce</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> <span>""</span><span>,</span> <span>err</span>
+    <span>}</span>
+    <span>params</span> <span>:=</span> <span>url</span><span>.</span><span>Values</span><span>{</span>
+        <span>"info_hash"</span><span>:</span>  <span>[]</span><span>string</span><span>{</span><span>string</span><span>(</span><span>t</span><span>.</span><span>InfoHash</span><span>[:])},</span>
+        <span>"peer_id"</span><span>:</span>    <span>[]</span><span>string</span><span>{</span><span>string</span><span>(</span><span>peerID</span><span>[:])},</span>
+        <span>"port"</span><span>:</span>       <span>[]</span><span>string</span><span>{</span><span>strconv</span><span>.</span><span>Itoa</span><span>(</span><span>int</span><span>(</span><span>Port</span><span>))},</span>
+        <span>"uploaded"</span><span>:</span>   <span>[]</span><span>string</span><span>{</span><span>"0"</span><span>},</span>
+        <span>"downloaded"</span><span>:</span> <span>[]</span><span>string</span><span>{</span><span>"0"</span><span>},</span>
+        <span>"compact"</span><span>:</span>    <span>[]</span><span>string</span><span>{</span><span>"1"</span><span>},</span>
+        <span>"left"</span><span>:</span>       <span>[]</span><span>string</span><span>{</span><span>strconv</span><span>.</span><span>Itoa</span><span>(</span><span>t</span><span>.</span><span>Length</span><span>)},</span>
+    <span>}</span>
+    <span>base</span><span>.</span><span>RawQuery</span> <span>=</span> <span>params</span><span>.</span><span>Encode</span><span>()</span>
+    <span>return</span> <span>base</span><span>.</span><span>String</span><span>(),</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/torrentfile/tracker.go#L19-L35">view in context</a></p>
+</div>
+<p>The important ones:</p>
+<ul>
+<li><strong>info_hash</strong>: Identifies the <em>file</em> we’re trying to download. It’s the infohash we calculated earlier from the bencoded <code>info</code> dict. The tracker will use this to figure out which peers to show us.</li>
+<li><strong>peer_id</strong>: A 20 byte name to identify <em>ourselves</em> to trackers and peers. We’ll just generate 20 random bytes for this. Real BitTorrent clients have IDs like <code>-TR2940-k8hj0wgej6ch</code> which identify the client software and version—in this case, TR2940 stands for Transmission client 2.94.</li>
+</ul>
+<img src="https://blog.jse.li/torrent/info-hash-peer-id.png" alt="a file with a name tag saying 'info_hash' and a person with a name tag 'peer_id'">
+<h2 id="parsing-the-tracker-response">Parsing the tracker response</h2>
+<p>We get back a bencoded response:</p>
+<div>
+  <pre><code><span>d</span>
+  <span>8</span>:<span>interval</span>
+    <span>i</span><span>900</span><span>e</span>
+  <span>5</span>:<span>peers</span>
+    <span>252</span>:<span>(another long binary blob)</span>
+<span>e</span></code></pre>
+</div>
+<p><code>Interval</code> tells us how often we’re supposed to connect to the tracker again to refresh our list of peers. A value of 900 means we should reconnect every 15 minutes (900 seconds).</p>
+<p><code>Peers</code> is another long binary blob containing the IP addresses of each peer. It’s made out of <strong>groups of six bytes</strong>. The first four bytes in each group represent the peer’s IP address—each byte represents a number in the IP. The last two bytes represent the port, as a big-endian <code>uint16</code>. <strong>Big-endian</strong>, or <strong>network order</strong>, means that we can interpret a group of bytes as an integer by just squishing them together left to right. For example, the bytes <code>0x1A</code>, <code>0xE1</code> make <code>0x1AE1</code>, or 6881 in decimal.<span>*<span>Interpreting the same bytes in <strong>little-endian</strong> order would make 0xE11A = 57626</span></span></p>
+<img src="https://blog.jse.li/torrent/address.png" alt="diagram showing how 192, 0, 2, 123, 0x1A, 0xE1 can be interpreted as 192.0.1.123:6881">
+<div>
+<div><pre><code data-lang="golang"><span>// Peer encodes connection information for a peer
+</span><span></span><span>type</span> <span>Peer</span> <span>struct</span> <span>{</span>
+    <span>IP</span>   <span>net</span><span>.</span><span>IP</span>
+    <span>Port</span> <span>uint16</span>
+<span>}</span>
+
+<span>// Unmarshal parses peer IP addresses and ports from a buffer
+</span><span></span><span>func</span> <span>Unmarshal</span><span>(</span><span>peersBin</span> <span>[]</span><span>byte</span><span>)</span> <span>([]</span><span>Peer</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>const</span> <span>peerSize</span> <span>=</span> <span>6</span> <span>// 4 for IP, 2 for port
+</span><span></span>    <span>numPeers</span> <span>:=</span> <span>len</span><span>(</span><span>peersBin</span><span>)</span> <span>/</span> <span>peerSize</span>
+    <span>if</span> <span>len</span><span>(</span><span>peersBin</span><span>)</span><span>%</span><span>peerSize</span> <span>!=</span> <span>0</span> <span>{</span>
+        <span>err</span> <span>:=</span> <span>fmt</span><span>.</span><span>Errorf</span><span>(</span><span>"Received malformed peers"</span><span>)</span>
+        <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+    <span>}</span>
+    <span>peers</span> <span>:=</span> <span>make</span><span>([]</span><span>Peer</span><span>,</span> <span>numPeers</span><span>)</span>
+    <span>for</span> <span>i</span> <span>:=</span> <span>0</span><span>;</span> <span>i</span> <span>&lt;</span> <span>numPeers</span><span>;</span> <span>i</span><span>++</span> <span>{</span>
+        <span>offset</span> <span>:=</span> <span>i</span> <span>*</span> <span>peerSize</span>
+        <span>peers</span><span>[</span><span>i</span><span>].</span><span>IP</span> <span>=</span> <span>net</span><span>.</span><span>IP</span><span>(</span><span>peersBin</span><span>[</span><span>offset</span> <span>:</span> <span>offset</span><span>+</span><span>4</span><span>])</span>
+        <span>peers</span><span>[</span><span>i</span><span>].</span><span>Port</span> <span>=</span> <span>binary</span><span>.</span><span>BigEndian</span><span>.</span><span>Uint16</span><span>(</span><span>peersBin</span><span>[</span><span>offset</span><span>+</span><span>4</span> <span>:</span> <span>offset</span><span>+</span><span>6</span><span>])</span>
+    <span>}</span>
+    <span>return</span> <span>peers</span><span>,</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/peers/peers.go">view in context</a></p>
+</div>
+<h2 id="downloading-from-peers">Downloading from peers</h2>
+<p>Now that we have a list of peers, it’s time to connect with them and start downloading pieces! We can break down the process into a few steps. For each peer, we want to:</p>
+<ol>
+<li>Start a TCP connection with the peer. This is like starting a phone call.</li>
+<li>Complete a two-way BitTorrent <strong>handshake</strong>. <em>“Hello?” “Hello."</em></li>
+<li>Exchange <strong>messages</strong> to download <strong>pieces</strong>. <em>“I’d like piece #231 please."</em></li>
+</ol>
+<h2 id="start-a-tcp-connection">Start a TCP connection</h2>
+<div>
+<div><pre><code data-lang="golang"><span>conn</span><span>,</span> <span>err</span> <span>:=</span> <span>net</span><span>.</span><span>DialTimeout</span><span>(</span><span>"tcp"</span><span>,</span> <span>peer</span><span>.</span><span>String</span><span>(),</span> <span>3</span><span>*</span><span>time</span><span>.</span><span>Second</span><span>)</span>
+<span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+    <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/client/client.go#L65-L69">view in context</a></p>
+</div>
+<p>I set a timeout so that I don’t waste too much time on peers that aren’t going to let me connect. For the most part, it’s a pretty standard TCP connection.</p>
+<h2 id="complete-the-handshake">Complete the handshake</h2>
+<p>We’ve just set up a connection with a peer, but we want do a handshake to validate our assumptions that the peer</p>
+<ul>
+<li>can communicate using the BitTorrent protocol</li>
+<li>is able to understand and respond to our messages</li>
+<li>has the file that we want, or at least knows what we’re talking about</li>
+</ul>
+<img src="https://blog.jse.li/torrent/handshake.png" alt="Two computers communicating. One asks 'do you speak BitTorrent and have this file?' and the other replies 'I speak BitTorrent and have that file'">
+<p>My father told me that the secret to a good handshake is a firm grip and eye contact. The secret to a good BitTorrent handshake is that it’s made up of five parts:</p>
+<ol>
+<li>The length of the protocol identifier, which is always 19 (0x13 in hex)</li>
+<li>The protocol identifier, called the <strong>pstr</strong> which is always <code>BitTorrent protocol</code></li>
+<li>Eight <strong>reserved bytes</strong>, all set to 0. We’d flip some of them to 1 to indicate that we support certain <a href="http://www.bittorrent.org/beps/bep_0010.html">extensions</a>. But we don’t, so we’ll keep them at 0.</li>
+<li>The <strong>infohash</strong> that we calculated earlier to identify which file we want</li>
+<li>The <strong>Peer ID</strong> that we made up to identify ourselves</li>
+</ol>
+<p>Put together, a handshake string might look like this:</p>
+<div><pre><code><span>\x13</span><span>BitTorrent protocol</span><span>\x00\x00\x00\x00\x00\x00\x00\x00</span><span>\x86\xd4\xc8\x00\x24\xa4\x69\xbe\x4c\x50\xbc\x5a\x10\x2c\xf7\x17\x80\x31\x00\x74</span><span>-TR2940-k8hj0wgej6ch</span></code></pre></div>
+<p>After we send a handshake to our peer, we should receive a handshake back in the same format. The infohash we get back should match the one we sent so that we know that we’re talking about the same file. If everything goes as planned, we’re good to go. If not, we can sever the connection because there’s something wrong. <em>“Hello?” “这是谁？ 你想要什么？” “Okay, wow, wrong number."</em></p>
+<p>In our code, let’s make a struct to represent a handshake, and write a few methods for serializing and reading them:</p>
+<div>
+<div><pre><code data-lang="golang"><span>// A Handshake is a special message that a peer uses to identify itself
+</span><span></span><span>type</span> <span>Handshake</span> <span>struct</span> <span>{</span>
+    <span>Pstr</span>     <span>string</span>
+    <span>InfoHash</span> <span>[</span><span>20</span><span>]</span><span>byte</span>
+    <span>PeerID</span>   <span>[</span><span>20</span><span>]</span><span>byte</span>
+<span>}</span>
+
+<span>// Serialize serializes the handshake to a buffer
+</span><span></span><span>func</span> <span>(</span><span>h</span> <span>*</span><span>Handshake</span><span>)</span> <span>Serialize</span><span>()</span> <span>[]</span><span>byte</span> <span>{</span>
+    <span>buf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>len</span><span>(</span><span>h</span><span>.</span><span>Pstr</span><span>)</span><span>+</span><span>49</span><span>)</span>
+    <span>buf</span><span>[</span><span>0</span><span>]</span> <span>=</span> <span>byte</span><span>(</span><span>len</span><span>(</span><span>h</span><span>.</span><span>Pstr</span><span>))</span>
+    <span>curr</span> <span>:=</span> <span>1</span>
+    <span>curr</span> <span>+=</span> <span>copy</span><span>(</span><span>buf</span><span>[</span><span>curr</span><span>:],</span> <span>h</span><span>.</span><span>Pstr</span><span>)</span>
+    <span>curr</span> <span>+=</span> <span>copy</span><span>(</span><span>buf</span><span>[</span><span>curr</span><span>:],</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>8</span><span>))</span> <span>// 8 reserved bytes
+</span><span></span>    <span>curr</span> <span>+=</span> <span>copy</span><span>(</span><span>buf</span><span>[</span><span>curr</span><span>:],</span> <span>h</span><span>.</span><span>InfoHash</span><span>[:])</span>
+    <span>curr</span> <span>+=</span> <span>copy</span><span>(</span><span>buf</span><span>[</span><span>curr</span><span>:],</span> <span>h</span><span>.</span><span>PeerID</span><span>[:])</span>
+    <span>return</span> <span>buf</span>
+<span>}</span>
+
+<span>// Read parses a handshake from a stream
+</span><span></span><span>func</span> <span>Read</span><span>(</span><span>r</span> <span>io</span><span>.</span><span>Reader</span><span>)</span> <span>(</span><span>*</span><span>Handshake</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>// Do Serialize(), but backwards
+</span><span></span>    <span>// ...
+</span><span></span><span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/a83013d250dd9b4268cceace28e4cd82b07f2cbd/handshake/handshake.go">view in context</a></p>
+</div>
+<h2 id="send-and-receive-messages">Send and receive messages</h2>
+<p>Once we’ve completed the initial handshake, we can send and receive <strong>messages</strong>. Well, not quite—if the other peer isn’t ready to accept messages, we can’t send any until they tell us they’re ready. In this state, we’re considered <strong>choked</strong> by the other peer. They’ll send us an <strong>unchoke</strong> message to let us know that we can begin asking them for data. By default, we assume that we’re choked until proven otherwise.</p>
+<p>Once we’ve been unchoked, we can then begin sending <strong>requests</strong> for pieces, and they can send us messages back containing pieces.</p>
+<img src="https://blog.jse.li/torrent/choke.png" alt="A cartoon in which person 1 says 'hello I would like piece number—' and person 2 grabs him by the neck and says '00 00 00 01 00 (choke)'">
+<h3 id="interpreting-messages">Interpreting messages</h3>
+<p>A message has a length, an <strong>ID</strong> and a <strong>payload</strong>. On the wire, it looks like:</p>
+<img src="https://blog.jse.li/torrent/message.png" alt="A message with 4 byte for the length, 1 byte for ID, and an optional payload">
+<p>A message starts with a length indicator which tells us how many bytes long the message will be. It’s a 32-bit integer, meaning it’s made out of four bytes smooshed together in big-endian order. The next byte, the <strong>ID</strong>, tells us which type of message we’re receiving—for example, a <code>2</code> byte means “interested.” Finally, the optional <strong>payload</strong> fills out the remaining length of the message.</p>
+<div>
+<div><pre><code data-lang="golang"><span>type</span> <span>messageID</span> <span>uint8</span>
+
+<span>const</span> <span>(</span>
+    <span>MsgChoke</span>         <span>messageID</span> <span>=</span> <span>0</span>
+    <span>MsgUnchoke</span>       <span>messageID</span> <span>=</span> <span>1</span>
+    <span>MsgInterested</span>    <span>messageID</span> <span>=</span> <span>2</span>
+    <span>MsgNotInterested</span> <span>messageID</span> <span>=</span> <span>3</span>
+    <span>MsgHave</span>          <span>messageID</span> <span>=</span> <span>4</span>
+    <span>MsgBitfield</span>      <span>messageID</span> <span>=</span> <span>5</span>
+    <span>MsgRequest</span>       <span>messageID</span> <span>=</span> <span>6</span>
+    <span>MsgPiece</span>         <span>messageID</span> <span>=</span> <span>7</span>
+    <span>MsgCancel</span>        <span>messageID</span> <span>=</span> <span>8</span>
+<span>)</span>
+
+<span>// Message stores ID and payload of a message
+</span><span></span><span>type</span> <span>Message</span> <span>struct</span> <span>{</span>
+    <span>ID</span>      <span>messageID</span>
+    <span>Payload</span> <span>[]</span><span>byte</span>
+<span>}</span>
+
+<span>// Serialize serializes a message into a buffer of the form
+</span><span>// &lt;length prefix&gt;&lt;message ID&gt;&lt;payload&gt;
+</span><span>// Interprets `nil` as a keep-alive message
+</span><span></span><span>func</span> <span>(</span><span>m</span> <span>*</span><span>Message</span><span>)</span> <span>Serialize</span><span>()</span> <span>[]</span><span>byte</span> <span>{</span>
+    <span>if</span> <span>m</span> <span>==</span> <span>nil</span> <span>{</span>
+        <span>return</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>4</span><span>)</span>
+    <span>}</span>
+    <span>length</span> <span>:=</span> <span>uint32</span><span>(</span><span>len</span><span>(</span><span>m</span><span>.</span><span>Payload</span><span>)</span> <span>+</span> <span>1</span><span>)</span> <span>// +1 for id
+</span><span></span>    <span>buf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>4</span><span>+</span><span>length</span><span>)</span>
+    <span>binary</span><span>.</span><span>BigEndian</span><span>.</span><span>PutUint32</span><span>(</span><span>buf</span><span>[</span><span>0</span><span>:</span><span>4</span><span>],</span> <span>length</span><span>)</span>
+    <span>buf</span><span>[</span><span>4</span><span>]</span> <span>=</span> <span>byte</span><span>(</span><span>m</span><span>.</span><span>ID</span><span>)</span>
+    <span>copy</span><span>(</span><span>buf</span><span>[</span><span>5</span><span>:],</span> <span>m</span><span>.</span><span>Payload</span><span>)</span>
+    <span>return</span> <span>buf</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/message/message.go#L90-L103">view in context</a></p>
+</div>
+<p>To read a message from a stream, we just follow the format of a message. We read four bytes and interpret them as a <code>uint32</code> to get the <strong>length</strong> of the message. Then, we read that number of bytes to get the <strong>ID</strong> (the first byte) and the <strong>payload</strong> (the remaining bytes).</p>
+<div>
+<div><pre><code data-lang="golang"><span>// Read parses a message from a stream. Returns `nil` on keep-alive message
+</span><span></span><span>func</span> <span>Read</span><span>(</span><span>r</span> <span>io</span><span>.</span><span>Reader</span><span>)</span> <span>(</span><span>*</span><span>Message</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>lengthBuf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>4</span><span>)</span>
+    <span>_</span><span>,</span> <span>err</span> <span>:=</span> <span>io</span><span>.</span><span>ReadFull</span><span>(</span><span>r</span><span>,</span> <span>lengthBuf</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+    <span>}</span>
+    <span>length</span> <span>:=</span> <span>binary</span><span>.</span><span>BigEndian</span><span>.</span><span>Uint32</span><span>(</span><span>lengthBuf</span><span>)</span>
+
+    <span>// keep-alive message
+</span><span></span>    <span>if</span> <span>length</span> <span>==</span> <span>0</span> <span>{</span>
+        <span>return</span> <span>nil</span><span>,</span> <span>nil</span>
+    <span>}</span>
+
+    <span>messageBuf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>length</span><span>)</span>
+    <span>_</span><span>,</span> <span>err</span> <span>=</span> <span>io</span><span>.</span><span>ReadFull</span><span>(</span><span>r</span><span>,</span> <span>messageBuf</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+    <span>}</span>
+
+    <span>m</span> <span>:=</span> <span>Message</span><span>{</span>
+        <span>ID</span><span>:</span>      <span>messageID</span><span>(</span><span>messageBuf</span><span>[</span><span>0</span><span>]),</span>
+        <span>Payload</span><span>:</span> <span>messageBuf</span><span>[</span><span>1</span><span>:],</span>
+    <span>}</span>
+
+    <span>return</span> <span>&amp;</span><span>m</span><span>,</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/message/message.go#L105-L131">view in context</a></p>
+</div>
+<h3 id="bitfields">Bitfields</h3>
+<p>One of the most interesting types of message is the <strong>bitfield</strong>, which is a data structure that peers use to efficiently encode which pieces they are able to send us. A bitfield looks like a byte array, and to check which pieces they have, we just need to look at the positions of the <em>bits</em> set to 1. You can think of it like the digital equivalent of a coffee shop loyalty card. We start with a blank card of all <code>0</code>, and flip bits to <code>1</code> to mark their positions as “stamped.”</p>
+<img src="https://blog.jse.li/torrent/bitfield.png" alt="a coffee shop loyalty card with eight slots, with stamps on the first four slots and a stamp on the second to last slot, represented as 11110010">
+<p>By working with <em>bits</em> instead of <em>bytes</em>, this data structure is super compact. We can stuff information about eight pieces in the space of a single byte—the size of a <code>bool</code>. The tradeoff is that accessing values becomes a little more tricky. The smallest unit of memory that computers can address are bytes, so to get to our bits, we have to do some bitwise manipulation:</p>
+<div>
+<div><pre><code data-lang="golang"><span>// A Bitfield represents the pieces that a peer has
+</span><span></span><span>type</span> <span>Bitfield</span> <span>[]</span><span>byte</span>
+
+<span>// HasPiece tells if a bitfield has a particular index set
+</span><span></span><span>func</span> <span>(</span><span>bf</span> <span>Bitfield</span><span>)</span> <span>HasPiece</span><span>(</span><span>index</span> <span>int</span><span>)</span> <span>bool</span> <span>{</span>
+    <span>byteIndex</span> <span>:=</span> <span>index</span> <span>/</span> <span>8</span>
+    <span>offset</span> <span>:=</span> <span>index</span> <span>%</span> <span>8</span>
+    <span>return</span> <span>bf</span><span>[</span><span>byteIndex</span><span>]</span><span>&gt;&gt;</span><span>(</span><span>7</span><span>-</span><span>offset</span><span>)</span><span>&amp;</span><span>1</span> <span>!=</span> <span>0</span>
+<span>}</span>
+
+<span>// SetPiece sets a bit in the bitfield
+</span><span></span><span>func</span> <span>(</span><span>bf</span> <span>Bitfield</span><span>)</span> <span>SetPiece</span><span>(</span><span>index</span> <span>int</span><span>)</span> <span>{</span>
+    <span>byteIndex</span> <span>:=</span> <span>index</span> <span>/</span> <span>8</span>
+    <span>offset</span> <span>:=</span> <span>index</span> <span>%</span> <span>8</span>
+    <span>bf</span><span>[</span><span>byteIndex</span><span>]</span> <span>|=</span> <span>1</span> <span>&lt;&lt;</span> <span>(</span><span>7</span> <span>-</span> <span>offset</span><span>)</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/bitfield/bitfield.go">view in context</a></p>
+</div>
+<h2 id="putting-it-all-together">Putting it all together</h2>
+<p>We now have all the tools we need to download a torrent: we have a list of peers obtained from the tracker, and we can communicate with them by dialing a TCP connection, initiating a handshake, and sending and receiving messages. Our last big problems are handling the <strong>concurrency</strong> involved in talking to multiple peers at once, and managing the <strong>state</strong> of our peers as we interact with them. These are both classically Hard problems.</p>
+<h3 id="managing-concurrency-channels-as-queues">Managing concurrency: channels as queues</h3>
+<p>In Go, we <a href="https://blog.golang.org/share-memory-by-communicating">share memory by communicating</a>, and we can think of a Go channel as a cheap thread-safe queue.</p>
+<p>We’ll set up two channels to synchronize our concurrent workers: one for dishing out work (pieces to download) between peers, and another for collecting downloaded pieces. As downloaded pieces come in through the results channel, we can copy them into a buffer to start assembling our complete file.</p>
+<div>
+<div><pre><code data-lang="golang"><span>// Init queues for workers to retrieve work and send results
+</span><span></span><span>workQueue</span> <span>:=</span> <span>make</span><span>(</span><span>chan</span> <span>*</span><span>pieceWork</span><span>,</span> <span>len</span><span>(</span><span>t</span><span>.</span><span>PieceHashes</span><span>))</span>
+<span>results</span> <span>:=</span> <span>make</span><span>(</span><span>chan</span> <span>*</span><span>pieceResult</span><span>)</span>
+<span>for</span> <span>index</span><span>,</span> <span>hash</span> <span>:=</span> <span>range</span> <span>t</span><span>.</span><span>PieceHashes</span> <span>{</span>
+    <span>length</span> <span>:=</span> <span>t</span><span>.</span><span>calculatePieceSize</span><span>(</span><span>index</span><span>)</span>
+    <span>workQueue</span> <span>&lt;-</span> <span>&amp;</span><span>pieceWork</span><span>{</span><span>index</span><span>,</span> <span>hash</span><span>,</span> <span>length</span><span>}</span>
+<span>}</span>
+
+<span>// Start workers
+</span><span></span><span>for</span> <span>_</span><span>,</span> <span>peer</span> <span>:=</span> <span>range</span> <span>t</span><span>.</span><span>Peers</span> <span>{</span>
+    <span>go</span> <span>t</span><span>.</span><span>startDownloadWorker</span><span>(</span><span>peer</span><span>,</span> <span>workQueue</span><span>,</span> <span>results</span><span>)</span>
+<span>}</span>
+
+<span>// Collect results into a buffer until full
+</span><span></span><span>buf</span> <span>:=</span> <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>t</span><span>.</span><span>Length</span><span>)</span>
+<span>donePieces</span> <span>:=</span> <span>0</span>
+<span>for</span> <span>donePieces</span> <span>&lt;</span> <span>len</span><span>(</span><span>t</span><span>.</span><span>PieceHashes</span><span>)</span> <span>{</span>
+    <span>res</span> <span>:=</span> <span>&lt;-</span><span>results</span>
+    <span>begin</span><span>,</span> <span>end</span> <span>:=</span> <span>t</span><span>.</span><span>calculateBoundsForPiece</span><span>(</span><span>res</span><span>.</span><span>index</span><span>)</span>
+    <span>copy</span><span>(</span><span>buf</span><span>[</span><span>begin</span><span>:</span><span>end</span><span>],</span> <span>res</span><span>.</span><span>buf</span><span>)</span>
+    <span>donePieces</span><span>++</span>
+<span>}</span>
+<span>close</span><span>(</span><span>workQueue</span><span>)</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/p2p/p2p.go#L188-L214">view in context</a></p>
+</div>
+<p>We’ll spawn a worker goroutine for each peer we’ve received from the tracker. It’ll connect and handshake with the peer, and then start retrieving work from the <code>workQueue</code>, attempting to download it, and sending downloaded pieces back through the <code>results</code> channel.</p>
+<img src="https://blog.jse.li/torrent/download.png" alt="a flow chart of the download strategy">
+<div>
+<div><pre><code data-lang="golang"><span>func</span> <span>(</span><span>t</span> <span>*</span><span>Torrent</span><span>)</span> <span>startDownloadWorker</span><span>(</span><span>peer</span> <span>peers</span><span>.</span><span>Peer</span><span>,</span> <span>workQueue</span> <span>chan</span> <span>*</span><span>pieceWork</span><span>,</span> <span>results</span> <span>chan</span> <span>*</span><span>pieceResult</span><span>)</span> <span>{</span>
+    <span>c</span><span>,</span> <span>err</span> <span>:=</span> <span>client</span><span>.</span><span>New</span><span>(</span><span>peer</span><span>,</span> <span>t</span><span>.</span><span>PeerID</span><span>,</span> <span>t</span><span>.</span><span>InfoHash</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>log</span><span>.</span><span>Printf</span><span>(</span><span>"Could not handshake with %s. Disconnecting\n"</span><span>,</span> <span>peer</span><span>.</span><span>IP</span><span>)</span>
+        <span>return</span>
+    <span>}</span>
+    <span>defer</span> <span>c</span><span>.</span><span>Conn</span><span>.</span><span>Close</span><span>()</span>
+    <span>log</span><span>.</span><span>Printf</span><span>(</span><span>"Completed handshake with %s\n"</span><span>,</span> <span>peer</span><span>.</span><span>IP</span><span>)</span>
+
+    <span>c</span><span>.</span><span>SendUnchoke</span><span>()</span>
+    <span>c</span><span>.</span><span>SendInterested</span><span>()</span>
+
+    <span>for</span> <span>pw</span> <span>:=</span> <span>range</span> <span>workQueue</span> <span>{</span>
+        <span>if</span> <span>!</span><span>c</span><span>.</span><span>Bitfield</span><span>.</span><span>HasPiece</span><span>(</span><span>pw</span><span>.</span><span>index</span><span>)</span> <span>{</span>
+            <span>workQueue</span> <span>&lt;-</span> <span>pw</span> <span>// Put piece back on the queue
+</span><span></span>            <span>continue</span>
+        <span>}</span>
+
+        <span>// Download the piece
+</span><span></span>        <span>buf</span><span>,</span> <span>err</span> <span>:=</span> <span>attemptDownloadPiece</span><span>(</span><span>c</span><span>,</span> <span>pw</span><span>)</span>
+        <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+            <span>log</span><span>.</span><span>Println</span><span>(</span><span>"Exiting"</span><span>,</span> <span>err</span><span>)</span>
+            <span>workQueue</span> <span>&lt;-</span> <span>pw</span> <span>// Put piece back on the queue
+</span><span></span>            <span>return</span>
+        <span>}</span>
+
+        <span>err</span> <span>=</span> <span>checkIntegrity</span><span>(</span><span>pw</span><span>,</span> <span>buf</span><span>)</span>
+        <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+            <span>log</span><span>.</span><span>Printf</span><span>(</span><span>"Piece #%d failed integrity check\n"</span><span>,</span> <span>pw</span><span>.</span><span>index</span><span>)</span>
+            <span>workQueue</span> <span>&lt;-</span> <span>pw</span> <span>// Put piece back on the queue
+</span><span></span>            <span>continue</span>
+        <span>}</span>
+
+        <span>c</span><span>.</span><span>SendHave</span><span>(</span><span>pw</span><span>.</span><span>index</span><span>)</span>
+        <span>results</span> <span>&lt;-</span> <span>&amp;</span><span>pieceResult</span><span>{</span><span>pw</span><span>.</span><span>index</span><span>,</span> <span>buf</span><span>}</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/p2p/p2p.go#L133-L169">view in context</a></p>
+</div>
+<h3 id="managing-state">Managing state</h3>
+<p>We’ll keep track of each peer in a struct, and modify that struct as we read messages. It’ll include data like how much we’ve downloaded from the peer, how much we’ve requested from them, and whether we’re choked. If we wanted to scale this further, we could formalize this as a finite state machine. But a struct and a switch are good enough for now.</p>
+<div>
+<div><pre><code data-lang="golang"><span>type</span> <span>pieceProgress</span> <span>struct</span> <span>{</span>
+    <span>index</span>      <span>int</span>
+    <span>client</span>     <span>*</span><span>client</span><span>.</span><span>Client</span>
+    <span>buf</span>        <span>[]</span><span>byte</span>
+    <span>downloaded</span> <span>int</span>
+    <span>requested</span>  <span>int</span>
+    <span>backlog</span>    <span>int</span>
+<span>}</span>
+
+<span>func</span> <span>(</span><span>state</span> <span>*</span><span>pieceProgress</span><span>)</span> <span>readMessage</span><span>()</span> <span>error</span> <span>{</span>
+    <span>msg</span><span>,</span> <span>err</span> <span>:=</span> <span>state</span><span>.</span><span>client</span><span>.</span><span>Read</span><span>()</span> <span>// this call blocks
+</span><span></span>    <span>switch</span> <span>msg</span><span>.</span><span>ID</span> <span>{</span>
+    <span>case</span> <span>message</span><span>.</span><span>MsgUnchoke</span><span>:</span>
+        <span>state</span><span>.</span><span>client</span><span>.</span><span>Choked</span> <span>=</span> <span>false</span>
+    <span>case</span> <span>message</span><span>.</span><span>MsgChoke</span><span>:</span>
+        <span>state</span><span>.</span><span>client</span><span>.</span><span>Choked</span> <span>=</span> <span>true</span>
+    <span>case</span> <span>message</span><span>.</span><span>MsgHave</span><span>:</span>
+        <span>index</span><span>,</span> <span>err</span> <span>:=</span> <span>message</span><span>.</span><span>ParseHave</span><span>(</span><span>msg</span><span>)</span>
+        <span>state</span><span>.</span><span>client</span><span>.</span><span>Bitfield</span><span>.</span><span>SetPiece</span><span>(</span><span>index</span><span>)</span>
+    <span>case</span> <span>message</span><span>.</span><span>MsgPiece</span><span>:</span>
+        <span>n</span><span>,</span> <span>err</span> <span>:=</span> <span>message</span><span>.</span><span>ParsePiece</span><span>(</span><span>state</span><span>.</span><span>index</span><span>,</span> <span>state</span><span>.</span><span>buf</span><span>,</span> <span>msg</span><span>)</span>
+        <span>state</span><span>.</span><span>downloaded</span> <span>+=</span> <span>n</span>
+        <span>state</span><span>.</span><span>backlog</span><span>--</span>
+    <span>}</span>
+    <span>return</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/p2p/p2p.go#L53-L83">view in context</a></p>
+</div>
+<h3 id="time-to-make-requests">Time to make requests!</h3>
+<p>Files, pieces, and piece hashes aren’t the full story—we can go further by breaking down pieces into <strong>blocks</strong>. A block is a part of a piece, and we can fully define a block by the <strong>index</strong> of the piece it’s part of, its byte <strong>offset</strong> within the piece, and its <strong>length</strong>. When we make requests for data from peers, we are actually requesting <em>blocks</em>. A block is usually 16KB large, meaning that a single 256 KB piece might actually require 16 requests.</p>
+<p>A peer is supposed to sever the connection if they receive a request for a block larger than 16KB. However, based on my experience, they’re often perfectly happy to satisfy requests up to 128KB. I only got moderate gains in overall speed with larger block sizes, so it’s probably better to stick with the spec.</p>
+<h3 id="pipelining">Pipelining</h3>
+<p>Network round-trips are expensive, and requesting each block one by one will absolutely tank the performance of our download. Therefore, it’s important to <strong>pipeline</strong> our requests such that we keep up a constant pressure of some number of unfulfilled requests. This can increase the throughput of our connection by an order of magnitude.</p>
+<img src="https://blog.jse.li/torrent/pipelining.png" alt="Two email threads simulating peer connections. The thread on the left shows a request followed by a reply, repeated three times. The thread on the left sends three requests, and receives three replies in quick succession.">
+<p>Classically, BitTorrent clients kept a queue of five pipelined requests, and that’s the value I’ll be using. I found that increasing it can up to double the speed of a download. Newer clients use an <a href="https://luminarys.com/posts/writing-a-bittorrent-client.html">adaptive</a> queue size to better accommodate modern network speeds and conditions. This is definitely a parameter worth tweaking, and it’s pretty low hanging fruit for future performance optimization.</p>
+<div>
+<div><pre><code data-lang="golang"><span>// MaxBlockSize is the largest number of bytes a request can ask for
+</span><span></span><span>const</span> <span>MaxBlockSize</span> <span>=</span> <span>16384</span>
+
+<span>// MaxBacklog is the number of unfulfilled requests a client can have in its pipeline
+</span><span></span><span>const</span> <span>MaxBacklog</span> <span>=</span> <span>5</span>
+
+<span>func</span> <span>attemptDownloadPiece</span><span>(</span><span>c</span> <span>*</span><span>client</span><span>.</span><span>Client</span><span>,</span> <span>pw</span> <span>*</span><span>pieceWork</span><span>)</span> <span>([]</span><span>byte</span><span>,</span> <span>error</span><span>)</span> <span>{</span>
+    <span>state</span> <span>:=</span> <span>pieceProgress</span><span>{</span>
+        <span>index</span><span>:</span>  <span>pw</span><span>.</span><span>index</span><span>,</span>
+        <span>client</span><span>:</span> <span>c</span><span>,</span>
+        <span>buf</span><span>:</span>    <span>make</span><span>([]</span><span>byte</span><span>,</span> <span>pw</span><span>.</span><span>length</span><span>),</span>
+    <span>}</span>
+
+    <span>// Setting a deadline helps get unresponsive peers unstuck.
+</span><span></span>    <span>// 30 seconds is more than enough time to download a 262 KB piece
+</span><span></span>    <span>c</span><span>.</span><span>Conn</span><span>.</span><span>SetDeadline</span><span>(</span><span>time</span><span>.</span><span>Now</span><span>().</span><span>Add</span><span>(</span><span>30</span> <span>*</span> <span>time</span><span>.</span><span>Second</span><span>))</span>
+    <span>defer</span> <span>c</span><span>.</span><span>Conn</span><span>.</span><span>SetDeadline</span><span>(</span><span>time</span><span>.</span><span>Time</span><span>{})</span> <span>// Disable the deadline
+</span><span></span>
+    <span>for</span> <span>state</span><span>.</span><span>downloaded</span> <span>&lt;</span> <span>pw</span><span>.</span><span>length</span> <span>{</span>
+        <span>// If unchoked, send requests until we have enough unfulfilled requests
+</span><span></span>        <span>if</span> <span>!</span><span>state</span><span>.</span><span>client</span><span>.</span><span>Choked</span> <span>{</span>
+            <span>for</span> <span>state</span><span>.</span><span>backlog</span> <span>&lt;</span> <span>MaxBacklog</span> <span>&amp;&amp;</span> <span>state</span><span>.</span><span>requested</span> <span>&lt;</span> <span>pw</span><span>.</span><span>length</span> <span>{</span>
+                <span>blockSize</span> <span>:=</span> <span>MaxBlockSize</span>
+                <span>// Last block might be shorter than the typical block
+</span><span></span>                <span>if</span> <span>pw</span><span>.</span><span>length</span><span>-</span><span>state</span><span>.</span><span>requested</span> <span>&lt;</span> <span>blockSize</span> <span>{</span>
+                    <span>blockSize</span> <span>=</span> <span>pw</span><span>.</span><span>length</span> <span>-</span> <span>state</span><span>.</span><span>requested</span>
+                <span>}</span>
+
+                <span>err</span> <span>:=</span> <span>c</span><span>.</span><span>SendRequest</span><span>(</span><span>pw</span><span>.</span><span>index</span><span>,</span> <span>state</span><span>.</span><span>requested</span><span>,</span> <span>blockSize</span><span>)</span>
+                <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+                    <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+                <span>}</span>
+                <span>state</span><span>.</span><span>backlog</span><span>++</span>
+                <span>state</span><span>.</span><span>requested</span> <span>+=</span> <span>blockSize</span>
+            <span>}</span>
+        <span>}</span>
+
+        <span>err</span> <span>:=</span> <span>state</span><span>.</span><span>readMessage</span><span>()</span>
+        <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+            <span>return</span> <span>nil</span><span>,</span> <span>err</span>
+        <span>}</span>
+    <span>}</span>
+
+    <span>return</span> <span>state</span><span>.</span><span>buf</span><span>,</span> <span>nil</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/p2p/p2p.go#L85-L123">view in context</a></p>
+</div>
+<h3 id="maingo">main.go</h3>
+<p>This is a short one. We’re almost there.</p>
+<div>
+<div><pre><code data-lang="golang"><span>package</span> <span>main</span>
+
+<span>import</span> <span>(</span>
+    <span>"log"</span>
+    <span>"os"</span>
+
+    <span>"github.com/veggiedefender/torrent-client/torrentfile"</span>
+<span>)</span>
+
+<span>func</span> <span>main</span><span>()</span> <span>{</span>
+    <span>inPath</span> <span>:=</span> <span>os</span><span>.</span><span>Args</span><span>[</span><span>1</span><span>]</span>
+    <span>outPath</span> <span>:=</span> <span>os</span><span>.</span><span>Args</span><span>[</span><span>2</span><span>]</span>
+
+    <span>tf</span><span>,</span> <span>err</span> <span>:=</span> <span>torrentfile</span><span>.</span><span>Open</span><span>(</span><span>inPath</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>log</span><span>.</span><span>Fatal</span><span>(</span><span>err</span><span>)</span>
+    <span>}</span>
+
+    <span>err</span> <span>=</span> <span>tf</span><span>.</span><span>DownloadToFile</span><span>(</span><span>outPath</span><span>)</span>
+    <span>if</span> <span>err</span> <span>!=</span> <span>nil</span> <span>{</span>
+        <span>log</span><span>.</span><span>Fatal</span><span>(</span><span>err</span><span>)</span>
+    <span>}</span>
+<span>}</span>
+</code></pre></div><p><a target="_blank" rel="noopener" href="https://github.com/veggiedefender/torrent-client/blob/2bde944888e1195e81cc5d5b686f6ec3a9f08c25/main.go">view in context</a></p>
+</div>
+
+<h2 id="this-isnt-the-full-story">This isn’t the full story</h2>
+<p>For brevity, I included only a few of the important snippets of code. Notably, I left out all the glue code, parsing, unit tests, and the boring parts that build character. View my <a href="https://github.com/veggiedefender/torrent-client">full implementation</a> if you’re interested.</p>
+
+<div><p>This is an ad.
+</p><p>
+If you’d like to try building a BitTorrent client yourself, but could use some structure and personalized guidance, consider using <a href="https://app.codecrafters.io/join?via=veggiedefender">CodeCrafters</a>.
+</p><p>
+They make programming challenges for experienced engineers (e.g Build your own Git, Docker, Redis etc). In particular, they offer a BitTorrent challenge which walks you through everything described in this post — parsing bencode, discovering peers, and downloading pieces — with test harnesses and scaffolding code for a bunch of languages.
+</p><p>
+It’s a paid service, but you can get a discount with my referral link: <a href="https://app.codecrafters.io/join?via=veggiedefender">https://app.codecrafters.io/join?via=veggiedefender</a></p></div>
+
+
+    </section>
+  </article>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Microsoft Cancels Leases for AI Data Centers, Analyst Says (164 pts)]]></title>
             <link>https://www.bloomberg.com/news/articles/2025-02-24/microsoft-cancels-leases-for-ai-data-centers-analyst-says</link>
             <guid>43157831</guid>
             <pubDate>Mon, 24 Feb 2025 10:12:37 GMT</pubDate>
@@ -17,7 +561,7 @@
 Couldn't get https://www.bloomberg.com/news/articles/2025-02-24/microsoft-cancels-leases-for-ai-data-centers-analyst-says: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Cloudflare takes legal action over LaLiga's "disproportionate blocking efforts" (130 pts)]]></title>
+            <title><![CDATA[Cloudflare takes legal action over LaLiga's "disproportionate blocking efforts" (136 pts)]]></title>
             <link>https://www.broadbandtvnews.com/2025/02/19/cloudflare-takes-legal-action-over-laligas-disproportionate-blocking-efforts/</link>
             <guid>43157000</guid>
             <pubDate>Mon, 24 Feb 2025 08:19:08 GMT</pubDate>
@@ -25,7 +569,7 @@ Couldn't get https://www.bloomberg.com/news/articles/2025-02-24/microsoft-cancel
 <div id="readability-page-1" class="page"><article aria-label="Cloudflare takes legal action over LaLiga’s “disproportionate blocking efforts”" itemscope="" itemtype="https://schema.org/CreativeWork"><div itemprop="text"><figure><img decoding="async" width="900" height="607" data-attachment-id="226912" data-permalink="https://www.broadbandtvnews.com/2025/02/19/cloudflare-takes-legal-action-over-laligas-disproportionate-blocking-efforts/laliga-yellow/" data-orig-file="https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow.jpg" data-orig-size="1200,809" data-comments-opened="0" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="LaLiga Yellow" data-image-description="" data-image-caption="" data-medium-file="https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-300x202.jpg" data-large-file="https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-900x607.jpg" src="https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-900x607.jpg" alt="" srcset="https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-900x607.jpg 900w, https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-300x202.jpg 300w, https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow-768x518.jpg 768w, https://cdn.broadbandtvnews.com/wp-content/uploads/2025/02/19125845/LaLiga-Yellow.jpg 1200w" sizes="(max-width: 900px) 100vw, 900px"></figure><p>Cloudflare has launched a legal action against LaLiga over IP blocking action that it says blocked millions of users from accessing unrelated websites.</p> <p>As reported in Broadband TV News, websites DazcFutbolios and RBTV77 were last weekend blocked in a joint action by the Spanish football league and local ISPs after illegally distributing LaLiga matches.</p><p>LaLiga said the two pirates were using technology provided by Cloudflare to conceal their identity and evade security controls. Together, the two platforms had more than 400,000 unique monthly users in Spain.</p><p>Cloudflare called the effort misguided and said LaLiga had left it with no other option than to pursue the legal action. “LaLiga secured this blocking order without notifying cloud providers, while concealing from the court the predictable harm to third parties and the public good. LaLiga’s actions pose a clear threat to the open Internet. Cloudflare has now filed a legal action to challenge the order and establish that LaLiga’s disproportionate blocking efforts are unlawful.&nbsp;</p><p>“Instead of addressing Spanish users’ concerns about excessive content blocking, LaLiga has attempted to deflect with baseless claims against Cloudflare while doubling down on its unlawful blocking practices.&nbsp;Cloudflare hopes this legal action helps prevent future indiscriminate blocking measures, and makes it clear that rightsholders cannot prioritise&nbsp;their commercial interests over the fundamental right of millions of consumers to access the open Internet.”</p><p>Like the majority of cloud providers, Cloudflare uses shared IP addresses to manage its network, meaning that thousands of domains can be accessed with a single IP address.</p><p>LaLiga claims more than 50% of pirate IPs illegally distributing its content are protected by Cloudflare.&nbsp;</p></div></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We don't need startups, we need Digital-Mittelstand (120 pts)]]></title>
+            <title><![CDATA[We don't need startups, we need Digital-Mittelstand (121 pts)]]></title>
             <link>https://mertbulan.com/2025/02/24/we-dont-need-startups-we-need-digital-mittelstand/</link>
             <guid>43156785</guid>
             <pubDate>Mon, 24 Feb 2025 07:40:18 GMT</pubDate>
@@ -33,7 +577,7 @@ Couldn't get https://www.bloomberg.com/news/articles/2025-02-24/microsoft-cancel
 Couldn't get https://mertbulan.com/2025/02/24/we-dont-need-startups-we-need-digital-mittelstand/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Pollution from Big Tech's data centre boom costs US public health $5.4bn (123 pts)]]></title>
+            <title><![CDATA[Pollution from Big Tech's data centre boom costs US public health $5.4bn (131 pts)]]></title>
             <link>https://www.ft.com/content/d595d5f6-79d1-47eb-b690-8597f09b39e7</link>
             <guid>43155975</guid>
             <pubDate>Mon, 24 Feb 2025 05:04:16 GMT</pubDate>
@@ -42,7 +586,7 @@ Couldn't get https://mertbulan.com/2025/02/24/we-dont-need-startups-we-need-digi
 Access to eight fresh articles a day, hand-picked by senior editors. Selected to feed your curiosity.</span></p></div></div><div id="recommendedOffers-Recommended Offers" data-component="recommendedOffers" data-component-unique-name="Recommended Offers"><p><h2 data-o-grid-colspan="12">Explore more offers.</h2></p><div data-o-grid-colspan="12"><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_standard.svg?source=next-barrier-page&amp;format=svg" alt=""></p><p><h3>Standard Digital</h3></p></div><p><span>was </span><span>CHF660</span><span> </span><span>now </span><span>CHF395</span><span> per year</span></p><p><span>Save now on essential digital access to quality FT journalism on any device.</span></p></div><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_premium.svg?source=next-barrier-page&amp;format=svg" alt=""></p></div><p><span>CHF85</span><span> per month</span></p><p><span>Complete digital access to quality FT journalism with expert analysis from industry leaders. Pay a year upfront and save 20%.</span></p></div><div data-o-grid-colspan="12"><div><p><img src="https://www.ft.com/__origami/service/image/v2/images/raw/https://barrier-page-components.s3.eu-west-1.amazonaws.com/assets/icons/primary_product_icon_print.svg?source=next-barrier-page&amp;format=svg" alt=""></p></div><p><span>CHF345</span><span> for your first year</span></p><p><span>FT newspaper delivered Monday-Saturday, plus FT Digital Edition delivered to your device Monday-Saturday.</span></p></div></div></div><div data-component="subscriptionOptions" data-component-unique-name="Subscription Options Offers API"><h2>Explore our full range of subscriptions.</h2><div><div><p>Discover all the plans currently available in your country</p></div><div><p>Digital access for organisations. Includes exclusive features and content.</p></div></div></div><div data-component="whyFT" data-component-unique-name="Why FT"><div><h2>Why the FT?</h2><p>See why over a million readers pay to read the Financial Times.</p></div><p><a href="https://subs.ft.com/whytheft?ft-content-uuid=d595d5f6-79d1-47eb-b690-8597f09b39e7">Find out why</a></p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenAI Researchers Find That AI Is Unable to Solve Most Coding Problems (127 pts)]]></title>
+            <title><![CDATA[OpenAI Researchers Find That AI Is Unable to Solve Most Coding Problems (128 pts)]]></title>
             <link>https://futurism.com/openai-researchers-coding-fail</link>
             <guid>43155825</guid>
             <pubDate>Mon, 24 Feb 2025 04:23:35 GMT</pubDate>
@@ -50,7 +594,7 @@ Access to eight fresh articles a day, hand-picked by senior editors. Selected to
 <div id="readability-page-1" class="page"><section id="incArticle"><p>OpenAI researchers have admitted that even the most advanced AI models&nbsp;still are no match for human coders — even though CEO Sam Altman insists they will be able to beat "<a href="https://www.reddit.com/r/singularity/comments/1iinrrq/sam_altman_software_engineering_will_be_very/">low-level</a>" software engineers by the end of this year.</p><p>In a <a href="https://arxiv.org/pdf/2502.12115">new paper</a>, the company's researchers found that even frontier models, or the most advanced and boundary-pushing AI systems, "are still unable to solve the majority" of coding tasks.</p><p>The researchers used&nbsp;a newly-developed benchmark called SWE-Lancer, built on more than 1,400 software engineering tasks from the freelancer site Upwork. Using the benchmark, OpenAI put three large language models (LLMs) — its own o1 reasoning model and flagship GPT-4o, as well as Anthropic's Claude 3.5 Sonnet — to the test.</p><p>Specifically, the new benchmark evaluated how well the LLMs performed with two types of tasks from Upwork: individual tasks, which involved resolving bugs and implementing fixes to them, or management tasks that saw the models trying to zoom out and make higher-level decisions. (The models weren't allowed to access the internet, meaning they couldn't just crib similar answers that'd been posted online.)</p><p>The models took on tasks cumulatively worth hundreds of thousands of dollars on Upwork,&nbsp;but they were only able to fix surface-level software issues, while remaining unable to actually find bugs in larger projects or find their root causes. These shoddy and half-baked "solutions" are likely familiar&nbsp;to anyone who's worked with AI — which is great at spitting out confident-sounding information that <a href="https://futurism.com/cnet-ai-errors">often falls apart</a> on closer inspection.</p><p>Though all three LLMs were often able to operate "far faster than a human would," the paper notes, they also failed to grasp how widespread bugs&nbsp;were or to understand their context, "leading to solutions that are incorrect or insufficiently comprehensive."</p><p>As the researchers explained, Claude 3.5 Sonnet performed better than the two OpenAI models pitted against it and made more money than o1 and GPT-4o. Still, the majority of its answers were wrong, and&nbsp;according to the researchers,&nbsp;any model would need "higher reliability" to be trusted with real-life coding tasks.</p><p>Put more plainly, the paper seems to demonstrate that although these frontier models can work quickly and solve zoomed-in tasks, they're are nowhere near as skilled at handling them as human engineers.</p><p>Though these LLMs have advanced rapidly over the past few years and will likely continue to do so, they're not skilled enough at software engineering to replace real-life people quite yet — not that that's stopping CEOs from <a href="https://futurism.com/the-byte/stack-overflow-layoffs-ai">firing their human coders</a> in favor of <a href="https://futurism.com/the-byte/ai-programming-assistants-code-error">immature AI models</a>.</p><p><strong>More on AI and coding: </strong><a href="https://futurism.com/the-byte/zuckerberg-automate-coding-ai"><em>Zuckerberg Announces Plans to Automate Facebook Coding Jobs With AI</em></a></p><br></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[DeepSeek Open Source FlashMLA – MLA Decoding Kernel for Hopper GPUs (298 pts)]]></title>
+            <title><![CDATA[DeepSeek Open Source FlashMLA – MLA Decoding Kernel for Hopper GPUs (313 pts)]]></title>
             <link>https://github.com/deepseek-ai/FlashMLA</link>
             <guid>43155023</guid>
             <pubDate>Mon, 24 Feb 2025 01:37:24 GMT</pubDate>
@@ -115,7 +659,7 @@ for i in range(num_layers):
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Write the post you wish you'd found (236 pts)]]></title>
+            <title><![CDATA[Write the post you wish you'd found (245 pts)]]></title>
             <link>https://www.gilesthomas.com/2025/02/20250223-til-deep-dive-posts</link>
             <guid>43154666</guid>
             <pubDate>Mon, 24 Feb 2025 00:34:34 GMT</pubDate>
@@ -208,7 +752,7 @@ blogs (Simon Willison is the master of this and even has <a href="https://til.si
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How the UK Is Weakening Safety Worldwide (228 pts)]]></title>
+            <title><![CDATA[How the UK Is Weakening Safety Worldwide (239 pts)]]></title>
             <link>https://blog.thenewoil.org/how-the-uk-is-weakening-safety-worldwide</link>
             <guid>43154501</guid>
             <pubDate>Mon, 24 Feb 2025 00:09:16 GMT</pubDate>
@@ -273,7 +817,7 @@ blogs (Simon Willison is the master of this and even has <a href="https://til.si
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Didn't realize it was this bad (139 pts)]]></title>
+            <title><![CDATA[Didn't realize it was this bad (143 pts)]]></title>
             <link>https://old.reddit.com/r/ITCareerQuestions/comments/1ir46b3/didnt_realize_it_was_this_bad/</link>
             <guid>43154332</guid>
             <pubDate>Sun, 23 Feb 2025 23:42:37 GMT</pubDate>
@@ -281,7 +825,136 @@ blogs (Simon Willison is the master of this and even has <a href="https://til.si
 Couldn't get https://old.reddit.com/r/ITCareerQuestions/comments/1ir46b3/didnt_realize_it_was_this_bad/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Defragging my old Dell's UEFI NVRAM (138 pts)]]></title>
+            <title><![CDATA[Sublinear Time Algorithms (102 pts)]]></title>
+            <link>https://people.csail.mit.edu/ronitt/sublinear.html</link>
+            <guid>43154331</guid>
+            <pubDate>Sun, 23 Feb 2025 23:42:33 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://people.csail.mit.edu/ronitt/sublinear.html">https://people.csail.mit.edu/ronitt/sublinear.html</a>, See on <a href="https://news.ycombinator.com/item?id=43154331">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><tbody><tr><td>
+
+
+We have long considered showing the existence of a linear
+time algorithm for a problem to be the gold standard
+of achievement.  Indeed, it is hard to imagine doing much
+better than that, since for any nontrivial problem, it would seem
+that an algorithm must consider all of the input in order to make
+a decision.  However, as extremely large data sets grow
+more prevalent in a wide variety of settings, it is natural
+to wonder what one can do in <i> sublinear </i>  time.   In fact,
+there has been a lot of recent interest in this direction.
+<p>
+
+Sublinear time is a daunting goal since it allows one to read only
+a miniscule fraction of the input.   There are problems for
+which deterministic exact sublinear time
+algorithms are known.  However, for most natural problems the
+algorithm must use randomization and must give an answer which is in
+some sense approximate.
+There is a growing body of work aimed at finding sublinear
+time algorithms for various problems.
+Recent results have shown that there are classical
+optimization problems whose values can be approximated in
+sublinear time.  In addition, <i> property testing </i>, an alternative
+notion of approximation for decision problems, has been
+applied to give sublinear algorithms for a wide variety of
+problems.
+One can also
+test various properties of distributions, where access to the distribution
+is given through samples generated according to the distribution, in
+time sublinear in the size of the support of the distribution.
+
+</p><p>
+Many examples of problems that can be solved in sublinear time
+have been found.   Several useful
+techniques, including the use of the Szemeredi Regularity lemma
+and low rank approximations of matrices, have emerged for
+designing sublinear algorithms.
+Still, the study of sublinear time algorithms is
+very new, and much remains to be understood about their scope,
+both in finding sublinear time algorithms for new problems
+and in finding more efficient algorithms for problems that
+already have sublinear time algorithms.
+
+</p><p>
+
+The following contains some pointers to a few surveys on sublinear algorithms
+and property testing, as well as slides from a short introductory talk.
+Some of these pointers are a bit older.
+
+</p><ul>
+<li> 
+    <a href="http://www.cs.technion.ac.il/users/eldar/surv.ps"> Survey by Eldar Fischer
+    </a> 
+</li><li>
+    <a href="http://www.wisdom.weizmann.ac.il/~oded/PS/testSU.ps"> Survey by Oded Goldreich
+    </a> 
+</li><li>
+    <a href="http://www.eng.tau.ac.il/~danar/Public-pdf/tut.pdf"> Survey by Dana Ron  (see also more recent books on her website)
+    </a> 
+</li><li>
+    <a href="https://people.csail.mit.edu/ronitt/papers/icm.ps"> Survey by Ronitt Rubinfeld 
+    </a>
+</li><li>
+    <a href="http://www.dcs.warwick.ac.uk/~czumaj/PUBLICATIONS/DRAFTS/Draft-Survey-Sublinear.pdf"> Survey by  Artur Czumaj and Christian Sohler
+    </a>
+</li><li>
+    <a href="https://people.csail.mit.edu/ronitt/papers/TR11-013.pdf"> Survey by Ronitt Rubinfeld  and Asaf Shapira
+    </a>
+</li><li>
+    <a href="https://people.csail.mit.edu/ronitt/papers/xrds-rr-dist.pdf"> 
+Survey on distribution testing by Ronitt Rubinfeld </a>  (see <a href="http://www.cs.columbia.edu/~ccanonne/files/misc/tamingbigdistr-fr.pdf"> French version </a> translated by Clement Canonne)
+</li><li>
+    <a href="https://people.csail.mit.edu/ronitt/sub.ppt"> Short introduction to sublinear algorithms (slides)
+    </a> 
+</li><li>
+<a href="https://sites.google.com/site/motimedina/publications/LocalGuide">
+A new survey on local algorithms by Reut Levi and Moti Medina
+</a> 
+
+	</li><li>
+		<a href="https://www.wisdom.weizmann.ac.il/~oded/PDF/pt-v3.pdf">
+			  Oded Goldreich's book "Intro to Property Testing" 
+		</a>
+	</li>
+	<li>
+		<a href="https://jukkasuomela.fi/doc/local-survey.pdf">
+			   Jukka Suomela's survey of local algorithms
+		</a>
+	</li>
+	<li>
+		<a href="https://ccanonne.github.io/survey-topics-dt.html">
+			Clement Canonne's survey of topics in distribution testing
+		</a>
+	</li>
+	<li>
+		<a href="https://link.springer.com/book/10.1007/978-981-16-8622-1">
+			Arnab Bhattacharyya and Yuichi Yoshida's  book on property testing
+		</a>
+	</li>
+
+
+</ul>
+
+	In the summer of 2024, the Simons Institute for the Theory of
+Computing had a program on <a href="https://simons.berkeley.edu/programs/sublinear-algorithms">
+Sublinear Algorithms
+</a>.  Follow the link to see details of the program, including videos of
+bootcamp and workshop talks.
+
+<p>
+The best place to get resources and
+recent pointers on sublinear algorithms is
+at the 
+<a href="http://sublinear.info/index.php?title=Main%20Page">
+o(n)</a> (little oh of n) site.
+
+</p><p>
+    
+<a href="https://accessibility.mit.edu/">Accessibility</a>
+</p></td></tr></tbody></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Defragging my old Dell's UEFI NVRAM (142 pts)]]></title>
             <link>https://artemis.sh/2025/02/22/uefi-nvram-defrag.html</link>
             <guid>43154218</guid>
             <pubDate>Sun, 23 Feb 2025 23:23:04 GMT</pubDate>
@@ -304,7 +977,7 @@ might brick your setup. Check <code>help dmpstore</code> first.</p><div><pre><co
 So I think this confirms my suspicions.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Adding Mastodon Comments to Your Blog (147 pts)]]></title>
+            <title><![CDATA[Adding Mastodon Comments to Your Blog (149 pts)]]></title>
             <link>https://beej.us/blog/data/mastodon-comments/</link>
             <guid>43154148</guid>
             <pubDate>Sun, 23 Feb 2025 23:12:46 GMT</pubDate>
@@ -747,7 +1420,7 @@ and I'll find out where all the breakages are. 😅</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: What are you working on? (February 2025) (112 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: What are you working on? (February 2025) (124 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=43154065</link>
             <guid>43154065</guid>
             <pubDate>Sun, 23 Feb 2025 23:00:16 GMT</pubDate>
@@ -755,7 +1428,7 @@ and I'll find out where all the breakages are. 😅</p>
 Couldn't get https://news.ycombinator.com/item?id=43154065: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Tokio and Prctl = Nasty Bug (163 pts)]]></title>
+            <title><![CDATA[Tokio and Prctl = Nasty Bug (166 pts)]]></title>
             <link>https://kobzol.github.io/rust/2025/02/23/tokio-plus-prctl-equals-nasty-bug.html</link>
             <guid>43153901</guid>
             <pubDate>Sun, 23 Feb 2025 22:37:57 GMT</pubDate>
@@ -763,7 +1436,7 @@ Couldn't get https://news.ycombinator.com/item?id=43154065: Error: timeout of 10
 Couldn't get https://kobzol.github.io/rust/2025/02/23/tokio-plus-prctl-equals-nasty-bug.html: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Partnering with the Shawnee Tribe for Civilization VII (172 pts)]]></title>
+            <title><![CDATA[Partnering with the Shawnee Tribe for Civilization VII (177 pts)]]></title>
             <link>https://civilization.2k.com/civ-vii/news/civilization-vii-shawnee-tribe-partnership/</link>
             <guid>43153662</guid>
             <pubDate>Sun, 23 Feb 2025 22:06:09 GMT</pubDate>
@@ -771,7 +1444,7 @@ Couldn't get https://kobzol.github.io/rust/2025/02/23/tokio-plus-prctl-equals-na
 <div id="readability-page-1" class="page"><div id="17399896778125" slug="/news/civilization-vii-shawnee-tribe-partnership/" localecode="en-US" promoted="false" disablelink="false" shouldshowsidebar="false"><article><p><h2><span>Partnering with the Shawnee Tribe for Civilization VII</span></h2></p><div><p><span>Est. Read Time</span><span>2 minutes, 4 seconds</span></p></div><!----><!--[--><!--]--><div><p><iframe type="text/html" allow="fullscreen" width="640" height="390" src="https://www.youtube.com/embed/l17v2Y8ZKFM?autoplay=0&amp;rel=0&amp;enablejsapi=1&amp;modestbranding=1&amp;fs=1&amp;start=0&amp;mute=0" frameborder="0"></iframe></p><p>With each <i>Civilization</i> title, we take great care to thoughtfully and authentically portray every culture on our roster of civilizations and leaders. During the development of <i>Civilization VII</i>, Firaxis Games reached out to Ben Barnes, chief of the Shawnee Tribe, to discuss the possibility of incorporating Shawnee history into the game. By chance, Chief Barnes is a longtime fan of strategy games, including the <i>Civilization</i> series, and these conversations eventually blossomed into an ongoing relationship of shared knowledge and resources which not only led to more accurate and meaningful in-game depictions, but also real gains in preserving Shawnee language and culture for future generations.</p><p>In 2021, the team at Firaxis began working with the Tribe to make sure the in-game <a href="https://civilization.2k.com/civ-vii/game-guide/civilizations/shawnee/"><u>Shawnee</u></a> civilization* and the visionary leader <a href="https://civilization.2k.com/civ-vii/game-guide/leaders/tecumseh/"><u>Tecumseh</u></a>*—who is included in <i>Civ VII</i>'s expansive roster of playable leaders, voiced by Shawnee actor Dillon Dean—were respectfully represented. In addition to faithfully incorporating the Shawnee language in-game, the developers researched archeological material, studied old family photographs, and consulted with cultural knowledge-keepers while carefully shaping how the Tribe was characterized.</p><p>Then, in February 2025, the next phase of our collaboration culminated in the grand opening of the George "Fife" Blanchard Yaatakciitonooteeki (Recording Studio) in Miami, Oklahoma. Paying homage to George Blanchard, a fluent Shawnee language speaker and visionary leader in his own right, the studio is fully equipped to produce audio recordings of the highest quality and support the Tribe's<a href="https://library.municode.com/tribes_and_tribal_nations/shawnee_tribe/munidocs/munidocs?nodeId=474b75806676f" target="_blank"> <u>ongoing preservation efforts</u></a>. The Shawnee Tribe is almost halfway through its "Decade of the Shawnee Language," and this new space will significantly bolster their work.</p><p>Of course, it also warmed our hearts to see Chief Ben Barnes as thrilled as we are to showcase the Shawnee in <i>Civilization VII</i>. It's been an honor to work alongside the Tribe in this fulfilling partnership, and now that the game has launched worldwide, we can't wait for more players to build something they believe in while embodying Tecumseh and leading the Shawnee in <i>Civ VII </i>for years to come!</p><p><i>*Tecumseh leader and Shawnee civilization are part of the Tecumseh and Shawnee Pack DLC. The Tecumseh and Shawnee Pack is included in the Deluxe and Founders Editions of Civilization VII. It will also be available for separate purchase starting April 15, 2025 (base game required, date subject to change).</i> </p></div><!--[--><!--]--><!----></article><!----></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bitwarden Authenticator (176 pts)]]></title>
+            <title><![CDATA[Bitwarden Authenticator (177 pts)]]></title>
             <link>https://bitwarden.com/products/authenticator/</link>
             <guid>43153262</guid>
             <pubDate>Sun, 23 Feb 2025 21:11:44 GMT</pubDate>
@@ -779,7 +1452,7 @@ Couldn't get https://kobzol.github.io/rust/2025/02/23/tokio-plus-prctl-equals-na
 <div id="readability-page-1" class="page"><div><nav data-testid="bw-mobile-header"><div><ul><li><div><div><h5><span>Password Manager</span></h5><div><div><p>Millions of users choose Bitwarden to protect themselves and their families</p></div><div><p>Countless businesses and enterprises choose Bitwarden to secure their interests</p></div></div></div><div><h5><span>Developer Products</span></h5><div><div><p>End-to-end encrypted secrets management for development, DevOps, and IT teams.</p></div><div><p>Unlock passkey features and more with just a few lines of code</p></div></div></div><div><h5><span>Explore More</span></h5></div></div></li><li><a aria-label="go to https://bitwarden.com/pricing/business/" id=":R99lnoq:7p5arAefD2xx42367Ouqy9" data-testid="cta-link" href="https://bitwarden.com/pricing/business/">Pricing</a></li><li><a aria-label="go to https://bitwarden.com/download/" id=":R9plnoq:7j6FxyqZqT1ICMOzINABJW" data-testid="cta-link" href="https://bitwarden.com/download/">Downloads</a></li><li><div><div><h5><span>Personal Plans Top Features</span></h5></div><div><h5><span>Business Plans Top Features</span></h5></div><div><h5><span>Top Tools</span></h5></div></div></li><li><div><div><h5><span>Resource Library</span></h5></div><div><h5><span>Security &amp; Trust</span></h5></div><div><h5><span>Training</span></h5></div></div></li></ul></div></nav><nav data-testid="bw-desktop-header"></nav></div><div><div data-testid="card-container" id="authenticator-hero"><h2 data-testid="card-tagline">Bitwarden Authenticator</h2><div data-testid="card-headline"><p>A simple authenticator to prove your identity online</p></div><div data-testid="card-subtext"> <h6>Bitwarden offers a standalone app that generates and stores all your two-step verification tokens so you stay more secure.&nbsp;</h6><h6><strong>Available on iOS and Android</strong></h6></div></div><div id="authenticator-more-than-strong-passwords"><div data-testid="card-container"><p data-testid="card-headline"><h3>You need more than strong passwords</h3></p><div data-testid="card-subtext"> <p>Use Bitwarden Authenticator to add an extra layer of protection to all your online accounts and applications</p></div></div><div data-testid="card-container"><p><img alt="authenticator-generate-codes" src="https://res.cloudinary.com/bw-com/image/upload/f_auto/v1/ctf/7rncvj1f8mw7/5SWvAP6G3T9lwHfWgzYspH/728f8906a6ff5b354e6121e8871c3449/authenticator-generate-codes.webp?_a=DAJCwlWIZAA0"></p><div data-testid="card-content"><p data-testid="card-headline"><h3>Easily generate authentication codes for all your accounts</h3></p><p>Generate verification codes to ensure your identity is verified, keeping your sensitive data out of reach of imposters.</p></div></div><div data-testid="card-container"><p><img alt="authenticator-scan-qr" src="https://res.cloudinary.com/bw-com/image/upload/f_auto/v1/ctf/7rncvj1f8mw7/25GPMlQM9ckGXIJyHRI5Wq/abd222763fb17bb9dd0c38e931855a05/authenticator-scan-qr.webp?_a=DAJCwlWIZAA0"></p><div data-testid="card-content"><p data-testid="card-headline"><h3>Quickly scan a QR code to add a new authentication code</h3></p><p>A simple, intuitive design and straightforward interface makes it easy to start incorporating authentication into your digital life.</p></div></div></div><section id="customers-love-bitwarden-authenticator"><p><h3>Customers love Bitwarden Authenticator</h3></p><div><div data-testid="card-container"> <h5>“Very smooth and fast”</h5></div><div data-testid="card-container"> <h5>“Great authenticator app works well, I look forward to see the additional features that will be added soon”</h5></div></div></section><div id="authenticator-faqs"><p><h3>FAQs</h3></p><div><div><p>Bitwarden Authenticator is a standalone app that is available for everyone, even those who don’t use Bitwarden Password Manager.&nbsp;&nbsp;</p></div><div><p>In its current release, Bitwarden Authenticator generates time-based one-time passwords (TOTP) for users who want to add an extra layer of authentication to their logins.</p></div><div><p>Integrated TOTP authentication is a premium feature in Bitwarden Password Manager. Bitwarden Authenticator is a free standalone mobile app that generates TOTP codes for any online service that supports them. Bitwarden Authenticator can be used without a Bitwarden account.</p></div><div><p>Yes! Many Bitwarden users have asked for a standalone authenticator in which to store their verification codes used to access their Bitwarden account. It is important to write down and store your Password Manager recovery codes in a secure place.&nbsp;</p></div><div><p>Yes, these are separate applications.</p></div><div><p>In this initial release, your data will be backed up through the mobile operating system's backup services. Please make sure your device is turned on and configured for backups. Bitwarden Authenticator data is included in the OS backups and will be restored with them.</p></div><div><p>Yes! Bitwarden Authenticator is open source and available at the following GitHub repositories for <a href="https://github.com/bitwarden/authenticator-android" target="_blank" rel="noopener noreferrer">Android</a> and <a href="https://github.com/bitwarden/authenticator-ios" target="_blank" rel="noopener noreferrer">iOS</a>.</p></div><div><p>New features on the roadmap include import, syncing to Bitwarden accounts, push-based 2FA, and account recovery.&nbsp;</p></div></div></div><section id="bitwarden-authenticator-mobile"><p><h3>Bitwarden Authenticator Mobile App</h3></p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Jq-Like Tool for Markdown (248 pts)]]></title>
+            <title><![CDATA[Show HN: Jq-Like Tool for Markdown (254 pts)]]></title>
             <link>https://github.com/yshavit/mdq</link>
             <guid>43152704</guid>
             <pubDate>Sun, 23 Feb 2025 20:05:49 GMT</pubDate>
@@ -895,7 +1568,7 @@ the resulting element is of a different shape than the original. See the wiki fo
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[European word translator: an interactive map showing words in over 30 languages (217 pts)]]></title>
+            <title><![CDATA[European word translator: an interactive map showing words in over 30 languages (223 pts)]]></title>
             <link>https://ukdataexplorer.com/european-translator/</link>
             <guid>43152587</guid>
             <pubDate>Sun, 23 Feb 2025 19:53:03 GMT</pubDate>
