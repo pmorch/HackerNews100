@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 07 Mar 2025 02:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 07 Mar 2025 03:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Using GRPO to Beat o1, o3-mini and R1 at "Temporal Clue" (108 pts)]]></title>
+            <title><![CDATA[Using GRPO to Beat o1, o3-mini and R1 at "Temporal Clue" (111 pts)]]></title>
             <link>https://openpipe.ai/blog/using-grpo-to-beat-o1-o3-mini-and-r1-on-temporal-clue</link>
             <guid>43284420</guid>
             <pubDate>Thu, 06 Mar 2025 19:51:55 GMT</pubDate>
@@ -17,7 +17,7 @@
 <div id="readability-page-1" class="page"><div data-framer-name="Content" data-framer-component-type="RichTextContainer"><p><img alt="" data-framer-asset="data:framer/asset-reference,XbGE2sLW99jyy3eDz6naY1UFHE.png" data-framer-height="971" data-framer-width="1626" height="485" src="https://framerusercontent.com/images/XbGE2sLW99jyy3eDz6naY1UFHE.png" srcset="https://framerusercontent.com/images/XbGE2sLW99jyy3eDz6naY1UFHE.png?scale-down-to=512 512w,https://framerusercontent.com/images/XbGE2sLW99jyy3eDz6naY1UFHE.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/XbGE2sLW99jyy3eDz6naY1UFHE.png 1626w" width="813" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p><br>In this post we’ll discuss how we used <!--$--><a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">Group Relative Policy Optimization (GRPO)</a><!--/$--> to surpass R1, o1, o3-mini, and come within a couple percentage points of Sonnet 3.7 on a reasoning-heavy game called “temporal clue”, while being over 100x cheaper to run at inference time. We’ll include specific lessons learned about task design and hyperparameters we’ve found to work well. And finally, we share the <!--$--><a href="https://github.com/openpipe/deductive-reasoning" rel="noopener">training recipe</a><!--/$--> we used to achieve these results, built on top of <!--$--><a href="https://github.com/pytorch/torchtune" rel="noopener">torchtune</a><!--/$-->.</p><h3>Background</h3><p>Since OpenAI launched its powerful&nbsp;<!--$--><a href="https://openai.com/index/learning-to-reason-with-llms/" rel="noopener">new o-series of reasoning models last year</a><!--/$-->, we've seen rapid progress in Large Language Models (LLMs) trained with Reinforcement Learning (RL). Leading organizations like&nbsp;<!--$--><a href="https://deepmind.google/technologies/gemini/flash-thinking/" rel="noopener">Google DeepMind</a><!--/$-->,&nbsp;<!--$--><a href="https://qwenlm.github.io/blog/qwq-32b-preview/" rel="noopener">Alibaba</a><!--/$-->,&nbsp;<!--$--><a href="https://arxiv.org/abs/2501.12948" rel="noopener">DeepSeek</a><!--/$-->, and&nbsp;<!--$--><a href="https://www.anthropic.com/research/visible-extended-thinking" rel="noopener">Anthropic</a><!--/$--> quickly followed suit, and have trained their own advanced models to reason with long “chains-of-thought” (CoT), taught with reinforcement learning on verifiable problems. Many previously challenging benchmarks—in areas like mathematics and coding—now approach saturation.</p><p>Yet despite these impressive strides, logical deduction remains stubbornly difficult for even today's best models. Typically, LLMs struggle to consistently attend to all relevant details, maintain logically sound reasoning chains, or reliably link multiple deduction steps. Even state-of-the-art models generating outputs 10–100 times longer frequently introduce elementary mistakes that a human solver would easily catch.</p><p>Intrigued by this unsolved mystery, we donned our deerstalker caps and set out to investigate: Could smaller, open-weight models reach frontier-level deduction performance with the latest reinforcement learning techniques? We began with substantially weaker models and iteratively trained them on a novel deduction task. Over time, we observed clear improvements in their detective prowess, eventually matching or even exceeding some of the strongest proprietary models.</p><p>Now we're happy to share our findings, including <!--$--><a href="https://github.com/openpipe/rl-experiments" rel="noopener">our experiments</a><!--/$-->, <!--$--><a href="https://github.com/openpipe/deductive-reasoning" rel="noopener">training recipe</a><!--/$-->, <!--$--><a href="https://github.com/bradhilton/temporal-clue" rel="noopener">dataset</a><!--/$-->, and <!--$--><a href="https://huggingface.co/OpenPipe/Deductive-Reasoning-Qwen-32B" rel="noopener">model weights</a><!--/$-->, all freely available under the MIT license, along with key practical insights (right here). Grab your magnifying glass, detective; the game is afoot!</p><h3>Benchmarking</h3><p>To begin our experiments, we first had to identify a challenging reasoning task with clearly verifiable solutions and scalable complexity. As it happened (not coincidentally), one of the authors previously created a puzzle set named <!--$--><a href="https://github.com/bradhilton/temporal-clue" rel="noopener">Temporal Clue</a><!--/$--> that matched these needs perfectly. Beyond meeting the criteria of ground truth clarity, new puzzles can be created as needed—a neat bonus.</p><p>Temporal Clue is inspired by the popular board game, <!--$--><a href="https://en.wikipedia.org/wiki/Cluedo" rel="noopener">Clue (Cluedo)</a><!--/$-->, where players race to uncover who killed Mr. Boddy in his palatial estate. Temporal Clue turns the game into a solitary logic puzzle that extends beyond the standard dimensions—<strong>who</strong>, (with)&nbsp;<strong>what</strong>, and&nbsp;<strong>where</strong>—and incorporates two additional dimensions:&nbsp;<strong>when</strong>&nbsp;(time) and&nbsp;<strong>why </strong>(motive). Puzzles are randomly generated, and minimal yet sufficient clues are selected with&nbsp;&nbsp;<!--$--><a href="https://developers.google.com/optimization" rel="noopener">OR-Tools'</a><!--/$-->&nbsp;<!--$--><a href="https://developers.google.com/optimization/cp/cp_solver" rel="noopener">CP-SAT solver</a><!--/$-->.</p><blockquote><p><!--$--><a href="https://gist.github.com/bradhilton/911e208183a389dc00e52de73f2c66bb" target="_blank" rel="noopener">On a dark winter night, wealthy and enigmatic Mr. John Q. Boddy hosted a small, but lavish, dinner party for some of his closest associates. However, the night ended in tragedy when Mr. Boddy was found dead in one of the rooms of Tudor Mansion in the early hours of the morning. The following persons of interest have been identified as suspects…</a><!--/$--></p></blockquote><p>To establish the current state-of-the-art for this deduction task, we benchmarked leading reasoning models—including DeepSeek R1, OpenAI’s o1 and o3-mini, and Anthropic’s Claude Sonnet 3.7. Additionally, we have benchmarked the 14B and 32B Qwen models, which we later improve using reinforcement learning, and include a preview of our final results:</p><figure><table><tbody><tr><td><p>Organization</p></td><td><p>Model</p></td><td><p>Reasoning Effort</p></td><td><p>Avg. Accuracy</p></td><td><p>Avg. Cost</p></td></tr><tr><td><p>DeepSeek</p></td><td><p>R1</p></td><td><p>Default</p></td><td><p>51.6%</p></td><td><p>$0.029</p></td></tr><tr><td><p>OpenAI</p></td><td><p>o1</p></td><td><p>Default</p></td><td><p>54.9%</p></td><td><p>$0.901</p></td></tr><tr><td><p>OpenAI</p></td><td><p>o3-mini</p></td><td><p>Medium</p></td><td><p>55.9%</p></td><td><p>$0.068</p></td></tr><tr><td><p>OpenAI</p></td><td><p>o3-mini</p></td><td><p>High</p></td><td><p>56.7%</p></td><td><p>$0.170</p></td></tr><tr><td><p>Anthropic</p></td><td><p>Sonnet 3.7</p></td><td><p>None</p></td><td><p>51.7%</p></td><td><p>$0.017</p></td></tr><tr><td><p>Anthropic</p></td><td><p>Sonnet 3.7</p></td><td><p>16k Token Budget</p></td><td><p>61.7%</p></td><td><p>$0.222</p></td></tr><tr><td><p>Anthropic</p></td><td><p>Sonnet 3.7</p></td><td><p>64k Token Budget</p></td><td><p><strong>69.5%</strong></p></td><td><p>$0.392</p></td></tr><tr><td><p>Alibaba</p></td><td><p>Qwen 2.5 14B Instruct</p></td><td><p>None</p></td><td><p>28.1% → 59.4%</p></td><td><p><strong>$0.001</strong></p></td></tr><tr><td><p>Alibaba</p></td><td><p>Qwen 2.5 32B Instruct</p></td><td><p>None</p></td><td><p>37.3% → 67.1%</p></td><td><p>$0.002</p></td></tr></tbody></table></figure><p>From these benchmarks, we saw that Claude Sonnet 3.7 with a 64k token thinking budget performed best on our task, but that all the leading models showed room for improvement. DeepSeek R1, a popular open-weight model, performed nearly as well as OpenAI's o1 and o3-mini. However, the untuned Qwen 2.5 Instruct models’ performance is unimpressive in comparison. The big question is: Can we train these smaller, open-weight models to frontier-level performance? Elementary, our dear reader—we just need the right approach.</p><h3>Training</h3><p>To train a frontier-level deduction model, we turned to reinforcement learning—an approach that allows agents to learn from their own experience inside a controlled environment. Here, the LLMs were our agents, and the puzzles were our environment. We guided the LLMs’ learning by having them generate multiple responses for each puzzle, exploring the problem landscape. We reinforced deductions leading to correct solutions and penalized reasoning that took the models astray.</p><p>Among various RL methods, we selected the popular <!--$--><a href="https://arxiv.org/abs/2402.03300" rel="noopener">Group Relative Policy Optimization (GRPO)</a><!--/$--> algorithm developed by DeepSeek. GRPO simplifies the training process compared to more traditional methods like <!--$--><a href="https://en.wikipedia.org/wiki/Proximal_policy_optimization" rel="noopener">Proximal Policy Optimization (PPO)</a><!--/$-->, while still providing robust performance. To speed up our experiments, we omitted the &nbsp;<!--$--><a href="https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence" rel="noopener">Kullback–Leibler (KL) divergence</a><!--/$--> penalty, although our training recipe supports it for interested readers.</p><p>At a high level, our training loop followed these basic steps:</p><ul><li data-preset-tag="p"><p>Generate model responses to puzzle tasks</p></li><li data-preset-tag="p"><p>Grade responses and estimate advantages for each group of chat completions (that’s the “Group Relative” part in GRPO)</p></li><li data-preset-tag="p"><p>Fine-tune the model using clipped policy gradients guided by these advantage estimates</p></li><li data-preset-tag="p"><p>Repeat these steps with new puzzles and the latest version of the model until we reach peak performance</p></li></ul><p>For generating responses, we used the popular&nbsp;<!--$--><a href="https://blog.vllm.ai/2023/06/20/vllm.html" rel="noopener">vLLM</a><!--/$-->&nbsp;inference engine. We tuned our parameter choices to maximize throughput and minimize startup time. Prefix caching was particularly important because we sampled many responses for each task, and caching prompts helps avoid redundant computation.</p><p>We observed that overwhelming vLLM with too many requests forces preemption or swapping out of in-progress requests. To address this, we limited requests using a semaphore tuned to maintain high key-value (KV) cache utilization while minimizing swaps. More advanced scheduling mechanisms could yield even higher utilization while still supporting flexible generation lengths.</p><p>After sampling, we processed completions using the standard&nbsp;<!--$--><a href="https://huggingface.co/docs/transformers" rel="noopener">HuggingFace Transformers</a><!--/$-->&nbsp;<!--$--><a href="https://huggingface.co/docs/transformers/en/model_doc/auto#transformers.AutoTokenizer" rel="noopener">AutoTokenizer</a><!--/$-->. Its chat template feature, which renders message objects as a prompt string, includes an assistant mask for determining which tokens the LLM generated. We found the models lacked the necessary&nbsp;<code>% generation %</code>&nbsp;tags in their default templates, so we modified them during the tokenization step. The resulting assistant mask was included in the dictionary of tensors used for tuning, identifying which positions required loss calculations.</p><p>After tokenizing responses and obtaining assistant masks, we packed the data for tuning. In addition to including multiple prompt/response pairs in each packed sequence, we identified shared prompt tokens and assigned each token a Parent ID alongside the standard Group ID. Particularly for tasks like Temporal Clue—averaging over 1,000 tokens per puzzle—generating numerous responses per task and efficiently packing tensors significantly reduced redundancy. Once packed with all necessary information, we could visualize our training dataset two-dimensionally, each row being a sequence of tokens potentially containing multiple prompts and completions:</p><p><img alt="" data-framer-asset="data:framer/asset-reference,yTOg965WW2AFP43ZerKodVHRROE.png" data-framer-height="1990" data-framer-width="1469" height="995" src="https://framerusercontent.com/images/yTOg965WW2AFP43ZerKodVHRROE.png" srcset="https://framerusercontent.com/images/yTOg965WW2AFP43ZerKodVHRROE.png?scale-down-to=1024 755w,https://framerusercontent.com/images/yTOg965WW2AFP43ZerKodVHRROE.png 1469w" width="734" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>With tightly-packed data in hand, we could proceed to tuning. Our models were already pre-trained, instruction-tuned, fairly intelligent, and adept at following instructions. However, they could not yet reliably solve Temporal Clue puzzles. Still, they occasionally succeeded, and that was enough. By increasing the probability of good reasoning and decreasing the probability of “not good” reasoning, we incrementally steered the models toward Master Detective status. We achieved this using standard machine learning techniques, employing policy gradient methods to compute loss and shift the weights beneficially.</p><p>For training, we used the&nbsp;<!--$--><a href="https://pytorch.org/torchtune" rel="noopener">torchtune</a><!--/$-->&nbsp;library provided by the PyTorch team. Torchtune features efficient decoder-only transformer implementations for popular models including Llama, Gemma, Phi, and more. Although we primarily used the Qwen models for this project, we also ran experiments with 8B and 70B Llama models. Torchtune also provides memory-saving and performance-enhancing utilities, including:</p><ul><li data-preset-tag="p"><p>Activation Checkpointing</p></li><li data-preset-tag="p"><p>Activation Offloading</p></li><li data-preset-tag="p"><p>Quantization</p></li><li data-preset-tag="p"><p><!--$--><a href="https://arxiv.org/abs/2312.12148" rel="noopener">Parameter-Efficient Fine-Tuning (PEFT)</a><!--/$-->, e.g.,&nbsp;<!--$--><a href="https://arxiv.org/abs/2106.09685" rel="noopener">Low Rank Adaptation (LoRA)</a><!--/$--></p></li></ul><p>See the&nbsp;<!--$--><a href="https://github.com/pytorch/torchtune?tab=readme-ov-file#optimization-flags" rel="noopener">README here</a><!--/$-->&nbsp;for the full list of supported optimizations.</p><p>Additionally, Torchtune supports multi-device (<!--$--><a href="https://pytorch.org/torchtune/main/tutorials/multinode.html" rel="noopener">and now multi-node</a><!--/$-->) training, making it ideal for larger models. It supports both Fully Sharded Data Parallel (FSDP) and Tensor Parallel (TP) training, which can be combined. They also provide&nbsp;<!--$--><a href="https://github.com/pytorch/torchtune/tree/main/recipes" rel="noopener">over a dozen recipes</a><!--/$-->, encouraging users to copy and customize them for their use cases. We created a modified version of their full fine-tune recipes supporting:</p><ul><li data-preset-tag="p"><p>Both multi-device and single-device training</p></li><li data-preset-tag="p"><p>Reference model loading and weight swapping for calculating KL divergences</p></li><li data-preset-tag="p"><p>Advanced causal mask calculations using group and parent IDs</p></li><li data-preset-tag="p"><p>GRPO loss integration and component logging</p></li></ul><p>The recipe can be seen <!--$--><a href="https://github.com/openpipe/deductive-reasoning/blob/main/lib/recipe.py" rel="noopener">here</a><!--/$-->. In the future, we would like to add tensor parallelism support and explore PEFT and quantization.</p><p>The RL training process involves selecting a myriad of hyperparameters. While training our models, we tested various configurations and largely settled upon the following:</p><ul><li data-preset-tag="p"><p>Models: Qwen 2.5 Instruct 14B &amp; 32B</p></li><li data-preset-tag="p"><p>Tasks per Iteration: 32</p></li><li data-preset-tag="p"><p>Samples per Task per Iteration: 50</p></li><li data-preset-tag="p"><p>Total Samples per Iteration: 32 * 50 = 1600</p></li><li data-preset-tag="p"><p>Learning Rate: 6e-6</p></li><li data-preset-tag="p"><p>Micro-Batch Size: 4 sequences for 14B model, 8 for 32B model</p></li><li data-preset-tag="p"><p>Batch Size: Variable, depending on the number of sequences</p></li></ul><p>The batch size is variable because response lengths can vary during training, sequence packing efficiency fluctuates each iteration, and responses with zero advantage are discarded. For one run, we tried dynamically adjusting learning rates inversely proportional to batch size, but this resulted in excessively high learning rates for small batch sizes, requiring a cap. The capped version didn’t meaningfully differ from using a constant learning rate, but tuning batch size and learning rate remains an interesting area for future experimentation.</p><p>We also ran brief experiments increasing tasks per iteration while reducing samples per task—and vice versa—keeping total samples per iteration roughly equal. Over a short training horizon, these variations showed no meaningful differences, suggesting the recipe is robust to different balances between the number of tasks and samples per task.</p><h3>Results</h3><p>After training our models for over 100 iterations, we reached frontier-level deduction.</p><p><img alt="" data-framer-asset="data:framer/asset-reference,TnI1xBpe3Xn46Ql65su2Ad7p46I.png" data-framer-height="1078" data-framer-width="1626" height="539" src="https://framerusercontent.com/images/TnI1xBpe3Xn46Ql65su2Ad7p46I.png" srcset="https://framerusercontent.com/images/TnI1xBpe3Xn46Ql65su2Ad7p46I.png?scale-down-to=512 512w,https://framerusercontent.com/images/TnI1xBpe3Xn46Ql65su2Ad7p46I.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/TnI1xBpe3Xn46Ql65su2Ad7p46I.png 1626w" width="813" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>Our models quickly improved before accuracy gains started to taper off and eventually degrade, sometimes aggressively. At their best, the 14B model approached Claude Sonnet 3.7’s performance at 16k tokens and the 32B model nearly matched Sonnet's results with the larger 64k budget.</p><p>While training, performance gains followed a power law, forming a linear relationship on a log-log chart (before deteriorating).</p><p><img alt="" data-framer-asset="data:framer/asset-reference,En7QbGZgBPfIwsBtipfujcDH6gY.png" data-framer-height="1078" data-framer-width="1626" height="539" src="https://framerusercontent.com/images/En7QbGZgBPfIwsBtipfujcDH6gY.png" srcset="https://framerusercontent.com/images/En7QbGZgBPfIwsBtipfujcDH6gY.png?scale-down-to=512 512w,https://framerusercontent.com/images/En7QbGZgBPfIwsBtipfujcDH6gY.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/En7QbGZgBPfIwsBtipfujcDH6gY.png 1626w" width="813" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>We suspect the models may have converged too early on greedy strategies that worked out of the gate, but potentially limited their long-term prospects. A logical next step would explore approaches that encourage diverse responses, or that build capabilities incrementally (like with curriculum learning), or that assign larger rewards to particularly outstanding solutions incentivizing thorough exploration.</p><p>Additionally, we noted interesting patterns in output length during training. Initially, responses grew longer, then stabilized, before diverging near the end of training, with the 14B model’s responses getting longer and the 32B model’s response lengths collapsing, especially after reaching peak performance.</p><p><img alt="" data-framer-asset="data:framer/asset-reference,jwjoe4Q3D2GPN5qKiA53kLu1fQ.png" data-framer-height="590" data-framer-width="1590" height="295" src="https://framerusercontent.com/images/jwjoe4Q3D2GPN5qKiA53kLu1fQ.png" srcset="https://framerusercontent.com/images/jwjoe4Q3D2GPN5qKiA53kLu1fQ.png?scale-down-to=512 512w,https://framerusercontent.com/images/jwjoe4Q3D2GPN5qKiA53kLu1fQ.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/jwjoe4Q3D2GPN5qKiA53kLu1fQ.png 1590w" width="795" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>To qualitatively assess improvements in logical reasoning, we asked the strongest frontier model, Claude Sonnet 3.7, to identify and evaluate the soundness of deductions made by the Qwen 32B model—before and after training for 100+ iterations—on similar puzzles.&nbsp;<!--$--><a href="https://gist.github.com/bradhilton/c012ce9ed7b8e7c993b14b9761574a3c#file-base-md" rel="noopener">Sonnet identified 6 deductions from the base model, with all but one judged erroneous;</a><!--/$-->&nbsp;<!--$--><a href="https://gist.github.com/bradhilton/c012ce9ed7b8e7c993b14b9761574a3c#file-trained-md" rel="noopener">conversely, it identified 7 deductions from the trained model, with all but one judged logically sound.</a><!--/$--></p><p><img alt="" data-framer-asset="data:framer/asset-reference,r9dGPn71HUynBKCOZO5Sr03jInQ.png" data-framer-height="433" data-framer-width="1626" height="216" src="https://framerusercontent.com/images/r9dGPn71HUynBKCOZO5Sr03jInQ.png" srcset="https://framerusercontent.com/images/r9dGPn71HUynBKCOZO5Sr03jInQ.png?scale-down-to=512 512w,https://framerusercontent.com/images/r9dGPn71HUynBKCOZO5Sr03jInQ.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/r9dGPn71HUynBKCOZO5Sr03jInQ.png 1626w" width="813" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>Finally, assuming <!--$--><a href="https://fireworks.ai/blog/why-gpus-on-demand" rel="noopener">sufficient throughput</a><!--/$--> with <!--$--><a href="https://fireworks.ai/pricing#ondemand" rel="noopener">on-demand deployments</a><!--/$-->, we estimated Qwen model costs from <!--$--><a href="https://fireworks.ai/" rel="noopener">Fireworks AI’s</a><!--/$--> <!--$--><a href="https://fireworks.ai/pricing#text" rel="noopener">serverless pricing tiers.</a><!--/$--> We plotted accuracy against the natural logarithm of the average inference cost per response, and observed a clear linear Pareto frontier among untuned models. By successfully training open-weight models to frontier-level accuracy, we dramatically improved the cost–accuracy trade-off.</p><p><img alt="" data-framer-asset="data:framer/asset-reference,9Zwetqv69wY3YceuOG3KMeYyzKg.png" data-framer-height="1078" data-framer-width="1626" height="539" src="https://framerusercontent.com/images/9Zwetqv69wY3YceuOG3KMeYyzKg.png" srcset="https://framerusercontent.com/images/9Zwetqv69wY3YceuOG3KMeYyzKg.png?scale-down-to=512 512w,https://framerusercontent.com/images/9Zwetqv69wY3YceuOG3KMeYyzKg.png?scale-down-to=1024 1024w,https://framerusercontent.com/images/9Zwetqv69wY3YceuOG3KMeYyzKg.png 1626w" width="813" data-framer-original-sizes="" sizes="(min-width: 1200px) 100vw, (max-width: 1199px) 100vw"></p><p>Here, after sharing satisfied nods for a job well done, we hail a hansom cab and return to Baker Street—the perfect place to contemplate our findings.</p><h3>Conclusion</h3><p>In our investigation, we set out to explore whether smaller, open-weight language models could achieve frontier-level deductive reasoning through reinforcement learning. After training Qwen 14B and 32B models on challenging Temporal Clue puzzles—using carefully selected hyperparameters and the GRPO method—we achieved impressive performance gains. These improvements brought open-weight models to the cutting edge of reasoning performance, at significantly reduced costs. Our findings highlight the promising potential for reinforcement learning to efficiently train open models on complex deduction tasks.</p><p>As mentioned previously, the <!--$--><a href="https://github.com/bradhilton/temporal-clue" rel="noopener">dataset</a><!--/$-->, <!--$--><a href="https://github.com/openpipe/rl-experiments" rel="noopener">experiments</a><!--/$-->, <!--$--><a href="https://github.com/openpipe/deductive-reasoning" rel="noopener">training recipe</a><!--/$-->, and model weights (<!--$--><a href="https://huggingface.co/OpenPipe/Deductive-Reasoning-Qwen-14B" rel="noopener">14B</a><!--/$-->, <!--$--><a href="https://huggingface.co/OpenPipe/Deductive-Reasoning-Qwen-32B" rel="noopener">32B</a><!--/$-->) are freely available under the MIT license. We encourage you to try reproducing and improving on our results.</p><p>Additionally, we’ve held out one particularly exciting finding for the end. We discovered that meaningful performance improvements, as high as 10–15%, can be achieved with as <strong>few as 16 training examples</strong>. This means you don’t need a lot of data to get started; just some intuition about the problem you’d like to solve.</p><p>Are you interested in using reinforcement learning to train your own models, or would like some help getting started? Feel free to <!--$--><a href="https://openpipe.ai/contact" rel="noopener">reach out to us at OpenPipe</a><!--/$-->—we'd love to chat!</p><p>Now, dear reader, please keep your deerstalker cap and magnifying glass handy; there's much more to explore. The game remains very much afoot.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rayhunter – Rust tool to detect cell site simulators on an orbic mobile hotspot (107 pts)]]></title>
+            <title><![CDATA[Rayhunter – Rust tool to detect cell site simulators on an orbic mobile hotspot (115 pts)]]></title>
             <link>https://github.com/EFForg/rayhunter</link>
             <guid>43283917</guid>
             <pubDate>Thu, 06 Mar 2025 19:04:12 GMT</pubDate>
@@ -123,7 +123,369 @@ rustup target add armv7-unknown-linux-gnueabihf
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Succinct Data Structures (250 pts)]]></title>
+            <title><![CDATA[50 Years in Filesystems: 1984 (104 pts)]]></title>
+            <link>https://blog.koehntopp.info/2023/05/06/50-years-in-filesystems-1984.html</link>
+            <guid>43283498</guid>
+            <pubDate>Thu, 06 Mar 2025 18:34:11 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.koehntopp.info/2023/05/06/50-years-in-filesystems-1984.html">https://blog.koehntopp.info/2023/05/06/50-years-in-filesystems-1984.html</a>, See on <a href="https://news.ycombinator.com/item?id=43283498">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+				<p>This is part 2 of a series. The first part is “<a href="https://blog.koehntopp.info/2023/05/05/50-years-in-filesystems-1974.html">1974</a>
+
+”.</p>
+<p>Progress is sometimes hard to see, especially when you have been part of it or otherwise lived through it.
+Often, it is easier to see if you compare modern educational material, and the problems discussed with older material.
+And then look for the research papers and sources that fueled the change.</p>
+<p>In Linux (and Unix in general), this is easy.</p>
+<h2 id="1984--the-bsd-fast-filing-system">
+    <a href="#1984--the-bsd-fast-filing-system">
+	1984 — The BSD Fast Filing System
+    </a>
+</h2>
+<p>The original Unix filesystem was doing well, but also had a large number of obvious problems.
+BSD Unix undertook an effort to fix them, and this is documented in the book
+“<a href="https://www.amazon.de/Design-Implementation-4-3Bsd-Operating-System/dp/0201061961" target="_blank" rel="noopener">The Design and Implementation of the 4.3BSD UNIX Operating System</a>
+
+”
+by Leffler, McKusick et. al<a href="http://libgen.rs/book/index.php?md5=61457A629D5DE3B8966141A9D51FE89B" target="_blank" rel="noopener">.</a>
+
+</p>
+<p>A more concise, but also more academic discussion can be found in the classic 1984 paper <a href="https://dsf.berkeley.edu/cs262/FFS.pdf" target="_blank" rel="noopener">A Fast File System for UNIX</a>
+
+,
+which lists Marshall McKusick, Bill Joy (then at Sun), Samuel Leffler (then at LucasFilm) and Robert Fabry as authors.
+The paper promises a reimplementation of the Unix filesystem for higher throughput, better allocation and better locality of reference.</p>
+<h2 id="the-hardware">
+    <a href="#the-hardware">
+	The hardware
+    </a>
+</h2>
+<p>It is 1984.
+The computers targeted by 4.3BSD are desktop and cabinet workstations.
+These are machines with 32-bit data registers and 32-bit address registers.</p>
+<p>External data and address bus sizes vary:
+Earlier 68k CPUs had smaller sized buses, but in 1984 the Motorola 68020 debuted.
+It was the first 68k to offer buses with the full width of 32 bits, at a budget of ca. 200k transistors on the die.
+Later the 68030 integrated the MMU, previously a separate chip,
+and the 68040 also integrated the FPU, again previously a separate chip.</p>
+<p>Early Sun workstations, the Sun-3 series, feature these CPUs.
+But Sun took the designs from the experimental Berkeley RISC systems and released the Sun-4 series in 1986 with SPARC architecture RISC chips.
+SPARC architecture is not without compromises, but was very viable and saw continuous development until after the purchase of Sun by Oracle, which then killed both the SPARC, and later also the Itanium CPU architecture.</p>
+<p>Curt Schimmel discusses the tradeoffs made by SPARC in the MMU, register and memory access design, and why they made sense. See <a href="https://www.amazon.de/UNIX-Systems-Modern-Architectures-Multiprocessing/dp/0201633388" target="_blank" rel="noopener">UNIX Systems for Modern Architectures</a>
+
+<a href="http://libgen.rs/book/index.php?md5=0E4A02E80A6250838CB1D3C3A1405CAD" target="_blank" rel="noopener">.</a>
+
+</p>
+<p>In between, in 1985, the MIPS architecture debuted, which is another series of RISC CPU architectures. It also starts out as a fully 32-bit type of system, and found use in SGI workstations.</p>
+<p>HP had another RISC-type of CPU, the PA-RISC, an outgrowth of their “Spectrum” research programme, coming to market in 1986 (and later replaced by Intel’s failed Itanium).</p>
+<p>Systems pioneer DEC themselves had the VAX, a 32-bit cabinet computer with a CISC CPU, and that since 1977 already.
+They would not go RISC until 1992, but then fully 64-bit with the Alpha AXP (“DEC Alpha”) architecture.
+While interesting, this did not last long: with the sale to Compaq in 1998, the CPU was discontinued, and the IP was sold to Intel in 2001.</p>
+<p>In general, workstation type systems in 1984 had main memory in the low two-digit MB range, and ran at clock speeds of two-digit MHz system clocks.</p>
+<h2 id="43bsds-fast-filing-system">
+    <a href="#43bsds-fast-filing-system">
+	4.3BSD’s Fast Filing System
+    </a>
+</h2>
+<h2 id="the-traditional-filesystems-shortcomings">
+    <a href="#the-traditional-filesystems-shortcomings">
+	The traditional filesystems shortcomings
+    </a>
+</h2>
+<p>The 32-bit VAX systems were being used for typical 1980’s workstation work, which include things such as image processing or VLSI chip design.
+On these systems, the original Unix filesystem showed structural problems in keeping up with file size, I/O speed, and simple number of files.
+Also, the tiny 512-byte I/O size slowed disk subsystem performance considerably.</p>
+<p>The paper mentions the strict segregation of filesystem metadata at the front of the file system from the actual data in the back part of the filesystem.</p>
+<blockquote>
+<p>A 150 MB traditional UNIX file system consists of 4 megabytes of inodes followed by 146
+megabytes of data.
+This organization segregates the inode information from the data; thus accessing a file
+normally incurs a long seek from the file’s inode to its data.
+Files in a single directory are not typically
+allocated consecutive slots in the 4 megabytes of inodes, causing many non-consecutive blocks of inodes to
+be accessed when executing operations on the inodes of several files in a directory.</p></blockquote>
+<p>This defines one major goal for BSD FFS: Better filesystem layout, bringing metadata and data closer together,
+storing files in a single directory closer together,
+and preventing fragmentation of a file into small fragments that can be loaded only inefficiently.</p>
+<p>
+  <img src="https://blog.koehntopp.info/uploads/2023/05/filesystem-fragmentierung.png" alt="">
+</p>
+
+
+<p><em>Fragmentation: Initially, four files are being created, each using 2 blocks.
+Then the files B and D are being deleted.
+The free space is then being reclaimed by the three-block-sized file E, which is stored in non-adjacent blocks.
+This causes small disk seeks, and slow I/O.</em></p>
+<p>Another goal stated is to increase disk block size.
+Larger disk blocks benefit throughput in two ways:</p>
+<ul>
+<li>Larger disk blocks provide larger units of I/O, so more data is transferred in a single I/O operation.</li>
+<li>Larger disk blocks also allow the filesystem to store more file pointers in an indirect block, greatly reducing the number of indirect block accesses.
+This is primarily a problem if indirect blocks are not cached in a file system buffer cache.</li>
+</ul>
+<p>The paper quotes the throughput of an already marginally optimized, traditional Unix filesystem at around 4% of the theoretical maximum,
+which is abysmally bad.
+This is mainly attributed to fragmentation, non-contiguous storage of adjacent blocks in a file.
+Defragmentation, already suggested in 1976, was discarded as a non-viable idea.
+The authors instead aim for a solution that places files sensibly in the first place.</p>
+<h2 id="bsd-ffs-innovations">
+    <a href="#bsd-ffs-innovations">
+	BSD FFS innovations
+    </a>
+</h2>
+<h3 id="cylinder-groups-and-understanding-chs">
+    <a href="#cylinder-groups-and-understanding-chs">
+	Cylinder Groups and understanding CHS
+    </a>
+</h3>
+<p>The BSD FFS understands the physical layout of a harddisk, with <a href="https://en.wikipedia.org/wiki/Cylinder-head-sector" target="_blank" rel="noopener">cylinders, heads and sectors</a>
+
+ (CHS).
+It divides the disk into cylinder groups, adjacent tracks of all disk heads.</p>
+<p>
+  <img src="https://blog.koehntopp.info/uploads/2023/05/cylinder-groups.png" alt="">
+</p>
+
+
+<p><em>As the disk rotates, various disk heads reach inside the platter stack like a comb.
+Each head marks a track on the disk, which is subdivided into physical disk blocks by the controller hardware.
+Together, all tracks marked by all heads form a cylinder.
+A cylinder group is a set of consecutive cylinders. (Image: <a href="https://pages.cs.wisc.edu/~remzi/OSTEP/file-ffs.pdf" target="_blank" rel="noopener">OSTEP</a>
+
+, page 3)</em></p>
+<p>Each cylinder group becomes a mini-version of a traditional Unix filesystem, with a copy of the superblock, its own local inode area, and local inode and block usage bitmaps.
+The usage of bitmaps is also novel, as they replace the free lists used in the traditional filesystem.
+As the filesystem has information about the CHS layout, it also makes sure that the superblock is not always placed on the same platter for each copy,
+trying to make the filesystem better redundant against harddisk failure.</p>
+<blockquote>
+<h2 id="excursion-raid-and-other-efforts-at-berkeley">
+    <a href="#excursion-raid-and-other-efforts-at-berkeley">
+	Excursion: Raid and other Efforts at Berkeley
+    </a>
+</h2>
+<p>The <a href="https://www2.eecs.berkeley.edu/Pubs/TechRpts/1987/CSD-87-391.pdf" target="_blank" rel="noopener">RAID paper</a>
+
+ was published only several years later,
+but <a href="http://web.eecs.umich.edu/~michjc/eecs584/Papers/katz-2010.pdf" target="_blank" rel="noopener">according to Katz</a>
+
+ was developed also in Berkeley, during the same time frame, 1983/1984.</p>
+<p>Katz also mentions that during that time Stonebraker was around, working on Ingres (a Postgres predecessor),
+and refers to his demands for low-commit latency as driving the attempts on improving disk bandwidth with FFS and, later,  RAID.
+Serious work on the RAID taxonomy we know today did not begin before 1987, though.</p>
+<p>The RAID paper was used by many startups and storage companies as the foundation of their development,
+among them NetApp, and EMC (via Data General’s Clariion Disk Array)</p></blockquote>
+<p>BSD FFS not only understood CHS geometry of disks, but also processor speed and disk rotational speed.
+This allowed it to configure and record in the superblock an <a href="https://en.wikipedia.org/wiki/Interleaving_%28disk_storage%29" target="_blank" rel="noopener">interleave factor</a>
+
+ to optimize disk I/O throughput.</p>
+<p>
+  <img src="https://blog.koehntopp.info/uploads/2023/05/interleave.jpg" alt="">
+</p>
+
+
+<p><em>The harddisk rotates continuously, but the CPU needs time to set up the next transfer.
+During this time the head may have moved already past the next block start boundary, and now the system would need to wait one full rotation to be able to write.
+Using an appropriate interleave factor, blocks of adjacent numbers are not stored adjacently on disk, but instead other blocks are interleaved in-between.
+This gives the CPU enough time to think and set up the next block transfer.</em></p>
+<p><em>The faster the CPU, the lower the interleave factor required.</em></p>
+<p>All of these optimizations became irrelevant relatively quickly the moment harddrives were sold with integrated controllers,
+started to lie about their CHS geometry and ultimately as linear block addresses (LBA) took over.
+But for ten to 15 years, this provided a nice performance advantage.</p>
+<h3 id="large-blocks-smaller-fragments-and-tail-packing">
+    <a href="#large-blocks-smaller-fragments-and-tail-packing">
+	Large blocks, smaller fragments, and tail packing
+    </a>
+</h3>
+<p>Internally, FFS uses logical blocks of at least 4 KB size.
+Anything with at least 4 KB block size can create files of 4 GB size with at most two levels of indirection.</p>
+<p>Large blocks make for faster I/O, but they also come with storage overhead, as files grow in sizes of blocks.
+Since logical blocks in FFS are made up from multiple physical blocks, FFS introduces the concept of fragments to expose the smaller internal physical blocks.
+Through tail packing, the ends of multiple files can be stored together in the same logical block, using only as many physical blocks as necessary.</p>
+<p>Additional logic was necessary to prevent a slowly growing file from going through phases of fragment-by-fragment growth and constant re-layouting.
+To overcome this, space is being pre-allocated to full logical blocks, and tail packing only happens on file close when the preallocation is canceled.</p>
+<h3 id="long-seek-layout-policy">
+    <a href="#long-seek-layout-policy">
+	Long Seek Layout Policy
+    </a>
+</h3>
+<p>BSD FFS introduces a number of layout policies that control the placement of new directories, new files and the handling of large files.
+Global policies are mostly concerned with choosing a well-suited cylinder group to place data in,
+while local policies then handle the placement inside a cylinder group.</p>
+<p>The new filesystem layout has cylinder groups. Each has their own inode table, and free space bitmaps for inodes and blocks.
+The filesystem aims to prevent fragmentation.</p>
+<p>This is of course impossible in certain circumstances:
+If, for example, a cylinder group is 512 MB in size, and a file larger than 512 MB is to be written, it will use up one inode in that cylinder group, but all available free blocks are gone.
+If a second file is to be placed into this cylinder group, the inode can be used, but the data blocks for that file need to be placed somewhere else – which is undesirable.</p>
+<p>It would be better to force a long seek, a switch from one cylinder group to the next, for large files.
+The filesystem would profit from forcing such a long seek every megabyte of filesize or so.
+This would use up free blocks from one cylinder group to the next, evenly, while at the same time leaving some number of free blocks for other files in each cylinder group.</p>
+<p>This would, of course, fragment a file, on purpose, but also make sure the fragments are sufficiently large to allow large file I/O.
+Fragmentation (non-adjacent placement of blocks in a file) is only really a performance problem if the fragments are too small to be read efficiently.</p>
+<h3 id="directory-layout-policy">
+    <a href="#directory-layout-policy">
+	Directory Layout Policy
+    </a>
+</h3>
+<p>Files in the same directory are often used together.
+It is useful to place all files in the same directory together in the same cylinder group.</p>
+<p>Of course, when this is done, it is also necessary to put different directories into different cylinder groups, to ensure even use of the filesystem space available.
+That means a shell script such as</p>
+<div><pre tabindex="0"><code data-lang="bash"><span><span><span>#! /usr/bin/bash
+</span></span></span><span><span><span></span>
+</span></span><span><span><span>for</span> i in <span>$(</span>seq -w <span>1</span> 10<span>)</span>
+</span></span><span><span><span>do</span>
+</span></span><span><span>  touch file<span>$i</span>
+</span></span><span><span>  mkdir dir<span>$i</span>
+</span></span><span><span><span>done</span>
+</span></span></code></pre></div><p>will create ten files named <code>fileXX</code>, which will all be placed in the same cylinder group as the current directory.</p>
+<p>It will also create ten subdirectories of the current directory named <code>dirXX</code>.
+Each of them will be placed in a different cylinder group, if possible.
+FFS will choose the cylinder group that has a greater than average number of free inodes, and the smallest number of directories already in it.</p>
+<p>The actual choice of the inode in a cylinder group is “next available”, so pretty simple.
+But that is not a problem, because the whole cylinder group inode table fits into 8-16 blocks.</p>
+<p>For placement of data blocks, a lot of effort is invested into finding rotationally optimal block, given the needed interleave factor for this machine.</p>
+<p>BSD FFS requires some free space to be available in the filesystem at all times.
+Many of its algorithms degenerate to the performance of the traditional file system if the filesystem fills up more than 90%.</p>
+<h2 id="other-changes-and-improvements">
+    <a href="#other-changes-and-improvements">
+	Other changes and improvements
+    </a>
+</h2>
+<p>BSD FFS also removes several limits that came with the traditional filesystem.</p>
+<h3 id="long-inode-numbers-and-block-addresses">
+    <a href="#long-inode-numbers-and-block-addresses">
+	Long Inode Numbers and Block Addresses
+    </a>
+</h3>
+<p>For example, <a href="https://github.com/dspinellis/unix-history-repo/blob/BSD-4_3_Tahoe-Snapshot-Development/.ref-BSD-4_3/usr/src/sys/h/dir.h#L42" target="_blank" rel="noopener">Inode numbers are now 32-bit numbers</a>
+
+.
+This increases the number of files possible per filesystem from 64 K to 4 G.</p>
+<p>The size of an <a href="https://github.com/dspinellis/unix-history-repo/blob/BSD-4_3_Tahoe-Snapshot-Development/.ref-BSD-4_3/usr/src/sys/h/inode.h#L40-L59" target="_blank" rel="noopener">inode</a>
+
+ has doubled:
+It is now <a href="https://github.com/dspinellis/unix-history-repo/blob/BSD-4_3_Tahoe-Snapshot-Development/.ref-BSD-4_3/usr/src/sys/h/inode.h#L61-L65" target="_blank" rel="noopener">forced to be 128 bytes</a>
+
+ in size (with 20 unused bytes)
+Also, disk block addresses are now 4 bytes.
+At 4 KB block size, this is sufficient to account for 4 G blocks, or a maximum of 16 TB filesystem size.<br>
+File length is recorded in a <code>quad</code>, allowing for more than 4 G individual filesize.</p>
+<p>Inodes now contain 12 direct blocks, and three types of indirect blocks.
+At 4 KB block size, this is good for 1024 block addresses per indirect block, resulting in
+<code>12 + 1024 + 1024^2 + 1024^3 = 1074791436</code> blocks per file, or a maximum filesize just north of 4 TB.</p>
+<p>Unix User-ID and Group-ID are still limited to a short, limiting the number of users and groups per system to 64 K.</p>
+<p>Space has been preallocated for 8-byte timestamps, even if the time types in the inode are still limited to 4 bytes.</p>
+<h3 id="long-filenames">
+    <a href="#long-filenames">
+	Long filenames
+    </a>
+</h3>
+<p>The traditional filesystem has directory slots of a fixed 16-byte length,
+with 2 bytes for the inode number and 14 bytes for the filename.</p>
+<p>BSD FFS defined a <a href="https://github.com/dspinellis/unix-history-repo/blob/BSD-4_3_Tahoe-Snapshot-Development/.ref-BSD-4_3/usr/src/sys/h/inode.h#L61-L65" target="_blank" rel="noopener">more complex directory entry structure</a>
+
+.
+A single entry contains a 4-byte inode number, a 2-byte record length and a 2-byte name length, and then the actual filename.
+Filenames are limited to 255 bytes for each pathname component,
+and directory entries are rounded up in length to the next 4-byte boundary.</p>
+<p>Directories are still essentially a linked list, and searching for names in large directories is slow.</p>
+<p>Searching for free space in directories is now more complicated:
+To create a new directory entry, we now need to search through the directory from the start, trying to find a gap in the current structure that is large enough for the name we are being asked to create.
+If none is found, the new name is appended at the end, growing the directory in size.</p>
+<p>Free space in directories is never reclaimed through compaction, only eventually re-used if a new name happens to fit.</p>
+<h3 id="symlinks">
+    <a href="#symlinks">
+	Symlinks
+    </a>
+</h3>
+<p>The traditional filesystem allowed a file to have multiple names, using the <code>link()</code> system call and the hardlink mechanism.
+Hardlinks are limited in number (a <code>short</code>, so 64 K names).</p>
+<p>They can be lost accidentally, for example, by saving a hardlinked file with certain editors.
+If the editor does write a file as <code>filename.new</code>, then unlinks the old <code>filename</code> and moves the new file into place, the hardlinked nature of the file will be modified.</p>
+<p>Hardlinks also reference the original inode of the file multiple times, so they cannot span filesystem boundaries.</p>
+<p>BSD introduces a new filetype (<code>l</code>, symlink), and places a “replacement filename” in the linked file, which determines the link target location.
+It can be an absolute or relative name (relative to the location of the symlink file).</p>
+<p>This creates a “soft” or “symbolic link.
+Trying to access a symlink will kick off a reinterpretation of the filename in <code>namei()</code> using the replacement filename,
+resulting in the attempted <code>open()</code> system call being deflected to the link target location.</p>
+<p>Since the deflection happens in <code>namei()</code>, which can traverse filesystem boundaries, the new link type is not subject to the single filesystem limitation.
+It is also not counting towards any link count limits.</p>
+<h3 id="rename-system-call">
+    <a href="#rename-system-call">
+	Rename System Call
+    </a>
+</h3>
+<p>BSD introduces the <code>rename()</code> system call, which previously needed to be implemented as a library function using calls to <code>unlink()</code> and <code>link()</code>.
+Since this uses more than one system call, the operation is not atomic:
+It is subject to partial execution, and it is subject to malicious interferences, because it is a multistep process.</p>
+<h3 id="quotas">
+    <a href="#quotas">
+	Quotas
+    </a>
+</h3>
+<p>BSD also introduces the idea of filesystem usage quotas:
+These are soft and hard limits on the number of files and the amount of disk space that a user or a group can use.</p>
+<p>In order to implement them in a useful way, the behavior of the filesystem had to be modified:</p>
+<ul>
+<li>It is now a privileged operation to change the owner of a file away from oneself.
+Without that, it is possible to create a directory that is only accessible for oneself, and then gift all files in it to another user.
+The files would then count against that user’s quota.</li>
+<li>Similarly, it is now no longer possible to change the group membership of files to just any group.
+Instead, only groups from the user’s group set can be used.</li>
+<li>And finally, new directories and files inherit their group from their parent directory, not from a users primary group.
+That way, project directories would contain files counting against a project’s quota, not a user’s primary group quota.</li>
+</ul>
+<h3 id="advisory-locking">
+    <a href="#advisory-locking">
+	Advisory Locking
+    </a>
+</h3>
+<p>Advisory file locking is already introduced in 4.2BSD.
+For this, the new <code>flock()</code> syscall has been implemented.</p>
+<ul>
+<li>Locks can be shared (read locks) or exclusive (write locks).</li>
+<li>They always apply to the entire file, and not to byte ranges.</li>
+<li>No deadlock detection is attempted.</li>
+<li>They are tied to a file descriptor.
+So when a process dies, its file-handles are automatically closed, which also automatically releases all locks held.
+This is very robust, until <code>dup()</code> and <code>fork()</code> are coming into play.</li>
+</ul>
+<p>Posix later tried to improve on this, introducing a second, completely different system of locks, using <code>fcntl()</code>.
+This is flawed in different ways, but can do byte-ranges, and it implements some rudimentary deadlock detection.</p>
+<p>Kernels that implement both systems such as Linux now have two different,
+incompatible file locking implementations that do not know of each other.</p>
+<p><a href="https://loonytek.com/2015/01/15/advisory-file-locking-differences-between-posix-and-bsd-locks/" target="_blank" rel="noopener">This article</a>
+
+ discusses all of this some more,
+and has example programs.</p>
+<h2 id="performance">
+    <a href="#performance">
+	Performance
+    </a>
+</h2>
+<p>The authors note the following advantages in their paper:</p>
+<ul>
+<li><code>ls</code> and <code>ls -l</code> are fast, because the inodes of the files in a single directory are within the same cylinder group.
+Hence, reading and listing a directory is very low on seeks, and on seek distance (except for subdirectories, which are guaranteed to be far away).
+They measure a 8x speedup for directories without subdirectories.</li>
+<li>Utilization of the theoretical maximal bandwidth increased from 3% in the traditional filesystem to 22% or even 47%, depending on the controller hardware used.
+The authors are very proud of the results because they have been achieved on an actual production system with real user production data being layouted,
+and not on a synthetic benchmark layout. Throughput is stable over the lifetime of the filesystem, as its file population changes.</li>
+</ul>
+<p>This solves the main drivers for the improvements: Better throughput and a stable layout that does not degrade performance over time.</p>
+<p>Additionally, a number of quality-of-life enhancements have been made, enabling more comfortable working in groups, and unlocking new functionality.</p>
+<p>While Linux contains no BSD code, the ext2 filesystem is pretty much an implementation-blind rewrite of the BSD FFS for Linux,
+recreating the features as described in the literature without using any BSD code.</p>
+<p>Both BSD FFS and Linux ext2 are still non-logging filesystems that require a filesystem check after a crash.
+They also cannot deal well with directories with many entries, and deal only slightly better with deep directory hierarchies.
+Additional changes are required to enable truly large filesystems in order to keep up with increasing storage sizes.</p>
+<p>Also, other limitations of more hidden nature still apply:
+Several places in the filesystem code are guarded by locks that make scaling certain operations hard on systems with high concurrency.</p>
+<p>It would take another ten years, until 1994, for SGI’s XFS to tackle these things.</p>
+
+			</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Succinct Data Structures (264 pts)]]></title>
             <link>https://blog.startifact.com/posts/succinct/</link>
             <guid>43282995</guid>
             <pubDate>Thu, 06 Mar 2025 17:48:37 GMT</pubDate>
@@ -131,7 +493,7 @@ rustup target add armv7-unknown-linux-gnueabihf
 Couldn't get https://blog.startifact.com/posts/succinct/: Error: connect EHOSTUNREACH 2a01:7c8:aab6:68:5054:ff:fe1a:c852:443]]></description>
         </item>
         <item>
-            <title><![CDATA[Mistral OCR (1016 pts)]]></title>
+            <title><![CDATA[Mistral OCR (1063 pts)]]></title>
             <link>https://mistral.ai/fr/news/mistral-ocr</link>
             <guid>43282905</guid>
             <pubDate>Thu, 06 Mar 2025 17:39:39 GMT</pubDate>
@@ -375,7 +737,7 @@ Couldn't get https://blog.startifact.com/posts/succinct/: Error: connect EHOSTUN
 <p dir="ltr">Mistral OCR capabilities are free to try on <a href="http://chat.mistral.ai/">le Chat</a>. To try the API, head over to <a href="http://console.mistral.ai/">la Plateforme</a>. We’d love to get your feedback; expect the model to continue to get even better in the weeks to come. As part of our strategic engagement programs, we will also offer on-premises deployment on a <a href="https://mistral.ai/contact">selective basis</a>.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[UK quietly scrubs encryption advice from government websites (113 pts)]]></title>
+            <title><![CDATA[UK quietly scrubs encryption advice from government websites (114 pts)]]></title>
             <link>https://techcrunch.com/2025/03/06/uk-quietly-scrubs-encryption-advice-from-government-websites/</link>
             <guid>43282892</guid>
             <pubDate>Thu, 06 Mar 2025 17:38:33 GMT</pubDate>
@@ -428,7 +790,7 @@ Couldn't get https://blog.startifact.com/posts/succinct/: Error: connect EHOSTUN
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[NASA Shuts Off Voyager Science Instrument (173 pts)]]></title>
+            <title><![CDATA[NASA Shuts Off Voyager Science Instrument (177 pts)]]></title>
             <link>https://gizmodo.com/nasa-shuts-off-voyager-science-instrument-more-power-cuts-ahead-to-keep-both-probes-going-2000572202</link>
             <guid>43282594</guid>
             <pubDate>Thu, 06 Mar 2025 17:14:39 GMT</pubDate>
@@ -446,7 +808,7 @@ Couldn't get https://blog.startifact.com/posts/succinct/: Error: connect EHOSTUN
                           </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Anime fans stumbled upon a mathematical proof (259 pts)]]></title>
+            <title><![CDATA[Anime fans stumbled upon a mathematical proof (275 pts)]]></title>
             <link>https://www.scientificamerican.com/article/the-surprisingly-difficult-mathematical-proof-that-anime-fans-helped-solve/</link>
             <guid>43282133</guid>
             <pubDate>Thu, 06 Mar 2025 16:37:34 GMT</pubDate>
@@ -454,7 +816,7 @@ Couldn't get https://blog.startifact.com/posts/succinct/: Error: connect EHOSTUN
 <div id="readability-page-1" class="page"><div><p data-block="sciam/paragraph">Math solutions can be found in surprising places, including the dark realms of the Internet. In 2011 an anonymous poster on the now infamously controversial image board 4chan posed a mathematical puzzle about the cult classic anime series <i>The Melancholy of Haruhi Suzumiya</i>. Though the bulletin board has become littered with hateful, violent and extreme content, that original post led to a solution to the sophisticated math problem.</p><p data-block="sciam/paragraph">The first season of this anime series consists of 14 episodes that were designed so that you can watch them in any order you like. (For people who are as unfamiliar with the anime world as I am: an eight-part live-action thriller called <i>Kaleidoscope</i> on Netflix follows the same principle.) At some point in a 2011 discussion of the series on 4chan, someone asked the minimum number of episodes they would have to watch to have seen it in every possible order.</p><p data-block="sciam/paragraph">In fact, this question is related to so-called superpermutations. And as it turns out, this mathematical area holds many puzzles: to this day, mathematicians are still unable to fully answer the problem that the 4chan user had posed.</p><hr><h2>On supporting science journalism</h2><p>If you're enjoying this article, consider supporting our award-winning journalism by<!-- --> <a href="https://www.scientificamerican.com/getsciam/">subscribing</a>. By purchasing a subscription you are helping to ensure the future of impactful stories about the discoveries and ideas shaping our world today.</p><hr><p data-block="sciam/paragraph">But amazingly, in that discussion, one of the anonymous users made an estimate of the minimum amount of all episodes to watch with an approach that was previously unknown to mathematicians. “I’ll need to [elaborate on] this in multiple posts. Please look it over for any loopholes I might have missed,” wrote the user, who explained in several steps how they arrived at their estimate. Other users then took up the arguments and discussed them—but outside of 4chan, none of this made any waves. No one seemed to take any notice.</p><h2 id="extreme-binge-watching" data-block="sciam/heading">Extreme Binge-Watching</h2><p data-block="sciam/paragraph">In mathematics, two objects permutate when they are rearranged or recombined. For example, you can permutate AB to BA. If an anime series consisted of only two parts, you could either watch the first and then the second episode (1-2) or the second and then the first (2-1).</p><p data-block="sciam/paragraph">If you want to watch a series in multiple arrangements—perhaps to figure out which sequence of episodes makes the most sense—you need a superpermutation. This is a sequence of all possible permutations. Imagine a marathon showing where you watch the first episode, followed by the second, and then watch the second episode, followed by the first (1-2-2-1). To avoid watching the second episode twice in a row, a shorter superpermutation would be 1-2-1; you would only have to watch three episodes to still have every possible order covered.</p><p data-block="sciam/paragraph">If a series consists of three episodes, it becomes a little trickier to find the shortest superpermutation. In this case, there are 3! = 6 different sequences: 1-2-3, 1-3-2, 2-3-1, 2-1-3, 3-1-2, 3-2-1. Fortunately, you don’t have to watch 3 × 6 = 18 parts but can find a clever shortcut, in this case: 1-2-3-1-2-1-3-2-1. That order contains all possible permutations of the numbers 1, 2 and 3, but you only have to watch nine episodes!</p><p data-block="sciam/paragraph">Mathematicians have also calculated the shortest superpermutations for a series consisting of <i>n</i> = 4 and <i>n</i> = 5 episodes (33 and 153 episodes, respectively). Beyond that, however, they are in the dark. The shortest superpermutations for <i>n</i> &gt; 5 are not known.</p><p data-block="sciam/paragraph">In fact, the challenge relates to one of the most intractable problems in algorithmics: <a href="https://www.scientificamerican.com/article/the-math-mystery-that-connects-sudoku-flight-schedules-and-protein-folding/">the traveling salesperson problem</a>. In this problem, a person wants to visit different cities and end up back in their hometown. The task is to find the shortest route that connects all the cities. The shortest superpermutation is a variation of this problem in which the individual permutations represent different cities. In this case, you assign different distances between cities by determining the overlap of the permutations. For example, cities 1-2-3 and 2-3-1 have a large overlap: the last two digits of the first permutation match the first two digits of the second, so they can be combined to form 1-2-3-1. We can therefore assign a short distance between those two cities. On the other hand, 1-2-3 and 2-1-3 do not overlap. (To see both sequences, you have to look at a full six parts; no shortcut is possible.) Thus, these cities have a large distance between them.</p><p data-block="sciam/paragraph">To find the shortest route within permutations, you connect the permutations that overlap the most. There is only one difficulty: there is no known algorithm that solves the traveling salesperson problem quickly. If we are dealing with a few cities—or, in the case of an anime series, a few episodes—this is not a major drawback. But as soon as the <i>n</i> becomes large, computers fail at the task because the computing time grows exponentially with <i>n</i>.</p><p data-block="sciam/paragraph">Computers are able to calculate superpermutations for <i>n</i> = 4 and <i>n</i> = 5 but not for anything beyond that. And although it is possible to calculate elaborate superpermutations for larger numbers, finding the shortest superpermutation becomes more difficult.</p><p data-block="sciam/paragraph">Experts must therefore make do with estimates. For example, there is an algorithm that helps estimate the length of the shortest possible superpermutation for <i>n</i> objects: 1! + 2! + 3! + ... + <i>n</i>! Using that algorithm, if <i>n</i> = 2, you get a superpermutation of length 1 + 2 = 3. For <i>n</i> = 3, this results in a length of 1 + 2 + 6 = 9. For <i>n</i> = 4, you get 33. And for <i>n</i> = 5, you get 153, which corresponds to the shortest superpermutation in each case.</p><p data-block="sciam/paragraph">For larger <i>n,</i> however, this algorithm no longer applies: computers have been able to find shorter superpermutations than it would suggest exists. In fact, the formula 1! + 2! + 3! + ... + <i>n</i>! massively overestimates the length of the shortest superpermutation for large <i>n</i>. Although the algorithm offers only an approximate answer, mathematicians use it as a starting place, with the goal of narrowing down options to find more precise answers.</p><h2 id="coincidences-and-rediscoveries" data-block="sciam/heading">Coincidences and Rediscoveries</h2><p data-block="sciam/paragraph">In 2013 Nathaniel Johnston, now a mathematics professor at Mount Allison University in New Brunswick, landed on a <i>Melancholy of Haruhi Suzumiya</i> fandom page. Johnston himself was not an anime fan. He had arrived at the site after Googling some search terms related to superpermutations. There he came across the discussion that had been held on 4chan almost two years earlier, which a user had copied to the fandom site.</p><p data-block="sciam/paragraph">Johnston didn’t bother doing the math <a href="http://www.njohnston.ca/2013/04/the-minimal-superpermutation-problem/">but cited the fandom post on his blog</a>. This comment, too, went unnoticed for several years.</p><p data-block="sciam/paragraph">Then in October 2018 mathematician Robin Houston came across his colleague’s blog post through a curious coincidence. Houston had just learned that Australian science fiction author Greg Egan had found a new <i>maximum </i>length for the shortest superpermutations, expressed as:</p><p data-block="sciam/paragraph"><i>n</i>! +(<i>n</i> –1)! + (<i>n</i> – 2)! + (<i>n</i> – 3)! + <i>n </i>– 3</p><p data-block="sciam/paragraph">That in itself was bizarre. But when Houston started learning more about this result, he realized that the minimum length of a superpermutation had been given a new value by an anonymous anime fandom user (he didn’t know about the origins on 4chan at that time). The formula for the minimum length is:</p><p data-block="sciam/paragraph"><i>n</i>! +(<i>n</i> – 1)! + (<i>n</i> – 2)! + <i>n</i> – 3</p><p data-block="sciam/paragraph">Houston shared <a href="https://x.com/robinhouston/status/1054637891085918209?ref_src=twsrc%5Etfw%7Ctwcamp%5Etweetembed%7Ctwterm%5E1054637891085918209%7Ctwgr%5Eaa026a45fed15b42edf702c30c79bae8cc6e60c7%7Ctwcon%5Es1_&amp;ref_url=https%3A%2F%2Fwww.spektrum.de%2Fkolumne%2Fsuperpermutation-und-anime-4chan-user-gelingt-mathematischer-beweis%2F2251925">his discovery on Twitter</a> (now X) on October 23 of that year. “A curious situation. The best known lower bound for the minimal length of superpermutations was proven by an anonymous user of a wiki mainly devoted to anime,” he wrote.</p><p data-block="sciam/paragraph">Along with his colleagues, mathematicians Jay Pantone and Vince Vatter, Houston decided to check the 4chan user’s proof and write it down in a mathematical way. <a href="https://oeis.org/A180632/a180632.pdf">The researchers posted their mathematical work</a> to the Online Encyclopedia of Integer Sequences that same month, and the first author is listed as “Anonymous 4chan Poster.”</p><p data-block="sciam/paragraph">So what do these formulas tell us? If you want to watch all episodes of an <i>n</i>-part series in all possible combinations, you must sit through at least <i>n</i>! +(<i>n </i>– 1)! + (<i>n</i> – 2)! + <i>n</i> – 3 episodes—that’s the 4chan user’s contribution—and at most <i>n</i>! +(<i>n</i> – 1)! + (<i>n</i> – 2)! + (<i>n</i> – 3)! + <i>n</i> – 3, which we know through Egan’s work.</p><p data-block="sciam/paragraph">In the case of the eight-episode series <i>Kaleidoscope,</i> you would have to watch at least 46,085 and, at most, 46,205 episodes. For <i>The Melancholy of Haruhi Suzumiya, </i>or <i>Haruhi,</i> with 14 episodes, the number increases drastically: a minimum of 93,884,313,611 episodes and a maximum of 93,924,230,411. Recall that this is not a complete solution—it’s just setting a range for the size of a superpermutation that would allow you to efficiently watch the series in every possible order.</p><p data-block="sciam/paragraph">Fortunately, Egan also provided an algorithm for constructing the corresponding superpermutation. This allows <i>Haruhi</i> fans to work out the best viewing order of episodes. But with an average episode length of around 24 minutes, it would take about 4 million years to sit through this superpermutation.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: CodeTracer – A new time-traveling debugger implemented in Nim and Rust (248 pts)]]></title>
+            <title><![CDATA[Show HN: CodeTracer – A new time-traveling debugger implemented in Nim and Rust (256 pts)]]></title>
             <link>https://github.com/metacraft-labs/codetracer</link>
             <guid>43280615</guid>
             <pubDate>Thu, 06 Mar 2025 14:30:10 GMT</pubDate>
@@ -575,7 +937,7 @@ The default configuration should be familiar to users experienced with Microsoft
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Age and cognitive skills: Use it or lose it (619 pts)]]></title>
+            <title><![CDATA[Age and cognitive skills: Use it or lose it (623 pts)]]></title>
             <link>https://www.science.org/doi/full/10.1126/sciadv.ads1560?af=R</link>
             <guid>43279494</guid>
             <pubDate>Thu, 06 Mar 2025 12:33:27 GMT</pubDate>
@@ -591,7 +953,7 @@ Couldn't get https://www.science.org/doi/full/10.1126/sciadv.ads1560?af=R: Error
 Couldn't get https://thebetter.news/housing-first-finland-homelessness/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Scientists crack how aspirin might stop cancers from spreading (139 pts)]]></title>
+            <title><![CDATA[Scientists crack how aspirin might stop cancers from spreading (141 pts)]]></title>
             <link>https://www.bbc.com/news/articles/c1d4n119xr7o</link>
             <guid>43279147</guid>
             <pubDate>Thu, 06 Mar 2025 11:53:08 GMT</pubDate>
@@ -607,7 +969,7 @@ Couldn't get https://thebetter.news/housing-first-finland-homelessness/: Error: 
 Couldn't get https://www.phoronix.com/news/AMD-Intella-Open-Source-LM: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Buy European Made. Support European Values (435 pts)]]></title>
+            <title><![CDATA[Buy European Made. Support European Values (437 pts)]]></title>
             <link>https://www.buy-european-made.eu/</link>
             <guid>43278705</guid>
             <pubDate>Thu, 06 Mar 2025 10:58:57 GMT</pubDate>
@@ -667,7 +1029,7 @@ Couldn't get https://www.phoronix.com/news/AMD-Intella-Open-Source-LM: Error: ti
 <iframe loading="lazy" width="920" height="517" src="https://www.youtube.com/embed/5YHfK6DBvGE" title="YouTube video player" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div><figure><a href="https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-scaled.jpg"><img loading="lazy" decoding="async" width="1024" height="608" src="https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-1024x608.jpg" alt="" srcset="https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-1024x608.jpg 1024w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-300x178.jpg 300w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-768x456.jpg 768w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-1536x912.jpg 1536w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-2048x1216.jpg 2048w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-1612x957.jpg 1612w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-1116x662.jpg 1116w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-806x478.jpg 806w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-558x331.jpg 558w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-655x389.jpg 655w, https://driesdepoorter.be/wp-content/uploads/2021/07/The-Flemish-Scrollers-Dries-Depoorter-600x356.jpg 600w" sizes="auto, (max-width: 1024px) 100vw, 1024px"></a></figure><h4><strong>Support my artwork by ordering one of my products:</strong></h4><figure><a href="https://driesdepoorter.be/product/shortlife-v3/"><img loading="lazy" decoding="async" width="1024" height="559" src="https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-1024x559.png" alt="" srcset="https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-1024x559.png 1024w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-300x164.png 300w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-768x419.png 768w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-1536x839.png 1536w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-1612x880.png 1612w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-1116x609.png 1116w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-806x440.png 806w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-558x305.png 558w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-655x358.png 655w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter-600x328.png 600w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shortlife-Dries-Depoorter.png 2048w" sizes="auto, (max-width: 1024px) 100vw, 1024px"></a></figure><figure><a href="https://driesdepoorter.be/product/shirt/"><img loading="lazy" decoding="async" width="1024" height="1024" src="https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-1024x1024.png" alt="" srcset="https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-1024x1024.png 1024w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-300x300.png 300w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-150x150.png 150w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-768x768.png 768w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-468x468.png 468w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-806x806.png 806w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-558x558.png 558w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-655x655.png 655w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-600x600.png 600w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter-220x220.png 220w, https://driesdepoorter.be/wp-content/uploads/2021/07/Shirt-Dries-Depoorter.png 1080w" sizes="auto, (max-width: 1024px) 100vw, 1024px"></a></figure><p>Ok the ads are done 🙂 <br>After I made the software I was invited for an exhibition in Switzerland and I made a custom made server that is running the software and is showing the process and the results: <br></p>                        </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Forget Twitter Threads; Write a Blog Post Instead (2021) (165 pts)]]></title>
+            <title><![CDATA[Forget Twitter Threads; Write a Blog Post Instead (2021) (166 pts)]]></title>
             <link>https://kevquirk.com/blog/forget-twitter-threads-write-a-blog-post-instead</link>
             <guid>43277924</guid>
             <pubDate>Thu, 06 Mar 2025 08:48:13 GMT</pubDate>
@@ -724,7 +1086,7 @@ All of the kool kids in Twitter land seem to be jumping on the bandwagon of a ve
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Revolt: Open-Source Alternative to Discord (614 pts)]]></title>
+            <title><![CDATA[Revolt: Open-Source Alternative to Discord (623 pts)]]></title>
             <link>https://revolt.chat</link>
             <guid>43277918</guid>
             <pubDate>Thu, 06 Mar 2025 08:47:32 GMT</pubDate>
@@ -743,7 +1105,7 @@ Made in Europe, motherland of GDPR.
 </p> </div>  <div data-astro-cid-ffs6crlo=""> <h2 data-astro-cid-ffs6crlo="">Next-gen DMs<br data-astro-cid-ffs6crlo="">and groups.</h2> <p data-astro-cid-ffs6crlo="">Send a friend request and you’re<br data-astro-cid-ffs6crlo="">good to go. It’s that easy.</p> </div>  <section data-astro-cid-572jwlr2=""> <h2 data-astro-cid-572jwlr2="">That’s the website,<br data-astro-cid-572jwlr2="">you can’t scroll further.</h2>   </section>     </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apache iceberg the Hadoop of the modern-data-stack? (101 pts)]]></title>
+            <title><![CDATA[Apache iceberg the Hadoop of the modern-data-stack? (102 pts)]]></title>
             <link>https://blog.det.life/apache-iceberg-the-hadoop-of-the-modern-data-stack-c83f63a4ebb9</link>
             <guid>43277214</guid>
             <pubDate>Thu, 06 Mar 2025 06:53:46 GMT</pubDate>
@@ -751,7 +1113,7 @@ Made in Europe, motherland of GDPR.
 <div id="readability-page-1" class="page"><div><div><div aria-hidden="false"><a href="https://medium.com/@danthelion?source=post_page---byline--c83f63a4ebb9---------------------------------------" rel="noopener follow"><div><p><img alt="Dani" src="https://miro.medium.com/v2/resize:fill:88:88/1*Nk5gx4bReeyCIUG7qXtRIw.png" width="44" height="44" loading="lazy" data-testid="authorPhoto"></p></div></a></div><div aria-hidden="false"><a href="https://blog.det.life/?source=post_page---byline--c83f63a4ebb9---------------------------------------" rel="noopener  ugc nofollow"><div><p><img alt="Data Engineer Things" src="https://miro.medium.com/v2/resize:fill:48:48/1*HtZXPy85bDrTZm9tMXi6aQ.png" width="24" height="24" loading="lazy" data-testid="publicationPhoto"></p></div></a></div></div><figure></figure><p id="f3b0">In the early 2010s, <a href="https://hadoop.apache.org/" rel="noopener ugc nofollow" target="_blank">Apache Hadoop</a> dominated the big data conversation. Organizations raced to adopt it, seeing it as the cornerstone for scalable, distributed storage and processing. Today, <a href="https://iceberg.apache.org/" rel="noopener ugc nofollow" target="_blank">Apache Iceberg</a> is emerging as a cornerstone for data lakes and lakehouses in the modern data stack.</p><p id="d2df">And yet, for those who lived through the “Big Data era,” a deeper look reveals striking parallels between Iceberg’s trajectory and the story of Hadoop.</p><p id="a68b">Let’s explore these parallels and what they mean for the future of data engineering.</p><h2 id="10d6">Adoption Frenzy: Solving the Right Problem at the Right Time</h2><figure><figcaption>Hey it’s an Iceberg!</figcaption></figure><p id="3eef">Hadoop’s rise was fueled by an urgent need for distributed file storage and processing, offering a solution to the “big data deluge.” Similarly, Iceberg addresses a core problem in data lakes: managing large, constantly evolving datasets with ACID compliance and schema evolution.</p><p id="980a">However, technology adoption often operates on a pendulum — the promise of solving a significant pain point drives rapid adoption, even when operational readiness lags. Hadoop’s meteoric rise led many organizations to implement it without understanding its complexities, often resulting in underutilized clusters or over-engineered architectures. Iceberg is walking a similar path. The ability to unify batch and streaming workloads, combined with features like schema evolution, has made it an alluring choice. Yet, Iceberg’s adoption often outpaces organizations’ abilities to operationalize it effectively.</p><p id="05a0">The lesson here is timeless: Adoption should be driven by alignment with organizational maturity. Jumping on the Iceberg bandwagon without a clear data strategy can lead to technical debt and unmet expectations. For example, a fintech company might adopt Iceberg for ACID guarantees in their fraud detection pipelines but grapple with compaction strategies because their streaming setup generates too many small files.</p><p id="ac99">Successful Iceberg adoption requires the same care as Hadoop — focusing on skill-building, workload alignment, and incremental integration.</p><h2 id="401a">The Small Files Problem Redux</h2><p id="395d">One of Hadoop’s most infamous pain points was the “small files problem.” HDFS wasn’t designed to handle many small files efficiently, leading to bottlenecks and degraded performance. Organizations often resorted to nightly compaction jobs or elaborate ETL pipelines to aggregate data.</p><p id="f2a4">Iceberg is not immune to this issue. While it abstracts much of the storage layer, small files remain a persistent challenge. For instance, streaming data pipelines or frequent incremental writes can lead to performance degradation due to excessive metadata overhead. Tools like Apache Spark and Flink — commonly used with Iceberg — magnify this issue if not carefully tuned.</p><p id="2511">However, the issues don’t stop there; the small file problem considerably impacts object storage costs (think of the number of requests toward S3), exponential extra computing is required for compaction, and so on.</p><p id="62f9">For example, consider a retail company capturing clickstream data. A poorly configured Flink job writes data into Iceberg tables with a default file size of 10 MB. Over time, these small files pile up, bloating the metadata catalog and slowing down query performance. Implementing periodic compaction jobs and tuning Flink’s file size thresholds could alleviate this problem.</p><p id="b4cb">As a counterexample, Estuary Flow utilizes a few tricks to <a href="https://estuary.dev/memory-efficient-streaming-parquet/" rel="noopener ugc nofollow" target="_blank">stream data into the underlying Parquet files efficiently</a>. It also allows users to stagger data materializations even in a streaming environment to align with compaction schedules.</p><p id="6220">File size tuning and write strategies are critical. Use tools like Apache Spark’s adaptive query execution to optimize partitioning or leverage Iceberg’s built-in compaction utilities to merge small files periodically. Ignoring these tasks can turn a promising Iceberg deployment into a performance bottleneck.</p><h2 id="c625">A Complex Stack to Maintain</h2><figure><figcaption>Source: <a href="https://mad.firstmark.com/" rel="noopener ugc nofollow" target="_blank">https://mad.firstmark.com/</a></figcaption></figure><p id="75ca">Hadoop was never a standalone product. It required a constellation of tools — HBase for real-time reads, Hive for SQL queries, and Spark for advanced analytics. Managing this complexity demanded specialized skill sets and sophisticated orchestration.</p><p id="c91a">Iceberg, despite its simplifications, is no different. Its power lies in its ecosystem: query engines (Trino, Spark, Flink), storage backends (S3, GCS, HDFS), and catalogs (Hive, Glue, Nessie, Polaris, Unity, the REST Catalog, and probably many more..). The configuration options can be overwhelming. For example, partitioning strategies can significantly impact query performance, and selecting the wrong catalog implementation might limit scalability.</p><p id="3f74">This complexity highlights a broader truth: No tool is an island. The success of Iceberg depends not just on its features but on the ecosystem around it. Companies that excel with Iceberg often adopt a “platform engineering” mindset, creating internal tooling and automation to manage metadata, monitor performance, and orchestrate workloads.</p><h2 id="5489">Metadata Overhead: A New Kind of Complexity</h2><p id="7770">Hadoop’s NameNode bottleneck exemplified how metadata management could derail performance. With its distributed snapshot-based metadata model, Iceberg avoids this single point of failure but introduces its own challenges. As table sizes grow, so do snapshots and manifests, leading to bloated metadata stores.</p><p id="d84b">A media company uses Iceberg to manage petabytes of video analytics data. Over time, their snapshot history grows unchecked, causing query planning times to increase. By implementing periodic snapshot expiration and manifest compaction, they keep their query performance consistent while controlling metadata growth.</p><p id="5307">My tip: Treat metadata as a first-class citizen. Automate snapshot pruning and compaction tasks and invest in monitoring solutions that surface metadata bottlenecks early.</p><h2 id="1bef">Build vs. Buy</h2><p id="3142">Hadoop’s early days required organizations to build everything from scratch. Managed services like Cloudera and AWS EMR eventually simplified adoption but came with trade-offs in cost and flexibility.</p><p id="5860">Iceberg users face a similar decision. Self-hosting offers maximum control but requires expertise in scaling and tuning. Managed solutions like Snowflake’s Iceberg tables or Starburst Galaxy reduce operational overhead but can limit flexibility and lead to vendor lock-in.</p><p id="8231">The decision boils down to your organization’s core competencies. If your team already excels in DevOps, self-hosting may offer the best ROI. Conversely, smaller teams or those new to Iceberg might benefit from managed services to jumpstart adoption.</p><h2 id="1acd">The Community Effect: Vibrant, Yet Fragmented</h2><figure><figcaption>Source: <a href="https://www.linkedin.com/posts/ydolan_in-the-last-2-years-most-of-my-apache-iceberg-activity-7256666018935173121-ofqB/" rel="noopener ugc nofollow" target="_blank">https://www.linkedin.com/posts/ydolan_in-the-last-2-years-most-of-my-apache-iceberg-activity-7256666018935173121-ofqB/</a></figcaption></figure><p id="2478">Hadoop thrived on open-source collaboration, but its fragmentation — Spark vs. MapReduce, Hive vs. Impala — often created confusion. Iceberg benefits from a vibrant open-source community. Yet, competing table formats like Delta Lake and Hudi mirror this fragmentation.</p><p id="c2dd">While competition drives innovation, it can also stall adoption. Standardization efforts — such as integrating Iceberg more deeply with query engines — will be crucial for its long-term success. The emergence of interoperability layers, akin to the “Hive Metastore” era, may define the next chapter for Iceberg.</p><h2 id="96f0">What’s Next for Iceberg?</h2><p id="e775">Despite its parallels to Hadoop, Iceberg benefits from hindsight. The data community has learned to prioritize simplicity, scalability, and cloud-native architectures. Here are key trends to watch:</p><h2 id="81f4">1. Consolidation</h2><p id="4da1">Just as Spark emerged as the dominant engine in the Hadoop ecosystem, a dominant table format and catalog may appear in the Iceberg era. This consolidation will drive standardization, whether Iceberg itself or a future innovation.</p><p id="e75a">Projects like <a href="https://xtable.apache.org/" rel="noopener ugc nofollow" target="_blank">Apache XTable</a> are working on making interoperability super easy among table formats.</p><h2 id="2e14">2. Operational Maturity</h2><p id="8351">The next wave of Iceberg tools will focus on reducing operational complexity. Managed services and orchestration frameworks are already emerging, following the footsteps of Databricks and Snowflake.</p><p id="ebc3">Amazon’s recently announced <a href="https://estuary.dev/s3-tables-for-apache-iceberg/" rel="noopener ugc nofollow" target="_blank">S3 Tables</a> is an excellent example of this. It abstracts away the complexities of maintaining Iceberg tables and offers a built-in catalog, although this has a side effect of reduced compatibility with the rest of the ecosystem.</p><h2 id="7576">3. Beyond Analytics</h2><p id="e9c2">Iceberg’s support for streaming and transactional workloads positions it as more than an analytics tool. Imagine using Iceberg to power event-driven architectures or real-time machine learning pipelines — scenarios that push beyond traditional batch processing.</p><p id="2c03"><a href="https://estuary.dev/destination/s3-iceberg/" rel="noopener ugc nofollow" target="_blank">Estuary Flow’s Iceberg connector</a> is a good example of the table format that can be integrated into real-time streaming projects.</p><h2 id="b3ca">Final Thoughts</h2><figure><figcaption>Iceberg is here to stay</figcaption></figure><p id="0a39">Apache Iceberg is undeniably transformative, much like Hadoop was a decade ago. But with great power comes great complexity. As with any tool in the modern data stack, success lies in aligning the technology with your organization’s readiness, skill set, and strategic goals.</p><p id="b7c3">While the parallels to Hadoop are striking, we also have the opportunity to avoid its pitfalls. By learning from the past, we can ensure that Iceberg isn’t just the Hadoop of the modern data stack — it’s the evolution we’ve been waiting for.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Authoritarian Regime Survival Guide (211 pts)]]></title>
+            <title><![CDATA[The Authoritarian Regime Survival Guide (212 pts)]]></title>
             <link>https://verfassungsblog.de/the-authoritarian-regime-survival-guide/</link>
             <guid>43276843</guid>
             <pubDate>Thu, 06 Mar 2025 05:53:30 GMT</pubDate>
