@@ -4,12 +4,244 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 07 May 2025 15:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 07 May 2025 16:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Unity’s Open-Source Double Standard: the ban of VLC (274 pts)]]></title>
+            <title><![CDATA[Waiting for Postgres 18: Accelerating Disk Reads with Asynchronous I/O (110 pts)]]></title>
+            <link>https://pganalyze.com/blog/postgres-18-async-io</link>
+            <guid>43916577</guid>
+            <pubDate>Wed, 07 May 2025 14:57:03 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://pganalyze.com/blog/postgres-18-async-io">https://pganalyze.com/blog/postgres-18-async-io</a>, See on <a href="https://news.ycombinator.com/item?id=43916577">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><p>With the Postgres 18 Beta 1 release this week a multi-year effort, and significant architectural shift in Postgres is taking shape: <strong>Asynchronous I/O (AIO)</strong>. These capabilities are still under active development, but they represent a fundamental change in how Postgres handles I/O, offering the potential for significant performance gains, particularly in cloud environments where latency is often the bottleneck.</p>
+<div>
+<ul>
+<li>
+<p><a href="#why-asynchronous-io-matters">Why asynchronous I/O matters</a></p>
+<ul>
+<li><a href="#how-postgres-17s-read-streams-paved-the-way">How Postgres 17’s read streams paved the way</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#new-io_method-setting-in-postgres-18">New io_method setting in Postgres 18</a></p>
+<ul>
+<li><a href="#io_method--sync">io_method = sync</a></li>
+<li><a href="#io_method--worker">io_method = worker</a></li>
+<li><a href="#io_method--io_uring">io_method = io_uring</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#asynchronous-io-in-action">Asynchronous I/O in action</a></p>
+<ul>
+<li><a href="#benchmark-on-aws-doubling-read-performance--even-greater-gains-from-io_uring">Benchmark on AWS: Doubling read performance &amp; even greater gains from io_uring</a></li>
+<li><a href="#tuning-effective_io_concurrency">Tuning effective_io_concurrency</a></li>
+<li><a href="#monitoring-ios-in-flight-with-pg_aios">Monitoring I/Os in flight with pg_aios</a></li>
+</ul>
+</li>
+<li>
+<p><a href="#heads-up-async-io-makes-io-timing-information-hard-to-interpret">Heads Up: Async I/O makes I/O timing information hard to interpret</a></p>
+</li>
+<li>
+<p><a href="#conclusion">Conclusion</a></p>
+<ul>
+<li><a href="#in-summary">In summary</a></li>
+<li><a href="#references">References</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<p>While some features may still be adjusted or dropped during the beta period before the final release, now is the best time to test and validate how Postgres 18 performs in practice. In Postgres 18 AIO is limited to read operations; writes remain synchronous, though support may expand in future versions.</p>
+<p>In this post, we explain what asynchronous I/O is, how it works in Postgres 18, and what it means for performance optimization.</p>
+<h2 id="why-asynchronous-io-matters"><a href="#why-asynchronous-io-matters" aria-label="why asynchronous io matters permalink"></a>Why asynchronous I/O matters</h2>
+<p>Postgres has historically operated under a synchronous I/O model, meaning every read request is a blocking system call. The database must pause and wait for the operating system to return the data before continuing. This design introduces unnecessary waits on I/O, especially in cloud environments where storage is often network-attached (e.g. Amazon EBS) and I/O can have over 1ms of latency.</p>
+<p>In a simplified model, we can illustrate the difference like this, ignoring any prefetching/batching the Linux kernel might do:</p>
+<p><span>
+      <a href="https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/913b9/sync_vs_async.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="Diagram showing synchronous vs asynchronous I/O model with concurrent requests" title="In the asynchronous I/O model, multiple read requests can be in flight simultaneously" src="https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/1d69c/sync_vs_async.png" srcset="https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/4dcb9/sync_vs_async.png 188w, https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/5ff7e/sync_vs_async.png 375w, https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/1d69c/sync_vs_async.png 750w, https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/78797/sync_vs_async.png 1125w, https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/aa440/sync_vs_async.png 1500w, https://pganalyze.com/static/cd0be5dde105345bb288ac73655b90f1/913b9/sync_vs_async.png 1822w" sizes="(max-width: 750px) 100vw, 750px" loading="lazy" decoding="async">
+  </a>
+    </span></p>
+<p>You can picture synchronous I/O like an imaginary librarian who retrieves one book at a time, returning before fetching the next. This inefficiency compounds as the number of physical reads for a logical operation increases.</p>
+<p>Asynchronous I/O eliminates that bottleneck by allowing programs to issue multiple read requests concurrently, without waiting for prior reads to return. In an async program flow, I/O requests are scheduled to be read into a memory location and the program waits for completion of those reads, instead of issuing each read individually.</p>
+<h3 id="how-postgres-17s-read-streams-paved-the-way"><a href="#how-postgres-17s-read-streams-paved-the-way" aria-label="how postgres 17s read streams paved the way permalink"></a>How Postgres 17’s read streams paved the way</h3>
+<p>The work for implementing asynchronous I/O in Postgres has been many years in the making. Postgres 17 introduced an essential internal abstration, <a href="https://pganalyze.com/blog/5mins-postgres-17-streaming-io">with the introduction of read stream APIs</a>. These internal changes standardized how read operations were issued across different subsystems and streamlined the use of <code>posix_fadvise()</code> to request that the operating system prefetch data in advance.</p>
+<p>However, this advisory mechanism only hinted to the kernel to load data into the OS page cache, not into Postgres’ own shared buffers. Postgres still had to issue syscalls for each read, and OS readahead behaviour is not always consistent.</p>
+<p>The upcoming Postgres 18 release removes this indirection. With true asynchronous reads, data is fetched directly into shared buffers by the database itself, bypassing reliance on kernel-level heuristics and enabling more predictable, higher-throughput I/O behavior.</p>
+<h2 id="new-io_method-setting-in-postgres-18"><a href="#new-io_method-setting-in-postgres-18" aria-label="new io_method setting in postgres 18 permalink"></a>New io_method setting in Postgres 18</h2>
+<p>To control the mechanism used for asynchronous I/O, Postgres 18 introduces a new configuration parameter: <code>io_method</code>. This setting determines how read operations are dispatched under the hood, and whether they’re handled synchronously, offloaded to I/O workers, or submitted directly to the kernel via <code>io_uring</code>.</p>
+<p>The <code>io_method</code> setting must be set in postgresql.conf and cannot be changed without restarting. It controls which  I/O implementation Postgres will use and is essential to understand when tuning I/O performance in Postgres 18. There are three possible settings for io_method, with the current default (as of Beta 1) being <code>worker</code>.</p>
+<h3 id="io_method--sync"><a href="#io_method--sync" aria-label="io_method  sync permalink"></a>io_method = sync</h3>
+<p>The <code>sync</code> setting in Postgres 18 mirrors the synchronous behavior as was implemented in Postgres 17. Reads are still synchronous and blocking, using <code>posix_fadvise()</code> to achieve read-ahead in the Linux kernel.</p>
+<h3 id="io_method--worker"><a href="#io_method--worker" aria-label="io_method  worker permalink"></a>io_method = worker</h3>
+<p>The <code>worker</code> setting utilizes dedicated <strong>I/O worker processes</strong> running in the background that retrieve data independently of query execution. The main backend process enqueues read requests, and these workers interact with the Linux kernel to fetch data, which is then delivered into shared buffers, <strong>without blocking the main process</strong>.</p>
+<p>The number of I/O workers can be configured through the new <code>io_workers</code> setting, and defaults to <code>3</code>. These workers are always running, and shared across all connections and databases.</p>
+<h3 id="io_method--io_uring"><a href="#io_method--io_uring" aria-label="io_method  io_uring permalink"></a>io_method = io_uring</h3>
+<p>This Linux-specific method uses <strong><code>io_uring</code></strong>, a high-performance I/O interface introduced in kernel version 5.1. Asynchronous I/O has been available in Linux since kernel version 2.5, but it was largely considered inefficient and hard to use. <code>io_uring</code> establishes a <strong>shared ring buffer</strong> between Postgres and the kernel, minimizing syscall overhead. This is the most efficient option, <strong>eliminating the need for I/O worker processes entirely</strong>, but is only available on newer Linux kernels and requires file systems and configurations compatible with <code>io_uring</code> support.</p>
+<p><strong>Important note:</strong> As of the Postgres 18 Beta 1, asynchronous I/O is supported for sequential scans, bitmap heap scans, and maintenance operations like <code>VACUUM</code>.</p>
+<h2 id="asynchronous-io-in-action"><a href="#asynchronous-io-in-action" aria-label="asynchronous io in action permalink"></a>Asynchronous I/O in action</h2>
+<p>Asynchronous I/O delivers the most noticeable gains in cloud environments where storage is network-attached, such as Amazon EBS volumes. In these setups, individual disk reads often take multiple milliseconds, introducing substantial latency compared to local SSDs.</p>
+<p>With traditional synchronous I/O, each of these reads blocks query execution until the data arrives, leading to idle CPU time and degraded throughput. By contrast, asynchronous I/O allows Postgres to issue multiple read requests in parallel and continue processing while waiting for results. This reduces query latency and enables much more efficient use of available I/O bandwidth and CPU cycles.</p>
+<h3 id="benchmark-on-aws-doubling-read-performance--even-greater-gains-from-io_uring"><a href="#benchmark-on-aws-doubling-read-performance--even-greater-gains-from-io_uring" aria-label="benchmark on aws doubling read performance  even greater gains from io_uring permalink"></a>Benchmark on AWS: Doubling read performance &amp; even greater gains from io_uring</h3>
+<p>To evaluate the performance impact of asynchronous I/O, we benchmarked a representative workload on AWS, comparing Postgres 17 with Postgres 18 using different <code>io_method</code> settings. The workload remained identical across versions, allowing us to isolate the effects of the new I/O infrastructure.</p>
+<p>We've tested on an AWS c7i.8xlarge instance (32 vCPUs, 64 GB RAM), with a dedicated 100GB <code>io2</code> EBS volume for Postgres, with 20,000 provisioned IOPS. The test table was 3.5GB in size:</p>
+<div data-language="sql"><pre><code><span>CREATE</span> <span>TABLE</span> test<span>(</span>id <span>int</span><span>)</span><span>;</span>
+<span>INSERT</span> <span>INTO</span> test <span>SELECT</span> <span>*</span> <span>FROM</span> generate_series<span>(</span><span>0</span><span>,</span> <span>100000000</span><span>)</span><span>;</span></code></pre></div>
+<div data-language="text"><pre><code>test=# \dt+
+                                   List of relations
+ Schema | Name | Type  |  Owner   | Persistence | Access method |  Size   | Description 
+--------+------+-------+----------+-------------+---------------+---------+-------------
+ public | test | table | postgres | permanent   | heap          | 3458 MB | 
+(1 row)</code></pre></div>
+<p>Between test runs we cleared the OS page cache (<code>sync; echo 3 &gt; /proc/sys/vm/drop_caches</code>), and restarted Postgres, to gather cold cache results. Warm cache results represent running the query a second time. We repeated the complete test run for each configuration multiple times, retaining the best result out of three.</p>
+<p>Whilst we also tested with parallel query, to keep results easier to understand all results below are with parallel query turned off (<code>max_parallel_workers_per_gather = 0</code>).</p>
+<p><strong>Cold cache results:</strong></p>
+<p>Postgres 17, using synchronous I/O, established the baseline. It showed consistent read latency, but throughput was limited by the need to complete each I/O request before issuing the next:</p>
+<div data-language="text"><pre><code>test=# SELECT COUNT(*) FROM test;
+   count   
+-----------
+ 100000001
+(1 row)
+
+Time: 15830.880 ms (00:15.831)</code></pre></div>
+<p>Postgres 18, when configured with <code>io_method = sync</code>, performed nearly identically, confirming that behavior remains unchanged without enabling asynchronous I/O:</p>
+<div data-language="text"><pre><code>test=# SELECT COUNT(*) FROM test;
+   count   
+-----------
+ 100000001
+(1 row)
+
+Time: 15071.089 ms (00:15.071)</code></pre></div>
+<p>However, when we switch to using the <code>worker</code> method, with 3 I/O workers (the default) a clear improvement shows:</p>
+<div data-language="text"><pre><code>test=# SELECT COUNT(*) FROM test;
+   count   
+-----------
+ 100000001
+(1 row)
+
+Time: 10051.975 ms (00:10.052)</code></pre></div>
+<p>We observed some gains by raising the number of I/O workers, but the biggested improvement comes when utilizing <code>io_uring</code>:</p>
+<div data-language="text"><pre><code>test=# SELECT COUNT(*) FROM test;
+   count   
+-----------
+ 100000001
+(1 row)
+
+Time: 5723.423 ms (00:05.723)</code></pre></div>
+<p>When we graph this (measuring runtime in ms, lower is better), it’s clear that Postgres 18 performs significantly better in cold cache situations:</p>
+<p><span>
+      <a href="https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/50e7d/runtime-compared.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="Read performance comparison between Postgres 17 and 18 with different io_method settings" title="Read performance comparison between Postgres 17 and 18 with different io_method settings" src="https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/1d69c/runtime-compared.png" srcset="https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/4dcb9/runtime-compared.png 188w, https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/5ff7e/runtime-compared.png 375w, https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/1d69c/runtime-compared.png 750w, https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/78797/runtime-compared.png 1125w, https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/aa440/runtime-compared.png 1500w, https://pganalyze.com/static/506febf39b7d14c7ba413260d30b63cc/50e7d/runtime-compared.png 1738w" sizes="(max-width: 750px) 100vw, 750px" loading="lazy" decoding="async">
+  </a>
+    </span></p>
+<p>For cold cache tests, both <code>worker</code> and <code>io_uring</code> delivered a consistent <strong>2-3x improvement</strong> in read performance compared to the legacy <code>sync</code> method.</p>
+<p>Whilst <code>worker</code> offers a slight benefit for warm cache tests due to its parallelism, <code>io_uring</code> consistently performed better in cold cache tests, and its lower syscall overhead and reduced process coordination would make <strong><code>io_uring</code> the recommended setting</strong> for maximizing I/O performance in Postgres 18.</p>
+<p>This performance shift for disk reads has meaningful implications for infrastructure planning, especially in cloud environments. By reducing I/O wait time, asynchronous reads can substantially increase query throughput, reduce latency and CPU overhead. For read-heavy workloads, this may translate into smaller instance sizes or better utilization of existing resources.</p>
+<h3 id="tuning-effective_io_concurrency"><a href="#tuning-effective_io_concurrency" aria-label="tuning effective_io_concurrency permalink"></a>Tuning effective_io_concurrency</h3>
+<p>In Postgres 18, <code>effective_io_concurrency</code> becomes more interesting, but only when used with an asynchronous <code>io_method</code> such as <code>worker</code> or <code>io_uring</code>. Previously, this setting merely advised the OS to prefetch data using <code>posix_fadvise</code>. Now, it directly controls how many asynchronous read-ahead requests Postgres issues internally.</p>
+<p>The number of blocks read ahead is influenced by both <code>effective_io_concurrency</code> and <code>io_combine_limit</code>, following the general formula:</p>
+<div data-language="text"><pre><code>maximum read-ahead = effective_io_concurrency × io_combine_limit</code></pre></div>
+<p>This gives DBAs and engineers greater control over I/O behavior. The optimal value requires benchmarking, as it depends on your I/O subsystem. For example, higher values may benefit cloud environments with high latency that also support high concurrency, like AWS EBS with high provisioned IOPS.</p>
+<p>When doing our benchmarks, we also tested higher <code>effective_io_concurrency</code> (between 16 and 128) but did not see a meaningful difference. However, that is likely due to the simple test query used.</p>
+<p>It’s worth noting that the previous default of effective_io_concurrency was 1 in Postgres 17, which is now raised to 16, <a href="https://git.postgresql.org/gitweb/?p=postgresql.git;a=commit;h=ff79b5b2ab">based on benchmarks done by the Postgres community</a>.</p>
+<h3 id="monitoring-ios-in-flight-with-pg_aios"><a href="#monitoring-ios-in-flight-with-pg_aios" aria-label="monitoring ios in flight with pg_aios permalink"></a>Monitoring I/Os in flight with pg_aios</h3>
+<p>As mentioned, previous versions of Postgres with synchronous I/O made it easy to spot read delays: the backend process would block while waiting for disk access, and monitoring tools like pganalyze can reliably surface <code>IO / DataFileRead</code> as a wait event during these stalls.</p>
+<p>For example, here we can see wait events clearly in Postgres 17 synchronous I/O.</p>
+<p><span>
+      <a href="https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/8deec/wait_events_io_read.png" target="_blank" rel="noopener">
+    <span></span>
+  <img alt="Screenshot of pganalyze showing wait events in Postgres 17" title="pganalyze interface showing clear IO / DataFileRead wait events in Postgres 17" src="https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/1d69c/wait_events_io_read.png" srcset="https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/4dcb9/wait_events_io_read.png 188w, https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/5ff7e/wait_events_io_read.png 375w, https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/1d69c/wait_events_io_read.png 750w, https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/78797/wait_events_io_read.png 1125w, https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/aa440/wait_events_io_read.png 1500w, https://pganalyze.com/static/67303bca18e1ab006c16c26979172b33/8deec/wait_events_io_read.png 2136w" sizes="(max-width: 750px) 100vw, 750px" loading="lazy" decoding="async">
+  </a>
+    </span></p>
+<p>With asynchronous I/O in Postgres 18, backend wait behavior changes. When using <code>io_method = worker</code>, the backend process delegates reads to a separate I/O worker. As a result, the backend may appear idle or show the new <code>IO / AioIoCompletion</code> wait event, while the I/O worker shows the actual I/O wait events:</p>
+<div data-language="sql"><pre><code><span>SELECT</span> backend_type<span>,</span> query<span>,</span> state<span>,</span> wait_event_type<span>,</span> wait_event
+  <span>FROM</span> pg_stat_activity
+ <span>WHERE</span> backend_type <span>=</span> <span>'client backend'</span> <span>OR</span> backend_type <span>=</span> <span>'io worker'</span><span>;</span></code></pre></div>
+<div data-language="text"><pre><code>  backend_type  | state  | wait_event_type |   wait_event    
+----------------+--------+-----------------+-----------------
+ client backend | active | IO              | AioIoCompletion
+ io worker      |        | IO              | DataFileRead
+ io worker      |        | IO              | DataFileRead
+ io worker      |        | IO              | DataFileRead
+(4 rows)</code></pre></div>
+<p>With <code>io_method = io_uring</code>, read operations are submitted directly to the kernel and completed asynchronously. The backend does not block on a traditional I/O syscall, so this activity is not visible from the Postgres side, even though I/O is in progress.</p>
+<p>To help with debugging of I/O requests in flight, the new <code>pg_aios</code> view can show Postgres internal state, even when using <code>io_uring</code>:</p>
+
+<div data-language="text"><pre><code>  pid  | io_id | io_generation |    state     | operation |    off    | length | target | handle_data_len | raw_result | result  |                   target_desc                    | f_sync | f_localmem | f_buffered 
+-------+-------+---------------+--------------+-----------+-----------+--------+--------+-----------------+------------+---------+--------------------------------------------------+--------+------------+------------
+ 91452 |     1 |          4781 | SUBMITTED    | read      | 996278272 | 131072 | smgr   |              16 |            | UNKNOWN | blocks 383760..383775 in file "base/16384/16389" | f      | f          | t
+ 91452 |     2 |          4785 | SUBMITTED    | read      | 996147200 | 131072 | smgr   |              16 |            | UNKNOWN | blocks 383744..383759 in file "base/16384/16389" | f      | f          | t
+ 91452 |     3 |          4796 | SUBMITTED    | read      | 996409344 | 131072 | smgr   |              16 |            | UNKNOWN | blocks 383776..383791 in file "base/16384/16389" | f      | f          | t
+ 91452 |     4 |          4802 | SUBMITTED    | read      | 996016128 | 131072 | smgr   |              16 |            | UNKNOWN | blocks 383728..383743 in file "base/16384/16389" | f      | f          | t
+ 91452 |     5 |          3175 | COMPLETED_IO | read      | 995885056 | 131072 | smgr   |              16 |     131072 | UNKNOWN | blocks 383712..383727 in file "base/16384/16389" | f      | f          | t
+(5 rows)</code></pre></div>
+<p>Understanding these behavior changes and understanding the impact of asynchronous execution is essential when optimizing I/O performance in Postgres 18.</p>
+<h2 id="heads-up-async-io-makes-io-timing-information-hard-to-interpret"><a href="#heads-up-async-io-makes-io-timing-information-hard-to-interpret" aria-label="heads up async io makes io timing information hard to interpret permalink"></a>Heads Up: Async I/O makes I/O timing information hard to interpret</h2>
+<p>Asynchronous I/O introduces a shift in how execution timing is reported. When the backend no longer blocks directly on disk reads (as is the case with <code>worker</code> or <code>io_uring</code>) the complete time spent doing I/O may not be reflected in <code>EXPLAIN ANALYZE</code> output. This can make I/O-bound queries seem to require less I/O effort than previously.</p>
+<p>First, let's run the earlier query in <code>EXPLAIN ANALYZE</code> on a cold cache in Postgres 17:</p>
+<div data-language="text"><pre><code>test=# EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT COUNT(*) FROM test;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1692478.40..1692478.41 rows=1 width=8) (actual rows=1 loops=1)
+   Buffers: shared read=442478
+   I/O Timings: shared read=14779.316
+   -&gt;  Seq Scan on test  (cost=0.00..1442478.32 rows=100000032 width=0) (actual rows=100000001 loops=1)
+         Buffers: shared read=442478
+         I/O Timings: shared read=14779.316
+ Planning:
+   Buffers: shared hit=13 read=6
+   I/O Timings: shared read=3.182
+ Planning Time: 8.136 ms
+ Execution Time: 18006.405 ms
+(11 rows)</code></pre></div>
+<p>We've read 442,478 buffers in 14.8 seconds.</p>
+<p>And now, we repeat the test on Postgres 18 with the default settings (<code>io_method = worker</code>):</p>
+<div data-language="text"><pre><code>test=# EXPLAIN (ANALYZE, BUFFERS, TIMING OFF) SELECT COUNT(*) FROM test;
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1692478.40..1692478.41 rows=1 width=8) (actual rows=1.00 loops=1)
+   Buffers: shared read=442478
+   I/O Timings: shared read=7218.835
+   -&gt;  Seq Scan on test  (cost=0.00..1442478.32 rows=100000032 width=0) (actual rows=100000001.00 loops=1)
+         Buffers: shared read=442478
+         I/O Timings: shared read=7218.835
+ Planning:
+   Buffers: shared hit=13 read=6
+   I/O Timings: shared read=2.709
+ Planning Time: 2.925 ms
+ Execution Time: 10480.827 ms
+(11 rows)</code></pre></div>
+<p>We've read 442,478 buffers in 7.2 seconds.</p>
+<p>Whilst with parallel query we get a summary of all the I/O time across all parallel workers, no such summarization occurs with I/O workers. What we are seeing is the wait time for the I/O to be completed, ignoring any parallelism that may happen behind the scenes.</p>
+<p>This is technically not a behaviour change, since even in Postgres 17 the time reported was the time spent waiting on I/Os, not the time spent performing the I/O, e.g. Kernel I/O time for readahead was never accounted for.</p>
+<p>Historically I/O timing was often equated with I/O effort, instead of just looking at shared buffer read counts, in order to distinguish from a OS page cache hit. Now, in Postgres 18, interpreting I/O timing requires more caution: asynchronous I/O can hide I/O overhead in query plans.</p>
+<h2 id="conclusion"><a href="#conclusion" aria-label="conclusion permalink"></a>Conclusion</h2>
+<p>To summarize, the upcoming release of Postgres 18 marks the beginning of a major evolution in how I/O is handled. While currently limited to reads, asynchronous I/O already opens the door to significant performance improvements in high-latency cloud environments.</p>
+<p>But some of these gains come with tradeoffs. Engineering teams will need to adjust their observability practices, learn new semantics for timing and wait events, and perhaps revisit tuning parameters with previously limited impact, like <code>effective_io_conurrency</code>.</p>
+<h3 id="in-summary"><a href="#in-summary" aria-label="in summary permalink"></a>In summary</h3>
+<ul>
+<li>Asynchronous I/O support in Postgres 18 introduces <code>worker</code> (as the default) and <code>io_uring</code> options under the new <code>io_method</code> setting.</li>
+<li>Benchmarks show up to a 2-3x throughput improvement for read-heavy workloads in cloud environments.</li>
+<li>Observability practices need to evolve: <code>EXPLAIN ANALYZE</code> may underreport I/O effort, and new views like <code>pg_aios</code> will help provide insights.</li>
+<li>Tools like pganalyze will be adapting to these changes to continue surfacing relevant performance insights.</li>
+</ul>
+<p>As Postgres development continues, future versions (19 and beyond) may bring asynchronous write support, further reducing I/O bottlenecks in modern workloads, and enabling production use of Direct I/O.</p>
+<h3 id="references"><a href="#references" aria-label="references permalink"></a>References</h3>
+<ul>
+<li><a href="https://www.postgresql.org/docs/devel/runtime-config-resource.html#GUC-IO-METHOD">PostgreSQL <code>io_method</code> GUC (Postgres 18)</a></li>
+<li><a href="https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-EFFECTIVE-IO-CONCURRENCY">PostgreSQL <code>effective_io_concurrency</code></a></li>
+<li><a href="https://www.postgresql.org/docs/current/storage-buffer.html">PostgreSQL Shared Buffers and Buffer Management</a></li>
+<li><a href="https://www.postgresql.org/docs/current/monitoring-stats.html#PG-STAT-ACTIVITY-VIEW"><code>pg_stat_activity</code> View</a></li>
+<li><a href="https://www.postgresql.org/docs/devel/monitoring-stats.html#PG-STAT-IO-VIEW"><code>pg_stat_io</code> View</a></li>
+<li><a href="https://www.postgresql.org/docs/devel/monitoring-stats.html#PG-AIOS-VIEW"><code>pg_aios</code> View (New in Postgres 18)</a></li>
+<li><a href="https://man7.org/linux/man-pages/man2/posix_fadvise.2.html"><code>posix_fadvise()</code> System Call</a></li>
+<li><a href="https://www.google.com/url?q=https://www.man7.org/linux/man-pages/man7/io_uring.7.html&amp;sa=D&amp;source=docs&amp;ust=1746206271490972&amp;usg=AOvVaw1B_RmjsiRaB-HDroNJCv6b">Linux io_uring Man Page</a></li>
+<li><a href="https://pganalyze.com/blog/5mins-postgres-17-streaming-io">5mins of Postgres: Waiting for Postgres 17: Streaming I/O for sequential scans &amp; ANALYZE</a></li>
+</ul></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Unity’s Open-Source Double Standard: the ban of VLC (320 pts)]]></title>
             <link>https://mfkl.github.io/2024/01/10/unity-double-oss-standards.html</link>
             <guid>43914832</guid>
             <pubDate>Wed, 07 May 2025 12:33:40 GMT</pubDate>
@@ -93,7 +325,7 @@
       </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[CLion Is Now Free for Non-Commercial Use (256 pts)]]></title>
+            <title><![CDATA[CLion Is Now Free for Non-Commercial Use (322 pts)]]></title>
             <link>https://blog.jetbrains.com/clion/2025/05/clion-is-now-free-for-non-commercial-use/</link>
             <guid>43914705</guid>
             <pubDate>Wed, 07 May 2025 12:18:38 GMT</pubDate>
@@ -319,7 +551,7 @@
                                                             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[So Much Blood (134 pts)]]></title>
+            <title><![CDATA[So Much Blood (175 pts)]]></title>
             <link>https://dynomight.net/blood/</link>
             <guid>43913751</guid>
             <pubDate>Wed, 07 May 2025 09:41:13 GMT</pubDate>
@@ -619,7 +851,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Zed: High-performance AI Code Editor (213 pts)]]></title>
+            <title><![CDATA[Zed: High-performance AI Code Editor (278 pts)]]></title>
             <link>https://zed.dev/blog/fastest-ai-code-editor</link>
             <guid>43912844</guid>
             <pubDate>Wed, 07 May 2025 06:38:40 GMT</pubDate>
@@ -704,7 +936,7 @@ Windows users can build from source, but the reason we don’t have a stable rel
 </ul><hr></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[EPA Plans to Shut Down the Energy Star Program (206 pts)]]></title>
+            <title><![CDATA[EPA Plans to Shut Down the Energy Star Program (218 pts)]]></title>
             <link>https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminated.html</link>
             <guid>43911252</guid>
             <pubDate>Wed, 07 May 2025 01:11:10 GMT</pubDate>
@@ -712,7 +944,7 @@ Windows users can build from source, but the reason we don’t have a stable rel
 Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminated.html: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Jury orders NSO to pay $167M for hacking WhatsApp users (197 pts)]]></title>
+            <title><![CDATA[Jury orders NSO to pay $167M for hacking WhatsApp users (199 pts)]]></title>
             <link>https://arstechnica.com/security/2025/05/jury-orders-nso-to-pay-167-million-for-hacking-whatsapp-users/</link>
             <guid>43911167</guid>
             <pubDate>Wed, 07 May 2025 00:54:19 GMT</pubDate>
@@ -732,7 +964,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FTC bans hidden fees for live events and short-term rentals, effective May 12 (181 pts)]]></title>
+            <title><![CDATA[FTC bans hidden fees for live events and short-term rentals, effective May 12 (183 pts)]]></title>
             <link>https://techcrunch.com/2025/05/05/ftc-bans-hidden-fees-for-live-events-and-short-term-rentals-effective-may-12/</link>
             <guid>43910794</guid>
             <pubDate>Tue, 06 May 2025 23:41:13 GMT</pubDate>
@@ -871,7 +1103,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bloat is still software's biggest vulnerability (2024) (208 pts)]]></title>
+            <title><![CDATA[Bloat is still software's biggest vulnerability (2024) (224 pts)]]></title>
             <link>https://spectrum.ieee.org/lean-software-development</link>
             <guid>43910745</guid>
             <pubDate>Tue, 06 May 2025 23:33:54 GMT</pubDate>
@@ -879,7 +1111,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
 <div id="readability-page-1" class="page"><div data-headline="Why Bloat Is Still Software’s Biggest Vulnerability"><p><em>This post is dedicated to the memory of </em><a href="https://ethz.ch/en/news-and-events/eth-news/news/2024/01/computer-pioneer-niklaus-wirth-has-died.html" rel="noopener noreferrer" target="_blank"><em>Niklaus Wirth</em></a><em>, a computing pioneer who passed away 1 January 2024. In 1995 he wrote an influential article called “</em><a href="https://cr.yp.to/bib/1995/wirth.pdf" rel="noopener noreferrer" target="_blank"><em>A Plea for Lean Software</em></a><em>,”</em><em> published in </em><a href="https://ieeexplore.ieee.org/document/348001" target="_blank">Computer</a><em>, the magazine for members of the <a href="https://spectrum.ieee.org/tag/ieee-computer-society">IEEE Computer Society</a>, which I read early in my career as an entrepreneur and software developer. In what follows, I try to make the same case nearly 30 years later, updated for today’s computing horrors. A version of this post was </em><a href="https://berthub.eu/articles/posts/a-2024-plea-for-lean-software/" rel="noopener noreferrer" target="_blank"><em>originally published</em></a><em> on my personal blog, <a href="http://berthub.eu/" target="_blank">Berthub.eu</a>.</em><br></p><p>Some years ago I did a talk at a local university on <a href="https://spectrum.ieee.org/tag/cybersecurity">cybersecurity</a>, titled “<a href="https://berthub.eu/cyber-mad/Cyber%20and%20information%20security.pdf" rel="noopener noreferrer" target="_blank">Cyber and Information Security: Have We All Gone Mad?</a>” It is still worth reading today since we <em>have</em> gone quite mad collectively.</p><p>The way we build and ship software these days is mostly ridiculous, leading to apps using millions of lines of code to open a garage door, and other simple programs importing <a href="https://github.com/SashenJayathilaka/Photo-Sharing-Application" target="_blank">1,600 external code libraries</a>—dependencies—of unknown provenance. <a href="https://spectrum.ieee.org/tag/software-security">Software security</a> is dire, which is a function both of the quality of the code and the sheer amount of it. Many of us <a href="https://spectrum.ieee.org/tag/programmers">programmers</a> know the current situation is untenable. Many programmers (and their management) sadly haven’t ever experienced anything else. And for the rest of us, we rarely get the time to do a better job.</p><p>It is not just you; we are not merely suffering from nostalgia: Software really is very weird today.</p><p> Let me briefly go over the terrible state of software security, and then spend some time on why it is so bad. I also mention some regulatory and legislative things going on that we might use to make software quality a priority again. Finally, I talk about <a href="https://berthub.eu/articles/trifecta" rel="noopener noreferrer" target="_blank">an actual useful piece of software I wrote</a> as a proof of concept that one can still make <a href="https://berthub.eu/articles/posts/trifecta-technology" rel="noopener noreferrer" target="_blank">minimal and simple yet modern software</a>.</p><p>I hope that this post provides some mental and moral support for suffering programmers and technologists who want to improve things. It is not just you; We are not merely suffering from nostalgia: Software really is very weird today.</p><h2>The terrible state of software security</h2><p>Without going all <a href="https://knowyourmeme.com/memes/old-man-yells-at-cloud" rel="noopener noreferrer" target="_blank">“Old man (48) yells at cloud</a>,” let me restate some obvious things. The state of software security is <em>dire</em>. If we only look at the past year, if you ran industry-standard software like <a href="https://www.ncsc.gov.uk/news/exploitation-ivanti-vulnerabilities" rel="noopener noreferrer" target="_blank">Ivanti</a>, <a href="https://en.wikipedia.org/wiki/2023_MOVEit_data_breach" rel="noopener noreferrer" target="_blank">MOVEit</a>, <a href="https://www.bleepingcomputer.com/news/microsoft/russian-hackers-exploiting-outlook-bug-to-hijack-exchange-accounts/" rel="noopener noreferrer" target="_blank">Outlook</a>, <a href="https://confluence.atlassian.com/security/cve-2023-22518-improper-authorization-vulnerability-in-confluence-data-center-and-server-1311473907.html" rel="noopener noreferrer" target="_blank">Confluence</a>, <a href="https://www.mandiant.com/resources/blog/barracuda-esg-exploited-globally" rel="noopener noreferrer" target="_blank">Barracuda Email Security Gateway</a>, <a href="https://www.mandiant.com/resources/blog/remediation-netscaler-adc-gateway-cve-2023-4966" rel="noopener noreferrer" target="_blank">Citrix NetScaler ADC, and NetScaler Gateway</a>, chances are you got hacked. Even companies with near-infinite resources (like Apple and <a href="https://spectrum.ieee.org/tag/google">Google</a>) made <a href="https://www.schneier.com/blog/archives/2023/09/critical-vulnerability-in-libwebp-library.html" rel="noopener noreferrer" target="_blank">trivial “worst practice” security mistakes</a> that put <a href="https://www.bleepingcomputer.com/news/security/apple-zero-click-imessage-exploit-used-to-infect-iphones-with-spyware/" rel="noopener noreferrer" target="_blank">their customers in danger</a>. Yet we continue to rely on all these products.</p><p>Software is now (rightfully) considered so dangerous that we tell everyone not to run it themselves.<em></em></p><p>Software is now (rightfully) considered so dangerous that we tell everyone not to run it themselves. Instead, you are supposed to leave that to an “<em>X</em> as a service” provider, or perhaps just to “the cloud.” Compare this to a hypothetical situation where cars are so likely to catch fire that the advice is not to drive a car yourself, but to leave that to professionals who are always accompanied by professional firefighters.</p><p>The assumption is then that the cloud is somehow able to make insecure software trustworthy. Yet in the past year, we’ve learned that Microsoft’s <a href="https://thehackernews.com/2023/09/outlook-breach-microsoft-reveals-how.html" rel="noopener noreferrer" target="_blank">email platform was thoroughly hacked</a>, including classified government email. (<a href="https://metacurity.substack.com/p/russian-hacking-group-midnight-blizzard" rel="noopener noreferrer" target="_blank">Twice!</a>) There are also <a href="https://www.lastweekinaws.com/blog/azures-terrible-security-posture-comes-home-to-roost/" rel="noopener noreferrer" target="_blank">well-founded worries about the security of the Azure cloud</a>. Meanwhile, industry darling Okta, which provides cloud-based software that enables user log-in to various applications, <a href="https://www.reuters.com/technology/cybersecurity/okta-says-hackers-stole-data-all-customer-support-users-cyber-breach-2023-11-29/" rel="noopener noreferrer" target="_blank">got comprehensively owned</a>. This was their second breach within two years. Also, there was a suspicious spate of Okta users subsequently getting hacked.</p><p>Clearly, we need better software.</p><p>The <a href="https://spectrum.ieee.org/tag/european-union">European Union</a> has launched three pieces of <a href="https://spectrum.ieee.org/tag/legislation">legislation</a> to this effect: <a href="https://digital-strategy.ec.europa.eu/en/policies/nis2-directive" rel="noopener noreferrer" target="_blank">NIS2 for important services</a>; the <a href="https://digital-strategy.ec.europa.eu/en/policies/cyber-resilience-act" rel="noopener noreferrer" target="_blank">Cyber Resilience Act </a>for almost all commercial software and electronic devices; and a revamped <a href="https://www.euractiv.com/section/digital/news/eu-updates-product-liability-regime-to-include-software-artificial-intelligence/" rel="noopener noreferrer" target="_blank">Product Liability Directive</a> that also extends to software. Legislation is always hard, and it remains to be seen <a href="https://berthub.eu/articles/posts/eu-cra-what-does-it-mean-for-open-source/" rel="noopener noreferrer" target="_blank">if they got it right</a>. But that software security is terrible enough these days to warrant legislation seems obvious.</p><h2>Why software security is so bad</h2><p>I want to touch on incentives. The situation today is clearly working well for commercial operators. Making more secure software takes time and is a lot of work, and the current security incidents don’t appear to be impacting the bottom line or stock prices. You can <a href="https://www.microsoft.com/en-us/research/publication/software-components-only-the-giants-survive/" rel="noopener noreferrer" target="_blank">speed up time to market by cutting corners</a>. So from an economic standpoint, what we see is entirely predictable. Legislation could be very important in changing this equation.</p><p>The security of software depends on two factors—the <em>density</em> of security issues in the <a href="https://spectrum.ieee.org/tag/source-code">source code</a> and the sheer <em>amount of code</em> accessible by <a href="https://spectrum.ieee.org/tag/hackers">hackers</a>. As the U.S. defense community loved to point out in the 1980s, <a href="https://www.quora.com/Who-said-Quantity-has-a-quality-all-its-own" rel="noopener noreferrer" target="_blank">quantity has a quality all of its own</a>. The reverse applies to software—the more you have of it, the more risks you run.</p><p>As a case in point, Apple iPhone users got repeatedly hacked over many years because of the huge attack surface exposed by iMessage. It is possible to send an unsolicited iMessage to an Apple user. The phone will then immediately process that message so it can preview it. The problem is that Apple in its wisdom decided that such unsolicited messages needed to support a vast array of image formats, accidentally <a href="https://googleprojectzero.blogspot.com/2021/12/a-deep-dive-into-nso-zero-click.html" rel="noopener noreferrer" target="_blank">including PDFs with weird embedded compressed fonts</a> using an ancient format that effectively included a <a href="https://spectrum.ieee.org/tag/programming">programming</a> language. So someone could send an unsolicited message to your iPhone that could probe for weaknesses in the rest of the phone.</p><p>In this way, attackers were able to benefit from security bugs in the phone’s millions of lines of code. You don’t need a high bug density to find <a href="https://www.europarl.europa.eu/meetdocs/2014_2019/plmrep/COMMITTEES/PEGA/DV/2023/05-08/REPORTcompromises_EN.pdf" rel="noopener noreferrer" target="_blank">an exploitable hole</a> in millions of lines of code.</p><p>Wiping out all the bugs in your code won’t save you from the decision to implement a feature to automatically execute code embedded in documents.</p><p>Apple could have prevented this situation by restricting previews to a far smaller range of image formats, or even a single “known good” image format. Apple could have saved themselves an enormous amount of pain simply by <a href="https://github.com/berthubert/sbox#sbox" target="_blank">exposing fewer lines of their code</a> to attackers. Incidentally, the E.U.’s Cyber Resilience Act <a href="https://berthub.eu/articles/posts/eu-cra-secure-coding-solution/" target="_blank">explicitly tells vendors to minimize the attack surface</a>.</p><p><span></span>Apple is (by far) not the worst offender in this field. But it is a widely respected and well-resourced company that usually thinks through what they do. And even they got it wrong by needlessly shipping and exposing too much code.</p><h2>Could we not write better code?</h2><p>There are those who think the biggest problem is the quality of the code, expressed in terms of the density of bugs in it. There are many interesting things happening on this front, like the use of <a href="https://www.nsa.gov/Press-Room/Press-Releases-Statements/Press-Release-View/Article/3608324/us-and-international-partners-issue-recommendations-to-secure-software-products/" target="_blank">memory safe languages</a> like <a href="https://www.rust-lang.org/" target="_blank">Rust</a>. Other languages are <a href="https://github.com/google/sanitizers/wiki/AddressSanitizer" target="_blank">also upping their security game</a>. <a href="https://en.wikipedia.org/wiki/Fuzzing" rel="noopener noreferrer" target="_blank">Fuzzers</a>—test tools that automatically modify inputs to computer programs to find weaknesses and bugs—are also getting ever more advanced.</p><p>But many security problems are in the logic underlying the code. For example, the Barracuda email exploit originated in a third-party library that would actually <a href="https://www.cvedetails.com/cve/CVE-2023-7101/" rel="noopener noreferrer" target="_blank">execute code</a> in Excel spreadsheets when they were scanned for <a href="https://spectrum.ieee.org/tag/viruses">viruses</a>. Wiping out all the bugs in your code won’t save you from the decision to implement a feature to automatically execute code embedded in documents.</p><h2>The state of shipping software</h2><p>Another problem is that we often don’t know what code we are actually shipping. Software has gotten <em>huge</em>. In 1995 <a href="https://en.wikipedia.org/wiki/Niklaus_Wirth" rel="noopener noreferrer" target="_blank">Niklaus Wirth</a> lamented that software had grown to megabytes in size. In his article “A Plea for Lean Software,” he went on to describe his <a href="https://en.wikipedia.org/wiki/Oberon_(operating_system)" rel="noopener noreferrer" target="_blank">Oberon operating system</a>, which was only 200 kilobytes, including an editor and a compiler. There are now projects that have more than 200 KB for their configuration files alone.</p><p>A typical app today is built on <a href="https://www.electronjs.org/" rel="noopener noreferrer" target="_blank">Electron JS</a>, a framework that incorporates both Chromium (“Chrome”) and Node.JS, which provides access to tens of thousands of software packages for <a href="https://spectrum.ieee.org/tag/javascript">JavaScript</a>. I estimate just using Electron JS entails at least 50 million lines of code if you include dependencies. Perhaps more. The app meanwhile likely pulls in hundreds or thousands of helper packages. Many packages used will also, by default, snitch on your users to advertisers and other data brokers. Dependencies pull in further dependencies, and exactly what gets included in the build can change on a daily basis, and no one really knows.</p><p>If this app controls anything in your house, it will also connect to a software stack over at <a href="https://spectrum.ieee.org/tag/amazon">Amazon</a>, probably also powered by Node.js, also pulling in many dependencies. </p><p>We are likely looking at over 50 million active lines of code to open a garage door….</p><p>But wait, there’s more. We used to ship software as the output of a compiler, or perhaps as a bunch of files to be interpreted. Such software then had to be <em>installed</em> and <em>configured</em> to work right. Getting your code packaged to ship like this is a lot of work. But it was good work since it forced people to think about what was in their “package.” This software package would then integrate with an <a href="https://spectrum.ieee.org/tag/operating-system">operating system</a> and with local services, based on the configuration.</p><p>Since the software ran on a different computer than the one it was developed on, people really had to know what they shipped and think it through. And sometimes it didn’t work, leading to the joke where a developer tells the operations people, “Well, it works on my system,” and the retort “Then back up your email, we’re taking your laptop into production!”</p><p>This used to be a joke, but these days we often ship software as containers, shipping not only the software itself but also including operating system files to make sure the software runs in a well-known environment. This frequently entails effectively shipping a complete computer disk image. This again vastly expands the amount of code being deployed. Note that you can do good things with containers like <a href="https://spectrum.ieee.org/tag/docker">Docker</a> (see below), but there are a lot of images over 350 MB on the <a href="https://hub.docker.com/explore" rel="noopener noreferrer" target="_blank">Docker Hub</a>.</p><p>Add it all up and we are likely looking at over 50 million active lines of code to open a garage door, running several operating-system images on multiple servers.</p><p>Now, even if all the included dependencies are golden, are we sure that their security updates are making it to your garage door opener app? I wonder how many Electron apps are still shipping with the <a href="https://www.schneier.com/blog/archives/2023/09/critical-vulnerability-in-libwebp-library.html" rel="noopener noreferrer" target="_blank">image processing bug</a> that had Google and Apple scramble to put out updates last year. We don’t even know.</p><p>But even worse, it is a known fact that all these dependencies are <em>not</em> golden. The Node.js ecosystem has a <a href="https://thehackernews.com/2023/02/researchers-hijack-popular-npm-package.html" rel="noopener noreferrer" target="_blank">comical history</a> of package repositories <a href="https://snyk.io/blog/npm-security-preventing-supply-chain-attacks/" rel="noopener noreferrer" target="_blank">being taken over</a>, hijacked, or resurrected under the same name by someone else, someone with nefarious<a href="https://www.theregister.com/2023/06/19/npm_s3_buckets_malware/" rel="noopener noreferrer" target="_blank"> plans for your security</a>. <a href="https://www.theregister.com/2023/06/02/novel_pypi_attack_reversinglabs/" rel="noopener noreferrer" target="_blank">PyPI</a> (a <a href="https://spectrum.ieee.org/tag/python">Python</a> counterpart of Node.js) has suffered from <a href="https://www.theregister.com/2023/01/04/pypi_pytorch_dependency_attack/" rel="noopener noreferrer" target="_blank">similar problems</a>. Dependencies always need scrutiny, but no one can reasonably be expected to <a href="https://medium.com/graph-commons/analyzing-the-npm-dependency-network-e2cf318c1d0d" rel="noopener noreferrer" target="_blank">check thousands of them frequently</a>. But we prefer not to think about this. (Note that you should also not overshoot and needlessly reimplement everything yourself to prevent dependencies. There are very good modules that <a href="https://sqlite.org/" rel="noopener noreferrer" target="_blank">likely are more secure</a> than what you could type in on your own.)</p><p>The world is shipping far too much code where we don’t even know what we ship and we aren’t looking hard enough (or at all) at what we <em>do</em> know we ship.</p><h2>You <em>can</em> write lean code today</h2><p>Writing has been called the process by which you find out you don’t <a href="https://fs.blog/writing-to-think/" rel="noopener noreferrer" target="_blank">know what you are talking about</a>. Actually doing stuff, meanwhile, is the process by which you find out you also did not know what you were writing about.</p><p>In a small reenactment of Wirth’s Oberon Project, I too wrote some code to prove a point, and to reassure myself I still know what I am talking and writing about. Can you still make useful and modern software the old way? I decided to try to create a minimalistic but full-featured image-sharing solution that I could trust.</p><p>Trifecta is the result. It is <a href="https://berthub.eu/articles/trifecta/" rel="noopener noreferrer" target="_blank">actual stand-alone software</a> that lets you use a browser to drag and drop images for easy sharing. It has pained me for years that I had to use <a href="https://imgur.com/" rel="noopener noreferrer" target="_blank">imgur</a> for this purpose. Not only does imgur install lots of cookies and trackers in my browser, I also force these trackers onto the people who view the images that I share. If you want to self-host a Web service like this, you also don’t want to get hacked. Most image-sharing solutions I found that you could run yourself are based on huge frameworks that I don’t trust too much for the reasons outlined above.</p><p>So, also to make a point, I decided to create a minimalistic but also useful image-sharing solution that I could trust. And more important, that other people could trust as well, because you can check out all Trifecta’s code within a few hours. It consists of <a href="https://berthub.eu/articles/posts/trifecta-technology" target="_blank">1,600 lines of new source code</a>, plus around five important dependencies. </p><p>You end up with a grand total of 3 megabytes of code.</p><p>To contrast, <a href="https://github.com/CaramelFur/Picsur/pkgs/container/picsur" rel="noopener noreferrer" target="_blank">one other image-sharing solution</a> ships as a 288-MB Docker image, although admittedly it looks better and has some more features. But not 285 MB worth of them. Another comparison is <a href="https://github.com/SashenJayathilaka/Photo-Sharing-Application" rel="noopener noreferrer" target="_blank">this Node-based picture-sharing solution</a>, which <a href="https://spectrum.ieee.org/tag/clocks">clocks</a> in at 1,600 dependencies, apparently totaling over 4 million lines of JavaScript.</p><p>The world ships too much code, most of it by third parties, sometimes unintended, most of it uninspected. <em></em></p><p><span></span>Note that Trifecta is not intended as a public site where random people can share images, as that does not tend to end well. It is however very suitable for company or personal use. You can read more about the project <a href="https://berthub.eu/articles/trifecta" target="_blank">here</a>, and there is also <a href="https://berthub.eu/articles/posts/trifecta-technology" target="_blank">a page</a> about the technology used to deliver such a tiny self-contained solution.</p><h2>Response to Trifecta</h2><p>This has been rather interesting. The most common response to Trifecta so far has been that I should use a whole bag of Amazon Web Services to deploy it. This is an exceedingly odd response to a project with the clearly stated goal of providing stand-alone software that does not rely on external services. I’m not sure what is going on here.</p><p>Another reaction has been that I treat Docker unfairly, and that you could definitely use containers for good. And I agree wholeheartedly. But I also look at what people are actually doing (also with other forms of containers or virtual machines), and it’s not so great.</p><p>I want to end this post with some observations from <a href="https://cr.yp.to/bib/1995/wirth.pdf" target="_blank">Niklaus Wirth’s 1995 paper</a>:</p><blockquote>“To some, complexity equals power. (…) Increasingly, <em>people seem to misinterpret complexity as sophistication</em>, which is baffling—the incomprehensible should cause suspicion rather than admiration.”</blockquote><p>I’ve similarly observed that some people prefer complicated systems. As <a href="https://en.wikipedia.org/wiki/Tony_Hoare" rel="noopener noreferrer" target="_blank">Tony Hoare</a> noted long ago, “[T]here are two methods in software design. <a href="https://dl.acm.org/doi/pdf/10.1145/1283920.1283936" rel="noopener noreferrer" target="_blank">One is to make the program so simple, there are obviously no errors</a>. The other is to make it so complicated, there are no obvious errors.” If you can’t do the first variant, the second way starts looking awfully attractive perhaps.</p><p>Back to Wirth: </p><blockquote>“Time pressure is probably the foremost reason behind the emergence of bulky software. The time pressure that designers endure discourages careful planning. It also discourages improving acceptable solutions; instead, it encourages quickly conceived software additions and corrections. Time pressure gradually corrupts an engineer’s standard of quality and perfection. It has a detrimental effect on people as well as products.”</blockquote><p>Why spend weeks paring down your software when you can also ship a whole pre-installed operating-system image that just works?</p><blockquote>“The plague of software explosion is not a ‘law of nature.’ It is avoidable, and it is the software engineer’s task to curtail it.”</blockquote><p>If this is indeed on the shoulders of software people, we should perhaps demand more time for it.</p><p>The world ships too much code, most of it by third parties, sometimes unintended, most of it uninspected. Because of this, there is a huge <em>attack surface</em> full of mediocre code. Efforts are ongoing to improve the quality of code itself, but many exploits are due to logic fails, and less progress has been made scanning for those. Meanwhile, great strides could be made by paring down just how much code we expose to the world. This will increase time to market for products, but legislation is around the corner that should force vendors to take security more seriously.</p><p>Trifecta is, like Wirth’s Oberon Project mentioned above, meant as a proof that you can deliver a lot of functionality even with a limited amount of code and dependencies. With effort and legislation, maybe the future could again bring sub-50-million-line garage-door openers. Let’s try to make it happen.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The DEA is now abandoning body cameras (140 pts)]]></title>
+            <title><![CDATA[The DEA is now abandoning body cameras (144 pts)]]></title>
             <link>https://www.propublica.org/article/drug-enforcement-administration-ends-body-camera-program-trump</link>
             <guid>43910720</guid>
             <pubDate>Tue, 06 May 2025 23:28:37 GMT</pubDate>
@@ -1022,7 +1254,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[VVVVVV Source Code (359 pts)]]></title>
+            <title><![CDATA[VVVVVV Source Code (371 pts)]]></title>
             <link>https://github.com/TerryCavanagh/VVVVVV</link>
             <guid>43910681</guid>
             <pubDate>Tue, 06 May 2025 23:22:08 GMT</pubDate>
@@ -1049,7 +1281,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[iOS Kindle app now has a ‘get book’ button after changes to App Store rules (180 pts)]]></title>
+            <title><![CDATA[iOS Kindle app now has a ‘get book’ button after changes to App Store rules (181 pts)]]></title>
             <link>https://www.theverge.com/news/661719/amazon-app-ios-apple-iphone-ipad-kindle-buy-books</link>
             <guid>43909432</guid>
             <pubDate>Tue, 06 May 2025 20:41:51 GMT</pubDate>
@@ -1057,7 +1289,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
 <div id="readability-page-1" class="page"><div id="zephr-anchor"><p>Following a <a href="https://www.theverge.com/news/659246/apple-epic-app-store-judge-ruling-control">ruling on April 30th</a> by the <em>Epic Games v. Apple</em> judge Yvonne Gonzalez Rogers, Apple can no longer collect a 27 percent commission on purchases made outside of apps or restrict how developers can direct users to alternate payment options. Apple has <a href="https://www.theverge.com/news/661032/apple-epic-games-app-store-antitrust-ninth-circuit">appealed the decision</a>, but is also complying with it in the interim, prompting several companies to <a href="https://www.theverge.com/news/660084/spotify-app-iphone-apple-update-external-payment-links">announce app updates</a> making it <a href="https://www.theverge.com/news/659754/patreon-update-iphone-ios-app-apple-payment-system-ruling">easier for users to pay for subscriptions and services</a>. That now includes Amazon’s iOS Kindle app. Contrary to prior limitations, there is now a prominent orange “Get book” button on Kindle app’s book listings.</p><p>“We regularly make improvements to our apps to help ensure we are providing customers the most convenient experience possible,” Amazon spokesperson Tim Gillman told <em>The Verge</em> over email. “By selecting ‘Get Book’ within the Kindle for iOS app, customers can now complete their purchase through their mobile web browser.”</p><p>Amazon wasn’t the first company to release a dedicated reading device with an E Ink screen. Companies like Sony beat them to the punch by a couple of years. What helped make the Kindle popular, and arguably destined to dominate the e-reader market, was that you could buy books right on the device, even if you didn’t have Wi-Fi access thanks to <a href="https://www.theverge.com/2021/7/28/22598747/kindle-3g-network-shutdown-e-readers-no-internet">Amazon’s now discontinued cellular Whispernet</a> service.</p><p>Before today’s updates, buying books wasn’t a feature you’d find in the Kindle mobile app following app store rule changes Apple implemented in 2011 that required developers to remove links or buttons leading to alternate ways to make purchases. You could <a href="https://www.theverge.com/2013/7/30/4572170/amazon-finds-clever-way-around-apple-restrictions-with-kindle-ios-app">search for books that offered samples</a> for download, add them to a shopping list, and read titles you already own, but you couldn’t actually buy titles through the Kindle or Amazon app, or even see their prices. </p><p>To avoid having to pay Apple’s 30 percent cut of in-app purchases, and the <a href="https://www.theverge.com/2024/1/18/24042892/apple-critics-27-percent-app-store-tax">27 percent tax on alternative payment methods</a> Apple introduced in January 2024, Amazon previously required you to visit and login to its online store through a device’s web browser to purchase ebooks on your iPhone or iPad, which were then synchronized to the app. It was a cumbersome process compared to the streamlined experience of buying ebooks directly on a Kindle e-reader.</p><p>Amazon probably isn’t going to change its mind about avoiding Apple’s 30 percent cut on ebook sales, but the update to the Kindle app now makes it much easier to purchase ebooks on your iPhone for those times when your Kindle e-reader doesn’t have a reliable Wi-Fi connection.</p><p>However, there’s still the chance Apple could win its appeal, forcing Amazon to undo these updates and improvements and once again make buying ebooks on iPhones overcomplicated and inconvenient.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[India launches attack on 9 sites in Pakistan and Pakistani Jammu and Kashmir (438 pts)]]></title>
+            <title><![CDATA[India launches attack on 9 sites in Pakistan and Pakistani Jammu and Kashmir (442 pts)]]></title>
             <link>https://www.reuters.com/world/india/india-launches-attack-9-sites-pakistan-pakistan-occupied-jammu-kashmir-2025-05-06/</link>
             <guid>43909430</guid>
             <pubDate>Tue, 06 May 2025 20:41:47 GMT</pubDate>
@@ -1065,7 +1297,7 @@ Couldn't get https://www.nytimes.com/2025/05/06/climate/epa-energy-star-eliminat
 Couldn't get https://www.reuters.com/world/india/india-launches-attack-9-sites-pakistan-pakistan-occupied-jammu-kashmir-2025-05-06/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[Claude's system prompt is over 24k tokens with tools (474 pts)]]></title>
+            <title><![CDATA[Claude's system prompt is over 24k tokens with tools (496 pts)]]></title>
             <link>https://github.com/asgeirtj/system_prompts_leaks/blob/main/claude.txt</link>
             <guid>43909409</guid>
             <pubDate>Tue, 06 May 2025 20:39:35 GMT</pubDate>
@@ -1357,7 +1589,7 @@ Couldn't get https://www.reuters.com/world/india/india-launches-attack-9-sites-p
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[TeleMessage, used by Trump officials, can access plaintext chat logs (239 pts)]]></title>
+            <title><![CDATA[TeleMessage, used by Trump officials, can access plaintext chat logs (242 pts)]]></title>
             <link>https://micahflee.com/despite-misleading-marketing-israeli-company-telemessage-used-by-trump-officials-can-access-plaintext-chat-logs/</link>
             <guid>43909220</guid>
             <pubDate>Tue, 06 May 2025 20:17:57 GMT</pubDate>
@@ -1993,7 +2225,7 @@ const val prodKeeper = "https://archive.telemessage.com"</code></pre><p>So basic
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Brush (Bo(u)rn(e) RUsty SHell) a POSIX and Bash-Compatible Shell in Rust (142 pts)]]></title>
+            <title><![CDATA[Brush (Bo(u)rn(e) RUsty SHell) a POSIX and Bash-Compatible Shell in Rust (145 pts)]]></title>
             <link>https://github.com/reubeno/brush</link>
             <guid>43908368</guid>
             <pubDate>Tue, 06 May 2025 18:47:49 GMT</pubDate>
@@ -2079,7 +2311,7 @@ These aren't all tracked with GitHub issues right now, but there's a number of t
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Matt Godbolt sold me on Rust (by showing me C++) (508 pts)]]></title>
+            <title><![CDATA[Matt Godbolt sold me on Rust (by showing me C++) (519 pts)]]></title>
             <link>https://www.collabora.com/news-and-blog/blog/2025/05/06/matt-godbolt-sold-me-on-rust-by-showing-me-c-plus-plus/</link>
             <guid>43907820</guid>
             <pubDate>Tue, 06 May 2025 17:51:03 GMT</pubDate>
@@ -2282,7 +2514,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</p
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Is Planet Nine Alone in the Outer System? (107 pts)]]></title>
+            <title><![CDATA[Is Planet Nine Alone in the Outer System? (109 pts)]]></title>
             <link>https://www.centauri-dreams.org/2025/05/06/is-planet-nine-alone-in-the-outer-system/</link>
             <guid>43907586</guid>
             <pubDate>Tue, 06 May 2025 17:29:31 GMT</pubDate>
@@ -2317,7 +2549,7 @@ note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</p
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Curl: We still have not seen a single valid security report done with AI help (420 pts)]]></title>
+            <title><![CDATA[Curl: We still have not seen a single valid security report done with AI help (421 pts)]]></title>
             <link>https://www.linkedin.com/posts/danielstenberg_hackerone-curl-activity-7324820893862363136-glb1</link>
             <guid>43907376</guid>
             <pubDate>Tue, 06 May 2025 17:07:58 GMT</pubDate>
@@ -2683,261 +2915,6 @@ We still have not seen a single valid security report done with AI help.</p>
         
       </section>
     </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[HNInternal: Launch HN: Exa (YC S21) – The web as a database (376 pts)]]></title>
-            <link>https://news.ycombinator.com/item?id=43906841</link>
-            <guid>43906841</guid>
-            <pubDate>Tue, 06 May 2025 16:18:42 GMT</pubDate>
-            <description><![CDATA[<p>See on <a href="https://news.ycombinator.com/item?id=43906841">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><td><table>
-        <tbody><tr id="43906841">
-      <td><span></span></td>      <td><center><a id="up_43906841" href="https://news.ycombinator.com/vote?id=43906841&amp;how=up&amp;goto=item%3Fid%3D43906841"></a></center></td><td><span><a href="https://news.ycombinator.com/item?id=43906841">Launch HN: Exa (YC S21) – The web as a database</a></span></td></tr><tr><td colspan="2"></td><td><span>
-          <span id="score_43906841">101 points</span> by <a href="https://news.ycombinator.com/user?id=willbryk">willbryk</a> <span title="2025-05-06T16:18:42 1746548322"><a href="https://news.ycombinator.com/item?id=43906841">2 hours ago</a></span> <span id="unv_43906841"></span> | <a href="https://news.ycombinator.com/hide?id=43906841&amp;goto=item%3Fid%3D43906841">hide</a> | <a href="https://hn.algolia.com/?query=Launch%20HN%3A%20Exa%20%28YC%20S21%29%20%E2%80%93%20The%20web%20as%20a%20database&amp;type=story&amp;dateRange=all&amp;sort=byDate&amp;storyText=false&amp;prefix&amp;page=0">past</a> | <a href="https://news.ycombinator.com/fave?id=43906841&amp;auth=df5e66fa77c7d4c7f7658447ad84557f43795188">favorite</a> | <a href="https://news.ycombinator.com/item?id=43906841">43&nbsp;comments</a>        </span>
-              </td></tr>
-    <tr><td></td></tr><tr><td colspan="2"></td><td><div><p>Hey HN! We’re Will and Jeff from Exa (<a href="https://exa.ai/">https://exa.ai</a>). We recently launched Exa Websets, an embeddings-powered search engine designed to return exactly what you’re asking for. You can get precise results for complex queries like “all startups working on open-source developer tools based in SF, founded 2021-2025”. 
-Demo here - <a href="https://youtu.be/Unt8hJmCxd4" rel="nofollow">https://youtu.be/Unt8hJmCxd4</a></p><p>We started working on Exa because we were frustrated that while LLM state-of-the-art is advancing every week, Google has gotten worse over time. The Internet used to feel like a magical information portal, but it doesn’t feel that way anymore when you’re constantly being pushed towards SEO-optimized clickbait.</p><p>Websets is a step in the opposite direction. For every search, we perform dozens of embedding searches over Exa’s vector database of the web to find good search candidates, then we run agentic workflows on each result to verify they match exactly what you asked for.</p><p>Websets results are good for two reasons. First, we train custom embedding models for our main search algorithm, instead of typical keyword matching search algorithms. Our embeddings models are trained specifically to return exactly the type of entity you ask for. In practice, that means if you search “startups working in nanotech”, keyword-based search engines return listicles about nanotech startups, because these listicles match the keywords in the query. In contrast, our embedding models return actual startup homepages, because these startup homepages match the meaning of the query.</p><p>The second is that LLMs provide the last-mile intelligence needed to verify every result. Each result and piece of data is backed with supporting references that we used to validate that the result is actually a match for your search criteria. That’s why Websets can take minutes or even hours to run, depending on your query and how many results you ask for. For valuable search queries, we think this is worth it.</p><p>Also notably, Websets are tables, not lists. You can add “enrichment” columns to find more information about each result, like “# of employees” or “does author have blog?”, and the cells asynchronously load in. This table format hopefully makes the web feel more like a database.</p><p>A few examples of searches that work with Websets:</p><p>- “Math blogs created by teachers from outside the US”: <a href="https://websets.exa.ai/cma1oz9xf007sis0ipzxgbamn">https://websets.exa.ai/cma1oz9xf007sis0ipzxgbamn</a></p><p>- "research paper about ways to avoid the O(n^2) attention problem in transformers, where one of the first author's first name starts with "A","B", "S", or "T", and it was written between 2018 and 2022”: <a href="https://websets.exa.ai/cm7dpml8c001ylnymum4sp11h">https://websets.exa.ai/cm7dpml8c001ylnymum4sp11h</a></p><p>- “US based healthcare companies, with over 100 employees and a technical founder": <a href="https://websets.exa.ai/cm6lc0dlk004ilecmzej76qx2">https://websets.exa.ai/cm6lc0dlk004ilecmzej76qx2</a></p><p>- “all software engineers in the Bay Area, with experience in startups, who know Rust and have published technical content before”: <a href="https://youtu.be/knjrlm1aibQ" rel="nofollow">https://youtu.be/knjrlm1aibQ</a></p><p>You can try it at <a href="https://websets.exa.ai/">https://websets.exa.ai/</a> and API docs are at <a href="https://docs.exa.ai/websets">https://docs.exa.ai/websets</a>. We’d love to hear your feedback!</p></div></td></tr>        <tr><td></td></tr><tr><td colspan="2"></td><td><form action="comment" method="post"></form></td></tr>  </tbody></table>
-  </td></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[HNInternal: Show HN: Sheet Music in Smart Glasses (192 pts)]]></title>
-            <link>https://news.ycombinator.com/item?id=43906442</link>
-            <guid>43906442</guid>
-            <pubDate>Tue, 06 May 2025 15:47:21 GMT</pubDate>
-            <description><![CDATA[<p>See on <a href="https://news.ycombinator.com/item?id=43906442">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><td colspan="2"></td><td><div><p>Hi everyone, my name is Kevin Lin, and this is a Show HN for my sheet music smart glasses project. My video was on the front page on Friday: <a href="https://news.ycombinator.com/item?id=43876243">https://news.ycombinator.com/item?id=43876243</a>, but dang said we should do a Show HN as well, so here goes!</p><p>I’ve wanted to put sheet music into smart glasses for a long time, but the perfect opportunity to execute came in mid-February, when Mentra (YC W25) tweeted about a smart glasses hackathon they were hosting - winners would get to take home a pair. I went, had a blast making a bunch of music-related apps with my teammate, and we won, so I got to take them home, refine the project, and make a pretty cool video about it (<a href="https://www.youtube.com/watch?v=j36u2i7PKKE" rel="nofollow">https://www.youtube.com/watch?v=j36u2i7PKKE</a>).</p><p>The glasses are Even Realities G1s. They look normal, but they have two microphones, a screen in each lens, and can be even made with a prescription. Every person I’ve met who tried them on was surprised at how good the display is, and the video recordings of them unfortunately don’t do them justice.</p><p>The software runs on AugmentOS, which is Mentra’s smart glasses operating system that works on various 3rd-party smart glasses, including the G1s. All I had to do to make an app was write and run a typescript file using the AugmentOS SDK. This gives you the voice transcription and raw audio as input, and text or bitmaps available as output to the screens, everything else is completely abstracted away. Your glasses communicate with an AugmentOS app, and then the app communicates with your typescript service.</p><p>The only hard part was creating a Python script to turn sheet music (MusicXML format) into small, optimized bitmaps to display on the screens. To start, the existing landscape of music-related Python libraries is pretty poorly documented and I ran into multiple never-before-seen error messages. Downscaling to the small size of the glasses screens also meant that stems and staff lines were disappearing, so I thought to use morphological dilation to emphasize those without making the notes unintelligible.  The final pipeline was MusicXML -&gt; music21 library to render chunks of bars to png -&gt; dilate with opencv- &gt; downscale -&gt; convert to bitmap with Pillow -&gt; optimize bitmaps with imagemagick. This is far from the best code I’ve ever written, but the LLMs attempt at this whole task was abysmal and my years of Python experience really got to shine here. The code is on GitHub: <a href="https://github.com/kevinlinxc/AugmentedChords">https://github.com/kevinlinxc/AugmentedChords</a>.</p><p>Putting it together, my typescript service serves these bitmaps locally when requested. I put together a UI where I can navigate menus and sheet music with voice commands (e.g. show catalog, next, select, start, exit, pause) and then I connected foot pedals to my laptop. Because of bitmap sending latency (~3s right now, but future glasses will do better), using foot pedals to turn the bars while playing wasn’t viable, so I instead had one of my pedals toggle autoscrolling, and the other two pedals sped up/temporarily paused the scrolling.</p><p>After lots of adjustments, I was able to play a full song using just the glasses! It took many takes and there was definitely lots of room for improvement. For example: - Bitmap sending is pretty slow, which is why using the foot pedals to turn bars wasn’t viable. - The resolution is pretty small, I would love to put more bars in at once so I can flip less frequently. - Since foot pedals aren’t portable, it would be cool to have a mode where the audio dictates when the sheet music changes. I tried implementing that with FFT but it was often wrong and more effort is needed. Head tilt controls would be cool too, because full manual control is a hard requirement for practicing.</p><p>All of these pain points are being targeted by Mentra and other companies competing in the space, and so I’m super excited to see the next generation! Also, feel free to ask me anything!</p></div></td></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Show HN: Plexe – ML Models from a Prompt (113 pts)]]></title>
-            <link>https://github.com/plexe-ai/plexe</link>
-            <guid>43906346</guid>
-            <pubDate>Tue, 06 May 2025 15:38:04 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://github.com/plexe-ai/plexe">https://github.com/plexe-ai/plexe</a>, See on <a href="https://news.ycombinator.com/item?id=43906346">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-hpc="true"><article itemprop="text"><div dir="auto">
-<p dir="auto"><h2 tabindex="-1" dir="auto">plexe ✨</h2><a id="user-content-plexe-" aria-label="Permalink: plexe ✨" href="#plexe-"></a></p>
-<p dir="auto"><a href="https://pypi.org/project/plexe/" rel="nofollow"><img src="https://camo.githubusercontent.com/a3a7fb738380617a4ae11851e81a046892b9f17a0b78ea3130c2ecb0366de667/68747470733a2f2f696d672e736869656c64732e696f2f707970692f762f706c6578652e737667" alt="PyPI version" data-canonical-src="https://img.shields.io/pypi/v/plexe.svg"></a>
-<a href="https://discord.gg/SefZDepGMv" rel="nofollow"><img src="https://camo.githubusercontent.com/31c62966d4bd1a7f1620fd3cb26b7d534943ac828ce385dbac5d37417d85b55c/68747470733a2f2f696d672e736869656c64732e696f2f646973636f72642f313330303932303439393838363335383532393f6c6f676f3d646973636f7264266c6f676f436f6c6f723d7768697465" alt="Discord" data-canonical-src="https://img.shields.io/discord/1300920499886358529?logo=discord&amp;logoColor=white"></a></p>
-<p><a target="_blank" rel="noopener noreferrer" href="https://github.com/plexe-ai/plexe/blob/main/resources/backed-by-yc.png"><img src="https://github.com/plexe-ai/plexe/raw/main/resources/backed-by-yc.png" alt="backed-by-yc" width="20%"></a></p><p dir="auto">Build machine learning models using natural language.</p>
-<p dir="auto"><a href="#1-quickstart">Quickstart</a> |
-<a href="#2-features">Features</a> |
-<a href="#3-installation">Installation</a> |
-<a href="#4-documentation">Documentation</a></p>
-
-<p dir="auto"><strong>plexe</strong> lets you create machine learning models by describing them in plain language. Simply explain what you want,
-and the AI-powered system builds a fully functional model through an automated agentic approach. Also available as a
-<a href="https://plexe.ai/" rel="nofollow">managed cloud service</a>.</p>
-</div>
-<details open="">
-  <summary>
-    
-    <span aria-label="Video description demo.mp4">demo.mp4</span>
-    <span></span>
-  </summary>
-
-  <video src="https://private-user-images.githubusercontent.com/16990733/433660339-05ac238b-464c-457c-a63a-819bfe9a4fed.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NDY2MDMzMDIsIm5iZiI6MTc0NjYwMzAwMiwicGF0aCI6Ii8xNjk5MDczMy80MzM2NjAzMzktMDVhYzIzOGItNDY0Yy00NTdjLWE2M2EtODE5YmZlOWE0ZmVkLm1wND9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNTA1MDclMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjUwNTA3VDA3MzAwMlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTgyMWI3YzgzNDJkNDkzZTQ1NjI0ZTMwMmIxYjczNjAxZDc1OWUwNDI3MTkyNDRmZWM4YTg3OTJjYzJjOGFkOGMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.-HVWwgnLlAHkijpg3hnZCppfx76DuVHQbhLQ2afF8pk" data-canonical-src="https://private-user-images.githubusercontent.com/16990733/433660339-05ac238b-464c-457c-a63a-819bfe9a4fed.mp4?jwt=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3NDY2MDMzMDIsIm5iZiI6MTc0NjYwMzAwMiwicGF0aCI6Ii8xNjk5MDczMy80MzM2NjAzMzktMDVhYzIzOGItNDY0Yy00NTdjLWE2M2EtODE5YmZlOWE0ZmVkLm1wND9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNTA1MDclMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjUwNTA3VDA3MzAwMlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTgyMWI3YzgzNDJkNDkzZTQ1NjI0ZTMwMmIxYjczNjAxZDc1OWUwNDI3MTkyNDRmZWM4YTg3OTJjYzJjOGFkOGMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0In0.-HVWwgnLlAHkijpg3hnZCppfx76DuVHQbhLQ2afF8pk" controls="controls" muted="muted">
-
-  </video>
-</details>
-
-<p dir="auto"><h2 tabindex="-1" dir="auto">1. Quickstart</h2><a id="user-content-1-quickstart" aria-label="Permalink: 1. Quickstart" href="#1-quickstart"></a></p>
-<p dir="auto"><h3 tabindex="-1" dir="auto">Installation</h3><a id="user-content-installation" aria-label="Permalink: Installation" href="#installation"></a></p>
-
-<p dir="auto"><h3 tabindex="-1" dir="auto">Using plexe</h3><a id="user-content-using-plexe" aria-label="Permalink: Using plexe" href="#using-plexe"></a></p>
-<p dir="auto">You can use plexe as a Python library to build and train machine learning models:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="import plexe
-
-# Define the model
-model = plexe.Model(
-    intent=&quot;Predict sentiment from news articles&quot;,
-    input_schema={&quot;headline&quot;: str, &quot;content&quot;: str},
-    output_schema={&quot;sentiment&quot;: str}
-)
-
-# Build and train the model
-model.build(
-    datasets=[your_dataset],
-    provider=&quot;openai/gpt-4o-mini&quot;,
-    max_iterations=10
-)
-
-# Use the model
-prediction = model.predict({
-    &quot;headline&quot;: &quot;New breakthrough in renewable energy&quot;,
-    &quot;content&quot;: &quot;Scientists announced a major advancement...&quot;
-})
-
-# Save for later use
-plexe.save_model(model, &quot;sentiment-model&quot;)
-loaded_model = plexe.load_model(&quot;sentiment-model.tar.gz&quot;)"><pre><span>import</span> <span>plexe</span>
-
-<span># Define the model</span>
-<span>model</span> <span>=</span> <span>plexe</span>.<span>Model</span>(
-    <span>intent</span><span>=</span><span>"Predict sentiment from news articles"</span>,
-    <span>input_schema</span><span>=</span>{<span>"headline"</span>: <span>str</span>, <span>"content"</span>: <span>str</span>},
-    <span>output_schema</span><span>=</span>{<span>"sentiment"</span>: <span>str</span>}
-)
-
-<span># Build and train the model</span>
-<span>model</span>.<span>build</span>(
-    <span>datasets</span><span>=</span>[<span>your_dataset</span>],
-    <span>provider</span><span>=</span><span>"openai/gpt-4o-mini"</span>,
-    <span>max_iterations</span><span>=</span><span>10</span>
-)
-
-<span># Use the model</span>
-<span>prediction</span> <span>=</span> <span>model</span>.<span>predict</span>({
-    <span>"headline"</span>: <span>"New breakthrough in renewable energy"</span>,
-    <span>"content"</span>: <span>"Scientists announced a major advancement..."</span>
-})
-
-<span># Save for later use</span>
-<span>plexe</span>.<span>save_model</span>(<span>model</span>, <span>"sentiment-model"</span>)
-<span>loaded_model</span> <span>=</span> <span>plexe</span>.<span>load_model</span>(<span>"sentiment-model.tar.gz"</span>)</pre></div>
-<p dir="auto"><h2 tabindex="-1" dir="auto">2. Features</h2><a id="user-content-2-features" aria-label="Permalink: 2. Features" href="#2-features"></a></p>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.1. 💬 Natural Language Model Definition</h3><a id="user-content-21--natural-language-model-definition" aria-label="Permalink: 2.1. 💬 Natural Language Model Definition" href="#21--natural-language-model-definition"></a></p>
-<p dir="auto">Define models using plain English descriptions:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="model = plexe.Model(
-    intent=&quot;Predict housing prices based on features like size, location, etc.&quot;,
-    input_schema={&quot;square_feet&quot;: int, &quot;bedrooms&quot;: int, &quot;location&quot;: str},
-    output_schema={&quot;price&quot;: float}
-)"><pre><span>model</span> <span>=</span> <span>plexe</span>.<span>Model</span>(
-    <span>intent</span><span>=</span><span>"Predict housing prices based on features like size, location, etc."</span>,
-    <span>input_schema</span><span>=</span>{<span>"square_feet"</span>: <span>int</span>, <span>"bedrooms"</span>: <span>int</span>, <span>"location"</span>: <span>str</span>},
-    <span>output_schema</span><span>=</span>{<span>"price"</span>: <span>float</span>}
-)</pre></div>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.2. 🤖 Multi-Agent Architecture</h3><a id="user-content-22--multi-agent-architecture" aria-label="Permalink: 2.2. 🤖 Multi-Agent Architecture" href="#22--multi-agent-architecture"></a></p>
-<p dir="auto">The system uses a team of specialized AI agents to:</p>
-<ul dir="auto">
-<li>Analyze your requirements and data</li>
-<li>Plan the optimal model solution</li>
-<li>Generate and improve model code</li>
-<li>Test and evaluate performance</li>
-<li>Package the model for deployment</li>
-</ul>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.3. 🎯 Automated Model Building</h3><a id="user-content-23--automated-model-building" aria-label="Permalink: 2.3. 🎯 Automated Model Building" href="#23--automated-model-building"></a></p>
-<p dir="auto">Build complete models with a single method call:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="model.build(
-    datasets=[dataset_a, dataset_b],
-    provider=&quot;openai/gpt-4o-mini&quot;,  # LLM provider
-    max_iterations=10,              # Max solutions to explore
-    timeout=1800                    # Optional time limit in seconds
-)"><pre><span>model</span>.<span>build</span>(
-    <span>datasets</span><span>=</span>[<span>dataset_a</span>, <span>dataset_b</span>],
-    <span>provider</span><span>=</span><span>"openai/gpt-4o-mini"</span>,  <span># LLM provider</span>
-    <span>max_iterations</span><span>=</span><span>10</span>,              <span># Max solutions to explore</span>
-    <span>timeout</span><span>=</span><span>1800</span>                    <span># Optional time limit in seconds</span>
-)</pre></div>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.4. 🚀 Distributed Training with Ray</h3><a id="user-content-24--distributed-training-with-ray" aria-label="Permalink: 2.4. 🚀 Distributed Training with Ray" href="#24--distributed-training-with-ray"></a></p>
-<p dir="auto">Plexe supports distributed model training and evaluation with Ray for faster parallel processing:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="from plexe import Model
-
-# Optional: Configure Ray cluster address if using remote Ray
-# from plexe import config
-# config.ray.address = &quot;ray://10.1.2.3:10001&quot;
-
-model = Model(
-    intent=&quot;Predict house prices based on various features&quot;,
-    distributed=True  # Enable distributed execution
-)
-
-model.build(
-    datasets=[df],
-    provider=&quot;openai/gpt-4o-mini&quot;
-)"><pre><span>from</span> <span>plexe</span> <span>import</span> <span>Model</span>
-
-<span># Optional: Configure Ray cluster address if using remote Ray</span>
-<span># from plexe import config</span>
-<span># config.ray.address = "ray://10.1.2.3:10001"</span>
-
-<span>model</span> <span>=</span> <span>Model</span>(
-    <span>intent</span><span>=</span><span>"Predict house prices based on various features"</span>,
-    <span>distributed</span><span>=</span><span>True</span>  <span># Enable distributed execution</span>
-)
-
-<span>model</span>.<span>build</span>(
-    <span>datasets</span><span>=</span>[<span>df</span>],
-    <span>provider</span><span>=</span><span>"openai/gpt-4o-mini"</span>
-)</pre></div>
-<p dir="auto">Ray distributes your workload across available CPU cores, significantly speeding up model generation and evaluation when exploring multiple model variants.</p>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.5. 🎲 Data Generation &amp; Schema Inference</h3><a id="user-content-25--data-generation--schema-inference" aria-label="Permalink: 2.5. 🎲 Data Generation &amp; Schema Inference" href="#25--data-generation--schema-inference"></a></p>
-<p dir="auto">Generate synthetic data or infer schemas automatically:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="# Generate synthetic data
-dataset = plexe.DatasetGenerator(
-    schema={&quot;features&quot;: str, &quot;target&quot;: int}
-)
-dataset.generate(500)  # Generate 500 samples
-
-# Infer schema from intent
-model = plexe.Model(intent=&quot;Predict customer churn based on usage patterns&quot;)
-model.build(provider=&quot;openai/gpt-4o-mini&quot;)  # Schema inferred automatically"><pre><span># Generate synthetic data</span>
-<span>dataset</span> <span>=</span> <span>plexe</span>.<span>DatasetGenerator</span>(
-    <span>schema</span><span>=</span>{<span>"features"</span>: <span>str</span>, <span>"target"</span>: <span>int</span>}
-)
-<span>dataset</span>.<span>generate</span>(<span>500</span>)  <span># Generate 500 samples</span>
-
-<span># Infer schema from intent</span>
-<span>model</span> <span>=</span> <span>plexe</span>.<span>Model</span>(<span>intent</span><span>=</span><span>"Predict customer churn based on usage patterns"</span>)
-<span>model</span>.<span>build</span>(<span>provider</span><span>=</span><span>"openai/gpt-4o-mini"</span>)  <span># Schema inferred automatically</span></pre></div>
-<p dir="auto"><h3 tabindex="-1" dir="auto">2.6. 🌐 Multi-Provider Support</h3><a id="user-content-26--multi-provider-support" aria-label="Permalink: 2.6. 🌐 Multi-Provider Support" href="#26--multi-provider-support"></a></p>
-<p dir="auto">Use your preferred LLM provider, for example:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="model.build(provider=&quot;openai/gpt-4o-mini&quot;)          # OpenAI
-model.build(provider=&quot;anthropic/claude-3-opus&quot;)     # Anthropic
-model.build(provider=&quot;ollama/llama2&quot;)               # Ollama
-model.build(provider=&quot;huggingface/meta-llama/...&quot;)  # Hugging Face    "><pre><span>model</span>.<span>build</span>(<span>provider</span><span>=</span><span>"openai/gpt-4o-mini"</span>)          <span># OpenAI</span>
-<span>model</span>.<span>build</span>(<span>provider</span><span>=</span><span>"anthropic/claude-3-opus"</span>)     <span># Anthropic</span>
-<span>model</span>.<span>build</span>(<span>provider</span><span>=</span><span>"ollama/llama2"</span>)               <span># Ollama</span>
-<span>model</span>.<span>build</span>(<span>provider</span><span>=</span><span>"huggingface/meta-llama/..."</span>)  <span># Hugging Face    </span></pre></div>
-<p dir="auto">See <a href="https://docs.litellm.ai/docs/providers" rel="nofollow">LiteLLM providers</a> for instructions and available providers.</p>
-<div dir="auto"><p dir="auto">Note</p><p dir="auto">Plexe <em>should</em> work with most LiteLLM providers, but we actively test only with <code>openai/*</code> and <code>anthropic/*</code>
-models. If you encounter issues with other providers, please let us know.</p>
-</div>
-<p dir="auto"><h2 tabindex="-1" dir="auto">3. Installation</h2><a id="user-content-3-installation" aria-label="Permalink: 3. Installation" href="#3-installation"></a></p>
-<p dir="auto"><h3 tabindex="-1" dir="auto">3.1. Installation Options</h3><a id="user-content-31-installation-options" aria-label="Permalink: 3.1. Installation Options" href="#31-installation-options"></a></p>
-<div dir="auto" data-snippet-clipboard-copy-content="pip install plexe                  # Standard installation
-pip install plexe[lightweight]     # Minimal dependencies
-pip install plexe[all]             # With deep learning support"><pre>pip install plexe                  <span><span>#</span> Standard installation</span>
-pip install plexe[lightweight]     <span><span>#</span> Minimal dependencies</span>
-pip install plexe[all]             <span><span>#</span> With deep learning support</span></pre></div>
-<p dir="auto"><h3 tabindex="-1" dir="auto">3.2. API Keys</h3><a id="user-content-32-api-keys" aria-label="Permalink: 3.2. API Keys" href="#32-api-keys"></a></p>
-<div dir="auto" data-snippet-clipboard-copy-content="# Set your preferred provider's API key
-export OPENAI_API_KEY=<your-key>
-export ANTHROPIC_API_KEY=<your-key>
-export GEMINI_API_KEY=<your-key>"><pre><span><span>#</span> Set your preferred provider's API key</span>
-<span>export</span> OPENAI_API_KEY=<span>&lt;</span>your-key<span>&gt;</span>
-<span>export</span> ANTHROPIC_API_KEY=<span>&lt;</span>your-key<span>&gt;</span>
-<span>export</span> GEMINI_API_KEY=<span>&lt;</span>your-key<span>&gt;</span></pre></div>
-<p dir="auto">See <a href="https://docs.litellm.ai/docs/providers" rel="nofollow">LiteLLM providers</a> for environment variable names.</p>
-<p dir="auto"><h2 tabindex="-1" dir="auto">4. Documentation</h2><a id="user-content-4-documentation" aria-label="Permalink: 4. Documentation" href="#4-documentation"></a></p>
-<p dir="auto">For full documentation, visit <a href="https://docs.plexe.ai/" rel="nofollow">docs.plexe.ai</a>.</p>
-<p dir="auto"><h2 tabindex="-1" dir="auto">5. Contributing</h2><a id="user-content-5-contributing" aria-label="Permalink: 5. Contributing" href="#5-contributing"></a></p>
-<p dir="auto">See <a href="https://github.com/plexe-ai/plexe/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> for guidelines. Join our <a href="https://discord.gg/SefZDepGMv" rel="nofollow">Discord</a> to connect with the team.</p>
-<p dir="auto"><h2 tabindex="-1" dir="auto">6. License</h2><a id="user-content-6-license" aria-label="Permalink: 6. License" href="#6-license"></a></p>
-<p dir="auto"><a href="https://github.com/plexe-ai/plexe/blob/main/LICENSE">Apache-2.0 License</a></p>
-<p dir="auto"><h2 tabindex="-1" dir="auto">7. Product Roadmap</h2><a id="user-content-7-product-roadmap" aria-label="Permalink: 7. Product Roadmap" href="#7-product-roadmap"></a></p>
-<ul>
-<li> Fine-tuning and transfer learning for small pre-trained models</li>
-<li> Use Pydantic for schemas and split data generation into a separate module</li>
-<li> Plexe self-hosted platform ⭐ (More details coming soon!)</li>
-<li> Lightweight installation option without heavy deep learning dependencies</li>
-<li> Distributed training with Ray on AWS</li>
-<li> Support for non-tabular data types in model generation</li>
-</ul>
-<p dir="auto"><h2 tabindex="-1" dir="auto">8. Citation</h2><a id="user-content-8-citation" aria-label="Permalink: 8. Citation" href="#8-citation"></a></p>
-<p dir="auto">If you use Plexe in your research, please cite it as follows:</p>
-<div dir="auto" data-snippet-clipboard-copy-content="@software{plexe2025,
-  author = {De Bernardi, Marcello AND Dubey, Vaibhav},
-  title = {Plexe: Build machine learning models using natural language.},
-  year = {2025},
-  publisher = {GitHub},
-  howpublished = {\url{https://github.com/plexe-ai/plexe}},
-}"><pre><span>@software</span>{<span>plexe2025</span>,
-  <span>author</span> = <span><span>{</span>De Bernardi, Marcello AND Dubey, Vaibhav<span>}</span></span>,
-  <span>title</span> = <span><span>{</span>Plexe: Build machine learning models using natural language.<span>}</span></span>,
-  <span>year</span> = <span><span>{</span>2025<span>}</span></span>,
-  <span>publisher</span> = <span><span>{</span>GitHub<span>}</span></span>,
-  <span>howpublished</span> = <span><span>{</span>\url{https://github.com/plexe-ai/plexe}<span>}</span></span>,
-}</pre></div>
-</article></div></div>]]></description>
         </item>
     </channel>
 </rss>
