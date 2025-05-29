@@ -4,12 +4,56 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 29 May 2025 17:30:03 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 29 May 2025 18:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[WeatherStar 4000+: Weather Channel Simulator (122 pts)]]></title>
+            <title><![CDATA[Human coders are still better than LLMs (114 pts)]]></title>
+            <link>https://antirez.com/news/153</link>
+            <guid>44127739</guid>
+            <pubDate>Thu, 29 May 2025 16:41:04 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://antirez.com/news/153">https://antirez.com/news/153</a>, See on <a href="https://news.ycombinator.com/item?id=44127739">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><article data-comment-id="153-" id="153-"><span><span><a href="https://antirez.com/user/antirez">antirez</a></span> 1 hour ago. 17444 views.  </span><pre>This is a short story of how humans are still so much more capable of LLMs. Note that I'm not anti-AI or alike, you know it if you know me / follow me somewhere. I use LLMs routinely, like I did today, when I want to test my ideas, for code reviews, to understand if there are better approaches than what I had in mind, to explore stuff at the limit of my expertise, and so forth (I wrote a blog post about coding with LLMs almost two years, when it was not exactly cool: I was already using LLMs for coding and never stopped, I'll have to write an update, but that's not the topic of this post).
+
+But, still: the current level of AI is useful, great too, but so incredibly behind human intelligence, and I want to remark this as lately it is impossible to have balanced conversations.
+
+So, today I was working to Vector Sets for Redis, to fix a complicated bug: during the time I stopped working at Redis my colleagues introduced resistance against corruption RDB and RESTORE payloads, even when the checksum of the data passes. This feature is disabled by default, but provides an enhanced layer of safety for people wanting it.
+
+But… there is a but as big as an elephant: In order to make HNSWs fast to save into Redis RDBs and to load back, I serialized the *graph* representation, and not the element-vector pairs, otherwise I would have to re-insert back data into HNSWs, and that would be, like, 100 times slower (!). So I store all the links the nodes have with other nodes, as integers, and then I resolve them into pointers, it’s a nice trick and works great. But if you mix this and random corruptions of the representation, and the fact that my own twist on HNSWs enforce reciprocal links between nodes (I wrote my own implementation of HNSWs with many useful features, but reciprocal links are needed to enable many of them) then this could happen:
+
+1. We load corrupted data that says A links to B, but B no longer links to A (corrupted node IDs).
+2. We delete node B: since the reciprocity is violated, we don’t clear the link from A to B.
+3. Then we scan the graph and once we are at B we access A: use-after-free :-D :-) :-|
+
+So after loading data, I need to check that every link is reciprocal, and in the vanilla case this is going to be O(N^2), for each node we need to scan all the levels, for each level all the neighbors of the node, and check that it also links to this node by scanning its links at that level. Not good.
+
+# Human vs LLM
+
+To start, I implemented the vanilla approach, to see if the fuzzer could no longer find the bug, and it worked indeed, but loading times for a big vector set with 20 million vectors went from 45 seconds to 90 or something. WTF. So I opened a Gemini 2.5 PRO chat and told the LLM, hey, what we can do here? Is there a super fast way to do so?
+
+The best solution that Gemini could find was to say: order the pointers of the neighbors links, so you can use binary search. Oh, well, sure, I know this, I’m not really sure if in arrays of 16/32 pointers this is going to be faster or slower. So I asked, anything else? Nope, no better solution.
+
+So I told it: look, what about when we see A linking B at level X we store in a hash table A:B:X (but we sort A and B always so that A&gt;B, and links are the same whatever the direction), and when we see the link again we clean it, this time we just scan the whole thing as we are already doing when resolving IDs to pointers in the links, and if at the end the hash table is not empty, we know there is some link that must be non-reciprocal?
+
+Gemini told me it was a nice idea, but there was the snprintf() to create the key and the hashing time and so forth, but yep, it was better than what my original approach (even sorting pointers). I made it notice that snprintf() was not needed. We could just memcpy() pointers in a fixed sized key. It recognized that it was possible to do so, then I realized something…
+
+Hey, I told Gemini, what about using a fixed accumulator for A:B:X? No hash table at all. Each time we see a link (A:B:X, so 8+8+4 bytes) we xor it in the current accumulator of 12 bytes. If we store it twice, it cancels out, so at the end if the register is non-zero, we know something is odd! However I anticipated Gemini that this system was potentially subject to collisions, and to evaluate them. Even if this feature is normally turned off in Redis, when users enable such extra checks they also often expect some more protection against an attacker deliberately crafting bad payloads.
+
+Gemini was quite impressed about the idea, but still told that pointers are… you know, similar in structure, change of a few bits, so if there were three spurious links L1, L2, L3 it could happen that the xor between L1 and L2 was the same as the L3 bits, and we could have a false negative (zero register). I also noticed that allocators tend to be very predictable and externally guessable.
+
+I asked Gemini for ways to improve upon this: it got no great ideas. Then I thought, wait, we can actually hash this with a good enough hash function that is still fast, murmur-128 or alike (we don’t need it to have cryptographic properties for this task), and proposed the following schema to Gemini:
+
+1. Take the link A:B:X, but use a seed obtained via /dev/urandom to prefix all the keys with it, so we actually have S:A:B:X.
+2. We just xor the output of murmur-128(S:A:B:X) into the 128 bit register.
+3. At the end, we check if the register is 0 (all links reciprocal).
+
+I asked Gemini to do an analysis of that, and it was finally happy, saying that this makes it a lot harder both to casually find orphaned links that happen to xor to 0 together, and even that an external attacker could ever use this in a useful way, since “S” is not known, there is to control the pointers too, and all that it is really hard to put together. Also, this feature is a best effort extra protection that you need to enable, it is normally off and to be practical it should not pose a too big performance penalty.
+
+Well, all this to say: I just finished the analysis and stopped to write this blog post, I’m not sure if I’m going to use this system (but likely yes), but, the creativity of humans still have an edge, we are capable of really thinking out of the box, envisioning strange and imprecise solutions that can work better than others. This is something that is extremely hard for LLMs. Still, to verify all my ideas, Gemini was very useful, and maybe I started to think at the problem in such terms because I had a “smart duck” to talk with.</pre></article></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[WeatherStar 4000+: Weather Channel Simulator (202 pts)]]></title>
             <link>https://weatherstar.netbymatt.com/</link>
             <guid>44127109</guid>
             <pubDate>Thu, 29 May 2025 15:38:45 GMT</pubDate>
@@ -17,7 +61,7 @@
 <div id="readability-page-1" class="page"><div id="loading" width="640" height="480"><p>WeatherStar 4000+</p><p>v5.21.2</p><p>Enter your location above to continue</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: I wrote a modern Command Line Handbook (109 pts)]]></title>
+            <title><![CDATA[Show HN: I wrote a modern Command Line Handbook (137 pts)]]></title>
             <link>https://commandline.stribny.name/</link>
             <guid>44126612</guid>
             <pubDate>Thu, 29 May 2025 14:44:33 GMT</pubDate>
@@ -72,7 +116,7 @@
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Learning C3 (119 pts)]]></title>
+            <title><![CDATA[Learning C3 (139 pts)]]></title>
             <link>https://alloc.dev/2025/05/29/learning_c3</link>
             <guid>44125966</guid>
             <pubDate>Thu, 29 May 2025 13:33:31 GMT</pubDate>
@@ -1289,7 +1333,7 @@ Result: 19.388445</code></pre>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google is using AI to censor independent websites like mine (132 pts)]]></title>
+            <title><![CDATA[Google is using AI to censor independent websites like mine (135 pts)]]></title>
             <link>https://travellemming.com/perspectives/ftc-letter-google-censors-indie-publishers-with-ai/</link>
             <guid>44124820</guid>
             <pubDate>Thu, 29 May 2025 11:05:43 GMT</pubDate>
@@ -1340,7 +1384,7 @@ Result: 19.388445</code></pre>
 <li>“<a href="https://podcasts.apple.com/us/podcast/the-open-web-is-under-attack/id1514456916?i=1000704428299" target="_blank" rel="noopener">The Open Web is Under Attack</a>” –<em>Next in Media Podcas</em>t (April 22, 2025)</li></ul><p><strong><em>Footnotes</em></strong>:</p><ol><li id="ce0a92e3-1027-45cd-a7ba-0c787e4a8635">&nbsp;“<a href="https://gizmodo.com/google-search-written-by-people-helpful-content-update-1850848956" target="_blank" rel="noopener">Google Quietly Removes ‘Written By People’ From Suggestions for Website Owners</a>” –<em>Gizmodo</em> (September 18, 2023)<br>“<a href="https://www.theverge.com/2024/5/2/24147152/google-search-seo-publishing-housefresh-product-reviews" target="_blank" rel="noopener">Google is getting even worse for independent sites</a>” –<em>The Verge</em> (May 2, 2024)<br>“<a href="https://www.theverge.com/2024/10/30/24283871/google-cant-guarantee-that-independent-sites-will-recover-from-search-changes" target="_blank" rel="noopener">Google “can’t guarantee” that independent sites will recover from Search changes</a>” –<em>The Verge</em> (October 31, 2024)<br> <a href="#ce0a92e3-1027-45cd-a7ba-0c787e4a8635-link" aria-label="Jump to footnote reference 1">↩︎</a></li><li id="e12e5083-12e3-4b59-89d8-3ea5f445a7db">Curiously, based on my own observations, one significant vertical <em>does </em>seem to have been at least partially spared from the carnage: recipes. I think it is relevant that recipes is the <em>only </em>vertical where <a href="https://www.androidcentral.com/apps-software/google-is-working-with-publishers-to-show-you-a-quick-view-for-recipes-in-a-limited-test" target="_blank" rel="noopener">Google has done direct content licensing deals</a> with (select) independent publishers. <a href="#e12e5083-12e3-4b59-89d8-3ea5f445a7db-link" aria-label="Jump to footnote reference 2">↩︎</a></li><li id="ddb3fe20-e1d8-4a4d-b2fc-8bd141d6f209"><em>Editor’s Note: this section with action items for readers was added to this blog post and did not appear in my original letter to the FTC. I also fixed a few typos from the original and added a link to the BBC article in the “further reading” section, and clarified that Mueller’s post was restricted, not entirely deleted. The original letter was directed to the FTC’s specific requests, but I didn’t want to leave readers without actionable steps.</em> <a href="#ddb3fe20-e1d8-4a4d-b2fc-8bd141d6f209-link" aria-label="Jump to footnote reference 3">↩︎</a></li></ol><!-- FeedbackWP Plugin --><!-- [element-154392] --><!-- [/element-154392] --></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Edamagit: Magit for VSCode (107 pts)]]></title>
+            <title><![CDATA[Edamagit: Magit for VSCode (110 pts)]]></title>
             <link>https://github.com/kahole/edamagit</link>
             <guid>44123953</guid>
             <pubDate>Thu, 29 May 2025 07:58:55 GMT</pubDate>
@@ -1625,7 +1669,7 @@ remove the default edamagit bindings and the collisions with the Vim extension.<
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Gurus of 90s Web Design: Zeldman, Siegel, Nielsen (289 pts)]]></title>
+            <title><![CDATA[Gurus of 90s Web Design: Zeldman, Siegel, Nielsen (303 pts)]]></title>
             <link>https://cybercultural.com/p/web-design-1997/</link>
             <guid>44123852</guid>
             <pubDate>Thu, 29 May 2025 07:33:02 GMT</pubDate>
@@ -1710,7 +1754,7 @@ remove the default edamagit bindings and the collisions with the Vim extension.<
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Typed-FFmpeg 3.0–Typed Interface to FFmpeg and Visual Filter Editor (276 pts)]]></title>
+            <title><![CDATA[Show HN: Typed-FFmpeg 3.0–Typed Interface to FFmpeg and Visual Filter Editor (279 pts)]]></title>
             <link>https://github.com/livingbio/typed-ffmpeg</link>
             <guid>44123098</guid>
             <pubDate>Thu, 29 May 2025 04:23:11 GMT</pubDate>
@@ -1848,7 +1892,7 @@ f"><pre><span>import</span> <span>ffmpeg</span>.<span>filters</span>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Run a C# file directly using dotnet run app.cs (242 pts)]]></title>
+            <title><![CDATA[Run a C# file directly using dotnet run app.cs (255 pts)]]></title>
             <link>https://devblogs.microsoft.com/dotnet/announcing-dotnet-run-app/</link>
             <guid>44122582</guid>
             <pubDate>Thu, 29 May 2025 02:30:28 GMT</pubDate>
@@ -1978,7 +2022,7 @@ To convert the file to a project, run:
             <div><div><p><img src="https://devblogs.microsoft.com/dotnet/wp-content/uploads/sites/10/2023/06/Damian-Edwards-Profile-Pic-2020-square-96x96.jpg" alt="Damian Edwards"></p></div><p>Damian's a Principal Architect on the .NET product team at Microsoft.</p></div>        </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[US Trade Court Finds Trump Tariffs Illegal (527 pts)]]></title>
+            <title><![CDATA[US Trade Court Finds Trump Tariffs Illegal (533 pts)]]></title>
             <link>https://www.bloomberg.com/news/articles/2025-05-28/trump-s-global-tariffs-blocked-by-us-trade-court</link>
             <guid>44121732</guid>
             <pubDate>Thu, 29 May 2025 00:06:19 GMT</pubDate>
@@ -1986,7 +2030,7 @@ To convert the file to a project, run:
 Couldn't get https://www.bloomberg.com/news/articles/2025-05-28/trump-s-global-tariffs-blocked-by-us-trade-court: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[HTAP is Dead (142 pts)]]></title>
+            <title><![CDATA[HTAP is Dead (143 pts)]]></title>
             <link>https://www.mooncake.dev/blog/htap-is-dead</link>
             <guid>44121177</guid>
             <pubDate>Wed, 28 May 2025 22:22:18 GMT</pubDate>
@@ -2003,7 +2047,7 @@ AKA: How do I CDC from my OLTP system to the data lake efficiently?</p><p><stron
 AKA: How do I ingest real-time data into the lake? Or how do I query Lake data with Postgres or Elastic functionality?</p><p>The HTAP challenge of our time comes down to making the lakehouse real-time ready.</p><p>After spending my best 10 years first starting and then rescuing it, HTAP as a database is dead. <br>But let the spirit live on.<br>🥮</p></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Long live American Science and Surplus (which needs your help) (355 pts)]]></title>
+            <title><![CDATA[Long live American Science and Surplus (which needs your help) (361 pts)]]></title>
             <link>https://milwaukeerecord.com/city-life/long-live-american-science-surplus-which-needs-your-help/</link>
             <guid>44120507</guid>
             <pubDate>Wed, 28 May 2025 20:47:30 GMT</pubDate>
@@ -2011,7 +2055,7 @@ AKA: How do I ingest real-time data into the lake? Or how do I query Lake data w
 Couldn't get https://milwaukeerecord.com/city-life/long-live-american-science-surplus-which-needs-your-help/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[A toy RTOS inside Super Mario Bros. using emulator save states (235 pts)]]></title>
+            <title><![CDATA[A toy RTOS inside Super Mario Bros. using emulator save states (236 pts)]]></title>
             <link>https://prettygoodblog.com/p/what-threads-are-part-2</link>
             <guid>44120241</guid>
             <pubDate>Wed, 28 May 2025 20:15:43 GMT</pubDate>
@@ -2019,7 +2063,7 @@ Couldn't get https://milwaukeerecord.com/city-life/long-live-american-science-su
 Couldn't get https://prettygoodblog.com/p/what-threads-are-part-2: Error: getaddrinfo ENOTFOUND prettygoodblog.com]]></description>
         </item>
         <item>
-            <title><![CDATA[What does “Undecidable” mean, anyway (136 pts)]]></title>
+            <title><![CDATA[What does “Undecidable” mean, anyway (137 pts)]]></title>
             <link>https://buttondown.com/hillelwayne/archive/what-does-undecidable-mean-anyway/</link>
             <guid>44119890</guid>
             <pubDate>Wed, 28 May 2025 19:37:47 GMT</pubDate>
@@ -2153,83 +2197,6 @@ Couldn't get https://prettygoodblog.com/p/what-threads-are-part-2: Error: getadd
 
 
         </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Deepseek R1-0528 (395 pts)]]></title>
-            <link>https://huggingface.co/deepseek-ai/DeepSeek-R1-0528</link>
-            <guid>44118818</guid>
-            <pubDate>Wed, 28 May 2025 17:59:02 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">https://huggingface.co/deepseek-ai/DeepSeek-R1-0528</a>, See on <a href="https://news.ycombinator.com/item?id=44118818">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><section>
-				
-				
-				
-				
-				<p>No model card</p></section>
-			<section><div><dl><dt>Downloads last month</dt><dd>0
-							</dd></dl>
-						</div>
-					
-
-				<div data-target="ModelTensorsParams" data-props="{&quot;modelId&quot;:&quot;deepseek-ai/DeepSeek-R1-0528&quot;,&quot;safetensors&quot;:{&quot;parameters&quot;:{&quot;BF16&quot;:3918786560,&quot;F8_E4M3&quot;:680571043840,&quot;F32&quot;:41555600},&quot;total&quot;:684531386000,&quot;sharded&quot;:true},&quot;isGated&quot;:false,&quot;query&quot;:{},&quot;model&quot;:{&quot;author&quot;:&quot;deepseek-ai&quot;,&quot;config&quot;:{&quot;architectures&quot;:[&quot;DeepseekV3ForCausalLM&quot;],&quot;auto_map&quot;:{&quot;AutoConfig&quot;:&quot;configuration_deepseek.DeepseekV3Config&quot;,&quot;AutoModel&quot;:&quot;modeling_deepseek.DeepseekV3Model&quot;,&quot;AutoModelForCausalLM&quot;:&quot;modeling_deepseek.DeepseekV3ForCausalLM&quot;},&quot;model_type&quot;:&quot;deepseek_v3&quot;,&quot;quantization_config&quot;:{&quot;quant_method&quot;:&quot;fp8&quot;},&quot;tokenizer_config&quot;:{&quot;bos_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜begin▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;eos_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜end▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;pad_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜end▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;unk_token&quot;:null,&quot;chat_template&quot;:&quot;{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\\n\\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{{'<｜User｜>' + message['content']}}{%- endif %}{%- if message['role'] == 'assistant' and 'tool_calls' in message %}{%- set ns.is_tool = false -%}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if message['content'] is none %}{{'<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{'<｜Assistant｜>' + message['content'] + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and 'tool_calls' not in message %}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + message['content'] + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{% set content = message['content'] %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{{'<｜Assistant｜>' + content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'<｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_tool %}{{'<｜Assistant｜>'}}{% endif %}&quot;}},&quot;createdAt&quot;:&quot;2025-05-28T09:46:42.000Z&quot;,&quot;discussionsDisabled&quot;:false,&quot;downloads&quot;:0,&quot;downloadsAllTime&quot;:0,&quot;id&quot;:&quot;deepseek-ai/DeepSeek-R1-0528&quot;,&quot;isLikedByUser&quot;:false,&quot;availableInferenceProviders&quot;:[],&quot;inference&quot;:&quot;&quot;,&quot;lastModified&quot;:&quot;2025-05-28T18:01:18.000Z&quot;,&quot;likes&quot;:251,&quot;librariesOther&quot;:[],&quot;trackDownloads&quot;:true,&quot;private&quot;:false,&quot;repoType&quot;:&quot;model&quot;,&quot;gated&quot;:false,&quot;pwcLink&quot;:{&quot;error&quot;:&quot;Unknown error, can't generate link to Papers With Code.&quot;},&quot;tags&quot;:[&quot;safetensors&quot;,&quot;deepseek_v3&quot;,&quot;custom_code&quot;,&quot;fp8&quot;,&quot;region:us&quot;],&quot;tag_objs&quot;:[{&quot;id&quot;:&quot;safetensors&quot;,&quot;label&quot;:&quot;Safetensors&quot;,&quot;type&quot;:&quot;library&quot;},{&quot;id&quot;:&quot;deepseek_v3&quot;,&quot;label&quot;:&quot;deepseek_v3&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;id&quot;:&quot;custom_code&quot;,&quot;label&quot;:&quot;custom_code&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;id&quot;:&quot;fp8&quot;,&quot;label&quot;:&quot;fp8&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;type&quot;:&quot;region&quot;,&quot;label&quot;:&quot;🇺🇸 Region: US&quot;,&quot;id&quot;:&quot;region:us&quot;}],&quot;safetensors&quot;:{&quot;parameters&quot;:{&quot;BF16&quot;:3918786560,&quot;F8_E4M3&quot;:680571043840,&quot;F32&quot;:41555600},&quot;total&quot;:684531386000,&quot;sharded&quot;:true},&quot;hasBlockedOids&quot;:false,&quot;region&quot;:&quot;us&quot;,&quot;isQuantized&quot;:false,&quot;xetEnabled&quot;:false},&quot;canWrite&quot;:false}"><div><p>Safetensors</p><a target="_blank" href="https://huggingface.co/docs/safetensors"></a></div>
-		<div><div><p>Model size</p>
-				<p>685B params</p></div>
-			<div><p>Tensor type</p>
-				<div><p>BF16
-						</p><p>·</p><p>F8_E4M3
-						</p><p>·</p><p>F32
-						</p><p>·</p></div></div>
-			</div></div>
-					
-
-				<div data-target="InferenceWidget" data-props="{&quot;model&quot;:{&quot;author&quot;:&quot;deepseek-ai&quot;,&quot;config&quot;:{&quot;architectures&quot;:[&quot;DeepseekV3ForCausalLM&quot;],&quot;auto_map&quot;:{&quot;AutoConfig&quot;:&quot;configuration_deepseek.DeepseekV3Config&quot;,&quot;AutoModel&quot;:&quot;modeling_deepseek.DeepseekV3Model&quot;,&quot;AutoModelForCausalLM&quot;:&quot;modeling_deepseek.DeepseekV3ForCausalLM&quot;},&quot;model_type&quot;:&quot;deepseek_v3&quot;,&quot;quantization_config&quot;:{&quot;quant_method&quot;:&quot;fp8&quot;},&quot;tokenizer_config&quot;:{&quot;bos_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜begin▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;eos_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜end▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;pad_token&quot;:{&quot;__type&quot;:&quot;AddedToken&quot;,&quot;content&quot;:&quot;<｜end▁of▁sentence｜>&quot;,&quot;lstrip&quot;:false,&quot;normalized&quot;:true,&quot;rstrip&quot;:false,&quot;single_word&quot;:false},&quot;unk_token&quot;:null,&quot;chat_template&quot;:&quot;{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='', is_first_sp=true) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '\\n\\n' + message['content'] %}{%- endif %}{%- endif %}{%- endfor %}{{ bos_token }}{{ ns.system_prompt }}{%- for message in messages %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{{'<｜User｜>' + message['content']}}{%- endif %}{%- if message['role'] == 'assistant' and 'tool_calls' in message %}{%- set ns.is_tool = false -%}{%- for tool in message['tool_calls'] %}{%- if not ns.is_first %}{%- if message['content'] is none %}{{'<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- else %}{{'<｜Assistant｜>' + message['content'] + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- set ns.is_first = true -%}{%- else %}{{'\\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- endif %}{%- endfor %}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- if message['role'] == 'assistant' and 'tool_calls' not in message %}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + message['content'] + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{% set content = message['content'] %}{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}{{'<｜Assistant｜>' + content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'<｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_tool %}{{'<｜Assistant｜>'}}{% endif %}&quot;}},&quot;createdAt&quot;:&quot;2025-05-28T09:46:42.000Z&quot;,&quot;discussionsDisabled&quot;:false,&quot;downloads&quot;:0,&quot;downloadsAllTime&quot;:0,&quot;id&quot;:&quot;deepseek-ai/DeepSeek-R1-0528&quot;,&quot;isLikedByUser&quot;:false,&quot;availableInferenceProviders&quot;:[],&quot;inference&quot;:&quot;&quot;,&quot;lastModified&quot;:&quot;2025-05-28T18:01:18.000Z&quot;,&quot;likes&quot;:251,&quot;librariesOther&quot;:[],&quot;trackDownloads&quot;:true,&quot;private&quot;:false,&quot;repoType&quot;:&quot;model&quot;,&quot;gated&quot;:false,&quot;pwcLink&quot;:{&quot;error&quot;:&quot;Unknown error, can't generate link to Papers With Code.&quot;},&quot;tags&quot;:[&quot;safetensors&quot;,&quot;deepseek_v3&quot;,&quot;custom_code&quot;,&quot;fp8&quot;,&quot;region:us&quot;],&quot;tag_objs&quot;:[{&quot;id&quot;:&quot;safetensors&quot;,&quot;label&quot;:&quot;Safetensors&quot;,&quot;type&quot;:&quot;library&quot;},{&quot;id&quot;:&quot;deepseek_v3&quot;,&quot;label&quot;:&quot;deepseek_v3&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;id&quot;:&quot;custom_code&quot;,&quot;label&quot;:&quot;custom_code&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;id&quot;:&quot;fp8&quot;,&quot;label&quot;:&quot;fp8&quot;,&quot;type&quot;:&quot;other&quot;},{&quot;type&quot;:&quot;region&quot;,&quot;label&quot;:&quot;🇺🇸 Region: US&quot;,&quot;id&quot;:&quot;region:us&quot;}],&quot;safetensors&quot;:{&quot;parameters&quot;:{&quot;BF16&quot;:3918786560,&quot;F8_E4M3&quot;:680571043840,&quot;F32&quot;:41555600},&quot;total&quot;:684531386000,&quot;sharded&quot;:true},&quot;hasBlockedOids&quot;:false,&quot;region&quot;:&quot;us&quot;,&quot;isQuantized&quot;:false,&quot;xetEnabled&quot;:false},&quot;canWrite&quot;:false,&quot;shouldUpdateUrl&quot;:true,&quot;inferenceContextData&quot;:{&quot;billableEntities&quot;:[],&quot;entityName2Providers&quot;:{}},&quot;linkToInferenceDiscussion&quot;:{&quot;url&quot;:&quot;/spaces/huggingface/InferenceSupport/discussions/2216&quot;,&quot;numReactions&quot;:10}}">
-
-<div>
-					<p><span>Inference Providers</span>
-					<a target="_blank" href="https://huggingface.co/docs/inference-providers">NEW
-					</a></p></div>
-
-
-		<div><p><span>This model isn't deployed by any Inference Provider.</span>
-
-					<a href="https://huggingface.co/spaces/huggingface/InferenceSupport/discussions/2216"><span><span>🙋</span>
-							<span>10</span></span>
-						<span>Ask for provider support</span></a></p></div></div>
-
-				
-	<h2>
-		Model tree for <span>deepseek-ai/DeepSeek-R1-0528</span>
-		<a href="https://huggingface.co/docs/hub/model-cards#specifying-a-base-model" target="_blank"></a></h2>
-	<div><div>
-				<svg width="19" height="28" viewBox="0 0 19 28" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" clip-rule="evenodd" d="M1 0C1 7.42391 7.4588 13.5 15.5 13.5V14.5C6.9726 14.5 0 8.04006 0 0H1Z" fill="currentColor"></path></svg></div>
-			<p>Finetunes</p>
-			
-			<p><a href="https://huggingface.co/models?other=base_model:finetune:deepseek-ai/DeepSeek-R1-0528">1 model</a>
-		</p></div>
-
-				
-				
-				
-					<h2>
-						Collection including
-						<span>deepseek-ai/DeepSeek-R1-0528</span></h2>
-					<div><article><a href="https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d"><header title="DeepSeek-R1"><h4>DeepSeek-R1</h4>
-				<div><p>
-					Collection
-				</p></div></header>
-
-			<div>
-				<p><span>9 items</span>
-				<span>• </span>
-				<span>Updated
-					<time datetime="2025-05-28T17:43:04" title="2025-05-28T17:43:04.961Z">about 2 hours ago</time></span>
-				<span>•</span></p><p>
-
-					645</p></div></a></article>
-	</div>
-
-				
-				</section></div></div>]]></description>
         </item>
     </channel>
 </rss>
