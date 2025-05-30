@@ -4,12 +4,822 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 30 May 2025 21:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 30 May 2025 22:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Beating Google's kernelCTF PoW using AVX512 (203 pts)]]></title>
+            <title><![CDATA[Surprisingly Fast AI-Generated Kernels We Didn't Mean to Publish (Yet) (113 pts)]]></title>
+            <link>https://crfm.stanford.edu/2025/05/28/fast-kernels.html</link>
+            <guid>44139454</guid>
+            <pubDate>Fri, 30 May 2025 20:03:12 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://crfm.stanford.edu/2025/05/28/fast-kernels.html">https://crfm.stanford.edu/2025/05/28/fast-kernels.html</a>, See on <a href="https://news.ycombinator.com/item?id=44139454">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+		
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    
+
+
+<div>
+    <p><a href="https://www.stanford.edu/" target="_blank">
+            <img src="https://crfm.stanford.edu/static/img/header/stanford-white.png">
+        </a>
+    </p>
+</div>
+
+<header>
+    <nav>
+        <div>
+            <div>
+                <p><a href="https://crfm.stanford.edu/">
+                    <img src="https://crfm.stanford.edu/static/img/header/crfm-rgb.png">
+                </a>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+                <a href="https://hai.stanford.edu/" target="_blank">
+                    <img src="https://crfm.stanford.edu/static/img/header/hai.png">
+                </a></p>
+            </div>
+            <div>
+                <ul>
+                    <li>
+                        <a href="https://crfm.stanford.edu/people.html">People</a>
+                    </li>
+                    <li>
+                        <a href="https://crfm.stanford.edu/report.html">Report</a>
+                    </li>
+                    <li id="dropdownContainer">
+                        <a id="dropdownButton">Research</a>
+                        
+                    </li>
+                    <li>
+                        <a href="https://crfm.stanford.edu/policy.html">Policy</a>
+                    </li>
+                    <li>
+                        <a href="https://crfm.stanford.edu/blog.html">Blog</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+    
+    
+</header>
+
+		<div>
+				
+
+  <h2>Surprisingly Fast AI-Generated Kernels We Didn’t Mean to Publish (Yet)</h2>
+  
+  
+  
+  
+  
+
+  
+
+  <hr>
+
+  
+
+  <div>
+    <h2 id="tldr">TL;DR</h2>
+
+<p>We have some very fast AI-generated kernels in pure CUDA-C without using libraries and DSLs such as CUTLASS and Triton. They are performing close to or in some cases even beating the standard expert-optimized production kernels shipped in PyTorch. Some of our highlighted results:</p>
+
+<ul>
+  <li><strong>Matmul (FP32): 101.3%</strong> performance of FP32 torch.matmul; problem size: 4096x4096 square matrices</li>
+  <li><strong>Conv2D: 179.9%</strong> performance of FP32 torch.nn.Conv2D; problem size: (100, 3, 224, 224) input tensor, conv(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2)</li>
+  <li><strong>Softmax: 111.8%</strong> performance of FP32 torch.softmax; problem size: (4096, 65536) input tensor</li>
+  <li><strong>LayerNorm: 484.4%</strong> performance of FP32 torch.nn.LayerNorm; problem size: (16, 64, 256, 256) input tensor</li>
+  <li><strong>Conv2D + ReLU + MaxPool: 290.1%</strong> performance of FP32 torch reference, 189.0% performance of FP32 torch.compile() reference; problem size: (100, 3, 224, 224) input tensor, conv(in_channels=3, out_channels=96, kernel_size=11, stride=4, padding=2), maxpool(kernel_size=3, stride=2)</li>
+</ul>
+
+<p>(Our results are benchmarked on an Nvidia L40S GPU, and % performance is defined as reference time divided by generated kernel time)</p>
+
+<p><img src="https://crfm.stanford.edu/static/img/posts/2025-05-28-fast-kernels/untiled.png" width="60%"><br>
+<small><em>“Untiled” by DALL·E (2025). (Digital pigment on virtual canvas)<br>From the MMA collection</em></small></p>
+
+<h2 id="intro">Intro</h2>
+
+<p>We started with the goal of generating synthetic data to train better kernel generation models. Somewhere along the way the unexpected happened: the test-time only synthetic data generation itself started producing <em>really</em> good kernels beating or performing close to human expert optimized PyTorch baselines, utilizing advanced optimizations and hardware features, which were previously thought to be challenging. As a result, we decided to write this blog post early and share our findings. The point of this blog post isn’t about a novel methodology; in fact, our synthetic data generation design is simple, and what’s surprising is that it is already showing promise.</p>
+
+<p>In this post, we’re sharing the method, five optimized kernels (4 foundational ML operators + 1 fused kernel of an AlexNet block), an example optimization trajectory, and some takeaways and thoughts on what this might mean for performant kernel generation. Consider this a first step in what’s next.</p>
+
+<h2 id="method">Method</h2>
+
+<p>We’re using the <a href="https://arxiv.org/abs/2502.10517">KernelBench</a> (a benchmark for AI based kernel generation that we released in December 2024) task setup: given torch code, the LLM writes custom kernels to replace the torch operators with the goal of getting a speedup. Consistent with the original KernelBench design, the reference code is in the default FP32, and given a tolerance threshold (1e-02), using lower precision solutions is valid. In addition, each problem in KernelBench has specific sizes since there are many size-specific optimizations, so the benchmark tests for the fastest kernel for the specific problem size, not necessarily a generally fast kernel for any arbitrary problem size. We run both the torch reference code and the generated code, and test for correctness by checking the numerical equality of the two outputs over many random inputs.<br>
+<img src="https://crfm.stanford.edu/static/img/posts/2025-05-28-fast-kernels/kernelbench_design.png" width="100%"></p>
+
+<p>The most common way people scale test-time compute for this problem of optimizing kernels today is through sequential revision, a multi-turn loop where a model incrementally edits a kernel, checks for correctness and performance, then tries again based on the result, either fixing the kernel or try to improve its performance. This loop is intuitive and easy to implement. The model fixes broken kernels, tweaks working ones, and gradually climbs toward something faster.</p>
+
+<p>The main limitation of this approach is the lack of optimization idea diversity. Sequential loops often fall into local minima, revisiting the same classes of transformations or endlessly refining unpromising trajectories. The result is inefficient use of test-time compute and little pressure on the model to generate fundamentally new optimization ideas.</p>
+
+<p>We introduced two key changes to address this:</p>
+
+<ol>
+  <li>Reasoning in natural language about optimization ideas: rather than directly generating new kernels in each step, we generate optimization ideas in natural language conditioned on previously attempted ideas, and realize those ideas into new code variants.</li>
+  <li>Branching at each optimization step: instead of refining a single candidate per step, we fan out such that each idea spawns multiple implementations, and the highest-performing kernels are used to seed the next round (we also keep a bank of good existing kernels for seeding). This unlocks massive parallelism allowing us to explore radically different directions at each turn, rather than getting stuck in a narrow optimization path.</li>
+</ol>
+
+<p><img src="https://crfm.stanford.edu/static/img/posts/2025-05-28-fast-kernels/search.png" width="100%"></p>
+
+<p>The result is a test-time loop that looks less like “chat with a compiler” in the case of sequential revision, and more like structured exploratory search, guided by explicit optimization hypotheses and aggressively parallel evaluation.</p>
+
+<p>We ran 10 problems from KernelBench level 1 (and modified the problem sizes to make sure that kernel launch overhead is negligible compared to the overall runtime of the problem). We ran 5 rounds with the OpenAI o3 and Gemini 2.5 Pro models. The plot below shows the distribution of rounds in which the best-performing kernel was first found. Most of the best results emerge in later rounds (out of a total of 5 rounds), with the majority coming in round 4 or 5.
+<img src="https://crfm.stanford.edu/static/img/posts/2025-05-28-fast-kernels/rounds.png" width="100%"></p>
+
+<p>As we scaled up our search, we also found that many high-performing kernels clustered into a few recurring optimization strategies, which also aligns with our experience of writing kernels by hand. The main optimization categories are summarized below:</p>
+
+<ul>
+  <li><strong>Memory Access Optimization:</strong> improving the efficiency of data movement between different memory hierarchies (global memory, shared memory, registers) and ensuring data is accessed in a way that maximizes bandwidth and minimizes conflicts.</li>
+  <li><strong>Asynchronous Operations &amp; Latency Hiding:</strong> hide the latency of slow operations (like global memory access) by overlapping them with computation or other memory transfers</li>
+  <li><strong>Data Type &amp; Precision Optimization:</strong> using lower-precision data types (like FP16 or BF16) where possible to reduce memory bandwidth requirements, increase cache effectiveness, and potentially leverage specialized hardware units.</li>
+  <li><strong>Compute &amp; Instruction Optimization</strong>: making the arithmetic computations themselves more efficient, reducing instruction count, or leveraging specialized hardware instructions</li>
+  <li><strong>Parallelism &amp; Occupancy Enhancement</strong>: maximize the number of active warps on the Streaming Multiprocessors (SMs) to better hide latencies and improve overall throughput</li>
+  <li><strong>Control Flow &amp; Loop Optimization</strong>: reducing the overhead associated with loops, branches, and indexing calculations</li>
+</ul>
+
+<h2 id="an-example-kernel-optimization-trajectory">An Example Kernel Optimization Trajectory</h2>
+
+<p>Here we show an example optimization trajectory of auto-generated ideas for Conv2D, with torch reference baseline time of <strong>1.41 ms</strong></p>
+
+<p><strong>Round 0: 7.02 ms, 20.1% of reference</strong><br>
+Idea: Given the pytorch code, replace the operation with a CUDA Kernel</p>
+
+<p><strong>Round 1: 7.54 ms, 18.8% of reference</strong><br>
+Idea: Exploit the read-only cache by loading invariant tensors with __ldg.</p>
+
+<p><strong>Round 2: 3.46 ms, 41.0% of reference</strong><br>
+Idea: Convert the convolution to an FP16 Tensor-Core GEMM. <em>[author comment: this is an algorithmic optimization converting a convolution to an implicit GEMM, which is important for running convolutions efficiently on Tensor Cores]</em></p>
+
+<p><strong>Round 3: 3.67 ms, 38.7% of reference</strong><br>
+Idea: Double-buffer cp.async pipeline that overlaps global-memory loads with Tensor-Core compute.</p>
+
+<p><strong>Round 4: 3.46 ms, 41.0% of reference</strong><br>
+Idea: Given the pytorch code, replace the operation with a CUDA Kernel using implicit matmul. The given GEMM kernel could be helpful.<br>
+<em>[author comment: since we know that the optimization involves using GEMM, we seeded the beginning of this round with an existing good GEMM kernel that we generated previously, and this idea is written manually]</em></p>
+
+<p><strong>Round 5: 1.91 ms, 74.9% of reference</strong><br>
+Idea: Precompute and reuse `k_idx`-decomposed kernel/input indices in shared memory within each K-tile loop to avoid redundant arithmetic.</p>
+
+<p><strong>Round 6: 1.37 ms, 103.6% of reference</strong><br>
+Idea: Precomputing and caching N-dimension GEMM indices in shared memory to reduce redundant arithmetic within the input data loading loop.</p>
+
+<p><strong>Round 7: 1.38 ms, 102.9% of reference</strong><br>
+Idea: Parallelize CUDA kernel output by using dedicated per-warp shared memory buffers to eliminate warp-wise serialization during writes to global memory.</p>
+
+<p><strong>Round 8: 1.37 ms, 103.6% of reference</strong><br>
+Idea: Precompute and cache base input coordinates in shared memory to reduce redundant arithmetic during input data loading.</p>
+
+<p><strong>Round 9: 1.36 ms, 105.1% of reference</strong><br>
+Idea: Software-pipeline B-fragment loading to overlap the next B-tile’s shared memory reads with the current B-tile’s WMMA computations.</p>
+
+<p><strong>Round 10: 1.07 ms, 133.6% of reference</strong><br>
+Idea: Reuse precomputed N-dimension GEMM decomposition from shared memory for output address calculation, avoiding redundant and costly division/modulo operations.</p>
+
+<p><strong>Round 11: 1.21 ms, 117.4% of reference</strong><br>
+Idea: Remove `hi/lo` decomposition in `half` WMMA operations, relying on standard FP16 accumulation to improve performance if the resulting accuracy is acceptable.</p>
+
+<p><strong>Round 12: 1.01 ms, 141.2% of reference</strong><br>
+Idea: Overlap K-loop global memory loads of `Asub` (weights) and `Bsub` (inputs) with MMA computation using double buffering, enabled by calculating K-dimension indices on-the-fly within the load stage of the pipeline.</p>
+
+<p><strong>Round 13: 0.795 ms, 179.9% of reference</strong><br>
+Idea: Implement vectorized shared memory writes for loading `Asub_pipe` and `Bsub_pipe` by using wider data types like `half2`</p>
+
+<p><strong>Final Code Sample</strong><br>
+The final code sample for the Conv2D kernel is included in the appendix. It uses advanced CUDA techniques that we find challenging to write ourselves!
+We also have more example kernels in this <a href="https://github.com/ScalingIntelligence/good-kernels">Github repo</a></p>
+
+<h2 id="takeaways">Takeaways</h2>
+
+<p>Our method echoes a growing theme in AI research: combining strong reasoning with parallel exploration of multiple hypotheses leads to improvements. As some recent work (<a href="https://storage.googleapis.com/deepmind-media/DeepMind.com/Blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/AlphaEvolve.pdf">AlphaEvolve</a>, <a href="https://x.com/GoogleDeepMind/status/1924881598102839373">Gemini 2.5 Pro Deep Think</a>) highlight, you might not always need massive retraining — sometimes, clever search and branching strategies can unlock scientific innovation and tackle complex problems, and there might be more gains through extensive searching with verifiers. <br>
+However, this doesn’t mean we shouldn’t do further training. On the contrary, our approach also helps generate better synthetic data to improve future model training (this requires more problem instances). So, it’s both a powerful test-time scaling method and a step toward smarter, more data-efficient model development.</p>
+
+<p>Finally, what we’ve demonstrated here is just an early sign of life. The optimization quality looks promising (it’s using many advanced strategies), but there’s plenty of room to improve, such as the generation of better optimization ideas, high quality resulting code, as well as applying this to increasingly complicated kernels. Two concrete examples that we are still actively working on improving are:</p>
+
+<ul>
+  <li>FP16 Matmul: 52% performance of torch.matmul</li>
+  <li>FP16 Flash Attention: 9% performance of torch.nn.functional.scaled_dot_product_attention</li>
+</ul>
+
+<p>FP32 is less common in modern ML workloads and often less optimized on recent hardware compared to FP16 or BF16, which may partly explain why it’s easier to achieve performance gains over PyTorch with FP32 kernels.</p>
+
+<p>Despite the current limitations, we’re optimistic. At the time of KernelBench, we couldn’t even generate functional versions of these two kernels above, and through searching we’ve been steadily increasing the performance of flash attention from &lt;1%, and note that we are working with a quite limited search budget here (around 3 million input tokens + 4 million output tokens in total). The progress since then gives us confidence in the potential for continual improvement, and we are excited to keep pushing the frontier of AI to create increasingly better kernels towards the eventual goal of self-improving AI systems.</p>
+
+<h2 id="thanks">Thanks</h2>
+
+<p>Christopher Rinard, Saman Amarasinghe, and Allen Nie for the helpful discussions; Standard Kernel Co. and Prime Intellect for supporting this work.</p>
+
+<h2 id="appendix-fast-conv2d-kernel">Appendix: Fast Conv2D Kernel</h2>
+<div><pre><code><span>import</span> <span>torch</span>
+<span>import</span> <span>torch.nn</span> <span>as</span> <span>nn</span>
+<span>import</span> <span>torch.nn.functional</span> <span>as</span> <span>F</span>
+<span>from</span> <span>torch.utils.cpp_extension</span> <span>import</span> <span>load_inline</span>
+
+<span>conv2d_implicit_gemm_cuda_source</span> <span>=</span> <span>r</span><span>"""
+#include &lt;torch/extension.h&gt;
+#include &lt;ATen/cuda/CUDAContext.h&gt; // For at::cuda::getCurrentCUDAStream()
+#include &lt;mma.h&gt;
+#include &lt;cuda_fp16.h&gt;
+
+using namespace nvcuda;
+
+// WMMA tile dimensions
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+
+// Skew padding for shared memory to avoid bank conflicts
+#define SKEW_HALF 8 // 8 half elements (16 bytes)
+
+// CUDA built-in warpSize is 32 for supported architectures (sm_70+)
+// This constant is used for host-side configuration (e.g. blockDim)
+#define CUDA_WARP_SIZE_CONST 32 
+
+// Threadblock configuration
+#define WARPS_PER_BLOCK 8
+// THREADS_PER_BLOCK must be evaluatable by host compiler for blockDim configuration
+#define THREADS_PER_BLOCK (WARPS_PER_BLOCK * CUDA_WARP_SIZE_CONST) 
+
+// Macro-tile dimensions computed by a threadblock
+// BLOCK_M_TILES_WMMA * WMMA_M = output channels processed by a block
+// BLOCK_N_TILES_WMMA * WMMA_N = output spatial elements processed by a block
+#define BLOCK_M_TILES_WMMA 8
+#define BLOCK_N_TILES_WMMA 8
+
+#define TILE_M_PER_BLOCK (BLOCK_M_TILES_WMMA * WMMA_M) // e.g., 8 * 16 = 128 (for C_out dimension)
+#define TILE_N_PER_BLOCK (BLOCK_N_TILES_WMMA * WMMA_N) // e.g., 8 * 16 = 128 (for N_batch * H_out * W_out dimension)
+
+// Vector size for shared memory writes (half2)
+#define VECTOR_SIZE_H2 2
+
+// Struct to hold precomputed N-dimension GEMM indices
+struct NDecomposed {
+    int ow_eff;
+    int oh_eff;
+    int n_batch_idx;
+    bool isValidPixel; // True if this pixel_idx is within N_gemm bounds
+    int h_in_base; 
+    int w_in_base; 
+};
+
+__global__ void conv2d_implicit_gemm_wmma_kernel(
+    const float* __restrict__ input_ptr,    // Input: (N, Cin, Hin, Win)
+    const float* __restrict__ weight_ptr,   // Weights: (Cout, Cin, Kh, Kw)
+    const float* __restrict__ bias_ptr,     // Bias: (Cout) or nullptr
+    float* __restrict__ output_ptr,         // Output: (N, Cout, Hout, Wout)
+    const int N_batch, const int C_in, const int H_in, const int W_in,
+    const int C_out, const int K_h, const int K_w,
+    const int stride_h, const int stride_w,
+    const int pad_h, const int pad_w,
+    const int H_out, const int W_out,
+    const int M_gemm, // C_out
+    const int N_gemm, // N_batch * H_out * W_out
+    const int K_gemm  // C_in * K_h * K_w
+) {
+    // Thread identification
+    const int warp_id = threadIdx.x / warpSize;        // 0 .. WARPS_PER_BLOCK-1
+    const int lane_id = threadIdx.x % warpSize;        // 0 .. 31 (or warpSize-1)
+
+    // Top-left corner of the macro-tile this block is responsible for in GEMM terms
+    const int block_row_gemm_start = TILE_M_PER_BLOCK * blockIdx.y;
+    const int block_col_gemm_start = TILE_N_PER_BLOCK * blockIdx.x;
+
+    // Shared memory for tiles of A (weights) and B (input/im2col) - Double Buffered for K-loop pipelining
+    __shared__ half Asub_pipe[2][TILE_M_PER_BLOCK][WMMA_K + SKEW_HALF];
+    __shared__ half Bsub_pipe[2][TILE_N_PER_BLOCK][WMMA_K + SKEW_HALF];
+
+    // Shared memory for precomputed N-indices
+    __shared__ NDecomposed n_params_sh[TILE_N_PER_BLOCK];
+
+    // Shared memory for output stage (per-warp buffers)
+    __shared__ float C_shmem_output_buffers[WARPS_PER_BLOCK][WMMA_M][WMMA_N];
+
+    // Accumulator fragments per warp.
+    wmma::fragment&lt;wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float&gt; acc_frag[BLOCK_N_TILES_WMMA];
+    #pragma unroll
+    for (int i = 0; i &lt; BLOCK_N_TILES_WMMA; ++i) {
+        wmma::fill_fragment(acc_frag[i], 0.0f);
+    }
+
+    // Populate n_params_sh once at the beginning of the kernel
+    if (threadIdx.x &lt; TILE_N_PER_BLOCK) {
+        int r_b_tile_idx = threadIdx.x; 
+        int current_pixel_idx = block_col_gemm_start + r_b_tile_idx;
+
+        if (current_pixel_idx &lt; N_gemm) {
+            n_params_sh[r_b_tile_idx].ow_eff = current_pixel_idx % W_out;
+            int temp_div_wout = current_pixel_idx / W_out;
+            n_params_sh[r_b_tile_idx].oh_eff = temp_div_wout % H_out;
+            n_params_sh[r_b_tile_idx].n_batch_idx = temp_div_wout / H_out;
+            n_params_sh[r_b_tile_idx].isValidPixel = true;
+
+            n_params_sh[r_b_tile_idx].h_in_base = n_params_sh[r_b_tile_idx].oh_eff * stride_h - pad_h;
+            n_params_sh[r_b_tile_idx].w_in_base = n_params_sh[r_b_tile_idx].ow_eff * stride_w - pad_w;
+        } else {
+            n_params_sh[r_b_tile_idx].isValidPixel = false;
+            n_params_sh[r_b_tile_idx].ow_eff = 0; 
+            n_params_sh[r_b_tile_idx].oh_eff = 0;
+            n_params_sh[r_b_tile_idx].n_batch_idx = 0;
+            n_params_sh[r_b_tile_idx].h_in_base = 0; 
+            n_params_sh[r_b_tile_idx].w_in_base = 0;
+        }
+    }
+    __syncthreads();
+
+    // Constants for vectorized shared memory loading
+    // Number of half2 elements along K-dim for a shared memory tile row
+    const int NUM_H2_ELEMENTS_IN_K_DIM = WMMA_K / VECTOR_SIZE_H2;
+    // Number of thread groups, where each group has NUM_H2_ELEMENTS_IN_K_DIM threads.
+    // Each group is responsible for loading the K-dimension for one M-row (for A) or N-row (for B) at a time,
+    // iterating over M-rows or N-rows with this step size.
+    const int NUM_ROW_PROCESSING_GROUPS = THREADS_PER_BLOCK / NUM_H2_ELEMENTS_IN_K_DIM;
+
+
+    // --- K-Loop Pipelining ---
+    int num_k_tiles = (K_gemm + WMMA_K - 1) / WMMA_K;
+    
+    // --- Prologue: Load first k-tile (k_tile_iter = 0) into pipe_idx = 0 ---
+    if (num_k_tiles &gt; 0) { 
+        int k_tile_start_prologue = 0; 
+        int current_pipe_idx_prologue = 0; 
+
+        // Load Asub_pipe[0] for k_tile_iter = 0
+        {
+            // This thread is responsible for the 'h2_idx_in_k_dim_A'-th half2 element
+            // in the K-dimension of the shared memory tile.
+            int h2_idx_in_k_dim_A = threadIdx.x % NUM_H2_ELEMENTS_IN_K_DIM;
+            // Starting 'half' index in shared memory for this half2 write.
+            int shmem_k_start_for_h2_A = h2_idx_in_k_dim_A * VECTOR_SIZE_H2;
+
+            // Global k-indices for the two half elements.
+            int k_global_A_0 = k_tile_start_prologue + shmem_k_start_for_h2_A;
+            int k_global_A_1 = k_tile_start_prologue + shmem_k_start_for_h2_A + 1;
+
+            // Decompose k_global_A_0
+            int kw_eff_reg_A_0 = 0, kh_eff_reg_A_0 = 0, ic_eff_reg_A_0 = 0;
+            bool is_valid_k_A_0 = (k_global_A_0 &lt; K_gemm);
+            if (is_valid_k_A_0) {
+                kw_eff_reg_A_0 = k_global_A_0 % K_w;
+                int temp_div_kw_A_0 = k_global_A_0 / K_w;
+                kh_eff_reg_A_0 = temp_div_kw_A_0 % K_h;
+                ic_eff_reg_A_0 = temp_div_kw_A_0 / K_h;
+            }
+
+            // Decompose k_global_A_1
+            int kw_eff_reg_A_1 = 0, kh_eff_reg_A_1 = 0, ic_eff_reg_A_1 = 0;
+            bool is_valid_k_A_1 = (k_global_A_1 &lt; K_gemm);
+            if (is_valid_k_A_1) {
+                kw_eff_reg_A_1 = k_global_A_1 % K_w;
+                int temp_div_kw_A_1 = k_global_A_1 / K_w;
+                kh_eff_reg_A_1 = temp_div_kw_A_1 % K_h;
+                ic_eff_reg_A_1 = temp_div_kw_A_1 / K_h;
+            }
+            
+            // This thread belongs to 'm_row_group_id_A'-th group of threads.
+            // This group iterates over M-rows of the Asub_pipe tile.
+            int m_row_group_id_A = threadIdx.x / NUM_H2_ELEMENTS_IN_K_DIM;
+            for (int r_a_tile_base = m_row_group_id_A; r_a_tile_base &lt; TILE_M_PER_BLOCK; r_a_tile_base += NUM_ROW_PROCESSING_GROUPS) {
+                int oc_idx = block_row_gemm_start + r_a_tile_base;
+                float weight_val_0 = 0.0f;
+                if (oc_idx &lt; C_out &amp;&amp; is_valid_k_A_0) {
+                    weight_val_0 = weight_ptr[oc_idx * C_in * K_h * K_w +
+                                              ic_eff_reg_A_0 * K_h * K_w +
+                                              kh_eff_reg_A_0 * K_w +
+                                              kw_eff_reg_A_0];
+                }
+                float weight_val_1 = 0.0f;
+                if (oc_idx &lt; C_out &amp;&amp; is_valid_k_A_1) {
+                    weight_val_1 = weight_ptr[oc_idx * C_in * K_h * K_w +
+                                              ic_eff_reg_A_1 * K_h * K_w +
+                                              kh_eff_reg_A_1 * K_w +
+                                              kw_eff_reg_A_1];
+                }
+                half2* smem_ptr_h2_A = reinterpret_cast&lt;half2*&gt;(
+                    &amp;Asub_pipe[current_pipe_idx_prologue][r_a_tile_base][shmem_k_start_for_h2_A]
+                );
+                *smem_ptr_h2_A = make_half2(__float2half(weight_val_0), __float2half(weight_val_1));
+            }
+        }
+
+        // Load Bsub_pipe[0] for k_tile_iter = 0
+        {
+            int h2_idx_in_k_dim_B = threadIdx.x % NUM_H2_ELEMENTS_IN_K_DIM;
+            int shmem_k_start_for_h2_B = h2_idx_in_k_dim_B * VECTOR_SIZE_H2;
+
+            int k_global_B_0 = k_tile_start_prologue + shmem_k_start_for_h2_B;
+            int k_global_B_1 = k_tile_start_prologue + shmem_k_start_for_h2_B + 1;
+
+            int kw_eff_reg_B_0 = 0, kh_eff_reg_B_0 = 0, ic_eff_reg_B_0 = 0;
+            bool is_valid_k_B_0 = (k_global_B_0 &lt; K_gemm);
+            if (is_valid_k_B_0) {
+                kw_eff_reg_B_0 = k_global_B_0 % K_w;
+                int temp_div_kw_B_0 = k_global_B_0 / K_w;
+                kh_eff_reg_B_0 = temp_div_kw_B_0 % K_h;
+                ic_eff_reg_B_0 = temp_div_kw_B_0 / K_h;
+            }
+
+            int kw_eff_reg_B_1 = 0, kh_eff_reg_B_1 = 0, ic_eff_reg_B_1 = 0;
+            bool is_valid_k_B_1 = (k_global_B_1 &lt; K_gemm);
+            if (is_valid_k_B_1) {
+                kw_eff_reg_B_1 = k_global_B_1 % K_w;
+                int temp_div_kw_B_1 = k_global_B_1 / K_w;
+                kh_eff_reg_B_1 = temp_div_kw_B_1 % K_h;
+                ic_eff_reg_B_1 = temp_div_kw_B_1 / K_h;
+            }
+
+            int n_row_group_id_B = threadIdx.x / NUM_H2_ELEMENTS_IN_K_DIM;
+            for (int r_b_tile_base = n_row_group_id_B; r_b_tile_base &lt; TILE_N_PER_BLOCK; r_b_tile_base += NUM_ROW_PROCESSING_GROUPS) {
+                float input_val_0 = 0.0f;
+                if (n_params_sh[r_b_tile_base].isValidPixel &amp;&amp; is_valid_k_B_0) {
+                    const NDecomposed&amp; current_n_params = n_params_sh[r_b_tile_base];
+                    int h_in_eff_0 = current_n_params.h_in_base + kh_eff_reg_B_0;
+                    int w_in_eff_0 = current_n_params.w_in_base + kw_eff_reg_B_0;
+                    if (h_in_eff_0 &gt;= 0 &amp;&amp; h_in_eff_0 &lt; H_in &amp;&amp; w_in_eff_0 &gt;= 0 &amp;&amp; w_in_eff_0 &lt; W_in) {
+                        input_val_0 = input_ptr[current_n_params.n_batch_idx * C_in * H_in * W_in +
+                                              ic_eff_reg_B_0 * H_in * W_in +
+                                              h_in_eff_0 * W_in +
+                                              w_in_eff_0];
+                    }
+                }
+                float input_val_1 = 0.0f;
+                 if (n_params_sh[r_b_tile_base].isValidPixel &amp;&amp; is_valid_k_B_1) {
+                    const NDecomposed&amp; current_n_params = n_params_sh[r_b_tile_base];
+                    int h_in_eff_1 = current_n_params.h_in_base + kh_eff_reg_B_1;
+                    int w_in_eff_1 = current_n_params.w_in_base + kw_eff_reg_B_1;
+                     if (h_in_eff_1 &gt;= 0 &amp;&amp; h_in_eff_1 &lt; H_in &amp;&amp; w_in_eff_1 &gt;= 0 &amp;&amp; w_in_eff_1 &lt; W_in) {
+                        input_val_1 = input_ptr[current_n_params.n_batch_idx * C_in * H_in * W_in +
+                                              ic_eff_reg_B_1 * H_in * W_in +
+                                              h_in_eff_1 * W_in +
+                                              w_in_eff_1];
+                    }
+                }
+                half2* smem_ptr_h2_B = reinterpret_cast&lt;half2*&gt;(
+                    &amp;Bsub_pipe[current_pipe_idx_prologue][r_b_tile_base][shmem_k_start_for_h2_B]
+                );
+                *smem_ptr_h2_B = make_half2(__float2half(input_val_0), __float2half(input_val_1));
+            }
+        }
+    }
+
+
+    // Loop over the K_gemm dimension in tiles of WMMA_K
+    for (int k_tile_iter = 0; k_tile_iter &lt; num_k_tiles; ++k_tile_iter) {
+        __syncthreads(); // Sync point for pipelining
+
+        int compute_pipe_idx = k_tile_iter % 2;
+        int load_pipe_idx = (k_tile_iter + 1) % 2;
+
+        // --- Load Stage for next k-tile (k_tile_iter + 1) into load_pipe_idx ---
+        int k_tile_start_for_load = (k_tile_iter + 1) * WMMA_K;
+        if (k_tile_start_for_load &lt; K_gemm) { 
+            // Load Asub_pipe[load_pipe_idx]
+            { 
+                int h2_idx_in_k_dim_A = threadIdx.x % NUM_H2_ELEMENTS_IN_K_DIM;
+                int shmem_k_start_for_h2_A = h2_idx_in_k_dim_A * VECTOR_SIZE_H2;
+
+                int k_global_A_0 = k_tile_start_for_load + shmem_k_start_for_h2_A;
+                int k_global_A_1 = k_tile_start_for_load + shmem_k_start_for_h2_A + 1;
+
+                int kw_eff_reg_A_0 = 0, kh_eff_reg_A_0 = 0, ic_eff_reg_A_0 = 0;
+                bool is_valid_k_A_0 = (k_global_A_0 &lt; K_gemm);
+                if (is_valid_k_A_0) {
+                    kw_eff_reg_A_0 = k_global_A_0 % K_w;
+                    int temp_div_kw_A_0 = k_global_A_0 / K_w;
+                    kh_eff_reg_A_0 = temp_div_kw_A_0 % K_h;
+                    ic_eff_reg_A_0 = temp_div_kw_A_0 / K_h;
+                }
+
+                int kw_eff_reg_A_1 = 0, kh_eff_reg_A_1 = 0, ic_eff_reg_A_1 = 0;
+                bool is_valid_k_A_1 = (k_global_A_1 &lt; K_gemm);
+                if (is_valid_k_A_1) {
+                    kw_eff_reg_A_1 = k_global_A_1 % K_w;
+                    int temp_div_kw_A_1 = k_global_A_1 / K_w;
+                    kh_eff_reg_A_1 = temp_div_kw_A_1 % K_h;
+                    ic_eff_reg_A_1 = temp_div_kw_A_1 / K_h;
+                }
+                
+                int m_row_group_id_A = threadIdx.x / NUM_H2_ELEMENTS_IN_K_DIM;
+                for (int r_a_tile_base = m_row_group_id_A; r_a_tile_base &lt; TILE_M_PER_BLOCK; r_a_tile_base += NUM_ROW_PROCESSING_GROUPS) {
+                    int oc_idx = block_row_gemm_start + r_a_tile_base;
+                    float weight_val_0 = 0.0f;
+                    if (oc_idx &lt; C_out &amp;&amp; is_valid_k_A_0) {
+                        weight_val_0 = weight_ptr[oc_idx * C_in * K_h * K_w +
+                                                  ic_eff_reg_A_0 * K_h * K_w +
+                                                  kh_eff_reg_A_0 * K_w +
+                                                  kw_eff_reg_A_0];
+                    }
+                    float weight_val_1 = 0.0f;
+                    if (oc_idx &lt; C_out &amp;&amp; is_valid_k_A_1) {
+                        weight_val_1 = weight_ptr[oc_idx * C_in * K_h * K_w +
+                                                  ic_eff_reg_A_1 * K_h * K_w +
+                                                  kh_eff_reg_A_1 * K_w +
+                                                  kw_eff_reg_A_1];
+                    }
+                    half2* smem_ptr_h2_A = reinterpret_cast&lt;half2*&gt;(
+                        &amp;Asub_pipe[load_pipe_idx][r_a_tile_base][shmem_k_start_for_h2_A]
+                    );
+                    *smem_ptr_h2_A = make_half2(__float2half(weight_val_0), __float2half(weight_val_1));
+                }
+            } 
+
+            // Load Bsub_pipe[load_pipe_idx]
+            { 
+                int h2_idx_in_k_dim_B = threadIdx.x % NUM_H2_ELEMENTS_IN_K_DIM;
+                int shmem_k_start_for_h2_B = h2_idx_in_k_dim_B * VECTOR_SIZE_H2;
+
+                int k_global_B_0 = k_tile_start_for_load + shmem_k_start_for_h2_B;
+                int k_global_B_1 = k_tile_start_for_load + shmem_k_start_for_h2_B + 1;
+
+                int kw_eff_reg_B_0 = 0, kh_eff_reg_B_0 = 0, ic_eff_reg_B_0 = 0;
+                bool is_valid_k_B_0 = (k_global_B_0 &lt; K_gemm);
+                if (is_valid_k_B_0) {
+                    kw_eff_reg_B_0 = k_global_B_0 % K_w;
+                    int temp_div_kw_B_0 = k_global_B_0 / K_w;
+                    kh_eff_reg_B_0 = temp_div_kw_B_0 % K_h;
+                    ic_eff_reg_B_0 = temp_div_kw_B_0 / K_h;
+                }
+
+                int kw_eff_reg_B_1 = 0, kh_eff_reg_B_1 = 0, ic_eff_reg_B_1 = 0;
+                bool is_valid_k_B_1 = (k_global_B_1 &lt; K_gemm);
+                if (is_valid_k_B_1) {
+                    kw_eff_reg_B_1 = k_global_B_1 % K_w;
+                    int temp_div_kw_B_1 = k_global_B_1 / K_w;
+                    kh_eff_reg_B_1 = temp_div_kw_B_1 % K_h;
+                    ic_eff_reg_B_1 = temp_div_kw_B_1 / K_h;
+                }
+
+                int n_row_group_id_B = threadIdx.x / NUM_H2_ELEMENTS_IN_K_DIM;
+                for (int r_b_tile_base = n_row_group_id_B; r_b_tile_base &lt; TILE_N_PER_BLOCK; r_b_tile_base += NUM_ROW_PROCESSING_GROUPS) {
+                    float input_val_0 = 0.0f;
+                    if (n_params_sh[r_b_tile_base].isValidPixel &amp;&amp; is_valid_k_B_0) {
+                        const NDecomposed&amp; current_n_params = n_params_sh[r_b_tile_base];
+                        int h_in_eff_0 = current_n_params.h_in_base + kh_eff_reg_B_0;
+                        int w_in_eff_0 = current_n_params.w_in_base + kw_eff_reg_B_0;
+                        if (h_in_eff_0 &gt;= 0 &amp;&amp; h_in_eff_0 &lt; H_in &amp;&amp; w_in_eff_0 &gt;= 0 &amp;&amp; w_in_eff_0 &lt; W_in) {
+                            input_val_0 = input_ptr[current_n_params.n_batch_idx * C_in * H_in * W_in +
+                                                  ic_eff_reg_B_0 * H_in * W_in +
+                                                  h_in_eff_0 * W_in +
+                                                  w_in_eff_0];
+                        }
+                    }
+                    float input_val_1 = 0.0f;
+                    if (n_params_sh[r_b_tile_base].isValidPixel &amp;&amp; is_valid_k_B_1) {
+                        const NDecomposed&amp; current_n_params = n_params_sh[r_b_tile_base];
+                        int h_in_eff_1 = current_n_params.h_in_base + kh_eff_reg_B_1;
+                        int w_in_eff_1 = current_n_params.w_in_base + kw_eff_reg_B_1;
+                        if (h_in_eff_1 &gt;= 0 &amp;&amp; h_in_eff_1 &lt; H_in &amp;&amp; w_in_eff_1 &gt;= 0 &amp;&amp; w_in_eff_1 &lt; W_in) {
+                            input_val_1 = input_ptr[current_n_params.n_batch_idx * C_in * H_in * W_in +
+                                                  ic_eff_reg_B_1 * H_in * W_in +
+                                                  h_in_eff_1 * W_in +
+                                                  w_in_eff_1];
+                        }
+                    }
+                    half2* smem_ptr_h2_B = reinterpret_cast&lt;half2*&gt;(
+                        &amp;Bsub_pipe[load_pipe_idx][r_b_tile_base][shmem_k_start_for_h2_B]
+                    );
+                    *smem_ptr_h2_B = make_half2(__float2half(input_val_0), __float2half(input_val_1));
+                }
+            } 
+        }
+
+        // --- Compute Stage for current k-tile (k_tile_iter) using compute_pipe_idx ---
+        int a_row_start_in_tile = warp_id * WMMA_M; 
+
+        wmma::fragment&lt;wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major&gt; a_frag;
+        wmma::load_matrix_sync(a_frag, &amp;Asub_pipe[compute_pipe_idx][a_row_start_in_tile][0], WMMA_K + SKEW_HALF);
+
+        wmma::fragment&lt;wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major&gt; b_frag_inner_pipe[2];
+
+        if (BLOCK_N_TILES_WMMA &gt; 0) {
+            int b_col_start_in_tile_current = 0 * WMMA_N; 
+            wmma::load_matrix_sync(b_frag_inner_pipe[0], &amp;Bsub_pipe[compute_pipe_idx][b_col_start_in_tile_current][0], WMMA_K + SKEW_HALF);
+        }
+        
+        int current_inner_pipe_idx = 0;
+
+        #pragma unroll
+        for (int n_tile = 0; n_tile &lt; BLOCK_N_TILES_WMMA; ++n_tile) {
+            int next_inner_pipe_idx = 1 - current_inner_pipe_idx;
+
+            if (n_tile &lt; BLOCK_N_TILES_WMMA - 1) {
+                int b_col_start_in_tile_next = (n_tile + 1) * WMMA_N;
+                wmma::load_matrix_sync(b_frag_inner_pipe[next_inner_pipe_idx], &amp;Bsub_pipe[compute_pipe_idx][b_col_start_in_tile_next][0], WMMA_K + SKEW_HALF);
+            }
+
+            wmma::mma_sync(acc_frag[n_tile], a_frag, b_frag_inner_pipe[current_inner_pipe_idx], acc_frag[n_tile]);
+            
+            current_inner_pipe_idx = next_inner_pipe_idx;
+        }
+    }
+    __syncthreads(); 
+
+    // Store results from accumulator fragments to global memory
+    #pragma unroll
+    for (int n_tile = 0; n_tile &lt; BLOCK_N_TILES_WMMA; ++n_tile) {
+        wmma::store_matrix_sync(&amp;C_shmem_output_buffers[warp_id][0][0], acc_frag[n_tile], WMMA_N, wmma::mem_row_major);
+
+        for (int elem_idx_in_frag = lane_id; elem_idx_in_frag &lt; WMMA_M * WMMA_N; elem_idx_in_frag += warpSize) {
+            int r_frag = elem_idx_in_frag / WMMA_N;
+            int c_frag = elem_idx_in_frag % WMMA_N;
+
+            int oc_idx = block_row_gemm_start + (warp_id * WMMA_M) + r_frag;
+            
+            int offset_in_block_N_processing = (n_tile * WMMA_N) + c_frag;
+
+            if (oc_idx &lt; C_out &amp;&amp; offset_in_block_N_processing &lt; TILE_N_PER_BLOCK &amp;&amp; 
+                n_params_sh[offset_in_block_N_processing].isValidPixel) {
+                const NDecomposed&amp; current_n_params = n_params_sh[offset_in_block_N_processing];
+                int ow_eff = current_n_params.ow_eff;
+                int oh_eff = current_n_params.oh_eff;
+                int n_batch_idx = current_n_params.n_batch_idx;
+
+                float val = C_shmem_output_buffers[warp_id][r_frag][c_frag];
+
+                if (bias_ptr != nullptr) {
+                    val += bias_ptr[oc_idx];
+                }
+
+                output_ptr[n_batch_idx * C_out * H_out * W_out +
+                           oc_idx * H_out * W_out +
+                           oh_eff * W_out +
+                           ow_eff] = val;
+            }
+        }
+    }
+}
+
+
+torch::Tensor conv2d_implicit_gemm_cuda(
+    torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+    int N_batch, int C_in, int H_in, int W_in,
+    int C_out, int K_h, int K_w,
+    int stride_h, int stride_w, int pad_h, int pad_w,
+    int H_out, int W_out) {
+
+    TORCH_CHECK(input.device().is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(weight.device().is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+    if (bias.defined()) {
+        TORCH_CHECK(bias.device().is_cuda(), "Bias must be a CUDA tensor");
+        TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+        TORCH_CHECK(bias.dim() == 1 &amp;&amp; bias.size(0) == C_out, "Bias has wrong shape");
+    }
+
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D");
+    TORCH_CHECK(weight.dim() == 4, "Weight must be 4D");
+    TORCH_CHECK(input.size(0) == N_batch, "Input N_batch mismatch");
+    TORCH_CHECK(input.size(1) == C_in, "Input C_in mismatch");
+    TORCH_CHECK(input.size(2) == H_in, "Input H_in mismatch");
+    TORCH_CHECK(input.size(3) == W_in, "Input W_in mismatch");
+    TORCH_CHECK(weight.size(0) == C_out, "Weight C_out mismatch");
+    TORCH_CHECK(weight.size(1) == C_in, "Weight C_in mismatch");
+    TORCH_CHECK(weight.size(2) == K_h, "Weight K_h mismatch");
+    TORCH_CHECK(weight.size(3) == K_w, "Weight K_w mismatch");
+
+    auto output = torch::zeros({N_batch, C_out, H_out, W_out}, input.options());
+
+    const int M_gemm = C_out;
+    const int N_gemm = N_batch * H_out * W_out;
+    const int K_gemm = C_in * K_h * K_w;
+
+    if (M_gemm == 0 || N_gemm == 0) { 
+        return output;
+    }
+    if (K_gemm == 0) { 
+         if (bias.defined()) { 
+            output = output + bias.reshape({1, C_out, 1, 1});
+        }
+        return output; 
+    }
+
+    dim3 block_dim(THREADS_PER_BLOCK);
+    dim3 grid_dim(
+        (N_gemm + TILE_N_PER_BLOCK - 1) / TILE_N_PER_BLOCK, 
+        (M_gemm + TILE_M_PER_BLOCK - 1) / TILE_M_PER_BLOCK  
+    );
+
+    const float* bias_ptr_data = bias.defined() ? bias.data_ptr&lt;float&gt;() : nullptr;
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    conv2d_implicit_gemm_wmma_kernel&lt;&lt;&lt;grid_dim, block_dim, 0, stream&gt;&gt;&gt;(
+        input.data_ptr&lt;float&gt;(),
+        weight.data_ptr&lt;float&gt;(),
+        bias_ptr_data,
+        output.data_ptr&lt;float&gt;(),
+        N_batch, C_in, H_in, W_in,
+        C_out, K_h, K_w,
+        stride_h, stride_w, pad_h, pad_w,
+        H_out, W_out,
+        M_gemm, N_gemm, K_gemm
+    );
+    
+    AT_CUDA_CHECK(cudaGetLastError());
+
+    return output;
+}
+"""</span>
+
+<span>conv2d_implicit_gemm_cuda_declaration</span> <span>=</span> <span>r</span><span>"""
+torch::Tensor conv2d_implicit_gemm_cuda(
+    torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+    int N_batch, int C_in, int H_in, int W_in,
+    int C_out, int K_h, int K_w,
+    int stride_h, int stride_w, int pad_h, int pad_w,
+    int H_out, int W_out);
+"""</span>
+
+<span># JIT compile the CUDA kernel
+</span><span>custom_conv2d_wmma_ops</span> <span>=</span> <span>load_inline</span><span>(</span>
+    <span>name</span><span>=</span><span>"custom_conv2d_wmma_ops_optimized_k_pipe_vec_smem"</span><span>,</span> <span># Changed name to avoid collision
+</span>    <span>cpp_sources</span><span>=</span><span>conv2d_implicit_gemm_cuda_declaration</span><span>,</span>
+    <span>cuda_sources</span><span>=</span><span>conv2d_implicit_gemm_cuda_source</span><span>,</span>
+    <span>functions</span><span>=</span><span>[</span><span>"conv2d_implicit_gemm_cuda"</span><span>],</span>
+    <span>verbose</span><span>=</span><span>True</span><span>,</span> 
+    <span>extra_cuda_cflags</span><span>=</span><span>[</span><span>"-arch=sm_70"</span><span>,</span> <span>"--use_fast_math"</span><span>,</span> <span>"-std=c++17"</span><span>]</span> 
+<span>)</span>
+
+
+<span>class</span> <span>ModelNew</span><span>(</span><span>nn</span><span>.</span><span>Module</span><span>):</span>
+    <span>def</span> <span>__init__</span><span>(</span><span>self</span><span>,</span> <span>num_classes</span><span>=</span><span>1000</span><span>):</span> <span># num_classes is part of original signature, kept for consistency
+</span>        <span>super</span><span>(</span><span>ModelNew</span><span>,</span> <span>self</span><span>).</span><span>__init__</span><span>()</span>
+        
+        <span># Define Conv1 parameters (matching the original model)
+</span>        <span>self</span><span>.</span><span>in_channels</span> <span>=</span> <span>3</span>
+        <span>self</span><span>.</span><span>out_channels</span> <span>=</span> <span>96</span>
+        <span>self</span><span>.</span><span>kernel_size_val</span> <span>=</span> <span>11</span> <span># Assuming square kernel
+</span>        <span>self</span><span>.</span><span>stride_val</span> <span>=</span> <span>4</span>       <span># Assuming square stride
+</span>        <span>self</span><span>.</span><span>padding_val</span> <span>=</span> <span>2</span>      <span># Assuming square padding
+</span>
+        <span># Create a temporary Conv2d layer to initialize weights and bias
+</span>        <span>temp_conv</span> <span>=</span> <span>nn</span><span>.</span><span>Conv2d</span><span>(</span>
+            <span>in_channels</span><span>=</span><span>self</span><span>.</span><span>in_channels</span><span>,</span> 
+            <span>out_channels</span><span>=</span><span>self</span><span>.</span><span>out_channels</span><span>,</span> 
+            <span>kernel_size</span><span>=</span><span>self</span><span>.</span><span>kernel_size_val</span><span>,</span> 
+            <span>stride</span><span>=</span><span>self</span><span>.</span><span>stride_val</span><span>,</span> 
+            <span>padding</span><span>=</span><span>self</span><span>.</span><span>padding_val</span><span>,</span>
+            <span>bias</span><span>=</span><span>True</span> <span># nn.Conv2d has bias=True by default
+</span>        <span>)</span>
+        <span>self</span><span>.</span><span>conv1_weight</span> <span>=</span> <span>nn</span><span>.</span><span>Parameter</span><span>(</span><span>temp_conv</span><span>.</span><span>weight</span><span>.</span><span>detach</span><span>().</span><span>clone</span><span>())</span>
+        <span>if</span> <span>temp_conv</span><span>.</span><span>bias</span> <span>is</span> <span>not</span> <span>None</span><span>:</span>
+            <span>self</span><span>.</span><span>conv1_bias</span> <span>=</span> <span>nn</span><span>.</span><span>Parameter</span><span>(</span><span>temp_conv</span><span>.</span><span>bias</span><span>.</span><span>detach</span><span>().</span><span>clone</span><span>())</span>
+        <span>else</span><span>:</span>
+            <span># Correctly register 'conv1_bias' as None if not present
+</span>            <span>self</span><span>.</span><span>register_parameter</span><span>(</span><span>'conv1_bias'</span><span>,</span> <span>None</span><span>)</span> 
+
+
+        <span>self</span><span>.</span><span>custom_conv_op</span> <span>=</span> <span>custom_conv2d_wmma_ops</span><span>.</span><span>conv2d_implicit_gemm_cuda</span>
+
+    <span>def</span> <span>forward</span><span>(</span><span>self</span><span>,</span> <span>x</span><span>):</span>
+        <span>N_batch</span> <span>=</span> <span>x</span><span>.</span><span>size</span><span>(</span><span>0</span><span>)</span>
+        <span># C_in_runtime = x.size(1) # Should match self.in_channels
+</span>        <span>H_in</span> <span>=</span> <span>x</span><span>.</span><span>size</span><span>(</span><span>2</span><span>)</span>
+        <span>W_in</span> <span>=</span> <span>x</span><span>.</span><span>size</span><span>(</span><span>3</span><span>)</span>
+
+        <span># Calculate output dimensions
+</span>        <span>H_out</span> <span>=</span> <span>(</span><span>H_in</span> <span>+</span> <span>2</span> <span>*</span> <span>self</span><span>.</span><span>padding_val</span> <span>-</span> <span>self</span><span>.</span><span>kernel_size_val</span><span>)</span> <span>//</span> <span>self</span><span>.</span><span>stride_val</span> <span>+</span> <span>1</span>
+        <span>W_out</span> <span>=</span> <span>(</span><span>W_in</span> <span>+</span> <span>2</span> <span>*</span> <span>self</span><span>.</span><span>padding_val</span> <span>-</span> <span>self</span><span>.</span><span>kernel_size_val</span><span>)</span> <span>//</span> <span>self</span><span>.</span><span>stride_val</span> <span>+</span> <span>1</span>
+        
+        <span># Bias tensor handling: pass an undefined tensor if bias is None.
+</span>        <span># The C++ TORCH_CHECK(bias.defined()) handles this by providing nullptr to kernel.
+</span>        <span>bias_tensor</span> <span>=</span> <span>self</span><span>.</span><span>conv1_bias</span> <span>if</span> <span>self</span><span>.</span><span>conv1_bias</span> <span>is</span> <span>not</span> <span>None</span> <span>else</span> <span>torch</span><span>.</span><span>Tensor</span><span>()</span>
+
+
+        <span>x</span> <span>=</span> <span>self</span><span>.</span><span>custom_conv_op</span><span>(</span>
+            <span>x</span><span>,</span> <span>self</span><span>.</span><span>conv1_weight</span><span>,</span> <span>bias_tensor</span><span>,</span>
+            <span>N_batch</span><span>,</span> <span>self</span><span>.</span><span>in_channels</span><span>,</span> <span>H_in</span><span>,</span> <span>W_in</span><span>,</span>
+            <span>self</span><span>.</span><span>out_channels</span><span>,</span> <span>self</span><span>.</span><span>kernel_size_val</span><span>,</span> <span>self</span><span>.</span><span>kernel_size_val</span><span>,</span> <span># K_h, K_w
+</span>            <span>self</span><span>.</span><span>stride_val</span><span>,</span> <span>self</span><span>.</span><span>stride_val</span><span>,</span> <span># stride_h, stride_w
+</span>            <span>self</span><span>.</span><span>padding_val</span><span>,</span> <span>self</span><span>.</span><span>padding_val</span><span>,</span> <span># pad_h, pad_w
+</span>            <span>H_out</span><span>,</span> <span>W_out</span>
+        <span>)</span>
+        <span>return</span> <span>x</span>
+</code></pre></div>
+
+  </div>
+
+
+			</div>
+		
+
+
+
+
+
+
+	</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Cap: Lightweight, modern open-source CAPTCHA alternative using proof-of-work (102 pts)]]></title>
+            <link>https://capjs.js.org/</link>
+            <guid>44137867</guid>
+            <pubDate>Fri, 30 May 2025 16:36:10 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://capjs.js.org/">https://capjs.js.org/</a>, See on <a href="https://news.ycombinator.com/item?id=44137867">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div data-v-9a6c75ad="" data-v-e07eaea7="" id="VPContent" data-v-d8b57b2d=""><!--[--><!--]--><div data-v-dd8814ff="" data-v-e07eaea7=""><div data-v-dd8814ff=""><!--[--><!--]--><!--[--><h2 data-v-dd8814ff=""><span data-v-dd8814ff="">Cap</span><span data-v-dd8814ff="">A modern, lightning-quick PoW captcha</span></h2><p data-v-dd8814ff="">Cap is a lightweight, modern open-source CAPTCHA alternative using SHA-256 proof-of-work</p><!--]--><!--[--><!--]--><!--[--><!--]--></div><div data-v-dd8814ff=""><!--[--><!--[--><p><img src="https://capjs.js.org/logo.png" alt="VitePress" data-v-ab19afbb=""></p><!--]--><!--]--></div></div><!--[--><!--]--><!--[--><!--]--><div data-v-b1eea84a="" data-v-e07eaea7=""><!--[--><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>⚡️</p><h2 data-v-bd37d1a2="">250x smaller than hCaptcha</h2><p data-v-bd37d1a2="">Cap's widget library is extremely small, only ~20kb minified (including WASM)</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>🔒️</p><h2 data-v-bd37d1a2="">Private</h2><p data-v-bd37d1a2="">Cap's usage of proof-of-work eliminates the need for any tracking, fingerprinting or data collection</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>🌈</p><h2 data-v-bd37d1a2="">Fully customizable</h2><p data-v-bd37d1a2="">Cap is self-hostable so you can customize both the backend &amp; frontend (or you can just use CSS variables)</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>🤖</p><h2 data-v-bd37d1a2="">PoW-based</h2><p data-v-bd37d1a2="">Cap uses PoW instead of complex puzzles, making it easier for humans and harder for bots</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>🧩</p><h2 data-v-bd37d1a2="">Standalone mode</h2><p data-v-bd37d1a2="">Cap offers a standalone mode with Docker, allowing you to use it with languages other than JS</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>💨</p><h2 data-v-bd37d1a2="">Invisible mode</h2><p data-v-bd37d1a2="">Cap can run invisibly in the background using a simple JS API</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>☁️</p><h2 data-v-bd37d1a2="">Floating mode</h2><p data-v-bd37d1a2="">Floating mode keeps your CAPTCHA hidden until it's needed</p><!----></article><!--]--></div><div data-v-b1eea84a="" data-v-bd37d1a2=""><!--[--><article data-v-bd37d1a2=""><p>🌳</p><h2 data-v-bd37d1a2="">Fully FOSS</h2><p data-v-bd37d1a2="">Completely open source under the Apache 2.0 license</p><!----></article><!--]--></div><!--]--></div><!--[--><!--]--><div data-v-e07eaea7="" data-v-c141a4bd=""><h2 id="what-is-cap" tabindex="-1">What is Cap? <a href="#what-is-cap" aria-label="Permalink to &quot;What is Cap?&quot;">​</a></h2><p>Cap is a lightweight, modern open-source CAPTCHA alternative using SHA-256 proof-of-work. It's fast, private, and extremely simple to integrate. <a href="https://capjs.js.org/guide/effectiveness.html">Learn more about proof-of-work here.</a></p><p>Cap is built into 2 main parts:</p><ul><li><p><strong><a href="https://capjs.js.org/guide/widget.html" target="_blank" rel="noreferrer">@cap.js/widget</a></strong>: A small JavaScript library that renders the CAPTCHA and handles solving it using Web Workers and WASM.</p></li><li><p><strong><a href="https://capjs.js.org/guide/server.html" target="_blank" rel="noreferrer">@cap.js/server</a></strong>: An extremely simple, zero-dependencies library that handles creating and validating challenges.</p></li></ul><p>There are also some other helpful packages:</p><ul><li><p><strong><a href="https://capjs.js.org/guide/solver.html" target="_blank" rel="noreferrer">@cap.js/solver</a></strong>: Server-side solver for the CAPTCHA in case you want to use machine-to-machine.</p></li><li><p><strong><a href="https://capjs.js.org/guide/cli.html" target="_blank" rel="noreferrer">@cap.js/cli</a></strong>: Command-line interface for solving CAPTCHAs made with Cap. It's mainly designed for testing and when you need to solve these CAPTCHAs in a browser without JavaScript support.</p></li><li><p><strong><a href="https://capjs.js.org/guide/standalone.html" target="_blank" rel="noreferrer">Standalone mode</a></strong>: Docker image that helps you use Cap with any language or framework. It runs a simple REST API that can be used to create and validate challenges and an interactive UI to manage your keys.</p></li><li><p><strong>@cap.js/wasm</strong>: WASM solvers for Node and Web built with Rust.</p></li></ul><p>We also provide a middleware for a Cloudflare browser checkpoint-like experience:</p><ul><li><a href="https://capjs.js.org/guide/middleware/hono.html" target="_blank" rel="noreferrer">@cap.js/checkpoint-hono</a></li><li><a href="https://capjs.js.org/guide/middleware/express.html" target="_blank" rel="noreferrer">@cap.js/checkpoint-express</a></li><li><a href="https://capjs.js.org/guide/middleware/elysia.html" target="_blank" rel="noreferrer">@cap.js/middleware-elysia</a></li><li>more coming soon!</li></ul><p>It's designed to be a drop-in replacement for existing CAPTCHA solutions, with a focus on performance and UX.</p><p>Cap is built with JavaScript, runs on any JS runtime (Bun, Node.js, Deno), and has no dependencies. If you're not using any JS runtime, you can also use the standalone mode with Docker, which relies entirely on a simple REST API to create and validate challenges.</p><h2 id="why-cap" tabindex="-1">Why Cap? <a href="#why-cap" aria-label="Permalink to &quot;Why Cap?&quot;">​</a></h2><ul><li><strong>250x smaller than hCaptcha</strong><br><code>@cap.js/widget</code> is extremely small, only 12kb minified and brotli'd.</li><li><strong>Private</strong><br> Cap's usage of proof-of-work eliminates the need for any tracking, fingerprinting or data collection.</li><li><strong>Fully customizable</strong><br> Cap's self-hostable so you can customize both the backend &amp; frontend — or you can just use CSS variables</li><li><strong>Proof-of-work</strong><br> Cap uses proof-of-work instead of complex puzzles, making it easier for humans and harder for bots</li><li><strong>Standalone mode</strong><br> Cap offers a standalone mode with Docker, allowing you to use it with languages other than JS.</li><li><strong>Invisible mode</strong><br> Cap can run invisibly in the background using a simple JS API.</li><li><strong>Floating mode</strong><br> Cap's floating mode keeps your CAPTCHA hidden until it's needed.</li><li><strong>Fully open-source</strong><br> Completely open source under the Apache license 2.0 license.</li></ul><p>It's ideal for:</p><ul><li>Protecting APIs from bots</li><li>Preventing spam on forms</li><li>Blocking automated login attempts</li><li>Securing free-tier abuse</li></ul><h2 id="feature-comparison" tabindex="-1">Feature comparison <a href="#feature-comparison" aria-label="Permalink to &quot;Feature comparison&quot;">​</a></h2><table tabindex="0"><thead><tr><th>CAPTCHA</th><th>Open-source</th><th>Free</th><th>Private</th><th>Fast to solve</th><th>Easy for humans</th><th>Small error rate</th><th>Checkpoint support</th><th>GDPR/CCPA Compliant</th><th>Customizable</th><th>Hard for bots</th><th>Easy to integrate</th></tr></thead><tbody><tr><td><strong>Cap</strong></td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>🟨</td><td>✅</td></tr><tr><td>Cloudflare Turnstile</td><td>❌</td><td>✅</td><td>🟨</td><td>🟨</td><td>✅</td><td>❌</td><td>🟨</td><td>✅</td><td>❌</td><td>🟨</td><td>✅</td></tr><tr><td>reCAPTCHA</td><td>❌</td><td>🟨</td><td>❌</td><td>✅</td><td>❌</td><td>🟨</td><td>❌</td><td>🟨</td><td>❌</td><td>❌</td><td>✅</td></tr><tr><td>hCAPTCHA</td><td>❌</td><td>🟨</td><td>🟨</td><td>❌</td><td>❌</td><td>🟨</td><td>❌</td><td>🟨</td><td>❌</td><td>🟨</td><td>✅</td></tr><tr><td>Altcha</td><td>✅</td><td>✅</td><td>✅</td><td>🟨</td><td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>🟨</td><td>🟨</td></tr><tr><td>FriendlyCaptcha</td><td>❌</td><td>❌</td><td>✅</td><td>🟨</td><td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>🟨</td><td>🟨</td></tr><tr><td>MTCaptcha</td><td>❌</td><td>🟨</td><td>🟨</td><td>❌</td><td>❌</td><td>🟨</td><td>❌</td><td>✅</td><td>❌</td><td>❌</td><td>🟨</td></tr><tr><td>GeeTest</td><td>❌</td><td>❌</td><td>❌</td><td>🟨</td><td>🟨</td><td>🟨</td><td>❌</td><td>✅</td><td>❌</td><td>🟨</td><td>🟨</td></tr><tr><td>Arkose Labs</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>❌</td><td>✅</td><td>🟨</td><td>❌</td><td>❌</td></tr></tbody></table><h2 id="alternatives" tabindex="-1">Alternatives <a href="#alternatives" aria-label="Permalink to &quot;Alternatives&quot;">​</a></h2><p>Cap is a modern alternative to:</p><ul><li><a href="https://www.google.com/recaptcha/about/" target="_blank" rel="noreferrer">reCAPTCHA</a></li><li><a href="https://www.hcaptcha.com/" target="_blank" rel="noreferrer">hCaptcha</a></li><li><a href="https://developers.cloudflare.com/turnstile/" target="_blank" rel="noreferrer">Cloudflare Turnstile</a></li></ul><p>But unlike them, Cap is <a href="https://capjs.js.org/guide/workings.html"><strong>computation-bound, not tracking-bound</strong></a>.</p><p><a href="https://capjs.js.org/guide/alternatives.html">Read more about alternatives</a></p><h2 id="license" tabindex="-1">License <a href="#license" aria-label="Permalink to &quot;License&quot;">​</a></h2><p>Cap is licensed under the Apache License 2.0.</p><hr><p><a href="https://www.bestpractices.dev/projects/9920" target="_blank" rel="noreferrer"><img src="https://www.bestpractices.dev/projects/9920/badge" alt="OpenSSF Best Practices" loading="lazy"></a></p></div></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Beating Google's kernelCTF PoW using AVX512 (217 pts)]]></title>
             <link>https://anemato.de/blog/kctf-vdf</link>
             <guid>44137715</guid>
             <pubDate>Fri, 30 May 2025 16:19:50 GMT</pubDate>
@@ -546,7 +1356,176 @@
 </span></code></pre></div><p>I hope you enjoyed my first-ever blog post. Hopefully there will be many more.</p><section data-footnotes="true"><h2 id="footnote-label">Footnotes</h2><ol><li id="user-content-fn-bounty"><p>$21,337 base reward, $10,000 for stability (successful exploitation on &gt;90% of runs), and $20,000 for a 0-day bug. <a href="#user-content-fnref-bounty" aria-label="Back to reference 1" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-thesis"><p>We had one shot at this; William's thesis was due in a few days and we wanted to include the exploit. <a href="#user-content-fnref-thesis" aria-label="Back to reference 2" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-hash"><p>Compare with proofs of work, for example, that request a SHA hash starting with some number of zeros. This process is embarrassingly parallel, so someone with many powerful GPUs could solve it in a fraction of the time as someone without. <a href="#user-content-fnref-hash" aria-label="Back to reference 3" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-rust"><p>The Rust implementation uses the exact same Mersenne trick, yet takes about 2.4 seconds; I assume this is FFI overhead? 🤷 <a href="#user-content-fnref-rust" aria-label="Back to reference 4" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-limbs"><p>Limbs are the term of art for the integer elements of an array that represents a big integer. On 64-bit systems, limbs are usually 64-bit unsigned integers. <a href="#user-content-fnref-limbs" aria-label="Back to reference 5" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-uops"><p>See <a target="_blank" rel="noopener noreferrer" href="https://uops.info/table.html">uops.info</a>, <em>imul r64</em> and <em>mulx r64, r64, r64</em>. <a href="#user-content-fnref-uops" aria-label="Back to reference 6" data-footnote-backref="">↩</a></p></li><li id="user-content-fn-numberworld"><p>The same performance problem was observed by y-cruncher author Alexander Yee <a target="_blank" rel="noopener noreferrer" href="https://www.numberworld.org/y-cruncher/news/2024.html">here</a>, section "Example 2: Everything Blows Up". <a href="#user-content-fnref-numberworld" aria-label="Back to reference 7" data-footnote-backref="">↩</a></p></li></ol></section></div></div></div></article></section></main></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The 'white-collar bloodbath' is all part of the AI hype machine (129 pts)]]></title>
+            <title><![CDATA[De Bruijn notation, and why it's useful (105 pts)]]></title>
+            <link>https://blueberrywren.dev/blog/debruijn-explanation/</link>
+            <guid>44137439</guid>
+            <pubDate>Fri, 30 May 2025 15:51:24 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blueberrywren.dev/blog/debruijn-explanation/">https://blueberrywren.dev/blog/debruijn-explanation/</a>, See on <a href="https://news.ycombinator.com/item?id=44137439">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+
+      
+
+
+
+  <meta property="og:title" content="Debruijn indexes + levels, and why they're handy">
+  <title> Debruijn indexes + levels, and why they're handy </title>
+
+
+
+
+
+
+<h2 id="de-bruijn-and-why-we-use-it">De Bruijn and why we use it</h2>
+<h2 id="assumed-knowledge">Assumed knowledge</h2>
+<p>At least a familiarity with the lambda calculus, including how it is evaluated. Some base knowledge of programming languages is also assumed.</p>
+<h2 id="the-problem">The problem</h2>
+<p>Let's look at a little imaginary term, in some lambda-calculus-like language. For future note, we call the lambda a "binder", as it binds a variable. There are other types of binders, e.g. <code>let</code>, but we will only consider lambdas for the moment.</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λ f</span><span>.</span><span> (λ y f</span><span>.</span><span> (f y)) f
+</span></code></pre>
+<p>We can perform what's called "beta reduction" on this term — essentially, function application, applying <code>f</code> to the lambda.</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λ f</span><span>.</span><span> (λ y f</span><span>.</span><span> (f y)) (f)
+</span><span>
+</span><span>substitute [y </span><span>:=</span><span> f] </span><span>in</span><span> λ y f</span><span>.</span><span> (f y)
+</span><span>
+</span><span>λ f</span><span>.</span><span> (λ f</span><span>.</span><span> f f)
+</span></code></pre>
+<p>Uh oh. We've accidentally captured a variable! Instead of <code>f</code> referring to the outer <code>f</code>, now it refers to the inner <code>f</code>. This is "the capture problem", and it is quite annoying. Generally to avoid this, we need to rename <em>everything</em><sup id="fr-1-1"><a href="#fn-1">1</a></sup> in our "substituted" term to names that are free (do not occur) in the "subsitutee" so nothing is accidentally captured. What if we could introduce a notation that avoids this?</p>
+<h2 id="presenting-de-bruijn-indexes">Presenting: De Bruijn Indexes!</h2>
+<p>De Bruijn indexes are a naming scheme where:</p>
+<ul>
+<li>We use natural numbers to refer to lambdas, and</li>
+<li>Zero refers to the "most recent" lambda; one refers to the second most recent, etc.</li>
+</ul>
+<p>Let's rewrite that term above using this system:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λ (λ λ (</span><span>0 1</span><span>)) </span><span>0
+</span></code></pre>
+<p>Here's some ascii art showing what refers to what:</p>
+<pre data-lang="hs"><code data-lang="hs"><span> λ   (λ   λ   (</span><span>0   1</span><span>))   </span><span>0
+</span><span> </span><span>|    |    \</span><span>———</span><span>/   |     |
+</span><span> </span><span>|    |            |     |
+</span><span> </span><span>|    \</span><span>————————————</span><span>/     |
+</span><span> </span><span>\</span><span>———————————————————————</span><span>/
+</span></code></pre>
+<p>Now, how does this help us with our substituion problem? Surely if we naively subtitute we will still have binding issues - and indeed we do:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λ (λ λ (</span><span>0 1</span><span>)) </span><span>0
+</span><span>-&gt;
+</span><span>λ (λ (</span><span>0 0</span><span>))
+</span></code></pre>
+<p>No good!</p>
+<p>What De Bruijn indexes allow us to do is simply avoid capturing. The rule is simple: Every time we go past a binder when substituting, we increment every free variable<sup id="fr-2-1"><a href="#fn-2">2</a></sup> in our substituted term by one, to avoid the new binder. Just once, we decrement every free varible in the substitutee, to account for the removal of the binder:</p>
+<pre data-lang="hs"><code data-lang="hs"><span> λ (λ λ (</span><span>1 2</span><span>)) </span><span>0
+</span><span> ^  ^ ^
+</span><span> a  b c
+</span><span> </span><span>-&gt;
+</span><span> λ (λ (</span><span>1 1</span><span>))
+</span><span> ^  ^  ^ ^ 
+</span><span> a  b  </span><span>| \</span><span> decremented by one
+</span><span>       </span><span>|
+</span><span>       </span><span>\</span><span> incremented by one when we passed </span><span>"through"</span><span> lambda c
+</span></code></pre>
+<p>Now we're cool! Everything works as expected, and it takes much less work (and is much more predictable!).</p>
+<p>At the bottom of this post there's a little widget that can convert terms to de Bruijn for you, if you want to play around!</p>
+<h2 id="presenting-de-bruijn-levels">Presenting: De Bruijn levels!</h2>
+<p>De Bruijn levels work similar to De Bruijn indexes, in that we use numbers to refer to binders. However, in De Bruijn levels, the lowest number refers to the <em>least</em> recently bound item.</p>
+<p>Recall that:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>Named</span><span>:</span><span>   λ f</span><span>.</span><span> (λ y f</span><span>.</span><span> (f y)) f
+</span><span>Indexes</span><span>:</span><span> λ (λ λ (</span><span>0 1</span><span>)) </span><span>0
+</span></code></pre>
+<p>Now, with levels:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>Levels</span><span>:</span><span>  λ (λ λ (</span><span>2 1</span><span>)) </span><span>0
+</span></code></pre>
+<p>This has the same diagram of what refers to what:</p>
+<pre data-lang="hs"><code data-lang="hs"><span> λ   (λ   λ   (</span><span>2   1</span><span>))   </span><span>0
+</span><span> </span><span>|    |    \</span><span>———</span><span>/   |     |
+</span><span> </span><span>|    |            |     |
+</span><span> </span><span>|    \</span><span>————————————</span><span>/     |
+</span><span> </span><span>\</span><span>———————————————————————</span><span>/
+</span></code></pre>
+<p>(As it should! These two representations represent the same term.)</p>
+<p>As you might expect, de Bruijn indexes and levels are each beneficial in their own situations.</p>
+<p>Generally, De Bruijn indexes are "more useful" than De Bruijn levels, as they're "more local". In order to work with levels, you need to know "how deep" you are in a term at all times.</p>
+<p>De Bruijn indexes give us the advantage that we can freely create new binders without the need for any information about where in a term we are, whereas de Bruijn levels give us the advantage when moving a term under a binder, free variables in said term do not need to be modified. Generally, one has many more free variables in a term than bound ones.</p>
+<pre data-lang="hs"><code data-lang="hs"><span> λ (λ λ (</span><span>2 1</span><span>)) </span><span>0
+</span><span>               ^ this zero</span><span>...
+</span><span> </span><span>-&gt;
+</span><span> λ (λ (</span><span>1 0</span><span>))
+</span><span>       ^ ^ is still zero</span><span>!
+</span><span>       </span><span>|
+</span><span>       </span><span>\</span><span> we had to modify this one though
+</span></code></pre>
+<h2 id="other-advantages">Other advantages</h2>
+<p>Something that can come up quite a lot in various contexts is comparing whether two terms are equal or not. There are many complicated ways to do so, but de Bruijn gives us an advantage in a critical one, called "alpha-equivalence". Consider the following two terms:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λf</span><span>.</span><span> λx</span><span>.</span><span> f x
+</span><span>λg</span><span>.</span><span> λy</span><span>.</span><span> g y
+</span></code></pre>
+<p>These terms should clearly be equal, right? They do the exact same thing. In this case, we consider them "alpha-equivalent", meaning they are equal up to the names of variables. Alpha renaming is the process of renaming one term to match the names of another, so that they are "clearly" equal.</p>
+<p>Let us consider the de Bruijn index representation of both of these terms:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λf</span><span>.</span><span> λx</span><span>.</span><span> f x </span><span>=&gt;</span><span> λ λ </span><span>1 0
+</span><span>λg</span><span>.</span><span> λy</span><span>.</span><span> g y </span><span>=&gt;</span><span> λ λ </span><span>1 0
+</span></code></pre>
+<p>Isn't that nice? They've gone from being alpha-equivalent, but not quite equal, to being equal. de Bruijn gives us the ability to compare terms for equality without having to consider alpha-equivalence at all.</p>
+<h2 id="wrapup">Wrapup</h2>
+<p>De Bruijn indexes and levels can also be summed up via the following:</p>
+<pre data-lang="hs"><code data-lang="hs"><span>λa</span><span>.</span><span> λb</span><span>.</span><span> λc</span><span>.</span><span> c
+</span><span>
+</span><span>indexes</span><span>:
+</span><span>λ λ λ </span><span>0
+</span><span>^ ^ ^
+</span><span>2 1 0
+</span><span>
+</span><span>levels</span><span>:
+</span><span>λ λ λ </span><span>2
+</span><span>^ ^ ^
+</span><span>0 1 2
+</span></code></pre>
+<p>if you’re “here”</p>
+<pre><code><span>  v
+</span><span>λ λ λ
+</span></code></pre>
+<ul>
+<li>Using indexes, adding any binders further left doesn’t affect the current binder's variables, or any further right.</li>
+<li>Using levels, adding any binders further right doesn’t affect the current binder's variables, or any further left.</li>
+</ul>
+
+<p>Try it out! Some example terms to try:</p>
+<pre><code><span>\f x. f x
+</span><span>\x x. x
+</span><span>\x. (x (\y. y))
+</span><span>
+</span><span>\x. \y. y x -- will not work
+</span><span>do \x. (\y. y x) or \x y. y x instead
+</span></code></pre>
+<p>(sorry, it does over-parenthesize a bit :P)</p>
+<pre data-lang="hs"><code data-lang="hs" id="goober">
+</code>
+
+<h2 id="alternatives">Alternatives</h2>
+<p>It is worth noting that there are several other methods for gaining the same, or similar, advantages as de Bruijn gives. This post is not intended to explain them, but I will list several here so that the curious reader may read further (tip: when searching, append "lambda calculus" to find the right results quicker):</p>
+<ul>
+<li>HOAS, or "Higher Order Abstract Syntax"</li>
+<li>PHOAS, or "Parametric HOAS"</li>
+<li>Locally nameless</li>
+<li>Nominal signatures</li>
+<li>Well-scoped de Bruijn indices</li>
+<li>Well-scoped names</li>
+<li><a href="http://doi.acm.org/10.1145/2034773.2034817">“Nameless,
+Painless”</a></li>
+<li>Abstract scope graphs</li>
+<li>Abstract Binding Trees</li>
+<li>Co-de Bruijn indices</li>
+</ul>
+<p>As you can see, there are many approaches! Jesper Cockx has an excellent summary of almost all of these, which can be found <a href="https://jesper.sikanda.be/posts/1001-syntax-representations.html">here.</a> Notably, many are intended for formalization efforts rather than for computational usage.</p>
+
+
+
+
+
+
+      </pre></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The 'white-collar bloodbath' is all part of the AI hype machine (164 pts)]]></title>
             <link>https://www.cnn.com/2025/05/30/business/anthropic-amodei-ai-jobs-nightcap</link>
             <guid>44136117</guid>
             <pubDate>Fri, 30 May 2025 13:38:21 GMT</pubDate>
@@ -647,7 +1626,7 @@
               </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[MinIO Removes Web UI Features from Community Version, Pushes Users to Paid Plans (153 pts)]]></title>
+            <title><![CDATA[MinIO Removes Web UI Features from Community Version, Pushes Users to Paid Plans (156 pts)]]></title>
             <link>https://biggo.com/news/202505261334_MinIO_Removes_Web_UI_Features</link>
             <guid>44136108</guid>
             <pubDate>Fri, 30 May 2025 13:37:17 GMT</pubDate>
@@ -686,7 +1665,7 @@
 </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsandbox: Virtual Machines that feel and perform like containers (194 pts)]]></title>
+            <title><![CDATA[Microsandbox: Virtual Machines that feel and perform like containers (208 pts)]]></title>
             <link>https://github.com/microsandbox/microsandbox</link>
             <guid>44135977</guid>
             <pubDate>Fri, 30 May 2025 13:20:04 GMT</pubDate>
@@ -1076,7 +2055,7 @@ sandboxes:
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Systems Correctness Practices at Amazon Web Services (255 pts)]]></title>
+            <title><![CDATA[Systems Correctness Practices at Amazon Web Services (265 pts)]]></title>
             <link>https://cacm.acm.org/practice/systems-correctness-practices-at-amazon-web-services/</link>
             <guid>44135638</guid>
             <pubDate>Fri, 30 May 2025 12:43:13 GMT</pubDate>
@@ -1087,7 +2066,7 @@ sandboxes:
 		</p><figcaption><span>Figure.&nbsp;</span> <span>Metastable system behavior under load.</span></figcaption></figure><p id="p-19">Traditional formal approaches to modeling distributed systems typically focus on <i>safety</i> (nothing bad happens) and <i>liveness</i> (something good eventually happens), but metastable failures remind us that systems have a variety of behaviors that cannot be neatly categorized this way. We have increasingly turned to discrete-event simulation to understand the emergent behavior of systems, investing both in custom-built systems simulations and tooling that allow the use of existing system models (built in languages such as TLA+ and P) to simulate system behavior. Extending exhaustive model checkers, like TLA+’s TLC with probabilistic simulations, also allows for the generation of statistical results such as posterior latency distributions, making model checking useful for tasks such as understanding the achievability of latency service-level agreements (SLAs).</p></section><section id="sec9"><h2>Formal Proof</h2><p id="p-20">In some cases, the formal methods enumerated so far in this article are not sufficient. For critical security boundaries such as authorization and virtualization, for example, proofs of correctness can be both desirable and worth the significant investment needed to create them.</p><p id="p-21">In 2023, AWS introduced the Cedar authorization policy language for writing policies that specify fine-grained permissions. Cedar was designed for automated reasoning and formal proof.<a href="#B12" data-jats-ref-type="bibr" data-jats-rid="B12"><sup>12</sup></a><sup>,</sup><a href="#B24" data-jats-ref-type="bibr" data-jats-rid="B24"><sup>24</sup></a> The language was designed to be well-suited for proof, and the implementation was built in the verification-aware programming language Dafny. Using Dafny, the team was able to prove that the implementation satisfies a variety of security properties. This type of proof goes beyond testing. It is a proof in the mathematical sense. The team also applied a differential testing approach using the Dafny code as a correctness oracle to verify the correctness of the production-ready Rust implementation. Publishing the Dafny code and test procedures as open source, along with the Cedar implementation, allows Cedar users to check the team’s work on correctness.</p><p id="p-22">Another example is the Firecracker virtual machine monitor (VMM). Firecracker uses a low-level protocol called <i>virtio</i> to expose emulated hardware devices (such as a network card or solid-state drive) to guest kernels running inside the VM. This emulated device is a critical security boundary because it is the most complex interaction between the untrusted guest and trusted host. The Firecracker team used a tool called Kani<a href="#B20" data-jats-ref-type="bibr" data-jats-rid="B20"><sup>20</sup></a> that can reason formally about Rust code to prove key properties of this security boundary. Again, proof here goes beyond testing and ensures that the critical properties of this boundary are held no matter what the guest attempts to do.</p><p id="p-23">Proofs around the behaviors of programs are an important part of AWS’s software correctness program, so we support development on tools such as Kani, Dafny,<a href="#B18" data-jats-ref-type="bibr" data-jats-rid="B18"><sup>18</sup></a> and Lean,<a href="#B16" data-jats-ref-type="bibr" data-jats-rid="B16"><sup>16</sup></a> and the underlying tools—such as satisfiability modulo theory (SMT) solvers—that power them.</p><p id="p-24">The ability to use formal models and specifications—for model-checking systems at design time, for validating in-production behavior using runtime monitoring by serving as a correctness oracle, for simulating emergent systems behavior, and for building proofs of critical properties—allows AWS to amortize the engineering effort of developing these specifications over a larger amount of business and customer value.</p></section><section id="sec10"><h2>Benefits Beyond Correctness</h2><p id="p-25">Finally, as discussed in the aforementioned 2015 paper, formal methods are a crucial part of safely improving the performance of cloud systems. Modeling a key commit protocol for the Aurora relational database engine in P and TLA+ allowed us to identify an opportunity to reduce the cost of distributed commits from 2 to 1.5 network roundtrips without sacrificing any safety properties. These kinds of stories are usual for teams that adopt formal methods, driven by at least two different dynamics.</p><p id="p-26">First, the act of deeply thinking about and formally writing down distributed protocols forces a structured way of thinking that leads to deeper insights about the structure of protocols and the problem to be solved.&nbsp;Second, having the ability to formally check (and, in some cases, prove) that proposed design optimizations are correct allows naturally conservative distributed-systems engineers to be bolder in their protocol design choices without increasing risk and boosting the developer velocity toward delivering reliable services.</p><p id="p-27">These productivity and cost benefits are limited not only to high-level design optimizations but also to low-level code that normally gets ignored. In one example, the AWS team identified optimizations to the implementation of the Rivest-Shamir-Adleman (RSA) public-key encryption scheme on our ARM-based Graviton 2 processor, which could improve throughput by up to 94%.<a href="#B17" data-jats-ref-type="bibr" data-jats-rid="B17"><sup>17</sup></a></p><p id="p-28">Using the HOL Light interactive theorem prover, the team was able to prove the correctness of these optimizations. Given the high percentage of cloud CPU cycles spent on cryptography, this type of optimization can significantly reduce infrastructure costs and aid sustainability while at the same time improving customer-visible performance.</p></section><section id="sec11"><h2>Challenges and Opportunities for the Future</h2><p id="p-29">Despite significant success in scaling formal and semi-formal testing methods across AWS over the past 15 years, several challenges persist, particularly in industrial adoption of formal methods. The primary barriers for formal methods tools include their steep learning curve and the specialized domain expertise required. Additionally, many of these tools remain academic in nature and lack user-friendly interfaces.</p><p id="p-30">Even well-established semi-formal approaches face adoption challenges. For example, deterministic simulation, a key distributed-systems testing technique used successfully at AWS and in projects like FoundationDB, remains unfamiliar to many experienced distributed-systems developers joining AWS. Similar gaps exist in the adoption of other proven methodologies, such as fault-injection testing, property-based testing, and fuzzing. The challenge is educating distributed-systems developers about these testing methods and tools, teaching the art of rigorous thinking.</p><p id="p-31">The education gap begins at the academic level, where even basic formal reasoning approaches are rarely taught, making it difficult for graduates from top institutions to adopt these tools. Although formal methods and automated reasoning are crucial for industry applications, they continue to be viewed as niche fields. We anticipate that increased industry adoption of formal methods and automated reasoning will attract more talent to this domain.</p><p id="p-32">Metastability and other emergent properties of large-scale systems represent another critical research area facing similar awareness challenges. Common practices that lead to metastable system behavior, such as “retry N times on timeout,” continue to be widely recommended despite their known issues. Current tools and techniques for understanding emergent system behavior are still in their early stages, making system stability modeling expensive and complex. Ongoing research in this area holds promising potential for advancement.</p><p id="p-33">Looking ahead, we believe large language models and AI assistants will significantly help address the adoption challenges of formal methods in practice. Just as AI-assisted unit testing has gained popularity, these tools are expected soon to help developers create formal models and specifications, making these advanced techniques more accessible to the broader developer community.</p></section><section id="sec12"><h2>Conclusion</h2><p id="p-34">Building reliable and secure software requires a range of approaches to reason about systems correctness. Alongside industry-standard testing methods (such as unit and integration testing), AWS has adopted model checking, fuzzing, property-based testing, fault-injection testing, deterministic simulation, event-based simulation, and runtime validation of execution traces. Formal methods have been an important part of the development process—perhaps most importantly, formal specifications as test oracles that provide the correct answers for many of AWS’s testing practices. Correctness testing and formal methods remain key areas of investment at AWS, accelerated by the excellent returns seen on investments in these areas already.</p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Darwin Gödel Machine: AI that improves itself by rewriting its own code (142 pts)]]></title>
+            <title><![CDATA[The Darwin Gödel Machine: AI that improves itself by rewriting its own code (147 pts)]]></title>
             <link>https://sakana.ai/dgm/</link>
             <guid>44135369</guid>
             <pubDate>Fri, 30 May 2025 12:08:40 GMT</pubDate>
@@ -1242,7 +2221,7 @@ sandboxes:
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: What is the best LLM for consumer grade hardware? (186 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: What is the best LLM for consumer grade hardware? (191 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=44134896</link>
             <guid>44134896</guid>
             <pubDate>Fri, 30 May 2025 11:02:19 GMT</pubDate>
@@ -1517,7 +2496,7 @@ It worked well on my MacBook Pro M1 32Gb. It does get a bit hot on a laptop thou
             </tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AI is not our future (211 pts)]]></title>
+            <title><![CDATA[AI is not our future (213 pts)]]></title>
             <link>https://procreate.com/ai</link>
             <guid>44134798</guid>
             <pubDate>Fri, 30 May 2025 10:45:03 GMT</pubDate>
@@ -1525,7 +2504,7 @@ It worked well on my MacBook Pro M1 32Gb. It does get a bit hot on a laptop thou
 <div id="readability-page-1" class="page"><div id="page-content"><main role="main" aria-label="Page Content"><!--[--><!--[--><section role="presentation"><div><h2>Where we stand</h2><div><!--[--><div><h3>No generative AI</h3><p>We deeply respect your hard-earned skills.</p></div><div><h3>Your work belongs to you</h3><p>We do not have access to your art, by design.</p></div><div><h3>We take pride in privacy</h3><p>Your activity is not tracked in our apps.</p></div><!--]--></div></div><div><p>Generative AI is ripping the humanity out of things. Built on a foundation of theft, the technology is steering us toward a barren future.  We think machine learning is a compelling technology with a lot of merit, but the path generative AI is on is wrong for us.</p><p>We're here for the humans. We're not chasing a technology that is a moral threat to our greatest jewel: human creativity. In this technological rush, this might make us an exception or seem at risk of being left behind. But we see this road less travelled as the more exciting and fruitful one for our community.</p></div></section><!----><!--]--><!--]--></main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Radio Astronomy Software Defined Radio (Rasdr) (103 pts)]]></title>
+            <title><![CDATA[Radio Astronomy Software Defined Radio (Rasdr) (111 pts)]]></title>
             <link>https://radio-astronomy.org/rasdr</link>
             <guid>44134364</guid>
             <pubDate>Fri, 30 May 2025 09:14:31 GMT</pubDate>
@@ -1619,7 +2598,7 @@ output options. The system uses USB2 to provide a high speed interface to the RA
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[RFK Jr's 'Maha' report found to contain citations to nonexistent studies (161 pts)]]></title>
+            <title><![CDATA[RFK Jr's 'Maha' report found to contain citations to nonexistent studies (165 pts)]]></title>
             <link>https://www.theguardian.com/us-news/2025/may/29/rfk-jr-maha-health-report-studies</link>
             <guid>44133962</guid>
             <pubDate>Fri, 30 May 2025 07:54:21 GMT</pubDate>
@@ -1627,7 +2606,7 @@ output options. The system uses USB2 to provide a high speed interface to the RA
 <div id="readability-page-1" class="page"><div id="maincontent"><p><a href="https://www.theguardian.com/us-news/robert-f-kennedy-jr" data-link-name="in body link">Robert F Kennedy Jr</a>’s flagship <a href="https://www.theguardian.com/us-news/2025/may/22/rfk-jr-maha-health-report-explained" data-link-name="in body link">health commission report</a> contains citations to studies that do not exist, according to an <a href="https://www.notus.org/health-science/make-america-healthy-again-report-citation-errors" data-link-name="in body link">investigation</a> by the US publication Notus.</p><p>The report exposes glaring scientific failures from a health secretary who earlier this week threatened to ban government scientists from publishing in leading medical journals.</p><p>The 73-page “Make America healthy again” report – which was commissioned by the <a href="https://www.theguardian.com/us-news/trump-administration" data-link-name="in body link">Trump administration</a> to examine the causes of chronic illness, and which Kennedy promoted it as “gold-standard” science backed by more than 500 citations – includes references to seven studies that appear to be entirely invented, and others that the researchers say have been mischaracterized.</p><figure id="0992c1a8-3359-4cf1-a406-e28fb87cfb06" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:3,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Key takeaways: RFK Jr’s ‘Maha’ report on chronic disease in children&quot;,&quot;elementId&quot;:&quot;0992c1a8-3359-4cf1-a406-e28fb87cfb06&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2025/may/22/rfk-jr-maha-health-report-explained&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>Two supposed studies on ADHD medication advertising simply do not exist in the journals where they are claimed to be published. Virginia Commonwealth University confirmed to Notus that researcher Robert L Findling, listed as an author of one paper, never wrote such an article, while another citation leads only to the Kennedy report itself when searched online.</p><p>Harold J Farber, a pediatric specialist supposedly behind research on asthma overprescribing, told Notus he never wrote the cited paper and had never worked with the other listed authors.</p><p>The US Department of <a href="https://www.theguardian.com/society/health" data-link-name="in body link" data-component="auto-linked-tag">Health</a> and Human Services has not immediately responded to a Guardian request for comment.</p><p>The citation failures come as Kennedy, a noted skeptic of vaccines, <a href="https://www.theguardian.com/us-news/2025/may/28/rfk-jr-medical-journals" data-link-name="in body link">criticized medical publishing</a> this week, branding top journals the Lancet, New England Journal of Medicine and Jama as “corrupt” and alleging they were controlled by pharmaceutical companies. He outlined plans for creating government-run journals instead.</p><p>Beyond the phantom studies in Kennedy’s report, Notus found it systematically misrepresented existing research.</p><figure id="5e068b28-7b23-4d73-bbb4-409abba4a53f" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:9,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;RFK’s health report omits key facts in painting dark vision for US children&quot;,&quot;elementId&quot;:&quot;5e068b28-7b23-4d73-bbb4-409abba4a53f&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2025/may/22/rfk-maha-health-report-children&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>For example, one paper was claimed to show that talking therapy was as effective as psychiatric medication, but the statistician Joanne McKenzie said this was impossible, as “we did not include psychotherapy” in the review.</p><p>The sleep researcher Mariana G Figueiro also said her study was mischaracterized, with the report incorrectly stating it involved children rather than college students, and citing the wrong journal entirely.</p><p>The <a href="https://www.theguardian.com/us-news/trump-administration" data-link-name="in body link" data-component="auto-linked-tag">Trump administration</a> asked Kennedy for the report in order to look at chronic illness causes, from pesticides to mobile phone radiation. Kennedy called it a “milestone” that provides “evidence-based foundation” for sweeping policy changes.</p><p>A follow-up “Make our children healthy again strategy” report is due in August, raising concerns about the scientific credibility underpinning the administration’s health agenda.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Buttplug MCP (225 pts)]]></title>
+            <title><![CDATA[Buttplug MCP (227 pts)]]></title>
             <link>https://github.com/ConAcademy/buttplug-mcp</link>
             <guid>44133706</guid>
             <pubDate>Fri, 30 May 2025 07:06:35 GMT</pubDate>
@@ -1946,7 +2925,7 @@ usage: buttplug-mcp [opts]
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[White House releases health report written by LLM, with hallucinated citations (184 pts)]]></title>
+            <title><![CDATA[White House releases health report written by LLM, with hallucinated citations (185 pts)]]></title>
             <link>https://www.nytimes.com/2025/05/29/well/maha-report-citations.html</link>
             <guid>44132873</guid>
             <pubDate>Fri, 30 May 2025 04:31:37 GMT</pubDate>
@@ -1954,7 +2933,7 @@ usage: buttplug-mcp [opts]
 Couldn't get https://www.nytimes.com/2025/05/29/well/maha-report-citations.html: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: MCP Server SDK in Bash (126 pts)]]></title>
+            <title><![CDATA[Show HN: MCP Server SDK in Bash (127 pts)]]></title>
             <link>https://github.com/muthuishere/mcp-server-bash-sdk</link>
             <guid>44132823</guid>
             <pubDate>Fri, 30 May 2025 04:25:23 GMT</pubDate>
@@ -2237,7 +3216,7 @@ run_mcp_server <span><span>"</span><span>$@</span><span>"</span></span></pre></d
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Triangle splatting: radiance fields represented by triangles (149 pts)]]></title>
+            <title><![CDATA[Triangle splatting: radiance fields represented by triangles (151 pts)]]></title>
             <link>https://trianglesplatting.github.io/</link>
             <guid>44132744</guid>
             <pubDate>Fri, 30 May 2025 04:07:17 GMT</pubDate>
@@ -2376,7 +3355,7 @@ run_mcp_server <span><span>"</span><span>$@</span><span>"</span></span></pre></d
         </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The radix 2^51 trick (2017) (372 pts)]]></title>
+            <title><![CDATA[The radix 2^51 trick (2017) (374 pts)]]></title>
             <link>https://www.chosenplaintext.ca/articles/radix-2-51-trick.html</link>
             <guid>44132673</guid>
             <pubDate>Fri, 30 May 2025 03:55:37 GMT</pubDate>
@@ -2722,7 +3701,7 @@ I hope you found it as interesting as I did!</p>
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[U.S. sanctions cloud provider 'Funnull' as top source of 'pig butchering' scams (160 pts)]]></title>
+            <title><![CDATA[U.S. sanctions cloud provider 'Funnull' as top source of 'pig butchering' scams (163 pts)]]></title>
             <link>https://krebsonsecurity.com/2025/05/u-s-sanctions-cloud-provider-funnull-as-top-source-of-pig-butchering-scams/</link>
             <guid>44132075</guid>
             <pubDate>Fri, 30 May 2025 01:58:24 GMT</pubDate>
@@ -2753,7 +3732,7 @@ I hope you found it as interesting as I did!</p>
 											</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Practical SDR: Getting started with software-defined radio (242 pts)]]></title>
+            <title><![CDATA[Practical SDR: Getting started with software-defined radio (244 pts)]]></title>
             <link>https://nostarch.com/practical-sdr</link>
             <guid>44131984</guid>
             <pubDate>Fri, 30 May 2025 01:34:23 GMT</pubDate>
