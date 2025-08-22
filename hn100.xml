@@ -4,12 +4,229 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Fri, 22 Aug 2025 06:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Fri, 22 Aug 2025 07:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Control shopping cart wheels with your phone (2021) (136 pts)]]></title>
+            <title><![CDATA[Io_uring, kTLS and Rust for zero syscall HTTPS server (122 pts)]]></title>
+            <link>https://blog.habets.se/2025/04/io-uring-ktls-and-rust-for-zero-syscall-https-server.html</link>
+            <guid>44980865</guid>
+            <pubDate>Fri, 22 Aug 2025 03:51:44 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.habets.se/2025/04/io-uring-ktls-and-rust-for-zero-syscall-https-server.html">https://blog.habets.se/2025/04/io-uring-ktls-and-rust-for-zero-syscall-https-server.html</a>, See on <a href="https://news.ycombinator.com/item?id=44980865">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div aria-label="Content">
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+
+  
+
+  <div itemprop="articleBody">
+    <p>Around the turn of the century we started to get a bigger need for high
+capacity web servers. For example there was <a href="https://en.wikipedia.org/wiki/C10k_problem">the C10k problem</a> paper.</p>
+
+<p>At the time, the kinds of things done to reduce work done per request was
+pre-forking the web server. This means a request could be handled without an
+expensive process creation.</p>
+
+<p>Because yes, creating a new process for every request used to be something
+perfectly normal.</p>
+
+<p>Things did get better. People learned how to create threads, making things more
+light weight. Then they switched to using <code>poll()</code>/<code>select()</code>, in order to not
+just spare the process/thread creation, but the whole context switch.</p>
+
+<p>I remember a comment on <a href="https://en.wikipedia.org/wiki/Kuro5hin">Kuro5hin</a> from anakata, the creator of both The
+Pirate Bay and the web server that powered it, along the lines of “I am select()
+of borg, resistance is futile”, mocking someone for not understanding how to
+write a scalable web server.</p>
+
+<p>But <code>select()</code>/<code>poll()</code> also doesn’t scale. If you have ten thousand
+connections, that’s an array of ten thousand integers that need to be sent to
+the kernel for every single iteration of your request handling loop.</p>
+
+<p>Enter <code>epoll</code> (<code>kqueue</code> on other operating systems, but I’m focusing on Linux
+here). Now that’s better. The main loop is now:</p>
+
+<div><pre><code>  set_up_epoll()
+  while True:
+    new, read, write = epoll()
+    epoll_add_connections(new)
+    for con in read:
+      process(con.read())
+      if con.read_all_we_need:
+        epoll_remove_read_op(con)
+    for con in write:
+      con.write_buffer()
+      if con.buffer_empty:
+        epoll_remove_write_op(con)
+</code></pre>
+</div>
+
+<p>All the syscalls are pretty cheap. <code>epoll()</code> only deals in deltas, and it
+doesn’t have to be re-told the thousands of active connections.</p>
+
+<p>But they’re not without cost. Once we’ve gotten this far, the cost of a syscall
+is actually a significant part of the total remaining cost.</p>
+
+<p>We’re here going to ignore improvements like <code>sendfile()</code> and <code>splice()</code>, and
+instead jump to…</p>
+
+
+
+<p>Instead of performing a syscall for everything we want to do, commanding the
+kernel to do this or that, io_uring lets us just keep writing orders to a
+queue, and letting the kernel consume that queue asynchronously.</p>
+
+<p>For example, we can put <code>accept()</code> into the queue. The kernel will pick that
+up, wait for an incoming connection, and when it arrives it’ll put a
+“completion” into the completion queue.</p>
+
+<p>The web server can then check the completion queue. If there’s a completion
+there, it can act on it.</p>
+
+<p>This way the web server can queue up all kinds of operations that were
+previously “expensive” syscalls by simply writing them to memory. That’s it.
+And then it’ll read the results from another part of memory. That’s it.</p>
+
+<p>In order to avoid busy looping, both the kernel and the web server will only
+busy-loop checking the queue for a little bit (configurable, but think
+milliseconds), and if there’s nothing new, the web server will do a syscall to
+“go to sleep” until something gets added to the queue.</p>
+
+<p>Similarly on the kernel side, the kernel will stop busy-looping if there’s
+nothing new, and needs a syscall to start busylooping again.</p>
+
+<p>This sounds like it would be tricky to optimize, but it’s not. In the end the
+web server just puts stuff on the queue, and calls a library function that only
+does that syscall if the kernel actually has stopped busylooping.</p>
+
+<p>This means that a busy web server can serve all of its queries without even once
+(after setup is done) needing to do a syscall. As long as queues keep getting
+added to, <code>strace</code> will show <em>nothing</em>.</p>
+
+<h2 id="one-thread-per-core">One thread per core</h2>
+
+<p>Since CPUs today have many cores, ideally you want to run exactly one thread
+per core, bind it to that core, and not share any read-write data structure.</p>
+
+<p>For <a href="https://en.wikipedia.org/wiki/Non-uniform_memory_access">NUMA</a> hardware, you also want to make sure that a thread only
+accesses memory on the local NUMA node. <a href="https://youtu.be/36qZYL5RlgY">This netflix talk</a> has some
+interesting stuff on NUMA and high volume HTTP delivery.</p>
+
+<p>The request load will still not be perfectly balanced between the threads (and
+therefore cores), but I guess fixing that would have to be the topic of a
+future post.</p>
+
+<h2 id="memory-allocations">Memory allocations</h2>
+
+<p>We will still have memory allocations though, both on the kernel and web server
+side. Memory allocations in user space will eventually need syscalls.</p>
+
+<p>For the web server side, you can pre-allocate a fixed chunk for every
+connection, and then have everything about that connection live there. That way
+new connections don’t need syscalls, memory doesn’t get fragmented, and you
+don’t run the risk of running out of memory.</p>
+
+<p>On the kernel side each connection will still need buffers for incoming and
+outgoing bytes. This may be somewhat controllable via socket options, but again
+it’ll have to be the subject of a future post.</p>
+
+<p>Try to not run out of RAM. Bad things tend to happen.</p>
+
+<h2 id="ktls">kTLS</h2>
+
+<p><a href="https://docs.kernel.org/networking/tls-offload.html">kTLS</a> is a feature of the Linux kernel where an application can hand off
+the job of encryption/decryption to the kernel. The application still has to
+perform the TLS handshake, but after that it can enable kTLS and pretend that
+it’s all sent in plaintext.</p>
+
+<p>You may say that this doesn’t actually speed anything up, it just moves <em>where</em>
+encryption was done. But there are gains:</p>
+
+<ol>
+  <li>This means that <code>sendfile()</code> can be used, removing the need to copy a bunch
+of data between user space and kernel space.</li>
+  <li>If the network card has hardware support for it, the crypto operation may
+actually be offloaded from the CPU onto the network card, leaving the CPU to
+do better things.</li>
+</ol>
+
+<h2 id="descriptorless-files">Descriptorless files</h2>
+
+<p>Another optimization is to avoid passing file descriptors back and forth
+between user space and kernel space. The mapping between file descriptors and
+io_uring apparently has overhead.</p>
+
+<p>So in comes <a href="https://lwn.net/Articles/863071/">descriptorless files</a> via
+<a href="https://docs.rs/io-uring/latest/io_uring/struct.Submitter.html#method.register_files"><code>register_files</code></a>.</p>
+
+<p>Now the supposed file descriptor numbers that user space sees are just
+integers. They don’t show up in <code>/proc/pid/fd</code>, and can only be used with
+io_uring. They’re still capped by the <code>ulimit</code> file descriptor limit, though.</p>
+
+<h2 id="tarweb">tarweb</h2>
+
+<p>In order to learn these technologies better, I built <a href="https://github.com/ThomasHabets/tarweb">a web server
+incorporating all these things</a>.</p>
+
+<p>It’s named <code>tarweb</code> because it’s a web server that serves the content of a
+single tar file.</p>
+
+<p>Rust, io_uring, and kTLS. Not exactly the most common combination. I found that
+io_uring and kTLS didn’t play super well together. Enabling kTLS requires three
+<code>setsockopt()</code> calls, and io_uring doesn’t support <code>setsockopt</code> (until they
+merge <a href="https://github.com/tokio-rs/io-uring/pull/320">my PR</a>, that is).</p>
+
+<p>And the <code>ktls</code> crate, part of <code>rustls</code>, only allows you to call the synchronous
+<code>setsockopt()</code>, not export the needed struct for me to pass to my new
+io_uring <code>setsockopt</code>. <a href="https://github.com/rustls/ktls/pull/54">Another pr sent</a>.</p>
+
+<p>So with those two PRs merged, it’s working great.</p>
+
+<p>tarweb is far from perfect. The code needs a lot of work, and there’s no
+guarantee that the TLS library (rustls) doesn’t do memory allocations during
+handshakes. But it does serve https without even one syscall on a per request
+basis. And that’s pretty cool.</p>
+
+<h2 id="benchmarks">Benchmarks</h2>
+
+<p>I have not done any benchmarks yet. I want to clean the code up first.</p>
+
+<h2 id="io-uring-and-safety">io-uring and safety</h2>
+
+<p>One thing making io_uring more complex than synchronous syscalls is that any
+buffer needs to stay in memory until the operation is marked completed by
+showing up in the completion queue.</p>
+
+<p>For example when submitting a <code>write</code> operation, the memory location of those
+bytes must not be deallocated or overwritten.</p>
+
+<p>The <code>io-uring</code> crate doesn’t help much with this. The API doesn’t allow the
+borrow checker to protect you at compile time, and I don’t see it doing any
+runtime checks either.</p>
+
+<p>I feel like I’m back in C++, where any mistake can blow your whole leg off.
+It’s a miracle that I’ve not seen a segfault.</p>
+
+<p>Someone should make a <code>safer-ring</code> crate or similar, using the powers of
+<a href="https://blog.cloudflare.com/pin-and-unpin-in-rust/">pinning</a> and/or borrows or something, to achieve Rust’s normal “if it
+compiles, then it’s correct”.</p>
+
+
+  </div>
+
+  
+  
+  
+  
+  
+  
+</article>
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Control shopping cart wheels with your phone (2021) (142 pts)]]></title>
             <link>https://www.begaydocrime.com/</link>
             <guid>44980004</guid>
             <pubDate>Fri, 22 Aug 2025 00:59:04 GMT</pubDate>
@@ -46,7 +263,7 @@
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Onion Brought Back Its Print Edition. The Gamble Is Paying Off (157 pts)]]></title>
+            <title><![CDATA[The Onion Brought Back Its Print Edition. The Gamble Is Paying Off (158 pts)]]></title>
             <link>https://www.wsj.com/business/media/the-onion-print-subscribers-6c24649c</link>
             <guid>44978869</guid>
             <pubDate>Thu, 21 Aug 2025 22:28:47 GMT</pubDate>
@@ -54,7 +271,7 @@
 Couldn't get https://www.wsj.com/business/media/the-onion-print-subscribers-6c24649c: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[CEO pay and stock buybacks have soared at the 100 largest low-wage corporations (206 pts)]]></title>
+            <title><![CDATA[CEO pay and stock buybacks have soared at the 100 largest low-wage corporations (207 pts)]]></title>
             <link>https://ips-dc.org/report-executive-excess-2025/</link>
             <guid>44978655</guid>
             <pubDate>Thu, 21 Aug 2025 22:04:39 GMT</pubDate>
@@ -252,7 +469,7 @@ Couldn't get https://www.wsj.com/business/media/the-onion-print-subscribers-6c24
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Uv format: Code Formatting Comes to uv (experimentally) (218 pts)]]></title>
+            <title><![CDATA[Uv format: Code Formatting Comes to uv (experimentally) (232 pts)]]></title>
             <link>https://pydevtools.com/blog/uv-format-code-formatting-comes-to-uv-experimentally/</link>
             <guid>44977645</guid>
             <pubDate>Thu, 21 Aug 2025 20:26:44 GMT</pubDate>
@@ -263,7 +480,7 @@ Couldn't get https://www.wsj.com/business/media/the-onion-print-subscribers-6c24
 <a href="#passing-arguments-to-ruff" aria-label="Permalink for this section"></a></h2><p>You can pass additional arguments to Ruff by placing them after <code>--</code>:</p><p>This flexibility means you can customize formatting behavior without losing uv’s conveniences.</p><div><p>Warning</p><div><p>Since this is an experimental feature, expect some rough edges:</p><ul><li>The command may change in future releases</li><li>Integration with uv’s project model might evolve</li><li>Error handling and output formatting could improve</li></ul></div></div><p>Try out <code>uv format</code> in your next project and see how it fits into your development workflow. The experimental nature means your feedback could help shape how this feature evolves.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Crimes with Python's Pattern Matching (2022) (173 pts)]]></title>
+            <title><![CDATA[Crimes with Python's Pattern Matching (2022) (182 pts)]]></title>
             <link>https://www.hillelwayne.com/post/python-abc/</link>
             <guid>44977189</guid>
             <pubDate>Thu, 21 Aug 2025 19:47:02 GMT</pubDate>
@@ -597,7 +814,120 @@ efg is a new class
   </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[DeepSeek-v3.1 Release (419 pts)]]></title>
+            <title><![CDATA[In the long run, LLMs make us dumber (101 pts)]]></title>
+            <link>https://desunit.com/blog/in-the-long-run-llms-make-us-dumber/</link>
+            <guid>44976815</guid>
+            <pubDate>Thu, 21 Aug 2025 19:10:39 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://desunit.com/blog/in-the-long-run-llms-make-us-dumber/">https://desunit.com/blog/in-the-long-run-llms-make-us-dumber/</a>, See on <a href="https://news.ycombinator.com/item?id=44976815">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+<p>The comfort we get when offloading our cognitive load to LLMs is bad for us. Cognitive load should exist, and if we reduce it too much – if we stop thinking – we can actually unlearn how to think.</p>
+
+
+
+<p>Kids who always choose the easy route and copy their homework from other students eventually find themselves completely clueless about what’s going on in school. Someone who always lets their spouse handle all the bills and banking may one day be unable to manage even a simple payment on their own. A person who never bothers to learn street names or routes will be lost when their phone dies, not even knowing how to get home.</p>
+
+
+
+<p>It all comes back to what Nassim Taleb talks about with hormesis in his insightful book <a href="https://www.amazon.com/Antifragile-Things-That-Disorder-Incerto/dp/0812979680">Antifragile</a> – the idea that small doses of stress or discomfort make us stronger.</p>
+
+
+
+<ul>
+<li>Muscles grow by lifting weights.</li>
+
+
+
+<li>Immunity builds through exposure.</li>
+
+
+
+<li>Confidence grows by taking risks.</li>
+
+
+
+<li>Skills sharpen through repetition.</li>
+
+
+
+<li>Creativity expands by solving hard problems.</li>
+</ul>
+
+
+
+<p>The mind works the same way. The friction of thinking, the awkward struggle to find the right words – that’s mental weightlifting.</p>
+
+
+
+<figure><a href="https://www.amazon.com/Antifragile-Things-That-Disorder-Incerto/dp/0812979680"><img decoding="async" width="338" height="522" src="https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image.png" alt="" srcset="https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image.png 338w, https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image-194x300.png 194w" sizes="(max-width: 338px) 100vw, 338px"></a></figure>
+
+
+
+<p>Maybe a slightly different example, but of a similar spirit – the <a href="https://en.wikipedia.org/wiki/Broken_windows_theory">Broken Windows theory</a>. The theory argues that visible signs of disorder – like graffiti, litter, or broken windows – signal that neglect is tolerated, lowering informal controls and inviting further misbehavior and even serious crime. In other words, when small cracks go unaddressed, they can cascade into much bigger fault lines. A constant reliance on LLMs will push this further and further until we’ve outsourced all our thinking, becoming little more than biological puppets.</p>
+
+
+
+<p>There’s even <a href="https://arxiv.org/pdf/2506.08872v1">recent research</a> that backs this up. In one study, participants were split into three groups:</p>
+
+
+
+<ul>
+<li>Brain-only: wrote essays without assistance.</li>
+
+
+
+<li>Search Engine: used Google search.</li>
+
+
+
+<li>LLM (ChatGPT): relied entirely on ChatGPT.</li>
+</ul>
+
+
+
+<p>And the results were:</p>
+
+
+
+<ul>
+<li>In the LLM group, 83% couldn’t quote anything from their own essays shortly after writing, whereas nearly everyone in the other groups could. </li>
+
+
+
+<li>Participants moving from LLM to writing solo exhibited reduced neural activity and continued under-engagement.</li>
+
+
+
+<li>Participants transitioning from brain-only to using LLM <strong>retained strong memory recall</strong> and showed neural activation patterns similar to the Search Engine group.</li>
+</ul>
+
+
+
+<figure><img decoding="async" width="930" height="596" src="https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image-1.png" alt="In the LLM group, 83% couldn’t quote anything from their own essays shortly after writing, whereas nearly everyone in the other groups could. " srcset="https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image-1.png 930w, https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image-1-300x192.png 300w, https://d2u08wkl163w0i.cloudfront.net/blog/wp-content/uploads/2025/08/image-1-768x492.png 768w" sizes="(max-width: 930px) 100vw, 930px"></figure>
+
+
+
+<p><em>Percentage of participants within each group who struggled to quote anything from their essays in Session</em></p>
+
+
+
+<p>They coined the term “<strong>cognitive debt</strong>” to describe the tradeoff: immediate convenience from AI assistance may come at the cost of long-term cognitive capabilities like critical thinking, memory retention, and creative autonomy.&nbsp;You borrow mental energy from the machine but with interest – and that cost shows up later when your own thinking has weakened.</p>
+
+
+
+<p>I keep saying that to my kids – LLM is a really powerful tool but use it wisely. Don’t ask it to solve your math equation; instead, provide your own solution and have it explain where you might be wrong. Starting with independent thinking and then integrating AI will be healthier for cognitive development. It’s like nuclear energy – you can use it for mass destruction or as a clean source of power.&nbsp;</p>
+
+
+
+<p>Consistent reliance on AI tools might undermine learning, memory, and creativity. Discomfort isn’t just a nuisance – it’s a training ground. </p>
+
+
+
+<p>Look for discomfort, seek it out, and encourage it.&nbsp;</p>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[DeepSeek-v3.1 Release (446 pts)]]></title>
             <link>https://api-docs.deepseek.com/news/news250821</link>
             <guid>44976764</guid>
             <pubDate>Thu, 21 Aug 2025 19:06:09 GMT</pubDate>
@@ -686,7 +1016,7 @@ efg is a new class
 <p><img src="https://cdn.deepseek.com/api-docs/v3.1_price_en.jpeg" width="600"></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AI tooling must be disclosed for contributions (593 pts)]]></title>
+            <title><![CDATA[AI tooling must be disclosed for contributions (606 pts)]]></title>
             <link>https://github.com/ghostty-org/ghostty/pull/8289</link>
             <guid>44976568</guid>
             <pubDate>Thu, 21 Aug 2025 18:49:57 GMT</pubDate>
@@ -706,7 +1036,7 @@ efg is a new class
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Building AI products in the probabilistic era (119 pts)]]></title>
+            <title><![CDATA[Building AI products in the probabilistic era (130 pts)]]></title>
             <link>https://giansegato.com/essays/probabilistic-era</link>
             <guid>44976468</guid>
             <pubDate>Thu, 21 Aug 2025 18:42:10 GMT</pubDate>
@@ -812,7 +1142,7 @@ efg is a new class
 <p>Welcome to the Probabilistic Era.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The unbearable slowness of AI coding (117 pts)]]></title>
+            <title><![CDATA[The unbearable slowness of AI coding (118 pts)]]></title>
             <link>https://joshuavaldez.com/the-unbearable-slowness-of-ai-coding/</link>
             <guid>44976437</guid>
             <pubDate>Thu, 21 Aug 2025 18:39:31 GMT</pubDate>
@@ -879,7 +1209,7 @@ efg is a new class
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The contrarian physics podcast subculture (180 pts)]]></title>
+            <title><![CDATA[The contrarian physics podcast subculture (182 pts)]]></title>
             <link>https://timothynguyen.org/2025/08/21/physics-grifters-eric-weinstein-sabine-hossenfelder-and-a-crisis-of-credibility/</link>
             <guid>44975378</guid>
             <pubDate>Thu, 21 Aug 2025 17:13:56 GMT</pubDate>
@@ -1111,7 +1441,7 @@ efg is a new class
 	</article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Core of Rust (157 pts)]]></title>
+            <title><![CDATA[The Core of Rust (158 pts)]]></title>
             <link>https://jyn.dev/the-core-of-rust/</link>
             <guid>44974688</guid>
             <pubDate>Thu, 21 Aug 2025 16:27:22 GMT</pubDate>
@@ -1250,7 +1580,7 @@ efg is a new class
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bank forced to rehire workers after lying about chatbot productivity, union says (282 pts)]]></title>
+            <title><![CDATA[Bank forced to rehire workers after lying about chatbot productivity, union says (286 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2025/08/bank-forced-to-rehire-workers-after-lying-about-chatbot-productivity-union-says/</link>
             <guid>44974365</guid>
             <pubDate>Thu, 21 Aug 2025 15:58:55 GMT</pubDate>
@@ -1271,7 +1601,7 @@ efg is a new class
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Forced every engineer to take sales calls.They rewrote our platform in 2 weeks (280 pts)]]></title>
+            <title><![CDATA[Forced every engineer to take sales calls.They rewrote our platform in 2 weeks (285 pts)]]></title>
             <link>https://old.reddit.com/r/Entrepreneur/comments/1mw5yfg/forced_every_engineer_to_take_sales_calls_they/</link>
             <guid>44974230</guid>
             <pubDate>Thu, 21 Aug 2025 15:46:16 GMT</pubDate>
@@ -1492,7 +1822,7 @@ Posts about specific investments, such as cryptocurrency, are not permitted. Ple
 </a></p><p>The OpenAI logo appears on a smartphone in front of a computer screen showing ChatGPT output, March 21, 2023, in Boston. (AP Photo/Michael Dwyer, File)</p></div><div id="penci-post-entry-inner"><p data-start="516" data-end="726">Over the last three years, companies worldwide have invested between 30 and 40 billion dollars into generative artificial intelligence projects. Yet most of these efforts have brought no real business return.</p><p data-start="728" data-end="905">A new study from <a href="https://nanda.media.mit.edu/ai_report_2025.pdf" target="_blank" rel="noopener">MIT found</a> that 95 percent of enterprise organizations report zero measurable gains from the adoption of AI tools. Only a small group has seen strong benefits.</p><p data-start="907" data-end="1082">“Just five percent of integrated AI pilots are extracting millions in value,” the report said. In contrast, the vast majority showed no impact on revenue or earnings at all.</p><p data-start="1084" data-end="1280">Many companies rushed to test programs such as ChatGPT, Copilot, and other large language model platforms. Surveys show that over 80 percent of major firms have already explored or piloted them.</p><p data-start="1282" data-end="1499">Nearly 40 percent of companies reported deploying these systems at some level. But researchers found most use cases were limited to boosting individual productivity rather than improving a company’s overall profits.</p><p data-start="1501" data-end="1706">One major reason is that generative AI tools often fail to match real work processes. The report described “brittle workflows, lack of contextual learning, and poor alignment with day-to-day operations.”</p><p data-start="1708" data-end="1903">Unlike humans, most generative AI models cannot retain past feedback or build new reasoning ability over time. They also struggle to adapt to context or transfer lessons across different tasks.</p><p data-start="1905" data-end="2083">“Most GenAI systems do not retain feedback, adapt to context, or improve over time,” the study said. Without these traits, long-term integration remains costly and ineffective.</p><p data-start="2085" data-end="2281">The hype around generative AI led to high expectations in boardrooms. But the report suggests that many of the investments have not translated into better profits or meaningful cost savings yet.</p><p data-start="2283" data-end="2464">Some companies use AI for customer service, marketing, or writing assistance. While these tools can save time for workers, they rarely add direct earnings for the business itself.</p><p data-start="2466" data-end="2647">The report also downplayed fears that generative AI will cause sweeping job losses in the near term. Instead, its effect is more likely to be in reducing external costs for firms.</p><p data-start="2649" data-end="2849">“Until AI systems achieve contextual adaptation and autonomous operation, organizational impact will manifest through external cost optimization rather than internal restructuring,” the report said.</p><p data-start="2851" data-end="2992">This means businesses may cut expenses on outsourced tasks but are less likely to replace large groups of staff with machines anytime soon.</p><p data-start="2994" data-end="3174">That conclusion goes against common public belief that generative AI will replace millions of jobs quickly. Researchers argue the technology is far from reaching such capability.</p><p data-start="3176" data-end="3345">Experts say many failures come from misunderstanding what AI can and cannot do. A program may generate text or code quickly, but it cannot truly learn as humans learn.</p><p data-start="3347" data-end="3532">For instance, an employee can adjust based on new instructions, previous mistakes, and situational needs. A generative AI model cannot carry that memory across tasks unless retrained.</p><p data-start="3534" data-end="3719">Investors and executives still show strong interest in AI, hoping that ongoing advances will close these gaps. But the short-term outlook points to slower progress than many expected.</p><p data-start="3721" data-end="3899">The findings suggest that while the promise of AI is large, businesses should temper expectations. The technology is not yet ready to deliver across every industry or workflow.</p><p data-start="3901" data-end="4100">The report also highlights the need for smarter planning around adoption. Organizations may need to focus on narrow use cases where AI can bring immediate, measurable savings or productivity gains.</p><p data-start="4102" data-end="4300">This might include customer support scripts, coding aids, or document drafting, but not full company-wide transformation. Widespread integration is still considered premature and prone to failure.</p><p data-start="4302" data-end="4484">As one researcher noted, “AI is powerful at tasks, not strategy.” Companies that expect it to replace entire decision-making processes are setting themselves up for disappointment.</p><p data-start="4486" data-end="4663">For now, the business case for generative AI rests mainly on selective success stories. A handful of firms report large value, but most see only minor help with routine tasks.</p><p data-start="4665" data-end="4812">The lesson, according to the MIT study, is clear. Companies should see generative AI as a limited tool rather than a guaranteed engine of growth.</p><p data-start="4814" data-end="5008">While interest remains high, experts caution against chasing hype. Until the systems learn to adapt more like humans, profits from AI adoption are likely to remain out of reach for most firms.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple Watch wearable foundation model (207 pts)]]></title>
+            <title><![CDATA[Apple Watch wearable foundation model (208 pts)]]></title>
             <link>https://arxiv.org/abs/2507.00191</link>
             <guid>44973375</guid>
             <pubDate>Thu, 21 Aug 2025 14:39:45 GMT</pubDate>
@@ -1514,12 +1844,38 @@ Posts about specific investments, such as cryptocurrency, are not permitted. Ple
 </p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Unity reintroduces the Runtime Fee through its Industry license (204 pts)]]></title>
+            <title><![CDATA[Unity reintroduces the Runtime Fee through its Industry license (205 pts)]]></title>
             <link>https://unity.com/products/unity-industry</link>
             <guid>44973269</guid>
             <pubDate>Thu, 21 Aug 2025 14:31:18 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://unity.com/products/unity-industry">https://unity.com/products/unity-industry</a>, See on <a href="https://news.ycombinator.com/item?id=44973269">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div><!--$--><section data-sentry-component="Hero" data-sentry-source-file="Hero.tsx"><img alt="hero-background-image" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fa15cb90f2c064ea7395e825ddee370611b4d14e0-1920x1080.png&amp;w=3840&amp;q=100"><div data-sentry-component="HeroContent" data-sentry-source-file="HeroContent.tsx"><p>Transform your 3D data into interactive applications that deliver measurable results, enhance efficiency, and achieve your business goals.</p></div></section><div><ul><li data-sentry-component="DesktopLinkItem" data-sentry-source-file="AlternateNavigation.tsx"><a target="_self" data-sentry-element="NextLink" data-sentry-source-file="AlternateNavigation.tsx" href="https://unity.com/products/unity-industry#overview">Overview</a></li><li data-sentry-component="DesktopLinkItem" data-sentry-source-file="AlternateNavigation.tsx"><a target="_self" data-sentry-element="NextLink" data-sentry-source-file="AlternateNavigation.tsx" href="https://unity.com/products/unity-industry#key-benefits">Key benefits</a></li><li data-sentry-component="DesktopLinkItem" data-sentry-source-file="AlternateNavigation.tsx"><a target="_self" data-sentry-element="NextLink" data-sentry-source-file="AlternateNavigation.tsx" href="https://unity.com/products/unity-industry#what's-included">What's included</a></li><li data-sentry-component="DesktopLinkItem" data-sentry-source-file="AlternateNavigation.tsx"><a target="_self" data-sentry-element="NextLink" data-sentry-source-file="AlternateNavigation.tsx" href="https://unity.com/products/unity-industry#get-started">Get started</a></li><li data-sentry-component="DesktopLinkItem" data-sentry-source-file="AlternateNavigation.tsx"><a target="_self" data-sentry-element="NextLink" data-sentry-source-file="AlternateNavigation.tsx" href="https://unity.com/products/unity-industry#faq">FAQ</a></li></ul></div><div data-sentry-component="FullWidthBlock" data-sentry-source-file="FullWidthBlock.tsx"><h2 data-sentry-element="Tag" data-sentry-component="Title" data-sentry-source-file="Title.tsx">Discover Unity Industry</h2><p>Join top companies in manufacturing, automotive, retail, and more using real-time 3D technology to gain a competitive edge, speed time-to-market, and optimize resources. From product visualization to simulations, Unity Industry powers immersive experiences.</p></div><div data-sentry-component="TitleDescriptionBlock" data-sentry-source-file="TitleDescriptionBlock.tsx"><p><h2>Transform Your Business with 3D Solutions</h2></p><p>Harness Unity’s solutions to integrate data, build impactful applications, and deploy across platforms to drive business success.</p></div><div data-sentry-component="Cards" data-sentry-source-file="Cards.tsx"><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Empower Smarter Decisions with Real-Time 3D</h2><p>Transform 3D data into immersive applications with real-time insights. Enable decision-makers with spatial visualizations to improve collaboration and accelerate time-to-market through clear, actionable insights.</p></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Optimize Efficiency and Lower Costs</h2><p>Seamlessly integrate and manage 3D data to streamline workflows, reduce redundancies, and enhance collaboration. Improve design efficiency, optimize resource use, lower production costs, and boost overall operational effectiveness.</p></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Reach Your Audience Anywhere</h2><p>Develop once and deploy immersive applications across 20+ platforms, including mobile, desktop, AR, and VR. Ensure accessibility and engagement wherever stakeholders and customers interact with your solutions.</p></div></div><div data-sentry-component="FullWidthBlock" data-sentry-source-file="FullWidthBlock.tsx"><div data-sentry-component="renderMedia" data-sentry-source-file="FullWidthBlock.tsx"><p>Image courtesy of Norconsult</p></div><div><h2 data-sentry-element="Tag" data-sentry-component="Title" data-sentry-source-file="Title.tsx">Optimize Your 3D Data Workflows</h2><p>Integrate CAD, BIM, and 3D data into real-time 3D projects with ease. Centralize asset management to improve collaboration, optimize processes, and deliver immersive experiences efficiently.</p></div></div><div data-sentry-component="FullWidthBlock" data-sentry-source-file="FullWidthBlock.tsx"><h2 data-sentry-element="Tag" data-sentry-component="Title" data-sentry-source-file="Title.tsx">Create Immersive Real-Time 3D Experiences</h2><p>Create lifelike scenes, simulate complex processes, and prototype quickly. Leverage expert tools and a global community to accelerate development, delivering impactful real-time 3D applications that achieve business meaningful business outcomes.</p></div><div data-sentry-component="FullWidthBlock" data-sentry-source-file="FullWidthBlock.tsx"><h2 data-sentry-element="Tag" data-sentry-component="Title" data-sentry-source-file="Title.tsx">Deploy Real-Time 3D Anywhere</h2><p>Deliver immersive applications across AR, VR, web, mobile, and desktop platforms. Reach your audience with seamless multi-platform support, leverage cutting-edge devices, and create interactive experiences that engage customers and stakeholders wherever they are.</p></div><div data-sentry-component="TitleDescriptionBlock" data-sentry-source-file="TitleDescriptionBlock.tsx"><p><h2>What's included</h2></p><p>Unity Industry includes the products and support needed to create, manage, and scale multiplatform applications. Designed for industry creators, it covers every stage from data integration to deployment.</p></div><div data-sentry-component="Cards" data-sentry-source-file="Cards.tsx"><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><p><img alt="Unity logo" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F19d1656d78819d6634202b73c53c29a6e2933353-811x455.png&amp;w=3840&amp;q=100"></p><div><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Unity 6</h2><p>Unity 6 empowers industry creators with faster rendering, enhanced visuals, runtime AI integration, and seamless multiplatform reach. Build collaborative, scalable applications with advanced workflows and improved productivity tools, all optimized for real-time 3D development.</p></div></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><p><img alt="pixyz logo icon" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F43777b49bfbfa72c599b12dad6adeb1da6b43315-810x455.png&amp;w=3840&amp;q=100"></p><div><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Unity Asset Transformer Toolkit</h2><div><p>Unity Asset Transformer Toolkit offers the easiest way to bring CAD and 3D models into Unity. Prepare data from 70+ file formats, customize levels of detail for target devices, and streamline workflows with automated import tools—designed for seamless use by Unity developers.</p><p><em>(Formerly known as Pixyz Plugin.)</em></p></div></div></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><p><img alt="Unity Asset Manager logo" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F0f8330e77ba19a0842e581a1a5c2d3d6d026355f-810x456.png&amp;w=3840&amp;q=100"></p><div><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Unity Asset Manager</h2><p>Unity Asset Manager is a cloud-based digital asset management (DAM) solution that streamlines how teams can upload, manage, transform, share, and access their complex 3D assets. It converts your industrial 3D data to real-time 3D assets, making it available to anyone, on any device.</p></div></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><p><img alt="Build automation icon" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2F1c79700de38f6d7bdb9a0f82334cc6e9744cd06d-809x455.png&amp;w=3840&amp;q=100"></p><div><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Build Server</h2><p>Unity Build Server streamlines development by offloading project builds to OnPrem hardware, keeping developers focused and accelerating iterations. It includes built-in Quality Assurance infrastructure to support teams as they scale and deliver high-quality applications.</p></div></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><p><img alt="Unity editor logo" loading="lazy" decoding="async" data-nimg="fill" sizes="100vw" srcset="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=640&amp;q=100 640w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=750&amp;q=100 750w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=828&amp;q=100 828w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=1080&amp;q=100 1080w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=1200&amp;q=100 1200w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=1920&amp;q=100 1920w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=2048&amp;q=100 2048w, https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=3840&amp;q=100 3840w" src="https://unity.com/_next/image?url=https%3A%2F%2Fcdn.sanity.io%2Fimages%2Ffuvbjjlp%2Fproduction%2Fb8bf43e38692760a76784ee6304b56df7ea2c048-810x455.png&amp;w=3840&amp;q=100"></p><div><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Industry Success</h2><p>Industry Success helps overcome onboarding challenges and speed time to market with Success Management, On-Demand Training, and premium technical support to upskill your team and deliver results efficiently.</p></div></div></div><div data-sentry-component="TitleDescriptionBlock" data-sentry-source-file="TitleDescriptionBlock.tsx"><p><h2>Unity Industry Partner Programs</h2></p><p>Whether you are delivering creative consulting services or building Unity-powered software solutions, we have a partner program tailored to your needs.</p></div><div data-sentry-component="Cards" data-sentry-source-file="Cards.tsx"><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Service Partner Program</h2><p>The Unity Service Partner Program empowers partners with tools, training, and incentives to grow their business with Unity.</p></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Independent Software Vendor Program</h2><p>The Unity ISV Program empowers software companies building commercial Unity-based solutions with resources, validation, and collaboration opportunities to scale and succeed.</p></div><div data-sentry-component="Card" data-sentry-source-file="Card.tsx"><h2 data-sentry-element="CardTitleTag" data-sentry-source-file="Cards.tsx">Reseller Partner Program</h2><p>The Unity Reseller Partner Program empowers value-added resellers with tools, expertise, and support to drive real-time 3D adoption across industries.</p></div></div><section data-sentry-component="Faq" data-sentry-source-file="Faq.tsx"><p data-sentry-component="FaqTitle" data-sentry-source-file="FaqTitle.tsx"><h2>Frequently asked questions</h2></p><div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>How can I start using Unity Industry?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>Is there a free trial of Unity Industry?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>How do I know Unity Industry is the right solution for me?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>How much does Unity Industry cost?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>Is there a support plan?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>What learning resources exist?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>Can industry customers still buy Unity Pro or Unity Enterprise?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>How do I upgrade from Unity Pro to Unity Industry?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>What is Unity Cloud?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>How do I get started with Unity Cloud?</h3><p><span>+</span></p></div><div role="button" tabindex="0" data-link-location="undefined-video-play" data-link-type="CTA" data-sentry-component="Accordion" data-sentry-source-file="Accordion.tsx"><h3>What happens if I am distributing the runtime for commercial purposes?</h3><p><span>+</span></p></div></div></section><!--$--><!--/$--><!--$--><!--/$--><!--/$--></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[7 years later, Valve's Proton has been a game-changer for Linux (101 pts)]]></title>
+            <link>https://www.gamingonlinux.com/2025/08/7-years-later-valves-proton-has-been-an-incredible-game-changer-for-linux/</link>
+            <guid>44973227</guid>
+            <pubDate>Thu, 21 Aug 2025 14:28:15 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.gamingonlinux.com/2025/08/7-years-later-valves-proton-has-been-an-incredible-game-changer-for-linux/">https://www.gamingonlinux.com/2025/08/7-years-later-valves-proton-has-been-an-incredible-game-changer-for-linux/</a>, See on <a href="https://news.ycombinator.com/item?id=44973227">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+						<p>It has been 7 years since Valve revealed Proton, their compatibility layer to run Windows games on Linux systems. <em>What an incredible time it has been.</em></p>
+
+<p>Hard to imagine Linux gaming without Proton now isn't it? Unless games use some funky video codecs or <a href="https://www.gamingonlinux.com/anticheat/" rel="noopener" target="_blank">kernel-level anti-cheat</a>, a lot of the time they do just work with the click of a button. We went from getting a handful of indie games and some AAA scraps from porting companies, to multiple tens of thousands of games — we're spoilt for choice on what to actually play. Going by ProtonDB there's at least 15,855 games rated playable by at least two reports, and Valve's Deck Verified system shows 21,694 games rated at least playable for SteamOS / Steam Deck. Incredible numbers and that's only what have actually seen some checks.</p>
+
+<p>I still <em>vividly</em> remember the <a href="https://www.gamingonlinux.com/2018/08/valve-officially-confirm-a-new-version-of-steam-play-which-includes-a-modified-version-of-wine/" rel="noopener" target="_blank">original announcement</a>, shaking with excitement on what it would mean for the future. It has opened up a world of possibilities, where you (for the most part) don't need to be attached to Windows to play some of the best games around.</p>
+
+<p>Valve's commitment to Linux and open source is very much self-serving of course, they are a company with goals. All of this was progress towards creating their own ecosystem with the likes of the Steam Deck / SteamOS and other potential hardware to come. Linux desktop users are mostly just along for the ride and reap all the benefits.</p>
+
+<p>Thanks to all the work with Proton and the Steam Deck, the Linux user share on Steam is also <a href="https://www.gamingonlinux.com/steam-tracker/" rel="noopener" target="_blank">on the cusp of breaking through 3%</a> which is impressive considering the massive mountain that is Windows. You don't beat or even get remotely close to such an entrenched system overnight, movement like this just takes time. Slow and steady wins the race right? Valve continue playing the long game here.</p>
+
+<p>What's truly incredible about Proton though is how it gives Valve a set platform to continue building on. So when we hopefully see a Steam Deck 2, or a Steam Machine TV console, it will be plug and play with all the existing games. Linking into why I love the whole idea of Valve using Linux with Proton, SteamOS / Steam Deck over traditional consoles is just having access to all the same games - no need to buy them again.</p>
+
+<p>And with more publishers like Microsoft and Sony pushing their games on Steam too, we all win.</p>
+
+<p>Here's to Valve and Proton, 7 years on. Cheers!</p>
+						<p><span>Article taken from <a href="https://www.gamingonlinux.com/">GamingOnLinux.com.</a></span>
+						
+					</p></div></div>]]></description>
         </item>
         <item>
             <title><![CDATA[In a first, Google has released data on how much energy an AI prompt uses (105 pts)]]></title>
