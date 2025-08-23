@@ -4,12 +4,186 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 23 Aug 2025 08:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 23 Aug 2025 09:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Measuring the environmental impact of AI inference (111 pts)]]></title>
+            <title><![CDATA[I'm too dumb for Zig's new IO interface (107 pts)]]></title>
+            <link>https://www.openmymind.net/Im-Too-Dumb-For-Zigs-New-IO-Interface/</link>
+            <guid>44993797</guid>
+            <pubDate>Sat, 23 Aug 2025 06:39:38 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.openmymind.net/Im-Too-Dumb-For-Zigs-New-IO-Interface/">https://www.openmymind.net/Im-Too-Dumb-For-Zigs-New-IO-Interface/</a>, See on <a href="https://news.ycombinator.com/item?id=44993797">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+  
+  
+  
+<p>You might have heard that Zig 0.15 introduces a new IO interface, with the focus for this release being the new std.Io.Reader and std.Io.Writer types. The old "interfaces" had problems. Like <a href="https://github.com/ziglang/zig/issues/17985">this performance issue</a> that I opened. And it relied on a <a href="https://www.openmymind.net/In-Zig-Whats-a-Writer/">mix of types</a>, which always confused me, and a lot of <code>anytype</code> - which is generally great, but a poor foundation to build an interface on.</p>
+
+<p>I've been slowly upgrading my libraries, and I ran into changes to the <code>tls.Client</code> client used by my smtp library. For the life of me, I just don't understand how it works.</p>
+
+<p>Zig has never been known for its documentation, but if we look at the documentation for <code>tls.Client.init</code>, we'll find:</p>
+
+<pre><code><span>pub</span> <span>fn</span> <span>init</span><span>(</span>input<span>:</span> <span><span>*</span>std<span>.</span>Io<span>.</span>Reader</span><span>,</span> output<span>:</span> <span><span>*</span>std<span>.</span>Io<span>.</span>Writer</span><span>,</span> options<span>:</span> <span>Options</span><span>)</span> InitError<span>!</span>Client
+Initiates a TLS handshake <span>and</span> establishes a TLSv1<span>.</span><span>2</span> <span>or</span> TLSv1<span>.</span><span>3</span> session<span>.</span></code></pre>
+
+<p>So it takes one of these new Readers and a new Writer, along with some options (sneak peak, which aren't all optional). It doesn't look like you can just give it a <code>net.Stream</code>, but <code>net.Stream</code> does expose a <code>reader()</code> and <code>writer()</code> method, so that's probably a good place to start:</p>
+
+<pre><code><span>const</span> stream <span>=</span> <span>try</span> std<span>.</span>net<span>.</span><span>tcpConnectToHost</span><span>(</span>allocator<span>,</span> <span>"www.openmymind.net"</span><span>,</span> <span>443</span><span>)</span><span>;</span>
+<span>defer</span> stream<span>.</span><span>close</span><span>(</span><span>)</span><span>;</span>
+
+<span>var</span> writer <span>=</span> stream<span>.</span><span>writer</span><span>(</span><span>&amp;</span><span>.</span><span>{</span><span>}</span><span>)</span><span>;</span>
+<span>var</span> reader <span>=</span> stream<span>.</span><span>reader</span><span>(</span><span>&amp;</span><span>.</span><span>{</span><span>}</span><span>)</span><span>;</span>
+
+<span>var</span> tls_client <span>=</span> <span>try</span> std<span>.</span>crypto<span>.</span>tls<span>.</span>Client<span>.</span><span>init</span><span>(</span>
+  reader<span>.</span><span>interface</span><span>(</span><span>)</span><span>,</span>
+  <span>&amp;</span>writer<span>.</span>interface<span>,</span>
+  <span>.</span><span>{</span><span>}</span><span>,</span> <span>// options TODO</span>
+<span>)</span><span>;</span></code></pre>
+
+<p>Note that <code>stream.writer()</code> returns a <code>Stream.Writer</code> and <code>stream.reader()</code> returns a <code>Stream.Reader</code> - those aren't the types our <code>tls.Client</code> expects. To convert the <code>Stream.Reader</code> to an <code>*std.Io.Reader</code>, we need to call its <code>interface()</code> method. To get a <code>*std.io.Writer</code> from an <code>Stream.Writer</code>, we need the address of its <code>&amp;interface</code> field. This doesn't seem particularly consistent. Don't forget that the <code>writer</code> and <code>reader</code> need a stable address. Because I'm trying to get the simplest example working, this isn't an issue - everything will live on the stack of <code>main</code>. In a real word example, I think it means that I'll always have to wrap the <code>tls.Client</code> into my own heap-allocated type; giving the writer and reader have a cozy stable home.</p>
+
+<p>Speaking of allocations, you might have noticed that <code>stream.writer</code> and <code>stream.reader</code> take a parameter. It's the buffer they should use. Buffering is a first class citizen of the new Io interface - who needs composition? The documentation <strong>does</strong> tell me these need to be at least <code>std.crypto.tls.max_ciphertext_record_len</code> large, so we need to fix things a bit:</p>
+
+<pre><code><span>var</span> write_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+<span>var</span> writer <span>=</span> stream<span>.</span><span>writer</span><span>(</span><span>&amp;</span>write_buf<span>)</span><span>;</span>
+
+<span>var</span> read_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+<span>var</span> reader <span>=</span> stream<span>.</span><span>reader</span><span>(</span><span>&amp;</span>read_buf<span>)</span><span>;</span></code></pre>
+
+<p>Here's where the code stands: </p>
+
+<pre><code><span>const</span> std <span>=</span> <span>@import</span><span>(</span><span>"std"</span><span>)</span><span>;</span>
+
+<span>pub</span> <span>fn</span> <span>main</span><span>(</span><span>)</span> <span><span>!</span><span>void</span></span> <span>{</span>
+  <span>var</span> gpa<span>:</span> std<span>.</span>heap<span>.</span><span>DebugAllocator</span><span>(</span><span>.</span><span>{</span><span>}</span><span>)</span> <span>=</span> <span>.</span>init<span>;</span>
+  <span>const</span> allocator <span>=</span> gpa<span>.</span><span>allocator</span><span>(</span><span>)</span><span>;</span>
+
+  <span>const</span> stream <span>=</span> <span>try</span> std<span>.</span>net<span>.</span><span>tcpConnectToHost</span><span>(</span>allocator<span>,</span> <span>"www.openmymind.net"</span><span>,</span> <span>443</span><span>)</span><span>;</span>
+  <span>defer</span> stream<span>.</span><span>close</span><span>(</span><span>)</span><span>;</span>
+
+  <span>var</span> write_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> writer <span>=</span> stream<span>.</span><span>writer</span><span>(</span><span>&amp;</span>write_buf<span>)</span><span>;</span>
+
+  <span>var</span> read_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> reader <span>=</span> stream<span>.</span><span>reader</span><span>(</span><span>&amp;</span>read_buf<span>)</span><span>;</span>
+
+  <span>var</span> tls_client <span>=</span> <span>try</span> std<span>.</span>crypto<span>.</span>tls<span>.</span>Client<span>.</span><span>init</span><span>(</span>
+      reader<span>.</span><span>interface</span><span>(</span><span>)</span><span>,</span>
+      <span>&amp;</span>writer<span>.</span>interface<span>,</span>
+      <span>.</span><span>{</span>
+      <span>}</span><span>,</span>
+  <span>)</span><span>;</span>
+  <span>defer</span> tls_client<span>.</span><span>end</span><span>(</span><span>)</span> <span>catch</span> <span>{</span><span>}</span><span>;</span>
+<span>}</span></code></pre>
+
+<p>But if you try to run it, you'll get a compilation error. Turns out we have to provide 4 options: the ca_bundle, a host, a <code>write_buffer</code> and a <code>read_buffer</code>. Normally I'd expect the options parameter to be for optional parameters, I don't understand why some parameters (input and output) are passed one way while <code>writer_buffer</code> and <code>read_buffer</code> are passed another.</p>
+
+<p>Let's give it what it wants AND send some data:</p>
+
+<pre><code><span>// existing setup...</span>
+
+<span>var</span> bundle <span>=</span> <span>std<span>.</span>crypto<span>.</span>Certificate<span>.</span>Bundle</span><span>{</span><span>}</span><span>;</span>
+<span>try</span> bundle<span>.</span><span>rescan</span><span>(</span>allocator<span>)</span><span>;</span>
+<span>defer</span> bundle<span>.</span><span>deinit</span><span>(</span>allocator<span>)</span><span>;</span>
+
+<span>var</span> tls_client <span>=</span> <span>try</span> std<span>.</span>crypto<span>.</span>tls<span>.</span>Client<span>.</span><span>init</span><span>(</span>
+  reader<span>.</span><span>interface</span><span>(</span><span>)</span><span>,</span>
+  <span>&amp;</span>writer<span>.</span>interface<span>,</span>
+  <span>.</span><span>{</span>
+    <span>.</span>ca <span>=</span> <span>.</span><span>{</span><span>.</span>bundle <span>=</span> bundle<span>}</span><span>,</span>
+    <span>.</span>host <span>=</span> <span>.</span><span>{</span> <span>.</span>explicit <span>=</span> <span>"www.openmymind.net"</span> <span>}</span> <span>,</span>
+    <span>.</span>read_buffer <span>=</span> <span>&amp;</span><span>.</span><span>{</span><span>}</span><span>,</span>
+    <span>.</span>write_buffer <span>=</span> <span>&amp;</span><span>.</span><span>{</span><span>}</span><span>,</span>
+  <span>}</span><span>,</span>
+<span>)</span><span>;</span>
+<span>defer</span> tls_client<span>.</span><span>end</span><span>(</span><span>)</span> <span>catch</span> <span>{</span><span>}</span><span>;</span>
+
+<span>try</span> tls_client<span>.</span>writer<span>.</span><span>writeAll</span><span>(</span><span>"GET / HTTP/1.1\r\n\r\n"</span><span>)</span><span>;</span></code></pre>
+
+<p>Now, if I try to run it, the program just hangs. I don't know what <code>write_buffer</code> is, but I know Zig now loves buffers, so let's try to give it something:</p>
+
+<pre><code><span>// existing setup...</span>
+
+<span>// I don't know what size this should/has to be??</span>
+<span>var</span> write_buf2<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+
+<span>var</span> tls_client <span>=</span> <span>try</span> std<span>.</span>crypto<span>.</span>tls<span>.</span>Client<span>.</span><span>init</span><span>(</span>
+  reader<span>.</span><span>interface</span><span>(</span><span>)</span><span>,</span>
+  <span>&amp;</span>writer<span>.</span>interface<span>,</span>
+  <span>.</span><span>{</span>
+    <span>.</span>ca <span>=</span> <span>.</span><span>{</span><span>.</span>bundle <span>=</span> bundle<span>}</span><span>,</span>
+    <span>.</span>host <span>=</span> <span>.</span><span>{</span> <span>.</span>explicit <span>=</span> <span>"www.openmymind.net"</span> <span>}</span> <span>,</span>
+    <span>.</span>read_buffer <span>=</span> <span>&amp;</span><span>.</span><span>{</span><span>}</span><span>,</span>
+    <span>.</span>write_buffer <span>=</span> <span>&amp;</span>write_buf2<span>,</span>
+  <span>}</span><span>,</span>
+<span>)</span><span>;</span>
+<span>defer</span> tls_client<span>.</span><span>end</span><span>(</span><span>)</span> <span>catch</span> <span>{</span><span>}</span><span>;</span>
+
+<span>try</span> tls_client<span>.</span>writer<span>.</span><span>writeAll</span><span>(</span><span>"GET / HTTP/1.1\r\n\r\n"</span><span>)</span><span>;</span></code></pre>
+
+
+<p>Great, now the code doesn't hang, all we need to do is read the response. <code>tls.Client</code> exposes a <code>reader: *std.Io.Reader</code> field which is "Decrypted stream from the server to the client." That sounds like what we want, but believe it or not <code>std.Io.Reader</code> doesn't have a <code>read</code> method. It has a <code>peak</code> a <code>takeByteSigned</code>, a <code>readSliceShort</code> (which seems close, but it blocks until the provided buffer is full), a <code>peekArray</code> and a lot more, but nothing like the <code>read</code> I'd expect. The closest I can find, which I think does what I want, is to stream it to a writer:</p>
+
+<pre><code><span>var</span> buf<span>:</span> <span><span>[</span><span>1024</span><span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+<span>var</span> w<span>:</span> <span>std<span>.</span>Io<span>.</span>Writer</span> <span>=</span> <span>.</span><span>fixed</span><span>(</span><span>&amp;</span>buf<span>)</span><span>;</span>
+<span>const</span> n <span>=</span> <span>try</span> tls_client<span>.</span>reader<span>.</span><span>stream</span><span>(</span><span>&amp;</span>w<span>,</span> <span>.</span><span>limited</span><span>(</span>buf<span>.</span>len<span>)</span><span>)</span><span>;</span>
+std<span>.</span>debug<span>.</span><span>print</span><span>(</span><span>"read: {d} - {s}\n"</span><span>,</span> <span>.</span><span>{</span>n<span>,</span> buf<span>[</span><span>0</span><span>..</span>n<span>]</span><span>}</span><span>)</span><span>;</span></code></pre>
+
+<p>If we try to run the code now, it crashes. We've apparently failed an assertion regarding the length of a buffer. So it seems like we also <em>have</em> to provide a <code>read_buffer</code>.</p>
+
+<p>Here's my current version (it doesn't work, but it doesn't crash!):</p>
+
+<pre><code><span>const</span> std <span>=</span> <span>@import</span><span>(</span><span>"std"</span><span>)</span><span>;</span>
+
+<span>pub</span> <span>fn</span> <span>main</span><span>(</span><span>)</span> <span><span>!</span><span>void</span></span> <span>{</span>
+  <span>var</span> gpa<span>:</span> std<span>.</span>heap<span>.</span><span>DebugAllocator</span><span>(</span><span>.</span><span>{</span><span>}</span><span>)</span> <span>=</span> <span>.</span>init<span>;</span>
+  <span>const</span> allocator <span>=</span> gpa<span>.</span><span>allocator</span><span>(</span><span>)</span><span>;</span>
+
+  <span>const</span> stream <span>=</span> <span>try</span> std<span>.</span>net<span>.</span><span>tcpConnectToHost</span><span>(</span>allocator<span>,</span> <span>"www.openmymind.net"</span><span>,</span> <span>443</span><span>)</span><span>;</span>
+  <span>defer</span> stream<span>.</span><span>close</span><span>(</span><span>)</span><span>;</span>
+
+  <span>var</span> write_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> writer <span>=</span> stream<span>.</span><span>writer</span><span>(</span><span>&amp;</span>write_buf<span>)</span><span>;</span>
+
+  <span>var</span> read_buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> reader <span>=</span> stream<span>.</span><span>reader</span><span>(</span><span>&amp;</span>read_buf<span>)</span><span>;</span>
+
+  <span>var</span> bundle <span>=</span> <span>std<span>.</span>crypto<span>.</span>Certificate<span>.</span>Bundle</span><span>{</span><span>}</span><span>;</span>
+  <span>try</span> bundle<span>.</span><span>rescan</span><span>(</span>allocator<span>)</span><span>;</span>
+  <span>defer</span> bundle<span>.</span><span>deinit</span><span>(</span>allocator<span>)</span><span>;</span>
+
+  <span>var</span> write_buf2<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> read_buf2<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+
+  <span>var</span> tls_client <span>=</span> <span>try</span> std<span>.</span>crypto<span>.</span>tls<span>.</span>Client<span>.</span><span>init</span><span>(</span>
+      reader<span>.</span><span>interface</span><span>(</span><span>)</span><span>,</span>
+      <span>&amp;</span>writer<span>.</span>interface<span>,</span>
+      <span>.</span><span>{</span>
+        <span>.</span>ca <span>=</span> <span>.</span><span>{</span><span>.</span>bundle <span>=</span> bundle<span>}</span><span>,</span>
+        <span>.</span>host <span>=</span> <span>.</span><span>{</span> <span>.</span>explicit <span>=</span> <span>"www.openmymind.net"</span> <span>}</span> <span>,</span>
+        <span>.</span>read_buffer <span>=</span> <span>&amp;</span>read_buf2<span>,</span>
+        <span>.</span>write_buffer <span>=</span> <span>&amp;</span>write_buf2<span>,</span>
+      <span>}</span><span>,</span>
+  <span>)</span><span>;</span>
+  <span>defer</span> tls_client<span>.</span><span>end</span><span>(</span><span>)</span> <span>catch</span> <span>{</span><span>}</span><span>;</span>
+
+  <span>try</span> tls_client<span>.</span>writer<span>.</span><span>writeAll</span><span>(</span><span>"GET / HTTP/1.1\r\n\r\n"</span><span>)</span><span>;</span>
+
+  <span>var</span> buf<span>:</span> <span><span>[</span>std<span>.</span>crypto<span>.</span>tls<span>.</span>max_ciphertext_record_len<span>]</span><span>u8</span></span> <span>=</span> <span>undefined</span><span>;</span>
+  <span>var</span> w<span>:</span> <span>std<span>.</span>Io<span>.</span>Writer</span> <span>=</span> <span>.</span><span>fixed</span><span>(</span><span>&amp;</span>buf<span>)</span><span>;</span>
+  <span>const</span> n <span>=</span> <span>try</span> tls_client<span>.</span>reader<span>.</span><span>stream</span><span>(</span><span>&amp;</span>w<span>,</span> <span>.</span><span>limited</span><span>(</span>buf<span>.</span>len<span>)</span><span>)</span><span>;</span>
+  std<span>.</span>debug<span>.</span><span>print</span><span>(</span><span>"read: {d} - {s}\n"</span><span>,</span> <span>.</span><span>{</span>n<span>,</span> buf<span>[</span><span>0</span><span>..</span>n<span>]</span><span>}</span><span>)</span><span>;</span>
+<span>}</span></code></pre>
+
+<p>When I looked through Zig's source code, there's <a href="https://github.com/ziglang/zig/blob/306176046e6ae5e30bc58e5f3bcf786159e367f2/lib/std/http/Client.zig#L329">only one place</a> using <code>tls.Client</code>. It helped to get me where where I am. I couldn't find any tests.</p>
+
+<p>I'll admit that during this migration, I've missed some basic things. For example, someone had to help me find <code>std.fmt.printInt</code> - the renamed version of <code>std.fmt.formatIntBuf</code>. Maybe there's a helper like: <code>tls.Client.init(allocator, stream)</code> somewhere. And maybe it makes sense that we do <code>reader.interface()</code> but <code>&amp;writer.interface</code> - I'm reminded of Go's <code>*http.Request</code> and <code>http.ResponseWrite</code>. And maybe Zig has some consistent rule for what parameters belong in options. And I know nothing about TLS, so maybe it makes complete sense to need 4 buffers. I feel a bit more confident about the weirdness of not having a <code>read(buf: []u8) !usize</code> function on <code>Reader</code>, but at this point I wouldn't bet on me.</p>
+
+</article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Measuring the environmental impact of AI inference (119 pts)]]></title>
             <link>https://arstechnica.com/ai/2025/08/google-says-it-dropped-the-energy-cost-of-ai-queries-by-33x-in-one-year/</link>
             <guid>44992832</guid>
             <pubDate>Sat, 23 Aug 2025 03:22:33 GMT</pubDate>
@@ -51,7 +225,7 @@
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Computer fraud laws used to prosecute leaking air crash footage to CNN (169 pts)]]></title>
+            <title><![CDATA[Computer fraud laws used to prosecute leaking air crash footage to CNN (181 pts)]]></title>
             <link>https://www.techdirt.com/2025/08/22/investigators-used-terrible-computer-fraud-laws-to-ensure-people-were-punished-for-leaking-air-crash-footage-to-cnn/</link>
             <guid>44991542</guid>
             <pubDate>Sat, 23 Aug 2025 00:04:56 GMT</pubDate>
@@ -107,7 +281,7 @@
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Popular Japanese smartphone games have introduced external payment systems (122 pts)]]></title>
+            <title><![CDATA[Popular Japanese smartphone games have introduced external payment systems (126 pts)]]></title>
             <link>https://english.kyodonews.net/articles/-/59689</link>
             <guid>44991384</guid>
             <pubDate>Fri, 22 Aug 2025 23:50:13 GMT</pubDate>
@@ -134,7 +308,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Mail Carriers Pause US Deliveries as Tariff Shift Sows Confusion (137 pts)]]></title>
+            <title><![CDATA[Mail Carriers Pause US Deliveries as Tariff Shift Sows Confusion (141 pts)]]></title>
             <link>https://www.bloomberg.com/news/articles/2025-08-21/global-mail-services-halt-us-deliveries-ahead-of-de-minimis-end</link>
             <guid>44991039</guid>
             <pubDate>Fri, 22 Aug 2025 23:09:04 GMT</pubDate>
@@ -142,7 +316,7 @@
 Couldn't get https://www.bloomberg.com/news/articles/2025-08-21/global-mail-services-halt-us-deliveries-ahead-of-de-minimis-end: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Bluesky Goes Dark in Mississippi over Age Verification Law (146 pts)]]></title>
+            <title><![CDATA[Bluesky Goes Dark in Mississippi over Age Verification Law (158 pts)]]></title>
             <link>https://www.wired.com/story/bluesky-goes-dark-in-mississippi-age-verification/</link>
             <guid>44990886</guid>
             <pubDate>Fri, 22 Aug 2025 22:51:27 GMT</pubDate>
@@ -150,7 +324,7 @@ Couldn't get https://www.bloomberg.com/news/articles/2025-08-21/global-mail-serv
 <div id="readability-page-1" class="page"><div data-journey-hook="client-content" data-testid="BodyWrapper"><p><span>People in Mississippi</span> can no longer use the social media platform <a href="https://www.wired.com/tag/bluesky/">Bluesky</a>. The company announced Friday that it will be blocking all IP addresses within Mississippi for the foreseeable future in response to a recent <a href="https://www.wired.com/tag/us-supreme-court/">US Supreme Court</a> decision that allows the state to enforce strict age verification for social media platforms.</p><p>According to Bluesky, Mississippi’s approach to verification “would fundamentally change” how users access the site. “We think this law creates challenges that go beyond its child safety goals, and creates significant barriers that limit free speech and disproportionately harm smaller platforms and emerging technologies,” the Bluesky team said in <a data-offer-url="https://bsky.social/about/blog/08-22-2025-mississippi-hb1126" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://bsky.social/about/blog/08-22-2025-mississippi-hb1126&quot;}" href="https://bsky.social/about/blog/08-22-2025-mississippi-hb1126" rel="nofollow noopener" target="_blank">its statement</a>.</p><p>Bluesky did not respond to a request for comment.</p><p>The company says that compliance with Mississippi’s law—which would require identifying and tracking all users under 18, in addition to asking every user for sensitive personal information to verify their age—is not possible with the team’s current resources and infrastructure. By not complying with the law, Bluesky could face fines of up to $10,000 per violation. It is the first major social media platform to take such drastic steps in response to the law.</p><p>Age verification laws, which on the surface are intended to protect children from harmful content online, have already begun to broadly impact internet use in places around the world where they've been enacted. <a href="https://www.wired.com/story/the-age-checked-internet-has-arrived/">In the UK</a>, users trying to access everything from pornography to social platforms must now submit to ID scans, credit card checks, age-estimation scans, and more to verify they’re over the age of 18. The state of Texas has a <a href="https://www.wired.com/story/us-supreme-court-porn-age-verification-decision-2025/">similar law</a> the US Supreme Court upheld in June, despite concerns from critics over the erosion of free speech and access to information on the open internet.</p><p>Whether these laws are effective at protecting children is unclear; the use of virtual private networks (VPNs) in the UK <a href="https://www.wired.com/story/vpn-use-spike-age-verification-laws-uk/">spiked</a> just after its age verification law went into effect as users deployed the tech to spoof their location. On platforms like Discord, people discovered they could use <a href="https://www.wired.com/story/age-verification-is-sweeping-gaming-is-it-ready-for-the-age-of-ai-fakes/">video game characters</a> to trick face scans. Furthermore, <a href="https://www.wired.com/story/the-age-checked-internet-has-arrived/">critics say</a> that age verification laws intended to reduce harm to children can sometimes have the opposite effect by putting kids in greater danger of identity theft and privacy violations.</p><p>WIRED has reached out to the sponsors of the original bill, Mississippi state representatives Jill Ford, Fabian Nelson, and Larry Byrd, and will update this story if they comment.</p><p>“We believe effective child safety policies should be carefully tailored to address real harms, without creating huge obstacles for smaller providers and resulting in negative consequences for free expression,” Bluesky wrote.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[U.S. government takes 10% stake in Intel (527 pts)]]></title>
+            <title><![CDATA[U.S. government takes 10% stake in Intel (534 pts)]]></title>
             <link>https://www.cnbc.com/2025/08/22/intel-goverment-equity-stake.html</link>
             <guid>44989773</guid>
             <pubDate>Fri, 22 Aug 2025 21:01:52 GMT</pubDate>
@@ -292,7 +466,7 @@ https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resiz
 <p>We do not take this decision lightly. Child safety is a core priority, and in this evolving regulatory landscape, we remain committed to building an open social ecosystem that protects users while preserving choice and innovation. We’ll keep you updated as this situation develops.</p></div></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Nitro: A tiny but flexible init system and process supervisor (181 pts)]]></title>
+            <title><![CDATA[Nitro: A tiny but flexible init system and process supervisor (185 pts)]]></title>
             <link>https://git.vuxu.org/nitro/about/</link>
             <guid>44988530</guid>
             <pubDate>Fri, 22 Aug 2025 19:06:29 GMT</pubDate>
@@ -488,7 +662,7 @@ daemontools, freedt, runit, perp, and s6.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: JavaScript-free (X)HTML Includes (137 pts)]]></title>
+            <title><![CDATA[Show HN: JavaScript-free (X)HTML Includes (145 pts)]]></title>
             <link>https://github.com/Evidlo/xsl-website</link>
             <guid>44988271</guid>
             <pubDate>Fri, 22 Aug 2025 18:47:30 GMT</pubDate>
@@ -502,7 +676,7 @@ daemontools, freedt, runit, perp, and s6.</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The First Media over QUIC CDN: Cloudflare (224 pts)]]></title>
+            <title><![CDATA[The First Media over QUIC CDN: Cloudflare (229 pts)]]></title>
             <link>https://moq.dev/blog/first-cdn/</link>
             <guid>44987924</guid>
             <pubDate>Fri, 22 Aug 2025 18:24:16 GMT</pubDate>
@@ -682,7 +856,7 @@ Stay tuned for a blog post about that if I can figure out a better use-case than
 🤮 Javascript 🤮 is still an abomination.</p> </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Should the web platform adopt XSLT 3.0? (113 pts)]]></title>
+            <title><![CDATA[Should the web platform adopt XSLT 3.0? (116 pts)]]></title>
             <link>https://github.com/whatwg/html/issues/11578</link>
             <guid>44987552</guid>
             <pubDate>Fri, 22 Aug 2025 17:56:12 GMT</pubDate>
@@ -924,7 +1098,7 @@ Stay tuned for a blog post about that if I can figure out a better use-case than
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Leaving Gmail for Mailbox.org (252 pts)]]></title>
+            <title><![CDATA[Leaving Gmail for Mailbox.org (263 pts)]]></title>
             <link>https://giuliomagnifico.blog/post/2025-08-18-leaving-gmail/</link>
             <guid>44987380</guid>
             <pubDate>Fri, 22 Aug 2025 17:41:48 GMT</pubDate>
@@ -1111,7 +1285,7 @@ Qjuwt/KpUqS4qTLl/Q==
 <p dir="auto">I would like <a data-hovercard-type="user" data-hovercard-url="/users/mfreed7/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/mfreed7">@mfreed7</a> <a data-hovercard-type="user" data-hovercard-url="/users/domenic/hovercard" data-octo-click="hovercard-link-click" data-octo-dimensions="link_type:self" href="https://github.com/domenic">@domenic</a> and other Googlers who initiated and move on with this proposal to acknowledge this, and provide more rationale for removing XSLT than just Chrome Status counter stats.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Waymo granted permit to begin testing in New York City (550 pts)]]></title>
+            <title><![CDATA[Waymo granted permit to begin testing in New York City (553 pts)]]></title>
             <link>https://www.cnbc.com/2025/08/22/waymo-permit-new-york-city-nyc-rides.html</link>
             <guid>44986949</guid>
             <pubDate>Fri, 22 Aug 2025 17:02:48 GMT</pubDate>
@@ -1119,7 +1293,7 @@ Qjuwt/KpUqS4qTLl/Q==
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-108110425" data-test="InlineImage"><p>Waymo self-driving cars with roof-mounted sensor arrays traveling near palm trees and modern buildings along the Embarcadero, San Francisco, California, February 21, 2025.&nbsp;</p><p>Smith Collection/gado | Archive Photos | Getty Images</p></div><div><p><a href="https://www.cnbc.com/2025/07/08/waymo-teen-accounts.html">Waymo</a> is getting one step closer to rides in <a href="https://www.cnbc.com/2025/06/18/waymo-cars-are-coming-to-new-york-with-a-driver-behind-the-wheel.html">New York City</a>.</p><p>The <span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-3"><a href="https://www.cnbc.com/quotes/GOOGL/">Alphabet</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> autonomous vehicle subsidiary received its first permit from the New York Department of Transportation on Friday to start testing in New York City, Mayor <a href="https://www.nyc.gov/mayors-office/news/2025/08/mayor-adams--dot-announce-approval-of-first-application-to-test-" target="_blank">Eric Adams</a> announced Friday. The rollout is the city's first <a href="https://www.cnbc.com/2025/07/02/autonomous-cars-are-having-their-chatgpt-moment-bank-of-america.html">autonomous vehicle</a> testing launch.</p><p>Waymo will start testing up to eight vehicles in <a href="https://www.cnbc.com/2025/04/02/manhattan-luxury-real-estate-market.html">Manhattan</a> and Downtown Brooklyn through late September with the potential to extend the program. New York state law requires the company to have a driver behind the wheel to operate.</p><p>"We're a tech-friendly administration and we're always looking for innovative ways to safely move our city forward," Adams said in a release. "New York City is proud to welcome Waymo to test this new technology in Manhattan and Brooklyn, as we know this testing is only the first step in moving our city further into the 21st century."</p></div><div id="RegularArticle-RelatedContent-1"><h2>Read more CNBC tech news</h2><div><ul><li><a href="https://www.cnbc.com/2025/08/20/google-pixel-10-gemini-ai.html">Google announces its AI-powered Pixel 10 smartphone series</a></li><li><a href="https://www.cnbc.com/2025/08/20/these-little-robots-are-changing-the-way-solar-farms-are-built.html">These little robots are changing the way solar farms are built, saving time and money</a></li><li><a href="https://www.cnbc.com/2025/08/20/intel-investors-equity-softbank-trump.html">Intel in talks with other large investors for equity boost at discount, sources say</a></li><li><a href="https://www.cnbc.com/2025/08/20/gates-nvidia-fieldai-robotics.html">Nvidia, Bill Gates-backed robotics startup Field AI hits $2 billion valuation after recent raise</a></li></ul></div></div><div><p>The news comes just two months after the company said it filed permits to test its cars in the city with a trained specialist behind the wheel.</p><p>Waymo has hit <a href="https://www.cnbc.com/2025/07/28/waymo-plans-to-bring-its-robotaxi-service-to-dallas-in-2026.html">expansion</a> mode on its services nationwide, launching in <a href="https://www.cnbc.com/2025/03/04/waymo-uber-begin-offering-robotaxi-rides-in-austin-ahead-of-sxsw.html">Austin</a> this year and expanding its <a href="https://www.cnbc.com/2025/03/11/waymo-expands-its-robotaxi-service-in-the-san-francisco-bay-area.html">San Francisco area</a> operations in March. Waymo also plans to bring autonomous vehicles to Atlanta, Miami and Washington, D.C. and recently said it will start operations in <a href="https://www.cnbc.com/2025/07/07/waymo-to-begin-testing-in-philadelphia-with-drivers-behind-the-wheel.html">Philadelphia</a> as it looks to break further into the Northeast market.</p><p>Waymo's CEO said the company surpassed 10 million <a href="https://www.cnbc.com/2025/05/20/waymo-ceo-tekedra-mawakana-10-million.html">robotaxi</a> trips in May.</p><p>For years, autonomous vehicle companies have sought to introduce their technology to The Big Apple, with Waymo previously taking a crack at it in 2021. At that time, the company rolled out some cars in certain areas of the city for<a href="https://waymo.com/blog/2021/11/introducing-waymo-driver-to-new-york" target="_blank"> manual driving and data collection</a>.</p><p>New York City has also expressed interest in bringing autonomous vehicles to the city. <a href="https://www.nyc.gov/mayors-office/news/2024/03/mayor-adams-releases-requirements-opens-permit-applications-responsible-autonomous-vehicle" target="_blank">Last year</a>, the Adams administration implemented a series of safety requirements for responsible testing in the city and opened a permit program.</p><p>As part of the permit, Waymo must regularly meet and report data to DOT and work closely with law enforcement and emergency services.</p><p><strong>WATCH:</strong> <a href="https://www.cnbc.com/video/2025/07/08/waymo-begins-testing-self-driving-cars-with-human-drivers-in-new-york-and-philadelphia.html">Waymo begins testing self-driving cars with human drivers in New York and Philadelphia</a></p></div><div id="Placeholder-ArticleBody-Video-108168745" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000381578" aria-labelledby="Placeholder-ArticleBody-Video-108168745"><p><img src="https://image.cnbcfm.com/api/v1/image/108168746-17519709091751970907-40621734100-1080pnbcnews.jpg?v=1751970908&amp;w=750&amp;h=422&amp;vtcrop=y" alt="Waymo begins testing self-driving cars with human drivers in New York and Philadelphia"><span></span><span></span></p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[FFmpeg 8.0 (809 pts)]]></title>
+            <title><![CDATA[FFmpeg 8.0 (832 pts)]]></title>
             <link>https://ffmpeg.org/index.html#pr8.0</link>
             <guid>44985730</guid>
             <pubDate>Fri, 22 Aug 2025 15:22:42 GMT</pubDate>
@@ -3221,947 +3395,6 @@ Couldn't get https://blog.thunderbird.net/2025/08/tbpro-august-2025-update/: Err
             <pubDate>Fri, 22 Aug 2025 10:02:21 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.bbc.co.uk/news/articles/cq68j5g2nr1o">https://www.bbc.co.uk/news/articles/cq68j5g2nr1o</a>, See on <a href="https://news.ycombinator.com/item?id=44982681">Hacker News</a></p>
 <div id="readability-page-1" class="page"><article id="urn-bbc-ares--article-cq68j5g2nr1o"><header data-component="headline-block"></header><div data-component="image-block"><figure><p><span><picture><source srcset="https://ichef.bbci.co.uk/ace/standard/240/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg.webp 240w, https://ichef.bbci.co.uk/ace/standard/320/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg.webp 320w, https://ichef.bbci.co.uk/ace/standard/480/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg.webp 480w, https://ichef.bbci.co.uk/ace/standard/624/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg.webp 624w, https://ichef.bbci.co.uk/ace/standard/800/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg.webp 800w" type="image/webp"><img alt="An image of the 4chan logo on a mobile phone shown on a multicoloured abstract background" src="https://ichef.bbci.co.uk/ace/standard/820/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg" srcset="https://ichef.bbci.co.uk/ace/standard/240/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg 240w, https://ichef.bbci.co.uk/ace/standard/320/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg 320w, https://ichef.bbci.co.uk/ace/standard/480/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg 480w, https://ichef.bbci.co.uk/ace/standard/624/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg 624w, https://ichef.bbci.co.uk/ace/standard/800/cpsprodpb/d789/live/a6b26a30-7e96-11f0-8884-75e02e8a067a.jpg 800w" width="820" height="460.00000000000006"></picture></span><span role="text"><span>Image source, </span>Getty Images</span></p></figure></div><div data-component="text-block"><p><b>A lawyer representing the online message board 4chan says it won't pay a proposed fine by the UK's media regulator as it enforces the Online Safety Act.</b></p><p>According to Preston Byrne, managing partner of law firm Byrne &amp; Storm, Ofcom has provisionally decided to impose a £20,000 fine "with daily penalties thereafter" for as long as the site fails to comply with its request.</p><p>"Ofcom's notices create no legal obligations in the United States," he told the BBC, adding he believed the regulator's investigation was part of an "illegal campaign of harassment" against US tech firms.</p><p>Ofcom has declined to comment while its investigation continues.</p></div><div data-component="text-block"><p>"4chan has broken no laws in the United States - my client will not pay any penalty," Mr Byrne said.</p><p><a href="https://www.bbc.co.uk/news/articles/ckgqwlvq180o">Ofcom began investigating 4chan</a> over whether it was complying with its obligations under the UK's Online Safety Act.</p><p>Then in August, it said it had issued 4chan with "a provisional notice of contravention" for failing to comply with two requests for information.</p><p>Ofcom said its investigation would examine whether the message board was complying with the act, including requirements to protect its users from illegal content.</p><p>4chan has often been at the heart of online controversies in its 22 years, including misogynistic campaigns and conspiracy theories.</p><p>Users are anonymous, which can often lead to extreme content being posted.</p></div><p data-component="subheadline-block"><h2 id="First-Amendment-rights" tabindex="-1"><span role="text">'First Amendment rights'</span></h2></p><div data-component="text-block"><p>In a statement posted on X, law firms Byrne &amp; Storm and Coleman Law said 4chan was a US company incorporated in the US, and therefore protected against the UK law.</p><p>"American businesses do not surrender their First Amendment rights because a foreign bureaucrat sends them an email," they wrote.</p><p>"Under settled principles of US law, American courts will not enforce foreign penal fines or censorship codes. </p><p>"If necessary, we will seek appropriate relief in US federal court to confirm these principles."</p><p>They said authorities in the US had been "briefed" on their response to Ofcom's investigation.</p><p>The statement concludes by calling on the Trump administration to invoke all diplomatic and legal levers to protect American businesses from "extraterritorial censorship mandates".</p><p>Ofcom has previously said the Online Safety Act only requires services to take action to protect users based in the UK.</p></div><p data-component="subheadline-block"><h2 id="UK-backs-down" tabindex="-1"><span role="text">UK backs down</span></h2></p><div data-component="text-block"><p>Some American politicians - particularly the Trump administration, its allies and officials - have pushed back against what they regard as overreach in the regulation of US tech firms by the UK and EU. </p><p>A perceived impact of the Online Safety Act on free speech has been a particular concern, but other laws have also been the source of disagreement.</p><p>On 19 August, US Director of National Intelligence Tulsi Gabbard said the UK had withdrawn its controversial demand for a "backdoor" in an Apple data protection system - saying she worked with the President and Vice President to get the UK to abandon its plan.</p><p>Two days later, US Federal Trade Commission chairman Andrew Ferguson warned big tech firms they could be violating US law if they weakened privacy and data security requirements by complying with international laws such as the Online Safety Act.</p><p>"Foreign governments seeking to limit free expression or weaken data security in the United States might count on the fact that companies have an incentive to simplify their operations and legal compliance measures by applying uniform policies across jurisdictions," he said.</p><p>If 4chan does successfully fight the fine in the US courts, Ofcom may have other options.</p><p>"Enforcing against an offshore provider is tricky," Emma Drake, partner of online safety and privacy at law firm Bird and Bird, told the BBC. </p><p>"Ofcom can instead ask a court to order other services to disrupt a provider's UK business, such as requiring a service's removal from search results or blocking of UK payments.</p><p>"If Ofcom doesn't think this will be enough to prevent significant harm, it can even ask that ISPs be ordered to block UK access."</p></div><div data-component="image-block"><figure><p><span><picture><source srcset="https://ichef.bbci.co.uk/ace/standard/240/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 240w, https://ichef.bbci.co.uk/ace/standard/320/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 320w, https://ichef.bbci.co.uk/ace/standard/480/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 480w, https://ichef.bbci.co.uk/ace/standard/624/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 624w, https://ichef.bbci.co.uk/ace/standard/800/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 800w, https://ichef.bbci.co.uk/ace/standard/976/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png.webp 976w" type="image/webp"><img alt="A green promotional banner with black squares and rectangles forming pixels, moving in from the right. The text says: “Tech Decoded: The world’s biggest tech news in your inbox every Monday.”" loading="lazy" src="https://ichef.bbci.co.uk/ace/standard/1600/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png" srcset="https://ichef.bbci.co.uk/ace/standard/240/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 240w, https://ichef.bbci.co.uk/ace/standard/320/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 320w, https://ichef.bbci.co.uk/ace/standard/480/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 480w, https://ichef.bbci.co.uk/ace/standard/624/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 624w, https://ichef.bbci.co.uk/ace/standard/800/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 800w, https://ichef.bbci.co.uk/ace/standard/976/cpsprodpb/80c1/live/7a4731e0-2128-11f0-9060-674316cb3a1f.png 976w" width="1600" height="263"></picture></span></p></figure></div></article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Go is still not good (525 pts)]]></title>
-            <link>https://blog.habets.se/2025/07/Go-is-still-not-good.html</link>
-            <guid>44982491</guid>
-            <pubDate>Fri, 22 Aug 2025 09:25:23 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://blog.habets.se/2025/07/Go-is-still-not-good.html">https://blog.habets.se/2025/07/Go-is-still-not-good.html</a>, See on <a href="https://news.ycombinator.com/item?id=44982491">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div aria-label="Content">
-        <article itemscope="" itemtype="http://schema.org/BlogPosting">
-
-
-  
-
-  <div itemprop="articleBody">
-    <p>Previous posts <a href="https://blog.habets.se/2013/10/Why-Go-is-not-my-favourite-language.html">Why Go is not my favourite language</a> and <a href="https://blog.habets.se/2022/02/Go-programs-are-not-portable.html">Go programs
-are not portable</a> have me critiquing Go for over a decade.</p>
-
-<p>These things about Go are bugging me more and more. Mostly because they’re so
-unnecessary. The world knew better, and yet Go was created the way it was.</p>
-
-<p>For readers of previous posts you’ll find some things repeated here. Sorry
-about that.</p>
-
-<h2 id="error-variable-scope-is-forced-to-be-wrong">Error variable scope is forced to be wrong</h2>
-
-<p>Here’s an example of the language forcing you to do the wrong thing. It’s very
-helpful for the reader of code (and code is read more often than it’s written),
-to minimize the scope of a variable. If by mere syntax you can tell the reader
-that a variable is just used in these two lines, then that’s a good thing.</p>
-
-<p>Example:</p>
-
-<div><pre><code><span>if</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>foo</span><span>();</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-   </span><span>return</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>(enough has been said about this verbose repeated boilerplate that I don’t have
-to. I also don’t particularly care)</p>
-
-<p>So that’s fine. The reader knows <code>err</code> is here and only here.</p>
-
-<p>But then you encounter this:</p>
-
-<div><pre><code><span>bar</span><span>,</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>foo</span><span>()</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>=</span><span> </span><span>foo2</span><span>();</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span><span>[</span><span>…</span><span> </span><span>a</span><span> </span><span>lot</span><span> </span><span>of</span><span> </span><span>code</span><span> </span><span>below</span><span> </span><span>…</span><span>]</span><span>
-</span></code></pre>
-</div>
-
-<p>Wait, what? Why is <code>err</code> reused for <code>foo2()</code>? Is there’s something subtle I’m
-not seeing? Even if we change that to <code>:=</code>, we’re left to wonder why <code>err</code> is
-in scope for (potentially) the rest of the function. Why? Is it read later?</p>
-
-<p>Especially when looking for bugs, an experienced coder will see these things
-and slow down, because here be dragons. Ok, now I’ve wasted a couple of seconds
-on the red herring of reusing <code>err</code> for <code>foo2()</code>.</p>
-
-<p>Is a bug perhaps that the function ends with this?</p>
-
-<div><pre><code><span>// Return foo99() error. (oops, that's not what we're doing)</span><span>
-</span><span>foo99</span><span>()</span><span>
-</span><span>return</span><span> </span><span>err</span><span> </span><span>// This is `err` from way up there in the foo() call.</span><span>
-</span></code></pre>
-</div>
-
-<p>Why does the scope of <code>err</code> extend way beyond where it’s relevant?</p>
-
-<p>The code would have been so much easier to read if only <code>err</code>’s scope had been
-smaller. But that’s not syntactically possible in Go.</p>
-
-<p>This was not thought through. Deciding on this was not thinking, it was typing.</p>
-
-<h2 id="two-types-of-nil">Two types of nil</h2>
-
-<p>Look at this nonsense:</p>
-
-<div><pre><code><span>package</span><span> </span><span>main</span><span>
-</span><span>import</span><span> </span><span>"fmt"</span><span>
-</span><span>type</span><span> </span><span>I</span><span> </span><span>interface</span><span>{}</span><span>
-</span><span>type</span><span> </span><span>S</span><span> </span><span>struct</span><span>{}</span><span>
-</span><span>func</span><span> </span><span>main</span><span>()</span><span> </span><span>{</span><span>
-    </span><span>var</span><span> </span><span>i</span><span> </span><span>I</span><span>
-    </span><span>var</span><span> </span><span>s</span><span> </span><span>*</span><span>S</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>s</span><span>,</span><span> </span><span>i</span><span>)</span><span> </span><span>// nil nil</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>s</span><span> </span><span>==</span><span> </span><span>nil</span><span>,</span><span> </span><span>i</span><span> </span><span>==</span><span> </span><span>nil</span><span>,</span><span> </span><span>s</span><span> </span><span>==</span><span> </span><span>i</span><span>)</span><span> </span><span>// t,t,f: They're equal, but they're not.</span><span>
-    </span><span>i</span><span> </span><span>=</span><span> </span><span>s</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>s</span><span>,</span><span> </span><span>i</span><span>)</span><span> </span><span>// nil nil</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>s</span><span> </span><span>==</span><span> </span><span>nil</span><span>,</span><span> </span><span>i</span><span> </span><span>==</span><span> </span><span>nil</span><span>,</span><span> </span><span>s</span><span> </span><span>==</span><span> </span><span>i</span><span>)</span><span> </span><span>// t,f,t: They are not equal, but they are.</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>Go was not satisfied with one <a href="https://www.infoq.com/presentations/Null-References-The-Billion-Dollar-Mistake-Tony-Hoare/">billion dollar
-mistake</a>,
-so they decided to have <strong>two</strong> flavors of <code>NULL</code>.</p>
-
-<p>“What color is your nil?” — The two billion dollar mistake.</p>
-
-<p>The reason for the difference boils down to again, not thinking, just typing.</p>
-
-<h2 id="its-not-portable">It’s not portable</h2>
-
-<p>Adding comment near the top of the file for conditional compilation must be the
-dumbest thing ever. Anybody who’s actually tried to maintain a portable program
-will tell you this will only cause suffering.</p>
-
-<p>It’s an <a href="https://en.wikipedia.org/wiki/Aristotelian_physics">Aristotle way of the science</a> of designing a language; lock
-yourself up in a room, and never test your hypotheses against reality.</p>
-
-<p>The problem is that this is not year 350 BCE. We actually have experience that
-aside from air resistance, heavy and light objects actually fall at the same
-speed. And we have experience with portable programs, and would not do
-something this dumb.</p>
-
-<p>If this had been the year 350 BCE, then this could be forgiven. Science as we
-know it hadn’t been invented yet. But this is after decades of very widely
-available experience in portability.</p>
-
-<p>More details in <a href="https://blog.habets.se/2022/02/Go-programs-are-not-portable.html">this post</a>.</p>
-
-<h2 id="append-with-no-defined-ownership"><code>append</code> with no defined ownership</h2>
-
-<p>What does this print?</p>
-
-<div><pre><code><span>package</span><span> </span><span>main</span><span>
-</span><span>import</span><span> </span><span>"fmt"</span><span>
-</span><span>func</span><span> </span><span>foo</span><span>(</span><span>a</span><span> </span><span>[]</span><span>string</span><span>)</span><span> </span><span>{</span><span>
-    </span><span>a</span><span> </span><span>=</span><span> </span><span>append</span><span>(</span><span>a</span><span>,</span><span> </span><span>"NIGHTMARE"</span><span>)</span><span>
-</span><span>}</span><span>
-</span><span>func</span><span> </span><span>main</span><span>()</span><span> </span><span>{</span><span>
-    </span><span>a</span><span> </span><span>:=</span><span> </span><span>[]</span><span>string</span><span>{</span><span>"hello"</span><span>,</span><span> </span><span>"world"</span><span>,</span><span> </span><span>"!"</span><span>}</span><span>
-    </span><span>foo</span><span>(</span><span>a</span><span>[</span><span>:</span><span>1</span><span>])</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>a</span><span>)</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>Probably <code>[hello NIGHTMARE !]</code>. Who wants that? Nobody wants that.</p>
-
-<p>Ok, how about this?</p>
-
-<div><pre><code><span>package</span><span> </span><span>main</span><span>
-</span><span>import</span><span> </span><span>"fmt"</span><span>
-</span><span>func</span><span> </span><span>foo</span><span>(</span><span>a</span><span> </span><span>[]</span><span>string</span><span>)</span><span> </span><span>{</span><span>
-    </span><span>a</span><span> </span><span>=</span><span> </span><span>append</span><span>(</span><span>a</span><span>,</span><span> </span><span>"BACON"</span><span>,</span><span> </span><span>"THIS"</span><span>,</span><span> </span><span>"SHOULD"</span><span>,</span><span> </span><span>"WORK"</span><span>)</span><span>
-</span><span>}</span><span>
-</span><span>func</span><span> </span><span>main</span><span>()</span><span> </span><span>{</span><span>
-    </span><span>a</span><span> </span><span>:=</span><span> </span><span>[]</span><span>string</span><span>{</span><span>"hello"</span><span>,</span><span> </span><span>"world"</span><span>,</span><span> </span><span>"!"</span><span>}</span><span>
-    </span><span>foo</span><span>(</span><span>a</span><span>[</span><span>:</span><span>1</span><span>])</span><span>
-    </span><span>fmt</span><span>.</span><span>Println</span><span>(</span><span>a</span><span>)</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>If you guessed <code>[hello world !]</code>, then you know more than anybody should have
-to know about quirks of a stupid programming language.</p>
-
-<h2 id="defer-is-dumb"><code>defer</code> is dumb</h2>
-
-<p>Even in a GC language, sometimes you just can’t wait to destroy a resource. It
-really does need to run as we leave the local code, be it by normal return, or
-via an exception (aka panic).</p>
-
-<p>What we clearly want is RAII, or something like it.</p>
-
-<p>Java has it:</p>
-
-<div><pre><code><span>try</span> <span>(</span><span>MyResource</span> <span>r</span> <span>=</span> <span>new</span> <span>MyResource</span><span>())</span> <span>{</span>
-  <span>/*
-  work with resource r, which will be cleaned up when the scope ends via
-  .close(), not merely when the GC feels like it.
-  */</span>
-<span>}</span>
-</code></pre>
-</div>
-
-<p>Python has it. Though Python is <em>almost</em> entirely refcounted, so one can pretty
-much rely on the <code>__del__</code> finalizer being called. But if it’s important, then
-there’s the <code>with</code> syntax.</p>
-
-<div><pre><code><span>with</span> <span>MyResource</span><span>()</span> <span>as</span> <span>res</span><span>:</span>
-  <span># some code. At end of the block __exit__ will be called on res.</span>
-</code></pre>
-</div>
-
-<p>Go? Go makes you go read the manual and see if this particular resource needs
-to have a defer function called on it, and which one.</p>
-
-<div><pre><code><span>foo</span><span>,</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>myResource</span><span>()</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span><span>defer</span><span> </span><span>foo</span><span>.</span><span>Close</span><span>()</span><span>
-</span></code></pre>
-</div>
-
-<p>This is so dumb. Some resources need a defer destroy. Some don’t. Which ones?
-Good fucking luck.</p>
-
-<p>And you also regularly end up with stuff like this monstrosity:</p>
-
-<div><pre><code><span>f</span><span>,</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>openFile</span><span>()</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>nil</span><span>,</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span><span>defer</span><span> </span><span>f</span><span>.</span><span>Close</span><span>()</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>f</span><span>.</span><span>Write</span><span>(</span><span>something</span><span>());</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>nil</span><span>,</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span><span>if</span><span> </span><span>err</span><span> </span><span>:=</span><span> </span><span>f</span><span>.</span><span>Close</span><span>();</span><span> </span><span>err</span><span> </span><span>!=</span><span> </span><span>nil</span><span> </span><span>{</span><span>
-  </span><span>return</span><span> </span><span>nil</span><span>,</span><span> </span><span>err</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>Yes, this is what you NEED to do to safely write something to a file in Go.</p>
-
-<p>What’s this, a <em>second</em> <code>Close()</code>? Oh yeah, of course that’s needed. Is it even
-safe to double-close, or does my defer need to check for that? It happens to be
-safe on <code>os.File</code>, but on other things: WHO KNOWS?!</p>
-
-<h2 id="the-standard-library-swallows-exceptions-so-all-hope-is-lost">The standard library swallows exceptions, so all hope is lost</h2>
-
-<p>(Largely a repeat of part of <a href="https://blog.habets.se/2013/10/Why-Go-is-not-my-favourite-language.html">a previous post</a>)</p>
-
-<p>Go says it doesn’t have exceptions. Go makes it extremely awkward to use
-exceptions, because they want to punish programmers who use them.</p>
-
-<p>Ok, fine so far.</p>
-
-<p>But all Go programmers must still write exception safe code. Because while
-<em>they</em> don’t use exceptions, other code will. Things will panic.</p>
-
-<p>So you need, not should, NEED, to write code like:</p>
-
-<div><pre><code><span>func</span><span> </span><span>(</span><span>f</span><span> </span><span>*</span><span>Foo</span><span>)</span><span> </span><span>foo</span><span>()</span><span> </span><span>{</span><span>
-    </span><span>f</span><span>.</span><span>mutex</span><span>.</span><span>Lock</span><span>()</span><span>
-    </span><span>defer</span><span> </span><span>f</span><span>.</span><span>mutex</span><span>.</span><span>Unlock</span><span>()</span><span>
-    </span><span>f</span><span>.</span><span>bar</span><span>()</span><span>
-</span><span>}</span><span>
-</span></code></pre>
-</div>
-
-<p>What is this stupid middle endian system? That’s dumb just like putting the day
-in the middle of a date is dumb. MMDDYY, honestly? (separate rant)</p>
-
-<p>But panic will terminate the program, they say, so why do you care if you
-unlock a mutex five milliseconds before it exits anyway?</p>
-
-<p>Because what if something swallows that exception and carries on as normal, and
-you’re now stuck with a locked mutex?</p>
-
-<p>But surely nobody would do that? Reasonable and strict coding standards would
-surely prevent it, under penalty of being fired?</p>
-
-<p>The standard library does that. <code>fmt.Print</code> when calling <code>.String()</code>, and the
-standard library HTTP server does that, for exceptions in the HTTP handlers.</p>
-
-<p>All hope is lost. You MUST write exception safe code. But you can’t use
-exceptions. You can only have the downsides of exceptions be thrust upon you.</p>
-
-<p>Don’t let them gaslight you.</p>
-
-<h2 id="sometimes-things-arent-utf-8">Sometimes things aren’t UTF-8</h2>
-
-<p>If you stuff random binary data into a <code>string</code>, Go just steams along, as
-described <a href="https://fasterthanli.me/articles/i-want-off-mr-golangs-wild-ride">in this post</a>.</p>
-
-<p>Over the decades I have lost data to tools skipping non-UTF-8 filenames. I
-should not be blamed for having files that were named before UTF-8 existed.</p>
-
-<p>Well… I had them. They’re gone now. They were silently skipped in a
-backup/restore.</p>
-
-<p>Go wants you to continue losing data. Or at least, when you lose data, it’ll
-say “well, what (encoding) was the data wearing?”.</p>
-
-<p>Or how about you just do something more thought through, when you design a
-language? How about doing the right thing, instead of the obviously wrong
-simple thing?</p>
-
-<h2 id="memory-use">Memory use</h2>
-
-<p>Why do I care about memory use? RAM is cheap. Much cheaper than the time it
-takes to read this blog post. I care because my service runs on a cloud
-instance where you actually pay for RAM. Or you run containers, and you want to
-run a thousand of them on the same machine. Your data may <a href="https://yourdatafitsinram.net/">fit in
-RAM</a>, but it’s still expensive if you have to
-give your thousand containers 4TiB of RAM instead of 1TiB.</p>
-
-<p>You can manually trigger a GC run with <code>runtime.GC()</code>, but “oh no don’t do
-that”, they say, “it’ll run when it has to, just trust it”.</p>
-
-<p>Yeah, 90% of the time, that works every time. But then it doesn’t.</p>
-
-<p>I rewrote some stuff in another language because over time the Go version would
-use more and more memory.</p>
-
-<h2 id="it-didnt-have-to-be-this-way">It didn’t have to be this way</h2>
-
-<p>We knew better. This was not the COBOL debate over whether to use symbols or
-English words.</p>
-
-<p>And it’s not like when we didn’t know at the time that <a href="https://blog.habets.se/2022/08/Java-a-fractal-of-bad-experiments.html">Java’s ideas were
-bad</a>, because we did know Go’s ideas were bad.</p>
-
-<p>We already knew better than Go, and yet now we’re stuck with bad Go codebases.</p>
-
-<h2 id="other-peoples-posts">Other people’s posts</h2>
-
-<ul>
-  <li>https://www.uber.com/en-GB/blog/data-race-patterns-in-go/</li>
-  <li>https://fasterthanli.me/articles/lies-we-tell-ourselves-to-keep-using-golang</li>
-  <li>https://fasterthanli.me/articles/i-want-off-mr-golangs-wild-ride</li>
-</ul>
-
-
-  </div>
-
-  
-  
-  
-  
-  
-  
-</article>
-
-      </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[LabPlot: Free, open source and cross-platform Data Visualization and Analysis (198 pts)]]></title>
-            <link>https://labplot.org/</link>
-            <guid>44982409</guid>
-            <pubDate>Fri, 22 Aug 2025 09:11:26 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://labplot.org/">https://labplot.org/</a>, See on <a href="https://news.ycombinator.com/item?id=44982409">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="page-container">
-		
-	<div>
-				<p>
-					By using our website, you agree to the use of our cookies.				</p>
-				
-			</div>
-
-
-
-									
-					
-
-							
-					
-
-		
-
-        
-
-			<div id="wrapper"><div data-vc-full-width="true" data-vc-full-width-init="false" data-vc-stretch-content="true"><div id="heading-i8kMxlHJIR">
-	<p>
-
-		
-			<h2>
-				FREE, open source and cross-platform Data Visualization and Analysis software accessible to everyone and trusted by  <a href="https://labplot.org/references">professionals</a>			</h2>
-
-		
-	</p>
-</div><div id="single-image-Z8UnYDWaAp">
-
-		
-			<p><img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/01_basic_plots_linux.png" alt="Example showing a combination of some basic visualizations together with a spreadsheet providing the data">
-													
-									
-							</p>
-
-		
-	</div></div><div id="features" data-vc-full-width="true" data-vc-full-width-init="false" data-jarallax="" data-speed="0.2"><div>
-<div id="heading-I6Zozs2f8D">
-	<p>
-
-		
-			<h2>
-				FEATURE HIGHLIGHTS			</h2>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        
-<div id="heading-BO4MrwNl16">
-	<p>
-
-		
-			<h2>
-				What can you expect?			</h2>
-
-		
-	</p>
-</div>
-            
-        </div><div><div data-wow-delay="0ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-JdIV17Yakn">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/01_basic_plots_linux-1024x646.png" rel="lightbox" data-rel="lightbox-image-0" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/01_basic_plots_linux-1024x646.png" alt="Example showing a combination of some basic visualizations together with a spreadsheet providing the data">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-PvFzOMfm1g">
-	<p>
-
-		
-			<h3>
-				High-quality data visualization and interactive plotting with few clicks			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div><div data-wow-delay="0.3ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-SOft7RPkag">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/02_overview_linux-1024x646.png" rel="lightbox" data-rel="lightbox-image-1" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/02_overview_linux-1024x646.png" alt="Example showing some basic statistical analysis of the data">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-4RmIw9bcxz">
-	<p>
-
-		
-			<h3>
-				Reliable and easy data analysis, statistics, regression, curve and peak fitting			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div><div data-wow-delay="0.6ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-fTbuiXCpW4">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/11_maxima_Duffing_Oscillator_linux-1024x646.png" rel="lightbox" data-rel="lightbox-image-2" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/11_maxima_Duffing_Oscillator_linux-1024x646.png" alt="Results of the computations performed in a Maxima session, visualized in LabPlot">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-V4Nxip0FSe">
-	<p>
-
-		
-			<h3>
-				Intuitive and fast computing with interactive notebooks using Python, R, Julia etc.			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div></div><div><div data-wow-delay="0ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-Pi6S2vNQXa">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/data_extractor_example-1024x547.jpg" rel="lightbox" data-rel="lightbox-image-3" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/data_extractor_example-1024x547.jpg" alt="Manual point-and-click or semi-automated approach to extract the data from images">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-6LsY7DJEmU">
-	<p>
-
-		
-			<h3>
-				Effortless data extraction (plot digitizer) and support for real-time data			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div><div data-wow-delay="0.3ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-jWu2st8VcS">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/data_import_example-1024x549.jpg" rel="lightbox" data-rel="lightbox-image-4" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/data_import_example-1024x549.jpg" alt="Data Import">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-7lcFOjboPp">
-	<p>
-
-		
-			<h3>
-				Smooth data import and export to and from multiple formats			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div><div data-wow-delay="0.6ss" data-wow-duration="0.7ss">
-            
-            
-
-        
-<div id="single-image-Y7I0Xl8kde">
-
-		
-			<p><a href="https://labplot.org/wp-content/uploads/2022/02/04_theming_win-1024x619.png" rel="lightbox" data-rel="lightbox-image-5" data-rl_title="" data-rl_caption="" title="">
-					
-													<img decoding="async" src="https://labplot.org/wp-content/uploads/2022/02/04_theming_win-1024x619.png" alt="Windows Theme">
-													
-											</a>
-									
-							</p>
-
-		
-	</div>
-            
-        
-            
-            
-
-        
-<div id="heading-swOkrgEAhT">
-	<p>
-
-		
-			<h3>
-				Available for Windows, macOS, Linux, FreeBSD and Haiku			</h3>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        </div></div><div id="features_more">
-	<p>
-
-		
-			<h2>
-				Visit feature page to view the complete feature list			</h2>
-
-		
-	</p>
-</div>
-
-            
-        </div><div id="latestnews" data-vc-full-width="true" data-vc-full-width-init="false"><div>
-<div id="heading-tZFxzWe57L">
-	<p>
-
-		
-			<h2>
-				LATEST NEWS			</h2>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        
-<div id="heading-oug3SerBFw">
-	<p>
-
-		
-			<h2>
-				Stay in touch with recent developments			</h2>
-
-		
-	</p>
-</div>
-            
-        </div>
-
-
-
-<div id="recent-posts-kO7GQ9qyR6" data-id="3">
-		
-	<article id="post-4200" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-				<a href="https://labplot.org/2025/08/18/labplot-2-12-1-released/">
-					<h2 itemprop="headline">
-												LabPlot 2.12.1 released					</h2>
-				</a>
-
-				
-
-				<p>Today we are announcing the availability of the minor patch release 2.12.1. This release contains minor improvements and bug fixes only. The fixes are distributed over many different areas of the application and we recommend everybody update to this patch release which is available from…</p>
-
-				
-			</div>
-	</article>
-
-
-
-	<article id="post-4026" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-			
-			<div>
-				
-									<p><img fetchpriority="high" decoding="async" width="470" height="236" src="https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0.png" alt="" srcset="https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0.png 470w, https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0-300x151.png 300w, https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0-24x12.png 24w, https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0-36x18.png 36w, https://labplot.org/wp-content/uploads/2025/04/LabPlot-Splash-2.12.0-48x24.png 48w" sizes="(max-width: 470px) 100vw, 470px"></p>
-
-    			</div>
-
-			<div>
-				<a href="https://labplot.org/2025/04/28/labplot-2-12-released/">
-					<h2 itemprop="headline">
-												LabPlot 2.12 released					</h2>
-				</a>
-
-				
-
-				<p>Welcome LabPlot 2.12! After many months of intense work, we are proud to announce the new release of LabPlot 2.12, a FREE, open source and cross-platform Data Visualization and Analysis software accessible to everyone and trusted by professionals! This latest release introduces a wealth of…</p>
-
-				
-			</div>
-
-		</div>
-	</article>
-
-
-
-	<article id="post-3768" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-				<a href="https://labplot.org/2024/12/20/new-labplot-user-documentation/">
-					<h2 itemprop="headline">
-												New LabPlot User Documentation					</h2>
-				</a>
-
-				
-
-				<p>In recent weeks we have been working on transferring LabPlot’s documentation to a new format. We decided to move the documentation from the DocBook and MediaWiki format to the Sphinx/reStrcutredText framework. In our perception Sphinx offers a user-friendly and flexible way to create and manage…</p>
-
-				
-			</div>
-	</article>
-
-
-
-	<article id="post-3709" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-				<a href="https://labplot.org/2024/11/05/performance-of-data-import-in-labplot/">
-					<h2 itemprop="headline">
-												Performance of data import in LabPlot					</h2>
-				</a>
-
-				
-
-				<p>In many cases, importing data into LabPlot for further analysis and visualization is the first step in the application: LabPlot supports many different formats (CSV, Origin, SAS, Stata, SPSS, MATLAB, SQL, JSON, binary, OpenDocument Spreadsheets (ods), Excel (xlsx), HDF5, MQTT, Binary Logging Format (BLF), FITS,…</p>
-
-				
-			</div>
-	</article>
-
-
-
-	<article id="post-3696" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-				<a href="https://labplot.org/2024/10/01/google-summer-of-code-2024/">
-					<h2 itemprop="headline">
-												Google Summer of Code 2024					</h2>
-				</a>
-
-				
-
-				<p>Programmes like Season of KDE (SoK) and Google Summer of Code (GSoC) provide a great opportunity for young talent to become part of the open source community and contribute to open source projects. LabPlot, and KDE in general, has a long history and experience in…</p>
-
-				
-			</div>
-	</article>
-
-
-
-	<article id="post-3320" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-			
-			<div>
-				
-									<p><img decoding="async" width="1024" height="132" src="https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner.png" alt="" srcset="https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner.png 1024w, https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner-300x39.png 300w, https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner-768x99.png 768w, https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner-24x3.png 24w, https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner-36x5.png 36w, https://labplot.org/wp-content/uploads/2024/08/Wikipedia_Banner-48x6.png 48w" sizes="(max-width: 1024px) 100vw, 1024px"></p>
-
-    			</div>
-
-			<div>
-				<a href="https://labplot.org/2024/08/13/bad-information-drives-out-good-or-how-much-can-we-trust-wikipedia/">
-					<h2 itemprop="headline">
-												Bad information drives out good or how much can we trust Wikipedia?					</h2>
-				</a>
-
-				
-
-				<p>This post is written on behalf of the LabPlot team. It’s different compared to what we usually publish on our homepage but we feel we need to share this story with our community. Introduction You might already know this, but finalizing a release for a…</p>
-
-				
-			</div>
-
-		</div>
-	</article>
-
-
-
-	<article id="post-3261" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-			
-			<div>
-				
-									<p><img decoding="async" width="470" height="236" src="https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet.png" alt="LabPlot gets NLNet funding!" srcset="https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet.png 470w, https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet-300x151.png 300w, https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet-24x12.png 24w, https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet-36x18.png 36w, https://labplot.org/wp-content/uploads/2024/07/2.11_splash_nlnet-48x24.png 48w" sizes="(max-width: 470px) 100vw, 470px"></p>
-
-    			</div>
-
-			<div>
-				<a href="https://labplot.org/2024/07/30/labplot-funded-through-ngio-core-fund/">
-					<h2 itemprop="headline">
-												LabPlot funded through NGIO Core Fund					</h2>
-				</a>
-
-				
-
-				<p>This year we applied to NLnet’s NGI Zero Core open call for proposals in February 2024. After a thorough review by the NLnet Foundation, LabPlot’s application was accepted and will be funded by the NGI0 Core Fund, a fund established by NLnet with financial support…</p>
-
-				
-			</div>
-
-		</div>
-	</article>
-
-
-
-	<article id="post-3186" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-			
-			<div>
-				
-									<p><img loading="lazy" decoding="async" width="470" height="236" src="https://labplot.org/wp-content/uploads/2024/07/2.11.png" alt="" srcset="https://labplot.org/wp-content/uploads/2024/07/2.11.png 470w, https://labplot.org/wp-content/uploads/2024/07/2.11-300x151.png 300w, https://labplot.org/wp-content/uploads/2024/07/2.11-24x12.png 24w, https://labplot.org/wp-content/uploads/2024/07/2.11-36x18.png 36w, https://labplot.org/wp-content/uploads/2024/07/2.11-48x24.png 48w" sizes="auto, (max-width: 470px) 100vw, 470px"></p>
-
-    			</div>
-
-			<div>
-				<a href="https://labplot.org/2024/07/16/labplot-2-11-released/">
-					<h2 itemprop="headline">
-												LabPlot 2.11 released					</h2>
-				</a>
-
-				
-
-				<p>Say hello to LabPlot 2.11! This brand new release comes with many new features, improvements and performance enhancements in several areas, as well as support for more data formats and visualisation types. The main new features are outlined below. For a more detailed overview of…</p>
-
-				
-			</div>
-
-		</div>
-	</article>
-
-
-
-	<article id="post-2847" itemscope="itemscope" itemtype="http://schema.org/Article">
-		<div>
-			
-			<div>
-				
-									<p><img loading="lazy" decoding="async" width="470" height="236" src="https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1.png" alt="" srcset="https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1.png 470w, https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1-300x151.png 300w, https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1-24x12.png 24w, https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1-36x18.png 36w, https://labplot.org/wp-content/uploads/2023/07/LabPlot_2.10.1-48x24.png 48w" sizes="auto, (max-width: 470px) 100vw, 470px"></p>
-
-    			</div>
-
-			<div>
-				<a href="https://labplot.org/2023/07/12/labplot-2-10-1-released/">
-					<h2 itemprop="headline">
-												LabPlot 2.10.1 released					</h2>
-				</a>
-
-				
-
-				<p>Today we are announcing the availability of the minor patch release 2.10.1. This release contains minor improvements and bug fixes only. The fixes are distributed over many different areas of the application and we recommend everybody update to this patch release which is available from…</p>
-
-				
-			</div>
-
-		</div>
-	</article>
-
-
-	</div>
-            
-        </div><div id="gallery" data-vc-full-width="true" data-vc-full-width-init="false">
-<div id="heading-8BdjTuVR0o">
-	<p>
-
-		
-			<h2>
-				GALLERY			</h2>
-
-		
-	</p>
-</div>
-            
-        
-            
-            
-
-        
-<div id="heading-A1ye4mWuT0">
-	<p>
-
-		
-			<h2>
-				Get a first impression			</h2>
-
-		
-	</p>
-</div>
-            
-        </div><div id="galery" data-vc-full-width="true" data-vc-full-width-init="false" data-vc-stretch-content="true">
-	<p>
-
-		
-			<h2>
-				Want to see more?			</h2>
-
-		
-	</p>
-</div><div id="heading-nSVtR6mQ2I" data-vc-full-width="true" data-vc-full-width-init="false">
-	<p>
-
-		
-			<h2>
-				Like what you see and curious to try it out?			</h2>
-
-		
-	</p>
-</div>
-</div>
-</div></div>]]></description>
         </item>
     </channel>
 </rss>
