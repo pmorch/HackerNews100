@@ -4,12 +4,174 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 23 Aug 2025 20:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 23 Aug 2025 21:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[I hacked Monster Energy (130 pts)]]></title>
+            <title><![CDATA[What makes Claude Code so damn good (122 pts)]]></title>
+            <link>https://minusx.ai/blog/decoding-claude-code/</link>
+            <guid>44998295</guid>
+            <pubDate>Sat, 23 Aug 2025 19:07:42 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://minusx.ai/blog/decoding-claude-code/">https://minusx.ai/blog/decoding-claude-code/</a>, See on <a href="https://news.ycombinator.com/item?id=44998295">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><p>Claude Code is the most delightful AI agent/workflow I have used so far. Not only does it make targeted edits or vibe coding throwaway tools less annoying, using Claude Code makes me happy. It has enough autonomy to do interesting things, while not inducing a jarring loss of control like some other tools do. Of course most of the heavy lifting is done by the new Claude 4 model (especially interleaved thinking). But I find Claude Code objectively less annoying to use compared to Cursor, or Github Copilot agents even with the same underlying model! What makes it so damn good? If you're reading this and nodding along, I'm going to try and provide some answers.</p>
+<p><strong>Note</strong>: This is not a blogpost with Claude Code's architecture dump (there are some good ones out there). This blogpost is meant to be a guide for building delightful LLM agents, based on my own experience using and tinkering with Claude Code over the last few months (and all the logs we intercepted and analyzed). You can find <a href="#appendix">prompts</a> and <a href="#appendix">tools</a> in the <a href="#appendix">Appendix section</a>. This post is ~2k words long, so strap in! If you're looking for some quick takeaways, the <a href="#how-to-build-a-claude-code-like-agent-tldr">TL;DR</a> section is a good place to start.</p>
+
+<p><img src="https://minusx.ai/images/claude-code/prompts.png" alt="prompts">
+</p><p>You can clearly see the different Claude Code updates.</p>
+
+<p>Claude Code (CC) feels great to use, because it <em>just simply works</em>. CC has been crafted with a fundamental understanding of what the LLM is good at and what it is terrible at. Its prompts and tools cover for the model's stupidity and help it shine in its wheelhouse. The control loop is extremely simple to follow and trivial to debug.</p>
+<p>We started using CC at MinusX as soon as it launched. To look under the hood, <a href="https://x.com/ppsreejith_">Sreejith</a> wrote a logger that intercepts and logs every network request made. The following analysis is from my extensive use over the last couple of months. <strong>This post attempts to answer the question - "What makes Claude Code so good, and how can you give a CC-like experience in your own chat-based-LLM agent?"</strong> We've incorporated most of these into MinusX already and I'm excited to see you do it too!</p>
+
+<p><img src="https://minusx.ai/images/claude-code/tools.png" alt="prompts">
+</p><p>Edit is the most frequent tool, followed by Read and ToDoWrite</p>
+<br>
+<h2 id="how-to-build-a-claude-code-like-agent-tldr"><a href="#how-to-build-a-claude-code-like-agent-tldr">How to build a Claude Code like agent: TL;DR</a></h2>
+<p>If there is one thing to take away from this, it is this - <strong>Keep Things Simple, Dummy</strong>. LLMs are terrible enough to debug and evaluate. Any additional complexity you introduce (multi-agents, agent handoffs or complex RAG search algorithms) only makes debugging 10x harder. If such a fragile system works at all, you'll be terrified of making drastic changes to it later. So, keep everything in one file, avoid excessive boilerplate scaffolding and rip it all out at least a couple of times :)</p>
+<p>Here are the main takeaways from Claude Code to implement in your own system.</p>
+<h4 id="1-control-loop"><a href="#1-control-loop">1. Control Loop</a></h4>
+<ul>
+<li>1.1 <a href="#11-keep-one-main-loop">Keep one main loop (with max one branch) and one message history</a></li>
+<li>1.2 <a href="#12-use-a-smaller-model-for-everything">Use a smaller model for all sorts of things. All. The. Frickin. Time.</a></li>
+</ul>
+<h4 id="2-prompts"><a href="#2-prompts">2. Prompts</a></h4>
+<ul>
+<li>2.1 <a href="#21-use-claudemd-for-collaborating-on-user-context-and-preferences">Use claude.md pattern to collaborate on and remember user preferences</a></li>
+<li>2.2 <a href="#22-special-xml-tags-markdown-and-lots-of-examples">Use special XML Tags, Markdown, and lots of examples</a></li>
+</ul>
+<h4 id="3-tools"><a href="#3-tools">3. Tools</a></h4>
+<ul>
+<li>3.1 <a href="#31-llm-search---rag-based-search">LLM search &gt;&gt;&gt;  RAG based search</a></li>
+<li>3.2 <a href="#32-how-to-design-good-tools-low-level-vs-high-level-tools">How to design good tools? (High vs Low level tools)</a></li>
+<li>3.3 <a href="#33-let-the-agent-manage-a-todo-list">Let your agent manage its own todo list</a></li>
+</ul>
+<h4 id="4-steerability"><a href="#4-steerability">4. Steerability</a></h4>
+<ul>
+<li>4.1 <a href="#41-tone-and-style">Tone and style</a></li>
+<li>4.2 <a href="#42-this-is-important-is-still-state-of-the-art">"<strong>PLEASE THIS IS IMPORTANT</strong>" is unfortunately still state of the art</a></li>
+<li>4.3 <a href="#43-write-the-algorithm-with-heuristics-and-examples">Write the algorithm, with heuristics and examples</a></li>
+</ul>
+<br>
+<blockquote>
+<p>Claude Code choses architectural simplicity at every juncture - one main loop, simple search, simple todolist, etc. Resist the urge to over-engineer, build good harness for the model let it cook! Is this end-to-end self-driving all over again? Bitter lesson much?</p>
+</blockquote>
+<hr>
+<h2 id="1-control-loop-design"><a href="#1-control-loop-design">1. Control Loop Design</a></h2>
+<h3 id="11-keep-one-main-loop"><a href="#11-keep-one-main-loop">1.1 Keep One Main Loop</a></h3>
+<p>Debuggability &gt;&gt;&gt; complicated hand-tuned multi-agent lang-chain-graph-node mishmash.</p>
+<p>Despite multi agent systems being all the rage, Claude Code has just one main thread. It uses a few different types of prompts periodically to summarize the git history, to clobber up the message history into one message or to come up with some fun UX elements. But apart from that, it maintains a flat list of messages. An interesting way it handles hierarchical tasks is by spawning itself as a sub-agent without the ability to spawn more sub-agents. There is a maximum of one branch, the result of which is added to the main message history as a "tool response".</p>
+<p>If the problem is simple enough, the main loop just handles it via iterative tool calling. But if there are one or more tasks that are complex, the main agent creates clones of itself. The combination of the max-1-branch and the todo list makes sure the agent has the ability to break the problem into sub-problems, but also keep the eye on the final desired outcome.</p>
+<p>I highly doubt your app needs a multi-agent system. With every layer of abstraction you make your system harder to debug, and more importantly you deviate from the general-model-improvement trajectory.</p>
+<p><img src="https://minusx.ai/images/claude-code/control_loop.gif" alt="Control Loop"></p>
+<h3 id="12-use-a-smaller-model-for-everything"><a href="#12-use-a-smaller-model-for-everything">1.2 Use a Smaller model for <em>everything</em></a></h3>
+<p>Over 50% of all important LLM calls made by CC are to claude-3-5-haiku. It is used to read large files, parse web pages, process git history and summarize long conversations. It is also used to come up with the one-word processing label - literally for every key stroke! The smaller models are 70-80% cheaper than the standard ones (Sonnet 4, GPT-4.1). Use them liberally!</p>
+<h2 id="2-prompts-1"><a href="#2-prompts-1">2. Prompts</a></h2>
+<p>Claude Code has extremely elaborate prompts filled with heuristics, examples and IMPORTANT (tch-tch) reminders. The system prompt is ~2800 tokens long, with the Tools taking up a whopping 9400 tokens. The user prompt always contains the claude.md file, which can typically be another 1000-2000 tokens. The system prompt contains sections on tone, style, proactiveness, task management, tool usage policy and doing tasks. It also contains the date, current working directory, platform and OS information and recent commits.</p>
+<p><a href="#appendix"><strong>Go read the entire prompt</strong></a>!</p>
+<h3 id="21-use-claudemd-for-collaborating-on-user-context-and-preferences"><a href="#21-use-claudemd-for-collaborating-on-user-context-and-preferences">2.1 Use claude.md for collaborating on user context and preferences</a></h3>
+<p>One of the major patterns most coding agent creators have settled on is the context file (aka Cursor Rules / claude.md / agent.md). The difference in Claude Code's performance with and without claude.md is night and day. It is a great way for the developers to impart context that cannot be inferred from the codebase and to codify all strict preferences. For example, you can force the LLM to skip some folders, or use specific libraries. CC sends the entire contents of the claude.md with every user request</p>
+<p>We recently introduced <a href="https://minusx.ai/blog/memory/">minusx.md in MinusX</a> which is fast becoming the de-facto context file for our agents to codify user and team preferences.</p>
+<h3 id="22-special-xml-tags-markdown-and-lots-of-examples"><a href="#22-special-xml-tags-markdown-and-lots-of-examples">2.2 Special XML Tags, Markdown, and lots of examples</a></h3>
+<p>It is fairly established that XML tags and Markdown are two ways to structure a prompt. CC uses both, extensively. Here are a few notable XML tags in Claude Code:</p>
+<ul>
+<li><code>&lt;system-reminder&gt;</code>: This is used at the end of many prompt sections to remind the LLM of thing it presumably otherwise forgets. Example:</li>
+</ul>
+<pre><code>&lt;system-reminder&gt;This is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware. If you are working on tasks that would benefit from a todo list please use the TodoWrite tool to create one. If not, please feel free to ignore. Again do not mention this message to the user.&lt;/system-reminder&gt;
+</code></pre>
+<ul>
+<li><code>&lt;good-example&gt;</code>, <code>&lt;bad-example&gt;</code>: These are used to codify heuristics. They can be especially useful when there is a fork in the road with multiple seemingly reasonable paths/tool_calls the model can choose. Examples can be used to contrast the cases and make it very clear which path is preferable. Example:</li>
+</ul>
+<pre><code>Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of `cd`. You may use `cd` if the User explicitly requests it.
+&lt;good-example&gt;
+pytest /foo/bar/tests  
+&lt;/good-example&gt;
+&lt;bad-example&gt;
+cd /foo/bar &amp;&amp; pytest tests
+&lt;/bad-example&gt;
+</code></pre>
+<p>CC also uses markdown to demarcate clear sections in the system prompt. Example markdown headings include:</p>
+<ul>
+<li>Tone and style</li>
+<li>Proactiveness</li>
+<li>Following conventions</li>
+<li>Code style</li>
+<li>Task Management</li>
+<li>Tool use policy</li>
+<li>Doing Tasks</li>
+<li>Tools</li>
+</ul>
+<h2 id="3-tools-1"><a href="#3-tools-1">3. Tools</a></h2>
+<p><a href="#appendix"><strong>Go read the entire tools prompt</strong></a> - it is a whopping 9400 tokens long!</p>
+<h3 id="31-llm-search---rag-based-search"><a href="#31-llm-search---rag-based-search">3.1 LLM search &gt;&gt;&gt;  RAG based search</a></h3>
+<p>One significant way in which CC deviates from other popular coding agents is in its rejection of RAG. Claude Code searches your code base just as you would, with really complex <code>ripgrep</code>, <code>jq</code> and <code>find</code> commands. Since the LLM understands code really well, it can use sophisticated regex to find pretty much any codeblock it deems relevant. Sometimes it ends up reading whole files with a smaller model.</p>
+<p>RAG sounds like a good idea in theory, but it introduces new (and more importantly, hidden) failure modes. What is the similarity function to use? What reranker? How do you chunk the code? What do you do with large JSON or log files? With LLM Search, it just looks at 10 lines of the json file to understand its structure. If it wants, it looks at 10 more lines - just like you would. Most importantly, this is RL learnable - something BigLabs are already working on. The model does most of the heavy lifting - as it should, dramatically reducing the number of moving parts in the agent. Also, having two complicated, intelligent systems wired this way is just ugly. I was recently kidding with a friend saying this is the Camera vs Lidar of the LLM era and I'm only half joking.</p>
+<h3 id="32-how-to-design-good-tools-low-level-vs-high-level-tools"><a href="#32-how-to-design-good-tools-low-level-vs-high-level-tools">3.2 How to design good tools? (Low level vs High level tools)</a></h3>
+<p>This question keeps anyone who is building an LLM agent up at night. Should you give the model generic tasks (like meaningful actions) or should it be low level (like type and click and bash)? The answer is that it depends (and you should use both).</p>
+<p>Claude Code has low level (Bash, Read, Write), medium level (Edit, Grep, Glob) and high level tools (Task, WebFetch, exit_plan_mode). CC can use bash, so why give a separate Grep tool? The real trade-off here is in how often you expect your agent to use the tool vs accuracy of the agent in using the tool. CC uses grep and glob so frequently that it makes sense to make separate tools out of them, but at the same time, it can also write generic bash commands for special scenarios.</p>
+<p>Similarly, there are even higher level tools like WebFetch or 'mcp__ide__getDiagnostics' that are extremely deterministic in what they do. This saves the LLM from having to do multiple low level clicking and typing and keeps it on track. Help the poor model out, will ya!? Tool descriptions have elaborate prompts with plenty of examples. The system prompt has information about ‘when to use a tool' or how to choose between two tools that can do the same task.</p>
+<p><strong>Tools in Claude Code:</strong></p>
+<div><div><ul>
+<li><a href="#appendix">Task</a></li>
+<li><a href="#appendix">Bash</a></li>
+<li><a href="#appendix">Glob</a></li>
+<li><a href="#appendix">Grep</a></li>
+<li><a href="#appendix">LS</a></li>
+<li><a href="#appendix">ExitPlanMode</a></li>
+<li><a href="#appendix">Read</a></li>
+<li><a href="#">Edit</a></li>
+</ul></div><div><ul>
+<li><a href="#appendix">MultiEdit</a></li>
+<li><a href="#appendix">Write</a></li>
+<li><a href="#appendix">NotebookEdit</a></li>
+<li><a href="#appendix">WebFetch</a></li>
+<li><a href="#appendix">TodoWrite</a></li>
+<li><a href="#appendix">WebSearch</a></li>
+<li><a href="#">mcp__ide__getDiagnostics</a></li>
+<li><a href="#">mcp__ide__executeCode</a></li>
+</ul></div></div>
+<h3 id="33-let-the-agent-manage-a-todo-list"><a href="#33-let-the-agent-manage-a-todo-list">3.3 Let the agent manage a todo list</a></h3>
+<p>There are many reasons why this is a good idea. Context rot is a common problem in long-running LLM agents. They enthusiastically start out tackling a difficult problem, but over time lose their way and devolve into garbage. There are a few ways current agent designs tackle this.
+Many agents have experimented with explicit todos (one model generates todos, another model implements them) or with Multi-agent handoff + verification (PRD/PM agent -&gt; implementer agent -&gt; QA agent)</p>
+<p>We already know multi-agent handoff is not a good idea, for many many reasons. CC uses an explicit todo list, but one that the model maintains. This keeps the LLM on track (it has been heavily prompted to refer to the todo list frequently), while at the same time giving the model the flexibility to course correct mid-way in an implementation. This also effectively leverages the model's interleaved thinking abilities to either reject or insert new todo items on the fly.</p>
+<h2 id="4-steerability-1"><a href="#4-steerability-1">4. Steerability</a></h2>
+<h3 id="41-tone-and-style"><a href="#41-tone-and-style">4.1 Tone and Style</a></h3>
+<p>CC explicitly attempts to control the aesthetic behavior of the agent. There are sections in the system prompt around tone, style and proactiveness - full of instructions and examples. This is  why Claude Code “feels” tasteful in its comments and eagerness. I recommend just copying large sections of this into your app as is.</p>
+<pre><code># Some examples of tone and style
+- IMPORTANT: You should NOT answer with unnecessary preamble or postamble (such as explaining your code or summarizing your action), unless the user asks you to.
+Do not add additional code explanation summary unless requested by the user.
+
+- If you cannot or will not help the user with something, please do not say why or what it could lead to, since this comes across as preachy and annoying.
+
+- Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.
+</code></pre>
+<h3 id="42-this-is-important-is-still-state-of-the-art"><a href="#42-this-is-important-is-still-state-of-the-art">4.2 "THIS IS IMPORTANT" is still State of the Art</a></h3>
+<p>Unfortunately CC is no better when it comes to asking the model to not do something. IMPORTANT, VERY IMPORTANT, NEVER and ALWAYS seem to be the best way to steer the model away from landmines. I expect the models to get more steerable in the future and avoid this ugliness. But for now, CC uses this liberally, and so should you. Some examples:</p>
+<pre><code>- IMPORTANT: DO NOT ADD ***ANY*** COMMENTS unless asked
+
+- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Task to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.\n  - If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first
+
+- IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+
+</code></pre>
+<h3 id="43-write-the-algorithm-with-heuristics-and-examples"><a href="#43-write-the-algorithm-with-heuristics-and-examples">4.3 Write the Algorithm (with heuristics and examples)</a></h3>
+<p>It is extremely important to identify the most important task the LLM needs to perform and write out the algorithm for it. Try to role-play as the LLM and work through examples, identify all the decision points and write them explicitly. It helps if this is in the form of a flow-chart. This helps structure the decision making and aids the LLM in following instructions. One thing to definitely avoid is a big soup of Dos and Don'ts. They are harder to keep track, and keep mutually exclusive. If your prompt is several thousand tokens long, you will inadvertently have conflicting Dos and Don'ts. The LLM becomes extremely fragile in this case and it becomes impossible to incorporate new use cases.</p>
+<p><code>Task Management</code>, <code>Doing Tasks</code> and <code>Tool Usage Policy</code> sections in Claude Code's system prompt clearly walk through the algorithm to follow. This is also the section to add lots of heuristics and examples of various scenarios the LLM might encounter.</p>
+<h2 id="bonus-why-pay-attention-to-biglab-prompts"><a href="#bonus-why-pay-attention-to-biglab-prompts">Bonus: Why pay attention to BigLab prompts?</a></h2>
+<p>A lot of the effort in steering LLMs is trying to reverse engineer their post-training / RLHF data distribution. Should you use JSON or XML? Should the tool descriptions be in the system prompt or just in tools? What about your app's current state? It helps to see what they do in their own apps and use it to inform yours. Claude Code design is very opinionated and it helps to use that in forming your own.</p>
+<br>
+<h2 id="conclusion"><a href="#conclusion">Conclusion</a></h2>
+<p>The main takeaway, again, is to keep things simple. Extreme scaffolding frameworks will hurt more than help you. Claude Code really made me believe that an "agent" can be simple and yet extremely powerful. We've incorporated a bunch of these lessons into MinusX, and are continuing to incorporate more.</p>
+<p>If you're interested in Claude-Codifying your own LLM agent, I'd love to chat - ping me on <a href="https://x.com/nuwandavek">twitter</a>! If you want trainable Claude Code like data agents for your Metabase, check out <a href="https://minusx.com/">MinusX</a> or set up a demo with me <a href="https://minusx.com/demo">here</a>. Happy (Claude) Coding!</p>
+
+<br>
+<hr>
+<br>
+<h2 id="appendix"><a href="#appendix">Appendix</a></h2>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[I hacked Monster Energy (145 pts)]]></title>
             <link>https://bobdahacker.com/blog/monster-energy</link>
             <guid>44997145</guid>
             <pubDate>Sat, 23 Aug 2025 16:42:18 GMT</pubDate>
@@ -86,7 +248,7 @@
         </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[RFC 9839 and Bad Unicode (187 pts)]]></title>
+            <title><![CDATA[RFC 9839 and Bad Unicode (195 pts)]]></title>
             <link>https://www.tbray.org/ongoing/When/202x/2025/08/14/RFC9839</link>
             <guid>44995640</guid>
             <pubDate>Sat, 23 Aug 2025 12:54:01 GMT</pubDate>
@@ -245,7 +407,7 @@ The badness that 9839 focuses on is “problematic characters”, so let’s sta
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Writing Speed-of-Light Flash Attention for 5090 in CUDA C++ (108 pts)]]></title>
+            <title><![CDATA[Writing Speed-of-Light Flash Attention for 5090 in CUDA C++ (115 pts)]]></title>
             <link>https://gau-nernst.github.io/fa-5090/</link>
             <guid>44995508</guid>
             <pubDate>Sat, 23 Aug 2025 12:29:02 GMT</pubDate>
@@ -808,7 +970,371 @@ $$</p><p>This associative property enables things like <a href="https://pytorch.
 </span></span></code></pre></div><p>Version 5: <a href="https://github.com/gau-nernst/learn-cuda/blob/e83c256/07_attention/attention_v5.cu">attention_v5.cu</a>.</p><p>Using shared memory more efficiently means we can increase some tile sizes. I increased <code>BLOCK_KV</code> from 32 back to 64. Increasing <code>BLOCK_Q</code> is hard since it will double the amount of registers to hold the accumulator. The improvement is modest but noticeable.</p><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr><tr><td>v5 (better pipelining)</td><td>197.74</td><td>94.39%</td></tr></tbody></table><h2 id="whats-next">What’s next?</h2><table><thead><tr><th>Kernel</th><th>TFLOPS</th><th>% of SOL</th></tr></thead><tbody><tr><td><code>F.sdpa()</code> (Flash Attention)</td><td>186.73</td><td>89.13%</td></tr><tr><td><code>F.sdpa()</code> (CuDNN)</td><td>203.61</td><td>97.19%</td></tr><tr><td><code>flash-attn</code></td><td>190.58</td><td>90.97%</td></tr><tr><td>v1 (basic)</td><td>142.87</td><td>68.20%</td></tr><tr><td>v2 (shared memory swizzling)</td><td>181.11</td><td>86.45%</td></tr><tr><td>v3 (2-stage pipelining)</td><td>189.84</td><td>90.62%</td></tr><tr><td>v4 (<code>ldmatrix.x4</code> for K and V)</td><td>194.33</td><td>92.76%</td></tr><tr><td>v5 (better pipelining)</td><td>197.74</td><td>94.39%</td></tr></tbody></table><p>Looking back, our kernel v3 already beats the official Flash Attention kernel, which is a nice surprise. It feels like it’s rather easy to get good performance out of 5090 compared to previous generations. However, our best kernel lagging behind CuDNN’s means that there is still headroom available. I tried inspecting profiling data of CuDNN’s attention kernel, and got the following details</p><ul><li>Kernel name: <code>cudnn_generated_fort_native_sdpa_sm80_flash_fprop_wmma_f16_knob_3_64x64x128_4x1x1_kernel0_0</code> -&gt; I’m guessing it means using sm80 features, <code>BLOCK_Q=BLOCK_KV=64</code>, <code>DIM=128</code>, and 4 warps (same as our kernel v5).</li><li>Shared memory: 40.96 Kb -&gt; that is <code>40960 / (64 * 128 * 2) = 2.5</code> times <code>(BLOCK_KV, DIM)</code>. The fractional number of buffers is rather strange. Or is their kernel more like <code>BLOCK_KV=32</code> and 5 buffers? I have no idea.</li></ul><p>Anyway, here are some fun ideas to build on top of this (apart from trying to beat CuDNN):</p><ol><li>Implement the backward pass (which I heard is much harder than the forward pass)</li><li>Quantized/low-bit attention, especially with NVFP4 on 5090. I believe <a href="https://github.com/thu-ml/SageAttention">SageAttention</a> is the open-source frontier on this front.</li><li>Use TMA (i.e. <code>cp.async.bulk</code>) with warp-specialization design. <a href="https://x.com/pranjalssh">Pranjal</a> wrote a <a href="https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog">nice blogpost</a> on this for H100 matmul.</li><li><a href="https://arxiv.org/abs/2309.06180">PagedAttention</a> (i.e. vLLM and SGLang), and then build a performant dependency-free serving engine.</li></ol><p>I hope this blogpost is useful to many people. Happy writing kernels!</p></section></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Librebox: An open source, Roblox-compatible game engine (184 pts)]]></title>
+            <title><![CDATA[Rethinking the Linux cloud stack for confidential VMs (102 pts)]]></title>
+            <link>https://lwn.net/Articles/1030818/</link>
+            <guid>44995234</guid>
+            <pubDate>Sat, 23 Aug 2025 11:39:15 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://lwn.net/Articles/1030818/">https://lwn.net/Articles/1030818/</a>, See on <a href="https://news.ycombinator.com/item?id=44995234">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+<blockquote>
+<b>Ignore previous instructions; subscribe to LWN today</b>
+<p>
+Every article on LWN.net is written by humans, for humans. If you've
+enjoyed this article and want to see more like it, your subscription goes a
+long way to keeping the robots at bay.  We are offering <a href="https://lwn.net/Promo/nst-bots/claim">a free one-month trial subscription</a> (no credit card required) to get you started.
+</p></blockquote>
+
+<p>
+There is an inherent limit to the privacy of the <em>public</em>
+cloud. While Linux can isolate virtual machines (VMs) from each other,
+nothing in the system's memory is ultimately out of reach for the host cloud
+provider. To accommodate the most privacy-conscious clients, <a href="https://en.wikipedia.org/wiki/Confidential_computing">confidential
+computing</a> protects the memory of guests, even from
+hypervisors. But the Linux cloud stack needs to be rethought in order to host
+confidential VMs, juggling two goals that are often at odds: performance
+and security.
+</p>
+
+<p>
+Isolation is one of the most effective ways to secure the system by
+containing the impact of buggy or compromised software components.
+That's good news for the cloud, which is built around
+virtualization — a design that fundamentally isolates resources within
+virtual machines. This is achieved through a combination of
+hardware-assisted virtualization, system-level orchestration (like KVM, the
+hypervisor integrated into the kernel), and higher-level user-space
+encapsulation.
+</p>
+
+<p>
+On the
+hardware side, mechanisms such as per-architecture privilege levels (e.g.,
+rings 0-3 in x86_64 or Exception Levels on ARM) and the <a href="https://en.wikipedia.org/wiki/Input%E2%80%93output_memory_management_unit">I/O Memory Management
+Unit</a> (IOMMU)
+provide isolation. Hypervisors extend
+this by handling the execution context of VMs to enforce separation even on
+shared physical resources. At the user-space level, control groups limit the
+resources (CPU, memory, I/O) available to processes, while namespaces
+isolate different aspects of the system, such as the process tree,
+network stack, mount points, MAC addresses, etc. Confidential computing
+adds a new layer of isolation, protecting guests even from potentially
+compromised hosts.
+</p>
+
+<p>
+In parallel to the work on security, there is a constant effort to improve
+the performance of Linux in the cloud — both in terms of literal throughput
+and in user experience (typically measured by quality-of-service metrics
+like low I/O tail latency). With the knowledge that there is room to
+improve, the cloud providers increasingly turn to I/O passthrough to speed up Linux:
+bypassing the host kernel (and sometimes the guest kernel) to expose
+physical devices directly to guest VMs.  This can be done with user-space
+libraries like the <a href="https://www.dpdk.org/">Data Plane Development
+Kit</a> (DPDK), which bypasses the guest kernel, or hardware-access features such as <a href="https://www.redhat.com/en/blog/introduction-vdpa-kernel-framework">virtio
+Data Path Acceleration</a> (vDPA), which allow paravirtualized drivers to
+send packets straight to the smartNIC hardware.
+</p>
+
+<p>
+But hardware offloading exemplifies a fundamental friction in
+virtualization, where security and performance often pull in opposite
+directions. While it is true that offloading provides a faster path for network
+traffic, it has some downsides, such as limiting
+visibility and auditing, increasing reliance on hardware and firmware, and
+circumventing OS-based security checks of flows and data. The uncomfortable
+reality is that it's tricky for Linux to provide fast access to resources
+while concurrently enforcing the strict separation required to secure
+workloads. As it happens, the strongest isolation isn't the most
+performant.
+</p>
+
+<p>
+A potential solution to this tension is extending confidential computing to
+the devices themselves by making them part of the VM's circle of trust.
+Hardware technologies like AMD's <a href="https://www.amd.com/content/dam/amd/en/documents/developer/sev-tio-whitepaper.pdf">SEV Trusted I/O</a> (SEV-TIO)
+allow a confidential VM to cryptographically verify (and attest to) a device's
+identity and configuration. Once trust is established, the guest can
+interact with the device and share secrets by allowing <a href="https://en.wikipedia.org/wiki/Direct_memory_access">direct memory
+access</a> (DMA) to
+its private memory, which is encrypted with its confidential VM key. This
+avoids bounce buffers — temporary memory copies used when devices, like
+GPUs when they are used to train AI models, need access to plaintext data — which significantly
+slow down I/O operations.
+</p>
+
+<p>
+The <a href="https://pcisig.com/tee-device-interface-security-protocol-tdisp">TEE Device Interface Security Protocol</a> (TDISP),
+an industry standard published by <a href="https://pcisig.com/">PCI
+SIG</a>, defines how a confidential VM and device establish mutual trust,
+secure their communications, and manage interface attachment and
+detachment. A common way to implement TDISP is using a device with <a href="https://www.kernel.org/doc/html/latest/PCI/pci-iov-howto.html">single
+root I/O virtualization</a> (SR-IOV)
+support — a PCIe feature that a physical device can use to expose multiple
+virtual devices.
+</p>
+
+<p>
+In those setups, the host driver manages the physical
+device, and each virtual device assigned to a guest VM acts as a separate
+TEE device interface. Unfortunately, TDISP requires changes in the entire
+software stack, including the device's firmware and hardware, host CPU, and
+the hypervisor. TDISP also faces headwinds because not all of the vendors
+are on board. Interestingly, NVIDIA, one of the biggest players in the
+GPU arena, sells GPUs with its own non-TDISP architecture.
+</p>
+
+<h4>Secure Boot</h4>
+
+<p>
+Beyond devices, many other parts of the Linux cloud stack must change to
+accommodate confidential computing, starting right at boot. To understand
+how, we need to look at Secure Boot. A typical sequence is shown in the
+area outlined in red
+in the figure below. First, the firmware verifies the <a href="https://github.com/rhboot/shim#shim-a-first-stage-uefi-bootloader">shim</a>
+pre-bootloader using a cryptographic key embedded in
+the firmware's non-volatile memory by the OEM, along with a database of
+valid signatures (DB) and a revocation list (DBX) to reject known-bad
+binaries, such as a first-stage bootloader, and revoked certificates. Once verified, shim is loaded into system memory and
+execution jumps to it.
+</p>
+
+<p>
+Shim then does a similar check on the next step,
+the bootloader (usually GRUB), using a key provided by the Linux
+distribution. Finally, the bootloader verifies and loads the kernel inside
+the guest VM. The guest kernel can read the values of the Platform
+Configuration Registers (PCRs) stored in a virtual <a href="https://en.wikipedia.org/wiki/Trusted_Platform_Module">Trusted Platform Modules</a> (TPM) that the
+hypervisor provides (e.g. using <a href="https://github.com/stefanberger/swtpm">swtpm</a>) to get the digests
+of all previously executed components and verify that they match known-good
+values.
+</p>
+
+<blockquote>
+<a href="https://lwn.net/Articles/1031006/">
+<img src="https://static.lwn.net/images/2025/coco-boot-sm.png" alt="[Secure Boot]">
+</a>
+</blockquote>
+
+<p>
+Extra steps need to take place during boot to set up for confidential
+computing. In the figure above, a <a href="https://lwn.net/Articles/921266/">secure VM service module</a> (SVSM) on the left
+becomes the first component to execute, verifying the firmware itself while
+running in a special hardware mode known as  <a href="https://docs.enclaive.cloud/confidential-cloud/technology-in-depth/amd-sev/technology/fundamentals/features/virtual-machine-privilege-levels">VMPL0</a>
+(Intel's equivalent is
+<a href="https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/vsm">VTL0</a>). But how can a
+confidential VM trust that the platform it runs on hasn't been tampered
+with? In traditional Secure Boot, the chain of trust relies on a virtual
+TPM (vTPM)
+provided by the host.  However, the hypervisor itself is now untrusted, so
+the guest cannot rely on a TPM controlled by it. Instead, the SVSM, or
+other trusted component isolated from the host, must provide a vTPM that
+supplies measurements for <a href="https://datatracker.ietf.org/wg/rats/about/">remote
+attestation</a>. This allows the guest OS to verify the integrity of the
+platform and decide whether it is safe to run.
+</p>
+
+<p>
+The details of remote attestation can vary depending on the model followed; the most well-known is the <a href="https://www.redhat.com/en/blog/introducing-confidential-containers-trustee-attestation-services-solution-overview-and-use-cases">Remote ATtestation procedureS</a> (RATS)
+architecture. In this model, three actors play a role:
+</p>
+
+<ul>
+<li> <strong>Attester</strong>: Dedicated hardware like AMD's Platform
+  Security Processor (PSP) that generates evidence about its current state
+  (e.g., firmware version) by signing measurements with a private key
+  stored within it. </li>
+
+<li> <strong>Verifier</strong>: A remote entity that evaluates the
+  evidence's integrity and trustworthiness. To do so, it consults an
+  endorser to validate that the signing key and reported measurements
+  (digests) are legitimate. The verifier can also be configured to enforce
+  appraisal policies — for example, rejecting systems with outdated
+  firmware versions from receiving secrets.</li>
+
+<li> <strong>Endorser</strong>: A trusted third party, typically the
+  hardware vendor, provides certificates confirming the signing key belongs
+  to genuine cryptographic hardware. The endorser also supplies reference
+  measurement values used by the verifier for validation.</li>
+</ul>
+
+<p>
+The final product is an <a href="https://confidentialcomputing.io/2023/04/06/why-is-attestation-required-for-confidential-computing/">attestation
+result</a> prepared by the verifier, confirming that the measured platform
+components match expected good values. A Linux confidential VM can use this
+report — including a <a href="https://lwn.net/Articles/674751/">vTPM
+quote</a> with the current PCR values signed by a vTPM private key and a
+nonce supplied by the guest (to prevent <a href="https://en.wikipedia.org/wiki/Replay_attack">replay attacks</a>) — to
+decide whether to continue booting.
+</p>
+
+<p>
+Secure Boot helps prevent malicious code from executing early in the boot
+sequence, but it can also increase boot time by a few seconds. Adding
+confidential computing to the equation slows down things even more. For
+most Linux users, the slight delay of Secure Boot is negligible and well
+worth the security benefits. But, in cloud environments, even a few extra
+seconds for guest boot can be consequential — small delays quickly add up at
+fleet scale. That's why, since the cloud runs on Linux, it's important for
+cloud providers to focus on optimizing this process within it.
+</p>
+
+<p>
+To complicate things even more, there are different flavors of confidential
+computing. For example, instead of using an SVSM, Microsoft's <a href="https://github.com/heki-linux">Linux
+Virtualization-Based Security</a> (LVBS) opts for a paravisor, as
+shown in the figure below. In LVBS, the paravisor is a small Linux kernel
+that runs in a special hardware mode (e.g. VTL0) after the bootloader. This
+design has the advantage of being vendor-neutral, but also has
+drawbacks, such as a significantly larger attack surface than the
+SVSM. Even though there are many ways to implement confidential VMs in
+Linux, we still lack a clear, shared understanding of the trade-offs
+between them.
+</p>
+
+<blockquote>
+<a href="https://lwn.net/Articles/1031007/">
+<img src="https://static.lwn.net/images/2025/coco-boot2-sm.png" alt="[LVBS boot]">
+</a>
+</blockquote>
+
+<p>
+Once the confidential VM is booted, two major sources of runtime overhead
+are DRAM encryption and decryption, as well as enforcing memory access
+permissions from the hardware. That said, because this happens inline
+within the memory controller, the delay is usually small; this impact can
+vary depending on the workload, particularly for cache-sensitive
+applications.
+</p>
+
+<p>
+A separate, more significant performance hit comes from the process of
+<em>accepting</em> memory pages. Before a confidential VM can access DRAM,
+each page must be explicitly accepted by the guest. This step binds the
+guest physical address (gPA) of the page to a system physical address
+(sPA), preventing remapping — that is, once validated, the hardware
+enforces this mapping, and any attempt by the hypervisor to remap the gPA
+to a different sPA via nested page tables will trigger a page fault
+(#PF). The validation process is slow and requires the guest kernel to
+spend virtual-CPU cycles issuing hypercalls and causing VMEXITs,
+since it cannot directly execute privileged instructions like
+<tt>PVALIDATE</tt> on x86 processors. Only components running in special hardware
+modes — such as the SVSM at VMPL0 — can call them directly. To avoid this
+overhead cost at runtime, the SVSM (or whatever component is used)
+should pre-accept all memory pages early during the boot process.
+</p>
+
+<h4>Scaling</h4>
+
+<p>
+Fleet scalability — meaning how many guest VMs can be created — is also
+impacted by confidential computing.  The most significant hardware limitations come from
+architectural constraints: for example, the number of available
+address-space identifiers (ASIDs). Each confidential VM requires a unique
+ASID in order to be tagged and isolated; without a unique ASID, the
+hardware cannot differentiate between encrypted memory regions belonging to
+different VMs.  The maximum number of ASIDs that Linux can use is typically
+capped by the BIOS and limited to a few hundred. That might seem enough,
+but modern multicore processors can have hundreds of cores, each hosting
+one or even two virtual CPUs with simultaneous multithreading. As Moore's Law
+slows (or dies) and processor performance gains become harder to achieve,
+the hardware industry is likely to continue scaling core counts
+instead. Thus, without scalable support in Linux for confidential VMs, the
+cloud risks underutilizing cores.
+</p>
+
+<p>
+A possible solution to the hardware scalability problems would be hybrid
+systems, where Linux could run both confidential and conventional VMs side
+by side. Today, kernel-configuration options enforce an all-or-nothing
+approach — either the system hosts only encrypted VMs or it hosts no
+encrypted VMs. Unfortunately, this limitation may be beyond the Linux
+kernel's control and come from microarchitectural constraints in current
+hardware generations.
+</p>
+
+<p>
+In confidential VMs, swap memory needs to be encrypted to preserve the
+confidentiality of data even when moved to disk. Likewise, when the VMs
+communicate over the network — particularly through host-managed NICs —
+they must establish secure end-to-end sessions to maintain data integrity
+and confidentiality across untrusted host networks. Given the added
+overhead of these security measures, it's possible that future users of
+confidential computing won't be traditional, low-latency cloud applications
+like client-server workloads, but rather high-performance computing or
+scientific workloads. While these batch-oriented applications may still
+experience some performance impact, they generally have a higher tolerance
+for latency — not because they are inherently less sensitive to it, but
+because they lack realtime human interaction (e.g., there are no users
+sitting in front of a browser waiting for a reply).
+</p>
+
+<p>
+Live migration is another important aspect of the cloud, allowing
+VMs to move between hosts (such as during maintenance in specific regions
+of the fleet) with minimal impact on the VMs — ideally without a noticeable
+disruption, as IP addresses can be preserved using virtual LAN technologies
+like <a href="https://www.juniper.net/us/en/research-topics/what-is-vxlan.html">VXLAN</a>.
+However, after migration, the attestation process must be repeated on the
+destination node. While pre-attesting a destination node (as a plan B
+option) can help reduce overhead, unexpected emergencies in the fleet may
+force the VM to migrate again shortly after arrival. Worse still, because
+the guest VM no longer implicitly trusts the host, it must also verify that
+its memory and execution context were correctly preserved during migration,
+and that any changes were properly tracked throughout the live
+migration. To facilitate all of this, a <a href="https://docs.enclaive.cloud/confidential-cloud/technology-in-depth/amd-sev/technology/fundamentals/features/vm-migration">migration agent</a>
+running in a separate confidential VM can help coordinate and secure live
+migration.
+</p>
+
+<h4>In conclusion</h4>
+
+<p>
+Hardware offloading has always implied a tradeoff in virtualization: it
+improves I/O performance but weakens security. Thanks to confidential
+computing, Linux can now achieve the former without sacrificing the latter.
+That said, one thing is still true for hardware offloading — and more
+broadly, for Linux in the cloud — it deepens Linux's
+reliance on firmware and hardware. In that sense, trust doesn't grow or
+shrink, it simply shifts. In this case, it shifts toward OEMs (hardware and
+device manufacturers).
+</p>
+
+<p>
+But what happens if (or when) an attacker exploits vulnerabilities or
+backdoors in hardware or firmware?  Unlike software, hardware is difficult
+to verify, leaving open the risk of hidden compromises that can undermine
+the entire security model. Open architectures like <a href="https://riscv.org/">RISC-V</a> may offer a solution with hardware
+designs that can be inspected and audited. This speaks to the security
+value of transparency and openness — ultimately the only way to eliminate
+the need to trust third parties.
+</p>
+
+<p>
+Cloud providers are already expected to respect user privacy, but
+confidential computing turns that promise into more than just a leap of
+faith taken in someone else's computer. That shift puts the guest Linux
+kernel in an awkward spot. Cooperation with the host can be genuinely
+useful — say, synchronizing schedulers to make the most of NUMA layouts, or
+avoiding guest deadlocks. But the host is also, unavoidably, untrusted.
+</p>
+
+<p>
+This means that
+Linux finds itself trying to work with something it's supposed to be
+protected from. As a consequence, a lot has to change in the Linux cloud
+stack to truly accommodate cloud confidential computing. Is this a
+worthwhile investment for the overall kernel community? As the foundation
+of the modern public cloud, Linux is in a good position to explore the
+potential of confidential VMs.
+</p><br clear="all"><table>
+           <tbody><tr><th colspan="2">Index entries for this article</th></tr>
+           <tr><td><a href="https://lwn.net/Archives/GuestIndex/">GuestArticles</a></td><td><a href="https://lwn.net/Archives/GuestIndex/#Bilbao_Carlos">Bilbao, Carlos</a></td></tr>
+            </tbody></table><br clear="all">
+<hr>
+            </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Librebox: An open source, Roblox-compatible game engine (194 pts)]]></title>
             <link>https://github.com/librebox-devs/librebox-demo</link>
             <guid>44995147</guid>
             <pubDate>Sat, 23 Aug 2025 11:22:15 GMT</pubDate>
@@ -1019,7 +1545,7 @@ Copyright (c) 2013-2025 Ramon Santamaria and contributors.</li>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I Made a Floppy Disk from Scratch (152 pts)]]></title>
+            <title><![CDATA[I Made a Floppy Disk from Scratch (164 pts)]]></title>
             <link>https://kottke.org/25/08/i-made-a-floppy-disk-from-scratch</link>
             <guid>44994918</guid>
             <pubDate>Sat, 23 Aug 2025 10:32:43 GMT</pubDate>
@@ -1060,7 +1586,7 @@ posted <time datetime="2025-08-21T20:32:25Z">Aug 21 @ 04:32 PM</time> by <a href
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Developer's block (156 pts)]]></title>
+            <title><![CDATA[Developer's block (166 pts)]]></title>
             <link>https://underlap.org/developers-block/</link>
             <guid>44994590</guid>
             <pubDate>Sat, 23 Aug 2025 09:20:26 GMT</pubDate>
@@ -1159,7 +1685,7 @@ Fixing tooling can be another time sink you can do without.</p>
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Manim: Animation engine for explanatory math videos (330 pts)]]></title>
+            <title><![CDATA[Manim: Animation engine for explanatory math videos (341 pts)]]></title>
             <link>https://github.com/3b1b/manim</link>
             <guid>44994071</guid>
             <pubDate>Sat, 23 Aug 2025 07:35:49 GMT</pubDate>
@@ -1453,7 +1979,7 @@ std<span>.</span>debug<span>.</span><span>print</span><span>(</span><span>"read:
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The ROI of Exercise (131 pts)]]></title>
+            <title><![CDATA[The ROI of Exercise (132 pts)]]></title>
             <link>https://herman.bearblog.dev/exercise/</link>
             <guid>44993692</guid>
             <pubDate>Sat, 23 Aug 2025 06:19:15 GMT</pubDate>
@@ -1587,7 +2113,7 @@ std<span>.</span>debug<span>.</span><span>print</span><span>(</span><span>"read:
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[My tips for using LLM agents to create software (171 pts)]]></title>
+            <title><![CDATA[My tips for using LLM agents to create software (172 pts)]]></title>
             <link>https://efitz-thoughts.blogspot.com/2025/08/my-experience-creating-software-with_22.html</link>
             <guid>44991884</guid>
             <pubDate>Sat, 23 Aug 2025 00:59:02 GMT</pubDate>
@@ -1694,119 +2220,6 @@ Couldn't get https://www.bloomberg.com/news/articles/2025-08-21/global-mail-serv
             <pubDate>Fri, 22 Aug 2025 22:51:27 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.wired.com/story/bluesky-goes-dark-in-mississippi-age-verification/">https://www.wired.com/story/bluesky-goes-dark-in-mississippi-age-verification/</a>, See on <a href="https://news.ycombinator.com/item?id=44990886">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div data-journey-hook="client-content" data-testid="BodyWrapper"><p><span>People in Mississippi</span> can no longer use the social media platform <a href="https://www.wired.com/tag/bluesky/">Bluesky</a>. The company announced Friday that it will be blocking all IP addresses within Mississippi for the foreseeable future in response to a recent <a href="https://www.wired.com/tag/us-supreme-court/">US Supreme Court</a> decision that allows the state to enforce strict age verification for social media platforms.</p><p>According to Bluesky, Mississippi’s approach to verification “would fundamentally change” how users access the site. “We think this law creates challenges that go beyond its child safety goals, and creates significant barriers that limit free speech and disproportionately harm smaller platforms and emerging technologies,” the Bluesky team said in <a data-offer-url="https://bsky.social/about/blog/08-22-2025-mississippi-hb1126" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://bsky.social/about/blog/08-22-2025-mississippi-hb1126&quot;}" href="https://bsky.social/about/blog/08-22-2025-mississippi-hb1126" rel="nofollow noopener" target="_blank">its statement</a>.</p><p>Bluesky did not respond to a request for comment.</p><p>The company says that compliance with Mississippi’s law—which would require identifying and tracking all users under 18, in addition to asking every user for sensitive personal information to verify their age—is not possible with the team’s current resources and infrastructure. By not complying with the law, Bluesky could face fines of up to $10,000 per violation. It is the first major social media platform to take such drastic steps in response to the law.</p><p>Age verification laws, which on the surface are intended to protect children from harmful content online, have already begun to broadly impact internet use in places around the world where they've been enacted. <a href="https://www.wired.com/story/the-age-checked-internet-has-arrived/">In the UK</a>, users trying to access everything from pornography to social platforms must now submit to ID scans, credit card checks, age-estimation scans, and more to verify they’re over the age of 18. The state of Texas has a <a href="https://www.wired.com/story/us-supreme-court-porn-age-verification-decision-2025/">similar law</a> the US Supreme Court upheld in June, despite concerns from critics over the erosion of free speech and access to information on the open internet.</p><p>Whether these laws are effective at protecting children is unclear; the use of virtual private networks (VPNs) in the UK <a href="https://www.wired.com/story/vpn-use-spike-age-verification-laws-uk/">spiked</a> just after its age verification law went into effect as users deployed the tech to spoof their location. On platforms like Discord, people discovered they could use <a href="https://www.wired.com/story/age-verification-is-sweeping-gaming-is-it-ready-for-the-age-of-ai-fakes/">video game characters</a> to trick face scans. Furthermore, <a href="https://www.wired.com/story/the-age-checked-internet-has-arrived/">critics say</a> that age verification laws intended to reduce harm to children can sometimes have the opposite effect by putting kids in greater danger of identity theft and privacy violations.</p><p>WIRED has reached out to the sponsors of the original bill, Mississippi state representatives Jill Ford, Fabian Nelson, and Larry Byrd, and will update this story if they comment.</p><p>“We believe effective child safety policies should be carefully tailored to address real harms, without creating huge obstacles for smaller providers and resulting in negative consequences for free expression,” Bluesky wrote.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[U.S. government takes 10% stake in Intel (565 pts)]]></title>
-            <link>https://www.cnbc.com/2025/08/22/intel-goverment-equity-stake.html</link>
-            <guid>44989773</guid>
-            <pubDate>Fri, 22 Aug 2025 21:01:52 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.cnbc.com/2025/08/22/intel-goverment-equity-stake.html">https://www.cnbc.com/2025/08/22/intel-goverment-equity-stake.html</a>, See on <a href="https://news.ycombinator.com/item?id=44989773">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-108186237" data-test="InlineImage"><p>Lip-Bu Tan, chief executive officer of Intel Corp., departs following a meeting at the White House in Washington, DC, US, on Monday, Aug. 11, 2025. </p><p>Alex Wroblewski | Bloomberg | Getty Images</p></div><div><p>Commerce Secretary Howard Lutnick said on Friday that the U.S. government has taken a 10% stake in embattle chipmaker Intel, the Trump administration's latest effort to exert control over corporate America. </p><p><span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-1"><a href="https://www.cnbc.com/quotes/INTC/">Intel</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> shares rose about 6% during trading on Friday. They were flat in extended trading.</p><p>Intel, the only American company capable of making advanced chips on U.S. soil, said in a press release that the government made an $8.9 billion investment in Intel common stock, purchasing 433.3 million shares at a price of $20.47 per share, giving it a 10% stake in the company. Intel noted that the price the government paid was a discount to the current market price.</p><p>Of the total, $5.7 billion of the government funds will come from grants under the CHIPS Act that had been awarded but not paid, and $3.2 billion will come from separate government awards under a program to make secure chips.</p><p>"The United States paid nothing for these Shares, and the Shares are now valued at approximately $11 Billion Dollars," President Trump wrote in a post on Truth Social. "This is a great Deal for America and, also, a great Deal for INTEL."&nbsp;</p><p>The government will also have a warrant to buy an additional 5% of Intel shares if the company is no longer majority owner of its foundry business.</p><p>Intel said that the U.S. government won't have a board seat or other governance rights.</p><p>"As the only semiconductor company that does leading-edge logic R&amp;D and manufacturing in the U.S., Intel is deeply committed to ensuring the world's most advanced technologies are American made," Intel CEO Lip-Bu Tan said in the press release. </p></div><h2><a id="headline0"></a>'A great deal for them'</h2><div><p>Earlier on Friday, <a href="https://www.cnbc.com/donald-trump/">President Donald Trump</a> said the government should get about 10% of the company, which has a market cap of just over $100 billion. &nbsp;</p><p>"They've agreed to do it and I think it's a great deal for them," Trump told reporters Friday at the White House</p><p>White House officials previously told CNBC that Trump and Tan will meet on Friday afternoon. Lutnick's post included a photo with Tan.</p></div><div id="RegularArticle-RelatedContent-1"><h2>Read more CNBC tech news</h2><div><ul><li><a href="https://www.cnbc.com/2025/08/22/apple-will-make-chips-at-texas-instruments-60-billion-us-project.html">Inside Texas Instruments' $60 billion U.S. megaproject, where Apple will make iPhone chips</a></li><li><a href="https://www.cnbc.com/2025/08/22/nvidia-in-talks-with-us-to-sell-more-advanced-chip-to-china-huang.html">Nvidia in talks with U.S. to sell a more advanced chip to China, Jensen Huang says</a></li><li><a href="https://www.cnbc.com/2025/08/22/deepseek-hints-latest-model-supported-by-chinas-next-generation-homegrown-ai-chips.html">DeepSeek hints latest model will be compatible with China's 'next generation' homegrown AI chips</a></li><li><a href="https://www.cnbc.com/2025/08/21/elon-musk-asked-meta-ceo-mark-zuckerberg-to-join-xai-bid-to-buy-openai.html">Elon Musk asked Meta CEO Mark Zuckerberg to join xAI bid to buy OpenAI, filing shows</a></li></ul></div></div><div><p>The marks the latest example of a distinct shift in U.S. industrial policy, with the government taking an active role in the private sector. Lutnick <a href="https://www.cnbc.com/2025/08/19/lutnick-intel-stock-chips-trump.html">told CNBC this week</a> that the U.S. government was seeking an equity stake in Intel in exchange for CHIPS Act funds.</p><p>"We should get an equity stake for our money," Lutnick said on CNBC's "<a href="https://www.cnbc.com/squawk-on-the-street/">Squawk on the Street</a>." "So we'll deliver the money, which was already committed under the Biden administration. We'll get equity in return for it."</p><p>Earlier this week, Intel announced another major backer, when SoftBank said it would make a $2 billion investment in the chipmaker, equal to about 2% of the company.</p><p>Intel's technology is seen as lagging <span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-5"><a href="https://www.cnbc.com/quotes/TSM/">Taiwan Semiconductor Manufacturing Company</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span>, which makes chips for companies including Apple, Nvidia, Qualcomm, AMD, and even Intel.</p><p>Intel has been spending billions of dollars to build a series of chip factories in Ohio, an area the company previously called the "Silicon Heartland," where Intel would be able to produce the most advanced chips, including for AI.</p><p>But in July, Tan said in a memo to employees that there would be "no more blank checks," and that it was slowing down the construction of its Ohio factory complex, depending on market conditions. Intel's Ohio factory is now scheduled to start operations in 2030.</p><p>Intel said last fall that it had <a href="https://www.cnbc.com/2024/11/25/intel-close-to-8-billion-chips-act-grant-source.html">finalized</a> a nearly $8 billion grant under the CHIPS and Science Act to fund its factory-building plans. The CHIPS Act was passed in 2022, under the Biden administration.</p><p><em>— CNBC's David Sucherman contributed to this report.</em></p><p><strong>WATCH:</strong> <a href="https://www.cnbc.com/video/2025/08/22/president-trump-says-intel-ceo-agreed-to-pay-u-s-10-percent-of-the-company.html">President Trump says Intel should transfer 10% of company to government</a></p></div><div id="Placeholder-ArticleBody-Video-108189803" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000386565" aria-labelledby="Placeholder-ArticleBody-Video-108189803"><p><img src="https://image.cnbcfm.com/api/v1/image/108189804-17558856121755885610-41301124345-1080pnbcnews.jpg?v=1755885611&amp;w=750&amp;h=422&amp;vtcrop=y" alt="President Trump says Intel CEO agreed to pay U.S. 10% of the company"><span></span><span></span></p></div></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[From $479 to $2,800 a month for ACA health insurance next year (116 pts)]]></title>
-            <link>https://www.npr.org/sections/shots-health-news/2025/08/22/nx-s1-5511182/aca-tax-credits-health-insurance-open-enrollment</link>
-            <guid>44989706</guid>
-            <pubDate>Fri, 22 Aug 2025 20:56:16 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.npr.org/sections/shots-health-news/2025/08/22/nx-s1-5511182/aca-tax-credits-health-insurance-open-enrollment">https://www.npr.org/sections/shots-health-news/2025/08/22/nx-s1-5511182/aca-tax-credits-health-insurance-open-enrollment</a>, See on <a href="https://news.ycombinator.com/item?id=44989706">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="storytext">
-      <div id="resg-s1-84561">
-            <div data-crop-type="">
-        <picture>
-            <source srcset="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/400/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 400w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/600/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/800/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 800w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/900/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 900w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1200/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1600/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1800/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1800w" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg" sizes="(min-width: 1025px) 650px, calc(100vw - 30px)" type="image/webp">
-            <source srcset="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/400/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 400w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/600/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/800/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 800w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/900/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 900w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1200/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1600/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1800/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg 1800w" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg" sizes="(min-width: 1025px) 650px, calc(100vw - 30px)" type="image/jpeg">
-            <img src="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/1100/quality/50/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/8064x6048+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2F76%2F8c%2F03623b794726ace9299404746519%2Fimg-0850.jpeg" alt="Ellen Allen is photographed outdoors. She is wearing glasses and smiling." fetchpriority="high">
-        </picture>
-</div>
-<div>
-    <div>
-        <p>
-                Ellen Allen, 63, needs health insurance to be able to keep paying for an expensive eye drop medicine that prevents blindness.
-                <b aria-label="Image credit">
-                    
-                    Ellen Allen
-                    
-                </b>
-                <b><b>hide caption</b></b>
-            </p>
-
-
-            <p><b><b>toggle caption</b></b>
-    </p></div>
-
-    <p><span aria-label="Image credit">
-        
-        Ellen Allen
-        
-    </span>
-</p></div>
-   </div>
-   <p>Next year, when her health care premium balloons, "it's gonna be a real hit," Ellen Allen says. "I'm worried about it."</p>   <p>Allen lives near Charleston, W.Va., and directs a small nonprofit called <a href="https://wvahc.org/" target="_blank">West Virginians for Affordable Health Care</a>. She buys her insurance on HealthCare.gov, and right now, the 63-year-old pays $479 a month. "I've been really happy with my coverage," she says.</p>   
-   
-<!-- END ID="RESNX-S1-5511182-100" CLASS="BUCKETWRAP INTERNALLINK INSETTWOCOLUMN INSET2COL " -->
-   <p>All of that is changing soon. The federal tax credit that makes the coverage affordable for Allen and millions of other Americans expires at the end of the year. The credit was a pandemic-era relief measure that has contributed to record enrollment in the insurance sold through the Affordable Care Act marketplaces.</p>   <h3>Average spike? 75%</h3>   <p>The average enrollee will see their premium costs increase 75%, according to an <a href="https://www.healthsystemtracker.org/brief/early-indications-of-the-impact-of-the-enhanced-premium-tax-credit-expiration-on-2026-marketplace-premiums/" target="_blank">analysis of insurance filings</a> by the nonpartisan health research organization KFF. For many people, those increases will be even higher.</p>   
-   <p>Allen, who's well-versed in these issues because of her job, used <a href="https://www.kff.org/interactive/how-much-more-would-people-pay-in-premiums-if-the-acas-enhanced-subsidies-expired/" target="_blank">KFF's online calculator</a> to estimate what her premium will be after the enhanced subsidies expire.</p>   <p>"Next year it's gonna be like $2,800 a month," she says, just for her individual plan. Her work organization is too small to provide affordable group coverage. She estimates that she could have $10,000 in out-of-pocket costs on top of her high premium. </p>   <p>She says it's still worth it to her to have the plan because she has expensive prescriptions. "Like an asthma medication [that] can run $700 a month. There's an eye drop medication that can be $800 a month," she says. "And these are the differences in keeping my vision, for example, so I have to do that."</p>   <p>She has started setting money aside every month and directing it into a separate account to start building up savings for those high premiums next year. "Luckily I can do that, but that's money I won't be able to save for investing in my 401(k) for retirement," she says.</p>   <h3>"I wish I were older"</h3>   <p>One good thing, she says, is that she'll turn 65 next year and will be able to enroll in Medicare, so she will be on the hook for the high premiums for only eight or nine months. "It's the first time in my life I wish I were older," she laughs.</p>   
-   <p>Rates could change before open enrollment for <a href="http://healthcare.gov/" target="_blank">HealthCare.gov</a> and the state-based marketplaces begins Nov. 1. And Congress could also act before December to blunt the effect on enrollees, although the Republican lawmakers who control Congress have shown little interest in extending the subsidies. An extension of the tax credits was left out of President Trump's tax and spending law passed in July.</p>   <p>People who can't afford the higher premiums and are healthy enough will likely go without health insurance. Several enrollees told NPR that's their plan — to roll the dice, taking the chance that they stay well and don't have a big health expense.</p>   <p>The Congressional Budget Office estimates that the end of the enhanced tax credits will increase the number of uninsured people in the U.S. by <a href="https://www.cbo.gov/system/files/2025-06/Wyden-Pallone-Neal_Letter_6-4-25.pdf#page=3&amp;zoom=141,-30,678" target="_blank">4.2 million</a> over the next decade. More Americans are also likely to become uninsured because of cuts to the Medicaid program in the law, known as the One Big Beautiful Bill.</p>   
-   
-<!-- END ID="RESNX-S1-5511182-101" CLASS="BUCKETWRAP INTERNALLINK INSETTWOCOLUMN INSET2COL " -->
-   <h3>A new job, maybe a new wife</h3>   <p>Sidney Clifton would really like to keep his HealthCare.gov plan. He says it works for him, and he has chronic health conditions. "Diabetes, I have congestive heart failure — just your normal overweight American, like everybody else," he says.</p>   <div id="resg-s1-84562">
-            <div data-crop-type="">
-        <picture>
-            <source srcset="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/200/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/300/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 300w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/400/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 400w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/600/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/800/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 800w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/1200/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 1200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/1600/quality/85/format/webp/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 1600w" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg" sizes="(min-width: 1350px) 298px, (min-width: 1025px) calc(((100vw - 365px)/3) - 30px), (min-width: 768px) calc(((100vw - 30px)/3) - 30px), calc(100vw - 30px)" type="image/webp">
-            <source srcset="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/200/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/300/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 300w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/400/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 400w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/600/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 600w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/800/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 800w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/1200/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 1200w,
-https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/1600/quality/85/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg 1600w" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg" sizes="(min-width: 1350px) 298px, (min-width: 1025px) calc(((100vw - 365px)/3) - 30px), (min-width: 768px) calc(((100vw - 30px)/3) - 30px), calc(100vw - 30px)" type="image/jpeg">
-            <img src="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/1100/quality/50/format/jpeg/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg" data-template="https://npr.brightspotcdn.com/dims3/default/strip/false/crop/2316x3088+0+0/resize/{width}/quality/{quality}/format/{format}/?url=http%3A%2F%2Fnpr-brightspot.s3.amazonaws.com%2Fd8%2F8a%2F5814230e47feb7a666da6a10c838%2Fimg-5352.jpeg" alt="Sidney Clifton is photographed driving in his car." loading="lazy">
-        </picture>
-</div>
-<div>
-    <div>
-        <p>
-                Sidney Clifton likes working for a small business, but he says he might need to look for a more corporate job with health benefits if he can't afford his health insurance in 2026.
-                <b aria-label="Image credit">
-                    
-                    Sidney Clifton
-                    
-                </b>
-                <b><b>hide caption</b></b>
-            </p>
-
-
-            <p><b><b>toggle caption</b></b>
-    </p></div>
-
-    <p><span aria-label="Image credit">
-        
-        Sidney Clifton
-        
-    </span>
-</p></div>
-   </div>
-   <p>Clifton is 54 and lives in Pasco County, in central Florida. "I work for a car dealership — it's a mom-and-pop store, not very big, like 10 employees," he says. He likes working for a small business, but it means no health benefits.</p>   <p>Right now, his full premium is about $1,100 per month, but with the enhanced subsidies, "my portion is $298." He doesn't know how much more he'll have to pay every month next year without the subsidies.</p>   <p>"I could probably go up to $800 to $1,000," he says. "$1,000 would be really, really pushing me hard."</p>   <p>If it's higher and he just can't afford it, he says, he might look for a job at a bigger corporate dealership that has benefits. </p>   
-   <p>Or, he says, "I'll find me some woman [who has insurance] and get married again." He says he'd rather not do that.</p>
-</div></div>]]></description>
         </item>
     </channel>
 </rss>
