@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 12 Oct 2025 11:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 12 Oct 2025 12:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The App Store was always authoritarian (113 pts)]]></title>
+            <title><![CDATA[The App Store was always authoritarian (114 pts)]]></title>
             <link>https://infrequently.org/2025/10/the-app-store-was-always-authoritarian/</link>
             <guid>45556032</guid>
             <pubDate>Sun, 12 Oct 2025 07:20:36 GMT</pubDate>
@@ -145,7 +145,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Spyware maker NSO Group confirms acquisition by US investors (110 pts)]]></title>
+            <title><![CDATA[Spyware maker NSO Group confirms acquisition by US investors (116 pts)]]></title>
             <link>https://techcrunch.com/2025/10/10/spyware-maker-nso-group-confirms-acquisition-by-us-investors/</link>
             <guid>45555570</guid>
             <pubDate>Sun, 12 Oct 2025 05:39:22 GMT</pubDate>
@@ -225,7 +225,158 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[China's New Rare Earth and Magnet Restrictions Threaten US Defense Supply Chains (172 pts)]]></title>
+            <title><![CDATA[Pipelining in psql (PostgreSQL 18) (109 pts)]]></title>
+            <link>https://postgresql.verite.pro/blog/2025/10/01/psql-pipeline.html</link>
+            <guid>45555308</guid>
+            <pubDate>Sun, 12 Oct 2025 04:46:57 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://postgresql.verite.pro/blog/2025/10/01/psql-pipeline.html">https://postgresql.verite.pro/blog/2025/10/01/psql-pipeline.html</a>, See on <a href="https://news.ycombinator.com/item?id=45555308">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        <article itemscope="" itemtype="http://schema.org/BlogPosting">
+
+  
+
+  <div itemprop="articleBody">
+    <h2 id="what-is-pipelining-in-postgres">What is pipelining in Postgres?</h2>
+
+<p>Pipelining is a client-side feature supported by the network protocol
+that basically consists of
+not waiting for the results of previously sent queries before sending the next.
+This increases the throughput in two ways:</p>
+
+<ul>
+  <li>
+    <p>The client, network and server can work in parallel. For instance,
+the network may transmit the results of the (N-1)th query while the
+server executes the Nth query and the client sends the (N+1)th query,
+all this at the same time.</p>
+  </li>
+  <li>
+    <p>The network is better utilized because successive queries can be
+grouped in the same network packets, resulting in less packets
+overall.</p>
+  </li>
+</ul>
+
+<p>Pipelining is possible since version 7.4 (released in 2003), which introduced
+the extended query protocol. But it’s only since 2021, with PostgreSQL 14,
+that it can be used through libpq, the client-side C library.
+Since then, some libpq-based drivers like <a href="https://www.psycopg.org/psycopg3/docs/advanced/pipeline.html">psycopg3</a> have started to support it.</p>
+
+<p>With <strong>PostgreSQL 18</strong>, released last week, <code>psql</code>, the command line client
+comes equipped with commands to use pipelining in SQL scripts, making it
+even more accessible.
+While this addition is not part of the highlighted features of that release,
+it can provide huge gains in query throughput, as we’re going to see in a simple
+test.</p>
+
+<h2 id="psql-commands">psql commands</h2>
+
+<p>The pipeline is started with <code>\startpipeline</code>, and in the most simple case, followed
+by the SQL queries and ended with <code>\endpipeline</code>.
+If intermediate results are needed, we can use <code>\syncpipeline</code> to force a 
+synchronisation point and <code>\getresults</code> to fetch all results up to that point.
+Also, starting a pipeline creates an implicit transaction. If a query fails,
+all the changes since the start (or before the last synchronization point) will
+be rolled back.</p>
+
+<p>If you know about the <a href="https://www.postgresql.org/docs/current/app-psql.html#APP-PSQL-META-COMMAND-SEMICOLON"><code>\;</code> syntax</a> to group several queries in the same request, there are similarities between this technique and pipelining: they’re both used to reduce server round-trips and have the same semantics with regard to transactions. In a way, pipelining is the evolution in the <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY">extended query protocol</a> of what multi-statement queries (<code>\;</code> in psql) are in the <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY">simple query protocol</a>.</p>
+
+<h2 id="performance-test">Performance test</h2>
+
+<p>Let’s do a simple test where data from devices are imported
+with <code>INSERT ... ON CONFLICT</code> queries. Same-device same-date does update the row,
+otherwise it inserts a new row.
+Note that if we wanted to unconditionally append all rows,
+<code>COPY</code> would be preferable and pipelining not necessary, which is why
+the more sophisticated insert-or-update is chosen for that test.</p>
+
+<p>The following bash code imports the (random) data, with or without the pipelining
+depending on a parameter.</p>
+
+<div><pre><code><span>function </span>import_data
+<span>{</span>
+  <span>local </span><span>count</span><span>=</span><span>$1</span>  <span># how many rows?</span>
+  <span>local </span><span>pipeline</span><span>=</span><span>$2</span> <span># 1 or 0</span>
+  <span>local </span><span>now_ts</span><span>=</span><span>$(</span><span>date</span> +%s<span>)</span>
+
+  <span>(</span>
+    <span>echo</span> <span>'PREPARE s AS insert into events(device, recorded_at, measure)
+values($1, to_timestamp($2), $3) on conflict(device,recorded_at) do update set measure=excluded.measure;'</span>
+    <span>echo</span> <span>"BEGIN;"</span>
+    <span>[[</span> <span>$pipeline</span> <span>=</span> 1 <span>]]</span> <span>&amp;&amp;</span> <span>echo</span> <span>"</span><span>\\</span><span>startpipeline"</span>
+    <span>for </span>i <span>in</span> <span>$(</span><span>seq </span>1 <span>$count</span><span>)</span>
+    <span>do
+      </span><span>device</span><span>=</span><span>$RANDOM</span>
+      <span>secs</span><span>=</span><span>$((</span><span>$now_ts</span> <span>+</span> <span>$RANDOM</span><span>*</span><span>50</span><span>))</span>
+      <span>measure</span><span>=</span><span>${</span><span>RANDOM</span><span>}</span><span>"."</span><span>${</span><span>RANDOM</span><span>}</span>
+      <span>echo</span> <span>"execute s(</span><span>$device</span><span>, '</span><span>$secs</span><span>', </span><span>$measure</span><span>);"</span>
+    <span>done</span>
+    <span>[[</span> <span>$pipeline</span> <span>=</span> 1 <span>]]</span> <span>&amp;&amp;</span> <span>echo</span> <span>"</span><span>\\</span><span>endpipeline"</span>
+    <span>echo</span> <span>"COMMIT;"</span>
+  <span>)</span> | <span>$psql</span> <span>-q</span> <span>-v</span> <span>ON_ERROR_STOP</span><span>=</span>1
+<span>}</span>
+</code></pre></div>
+<p>Let’s try this with batches of 100, 1000, 5000, 10000, 50000, 100000 rows, with and
+without pipelining, and compare how fast these batches are processed.</p>
+
+<p>Also, since the network speed matters a lot here, let’s try with three
+typical kinds of network connections:</p>
+<ul>
+  <li>localhost (ping time ~ 0.04ms): client and server are on the same host.</li>
+  <li>LAN (ping time ~ 1ms): client and server are separated only by an Ethernet 1GB/s switch.</li>
+  <li>WAN (ping time ~ 4ms): the server is reached through a public Internet connection.</li>
+</ul>
+
+<p>Finally, each case is run 5 times and we keep only the median time of the runs.</p>
+
+<p><img src="https://postgresql.verite.pro/blog/assets/img/pipeline-psql-localhost-graph.png" alt="graph localhost"></p>
+
+<p>On the same host, the pipeline acceleration ranges from 1.5x for the smallest batch size, up to 5x.</p>
+
+<p><img src="https://postgresql.verite.pro/blog/assets/img/pipeline-psql-lan-graph.png" alt="graph LAN"></p>
+
+<p>On a local network connection, the smallest batch size is accelerated by 2.6x, and it goes up to 42x with the bigger sizes.</p>
+
+<p><img src="https://postgresql.verite.pro/blog/assets/img/pipeline-psql-wan-graph.png" alt="psql WAN"></p>
+
+<p>On the slowest network, it’s even more impressive. The acceleration is between 5.4x and 71x !</p>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>These accelerations show how under-utilized the network is when we
+send batches of small queries without pipelining: the network packets
+are like 50 seater buses that ride with only one passenger.</p>
+
+<p>In our example, all we have to do to optimize on that front
+is to add a pair of <code>\startpipeline</code> and <code>\endpipeline</code>.
+That’s because our queries do not depend on the results of previous queries
+of the same batch, except in the sense that if one fails, the entire batch fails.</p>
+
+<p>Without pipelining, we could still optimize our test by adding many
+rows to the <code>VALUES</code> clauses for each query instead of one row per
+query. But it’s not easy to find the sweet spot for how many data rows
+there needs to be per query, and large queries with thousands of parameters
+are not the nicest to handle on the server side.
+Also, if the client-side logic is more complicated, for instance
+conditionally targeting several tables, running simple statements in
+a pipeline while using row-by-row logic might be much easier.</p>
+
+<p>The pipelining meta-commands were added in psql version 18, but they do not
+require PostgreSQL 18 on the server side. For those interested in this feature
+who can’t upgrade their server soon, you can still upgrade to the latest
+version of psql: it’s backward-compatible as much as possible.</p>
+
+  </div>
+
+    
+
+
+</article>
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[China's New Rare Earth and Magnet Restrictions Threaten US Defense Supply Chains (176 pts)]]></title>
             <link>https://www.csis.org/analysis/chinas-new-rare-earth-and-magnet-restrictions-threaten-us-defense-supply-chains</link>
             <guid>45554369</guid>
             <pubDate>Sun, 12 Oct 2025 01:37:37 GMT</pubDate>
@@ -235,7 +386,7 @@
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Rift – A tiling window manager for macOS (149 pts)]]></title>
+            <title><![CDATA[Show HN: Rift – A tiling window manager for macOS (154 pts)]]></title>
             <link>https://github.com/acsandmann/rift</link>
             <guid>45553995</guid>
             <pubDate>Sun, 12 Oct 2025 00:22:15 GMT</pubDate>
@@ -267,7 +418,7 @@
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[LineageOS 23 (246 pts)]]></title>
+            <title><![CDATA[LineageOS 23 (252 pts)]]></title>
             <link>https://lineageos.org/Changelog-30/</link>
             <guid>45553835</guid>
             <pubDate>Sat, 11 Oct 2025 23:53:17 GMT</pubDate>
@@ -1650,7 +1801,15 @@ poor translations waste both our time and yours.</p>
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google blocks Android hack that let Pixel users enable VoLTE anywhere (170 pts)]]></title>
+            <title><![CDATA[Vancouver Stock Exchange: Scam capital of the world (1989) [pdf] (102 pts)]]></title>
+            <link>https://scamcouver.wordpress.com/wp-content/uploads/2012/04/scam-capital.pdf</link>
+            <guid>45553783</guid>
+            <pubDate>Sat, 11 Oct 2025 23:43:42 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://scamcouver.wordpress.com/wp-content/uploads/2012/04/scam-capital.pdf">https://scamcouver.wordpress.com/wp-content/uploads/2012/04/scam-capital.pdf</a>, See on <a href="https://news.ycombinator.com/item?id=45553783">Hacker News</a></p>
+&lt;Not HTML&gt;]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Google blocks Android hack that let Pixel users enable VoLTE anywhere (172 pts)]]></title>
             <link>https://www.androidauthority.com/pixel-ims-broken-october-update-3606444/</link>
             <guid>45553764</guid>
             <pubDate>Sat, 11 Oct 2025 23:41:00 GMT</pubDate>
@@ -1664,7 +1823,7 @@ poor translations waste both our time and yours.</p>
 </div><p>Pixel phones are beloved for their <a href="https://www.androidauthority.com/best-pixel-features-explained-3217987/">many unique software features</a>, but their limited availability prevents many people from buying them. While Google has made strides in expanding access, Pixels still aren’t sold in nearly as many countries as iPhones or Samsung Galaxy devices. This leads many fans to <a href="https://www.androidauthority.com/imported-google-pixel-phone-mistake-3562340/">import Pixel phones</a> from other markets, a move that can unfortunately break crucial calling features like VoLTE and VoWiFi.</p><p>VoLTE (Voice over LTE) is the feature that routes voice calls over a 4G LTE connection, a crucial function now that carriers worldwide are phasing out their 2G and 3G networks. Without it, you might not be able to make phone calls at all on many modern networks. Similarly, VoWiFi (Voice over WiFi) handles <a href="https://www.androidauthority.com/wi-fi-calling-free-travel-3532728/">Wi-Fi calling</a>, routing calls over a Wi-Fi network instead of cellular — a handy feature when you’re in a building with poor signal.</p><p>In theory, any phone with the right hardware for a carrier’s cellular frequencies should be able to use VoLTE, and any capable phone with a supporting plan should get VoWiFi. The reality, however, is more complex. Many carriers only permit VoLTE and VoWiFi on devices they sell or have officially tested. This means that even if your imported Pixel has the necessary hardware, the carrier can still block these features, potentially preventing you from making voice calls entirely.</p><p>This issue plagued Pixel phone importers until Korean developer <a href="https://github.com/kyujin-cho" target="_blank">Kyujin Cho</a> released a workaround in 2023. The developer’s app, “<a href="https://github.com/kyujin-cho/pixel-volte-patch" target="_blank">Pixel IMS,</a>” enables VoLTE and VoWiFi on unsupported carriers by overriding the carrier check that Android normally performs. Normally, Android uses a signal from the carrier to decide whether to enable VoLTE for the device; the Pixel IMS app overrides this signal and forces it to always be enabled.</p><p>Overriding this check isn’t something just any app can do, as it’s part of Android’s privileged telephony framework. That’s why Pixel IMS cleverly leverages a loophole intended for testing purposes. Android allows the “shell” user — the same user that runs <a href="https://www.androidauthority.com/how-to-use-adb-android-3260397/">ADB commands</a> — to override carrier configurations. To gain these elevated privileges, Pixel IMS uses Shizuku, an <a href="https://www.androidauthority.com/best-open-source-android-apps-3565444/">open source Android app</a> that lets other apps run processes as the shell user.</p><p>But loopholes don’t last forever, and after more than two and a half years, Google has seemingly closed this one. Following the recent <a href="https://www.androidauthority.com/october-2025-pixel-update-3605572/">October 2025 Pixel update</a>, many users <a href="https://github.com/kyujin-cho/pixel-volte-patch/issues/384" target="_blank">discovered</a> the “Pixel IMS” app was no longer functional, crashing when attempting to toggle VoLTE or VoWiFi. The crash log gives a clear reason: “<strong>overrideConfig cannot be invoked by shell</strong>.”</p><p>While not documented in the official changelog, Google appears to have quietly patched this particular exploit. According to a source, the company has designated this loophole as <strong>CVE-2025-48617</strong>, a high-severity privilege escalation vulnerability. Its absence from the October 2025 Android Security Bulletin is likely because it didn’t meet the “high risk” threshold for immediate inclusion under <a href="https://www.androidauthority.com/android-risk-based-security-updates-3597466/">Google’s new Risk-Based Update System (RBUS)</a>. Google will probably include it in the next quarterly security bulletin, scheduled for December.</p><p>Fortunately for Pixel users, another developer has allegedly <a href="https://github.com/kyujin-cho/pixel-volte-patch/issues/384#issuecomment-3384423112" target="_blank">found a new workaround</a>. While the new method isn’t as accessible — with the instructions being in Chinese and the APK distributed on the developer’s Telegram channel — it at least seems to work.</p><p>Unfortunately, the new method only enables VoLTE and not VoWiFi, so Pixel users in unsupported regions who need the latter feature will have to <a href="https://www.androidauthority.com/root-android-277350/">root their phones</a> for now. Rooting requires unlocking the bootloader, which <a href="https://www.androidauthority.com/gemini-nano-bootloader-3605497/">breaks some Gemini-powered features</a> and complicates using Google Wallet. The only other alternative is to wait for Google to officially enable VoLTE in more markets — something the company <a href="https://www.androidauthority.com/google-pixel-phones-volte-gsma-3571825/">recently signaled it’s working on</a>.</p><div data-container-type="content"><p>Thank you for being part of our community. Read our&nbsp;<a href="https://www.androidauthority.com/android-authority-comment-policy/" target="_blank" rel="noopener noreferrer" data-stringify-link="https://www.androidauthority.com/android-authority-comment-policy/" data-sk="tooltip_parent">Comment Policy</a> before posting.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Meta Superintelligence's surprising first paper (306 pts)]]></title>
+            <title><![CDATA[Meta Superintelligence's surprising first paper (314 pts)]]></title>
             <link>https://paddedinputs.substack.com/p/meta-superintelligences-surprising</link>
             <guid>45553577</guid>
             <pubDate>Sat, 11 Oct 2025 23:16:05 GMT</pubDate>
@@ -1672,7 +1831,7 @@ poor translations waste both our time and yours.</p>
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><ul><li><p>MSI’s first paper, REFRAG, is about a new way to do RAG.</p></li><li><p><span>This slightly modified LLM converts most retrieved document chunks into compact, LLM-aligned </span><strong>chunk embeddings</strong><span> that the LLM can consume directly.</span></p></li><li><p><span>A lightweight </span><strong>policy</strong><span> (trained with RL) decides which chunk embeddings should be </span><em>expanded</em><span> back into full tokens under a budget; the LLM runs normally on this mixed input.</span></p></li><li><p>The net effect is far less KV cache and attention cost, much faster first-byte latency and higher throughput, while preserving perplexity and task accuracy in benchmarks.</p></li></ul><p>Meta’s new Superintelligence labs made big headlines with its eyewatering salaries for researchers and leaders alike. Big name founders flocked to this new group, so when they published their first paper, we thought it was a good time to do a quick paper review. </p><p><span>This is the paper: </span><a href="https://arxiv.org/abs/2509.01092" rel="nofollow ugc noopener">https://arxiv.org/abs/2509.01092</a></p><p>Our first thought was that the paper was on a topic that we didn’t expect: RAG. If you’re building or investing in products that rely on RAG, you might be building things like AI agents, LLM-powered search, customer support, summarization, or vertical agents. </p><p>In these cases, your inference cost and latency are both massive drivers of your user experience and business model. A very intelligent model creates a better UX, but you run the risk of having CAC &gt; LTV. A fast response, measured by things like time-to-first token, may be attractive, but it will typically mean needing a bigger inference machine. All of these impact whether your AI application is economically viable.</p><p><span>This is precisely where Meta Superintelligence’s (MSI for short) first paper innovates. REFRAG promises </span><strong>30x faster responses </strong><span>(specifically, time to first token) for existing RAG stacks.</span></p><p>Why is this surprising?</p><p>Well, this was surprising because we were expecting that MSI will publish papers that address improvements in the “model layer”, focused on foundational model performance. These maybe experiments that push us beyond scaling training datasets and using more compute for reasoning. New architectures. New modalities. But RAG is a very real world, practical topic for something as significant as a new lab’s first paper.</p><p>Specifically, RAG is ‘different’ because enterprises and consumer apps have operational RAG pipelines with real revenue attached to them. Any improvements to cost/latency in these areas will lead to immediate ROI, also in a way where the benefits are very clear to application layer teams doing things with LLM, and less clear to foundational labs like MSI. </p><p>The ROI comes from a few places. If we zoom in, on the UX level, faster responses increase retention. Cutting time-to-first-token (TTFT) multiplies effective capacity. Software-level efficiency opens new headroom without buying new GPUs or re-architecting models.</p><p>In traditional RAG, you have a knowledge base, say a vector database of unstructured text in “documents”, and then you have a LLM that takes a user query, searches the knowledge base for relevant documents/chunks, and generates a response for the user. The main limitation here is the context window: LLMs can take a finite amount of information, up to millions of tokens as of the publishing of this article.</p><p><span>In Meta’s REFRAG, documents for retrieval are still chunked (~128-token pieces). But, after that, each chunk is encoded into a compact </span><em>chunk embedding</em><span> by a lightweight encoder, then projected into the LLM embedding space. These embeddings are </span><em>precomputable</em><span> and cached.</span></p><p><span>In the product, the user query is embedded and the system retrieves candidate chunks. Instead of sending every chunk’s full token stream to the LLM, the system feeds the LLM a </span><em>mixture</em><span> of: (a) projected chunk embeddings for most chunks, and (b) full token sequences for a few chunks that the policy picks to expand.</span></p><p>A small policy network, trained to maximize downstream generation quality under an expansion budget, looks at the chunk embeddings and picks which chunks to expand to tokens. This policy can be trained with an RL objective that rewards reduced perplexity on generation.</p><p>The LLM sees a short token sequence (expanded chunks + query) plus a number of single-vector placeholders (unexpanded chunks). LLM proceeds to generate text as normal.</p><p><span>In the paper, the core insight is stated to be using the policy network to compress less-relevant chunks in the RAG process, but to us, </span><strong>the core insight here is actually: if embeddings are generated by layers within the LLM, it makes no sense to convert them back to natural language, just for another LLM to compress those tokens back to embeddings.</strong></p><p>That is why the speedups come without collapsing accuracy.</p><p>Contrast two vectors of innovation in LLM land:</p><ul><li><p><strong>Model-level breakthroughs</strong><span> (new architectures, larger models, novel pretraining): high-risk, high-reward, long timelines, big capital.</span></p></li><li><p><strong>Application/system-level efficiency</strong><span> (inference optimizations, retrieval tricks, orchestration): lower-risk, immediate ROI, directly monetizable.</span></p></li></ul><p><span>MSI publishing a RAG efficiency paper, in our opinion, signals a broader direction for them to go after problems with ROI </span><strong>today,</strong><span> where their research and infra expertise can move the needle.</span></p><p>For enterprises and product teams, this is a ripe candidate for production pilots. Evaluate TTFT, throughput, and cost-per-query before and after. The upside is immediate: more queries per GPU, lower infra spend, and better UX.</p><p>You can also mix-and-match stacks. REFRAG is orthogonal to better retrievers or rerankers, you can combine it with stronger rerankers to shrink the candidate set even more.</p><p>In the broader market, it’s an interesting paper during an even more interesting time in the vector DB space. Leading vector DB Pinecone is rumoured to be exploring a sale and there was a founder-operator CEO transition. </p><p><span>Fresh research from DeepMind, "On the Theoretical Limitations of Embedding-Based Retrieval," highlights how some documents are always out of reach for RAG. Deedy Das of Menlo Ventures, called this proof that “</span><a href="https://venturebeat.com/data-infrastructure/pinecone-founder-edo-liberty-appoints-googler-ash-as-ceo#:~:text=Deedy%20Das%2C%20posting%20on%20X%2C" rel="nofollow ugc noopener">plain old BM25 from 1994 outperforms vector search on recall,</a><span>”</span></p><p>While we don’t have a working implementation of REFRAG yet, we can see/guess some limitations:</p><ul><li><p><strong>Training &amp; engineering complexity.</strong><span> You must add an encoder + projection and train it so the LLM </span><em>understands</em><span> embeddings (reconstruction pretraining + SFT). The selective-policy is an RL problem: stable but adding development complexity.</span></p></li><li><p><strong>Compression ceiling.</strong><span> Aggressive compression eventually degrades downstream quality. There’s a tradeoff between how small your embeddings are and how often you must expand.</span></p></li><li><p><strong>Freshness.</strong><span> Precomputed chunk embeddings are great for static corpora. For frequently changing data you need pipelines to recompute embeddings or rely on hybrid strategies.</span></p></li><li><p><strong>Use cases.</strong><span> Summaries are coarse; certain precision-critical tasks (legal reasoning, exact quoting, sensitive medical facts) need careful evaluation, you may need lower compression budgets there.</span></p></li></ul><p>A few closing thoughts.</p><p>This paper seems to say, “Why optimise token costs, when you can use a completely different kind of token?”</p><p>If LLMs can be embedding native on the READ side, can it also be embedding native on the WRITE side, thus accelerating agents 30x overall?</p><p>Cost per token for an embedding model is almost zero – have we just saved a ton of token prices by moving to a different architecture? What’s the catch?</p><p>REFRAG is a reminder that not all breakthroughs come from bigger models. Making RAG cheaper and faster at scale is a direct lever on product economics, and the industry will reward teams that operationalize these wins.</p></div></article></div><div id="discussion"><h4>Discussion about this post</h4></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Heroin addicts often seem normal (106 pts)]]></title>
+            <title><![CDATA[Heroin addicts often seem normal (110 pts)]]></title>
             <link>https://justismills.substack.com/p/heroin-addicts-often-seem-normal</link>
             <guid>45553296</guid>
             <pubDate>Sat, 11 Oct 2025 22:43:58 GMT</pubDate>
@@ -1680,7 +1839,7 @@ poor translations waste both our time and yours.</p>
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><p><span>I recently saw an </span><a href="https://www.lesswrong.com/posts/izaahSqv3oRRDu4mr?commentId=98A9ibWbcKACuhrh3" rel="">online suggestion</a><span> that to treat hard drug addiction, you could provide drugs publicly at government facilities, conditional on (inpatient) treatment afterward. The idea being that (extreme) drug addicts have very high time preference, and so will accept a hit now at any cost, even a cost that would forcibly break their habit soon after.</span></p><p>Instinctively, I doubt this would work for almost any addicts, as even the most far gone addicts are still human beings with human faculties who can behave strategically when they need to. But also, the suggestion is an example of analysis that thinks of the typical drug addict as, like, the sort of obviously crazy, addicted, and presumptively homeless person you sometimes see on the street.</p><p>In my experience, many addicts aren’t like that.</p><p>In the summer of my youth, I lived with two different opiate addicts. One was (and is) a close friend, and the other I liked but was mostly just a roommate. I won’t go into lots of detail since it feels icky to mine my friends’ lives for content, but I will say that I had lots and lots of roommates before moving in with my wife, and neither opiate addict was a particularly bad one. They washed their dishes, responded well to requests or criticisms of basic house behaviors, and weren’t nearly as responsible for the rat infestation as I was.</p><p>(Okay, fine. A pretty girl who had a pet rat heard we had a rat problem and brought some rat food to ostensibly… lure out the rat? I don’t even remember the pretext. Anyway we hooked up and the rat food ended up just kind of left out. In the open. For the rats. Ah, to be young.)</p><p>I was pretty tangential to the social scene my addicted friends were part of, but they had friends over sometimes and some of them were closer to the stereotype for people with a drug problem; one guy in particular would occasionally steal things (though never from our house, that I recall), and was generally quite stressful to be around. But I had no idea one of my addicted friends had a drug problem, even though I lived with him during pretty serious crisis in retrospect.</p><p>Nor do I think I’m especially oblivious! I sometimes perceive things like subtle intra-relationship needling that my wife misses among our friends, and in general I’m a bit of a people pleaser and try to remain attuned to social cues. If anything kept me from seeing my friends’ addictions, it was that doing heroin seemed so beyond the pale to me that it was hard to imagine anybody going down that road.</p><p>Even in the case of the roommate who did more obviously have a problem, it didn’t really feel like a crisis from the inside. He’d just sort of invite shady people over to hang out in his room, then fall asleep with them over. Yes, yes, obviously bad stuff was going on there in retrospect, but it wasn’t like he looked gaunt, or like there were any obvious physical signs of drug use anywhere. There were bad specific moments, like one time he passed out in front of the house, but that was fairly indistinguishable from stories about alcoholic acquaintances, rather than a sign of something as directly lethal as heroin addiction. I mostly learned how bad it was when that roommate, feeling bad about exposing us to such behavior, spontaneously evicted himself. Alas, his subsequent attempts to get clean failed, and he died a year or so later.</p><p>But even that guy - may he rest in peace, really a sweet person - was way more obvious than my closer friend, who played video games with me almost every day, had a girlfriend and job, and maintained a seemingly normal and functional life while risking his life regularly.</p><p>In fact, having seen opiate addiction really get its claws into a community from a wallflower’s point of view, the distribution seemed pretty bimodal. The most dysfunctional people tended to get hit, and a smattering of highly functional and friendly people tended to get hit, though you’d only learn that years later, or when they died. Of course, for all I know people in the middle got hit too, and I just never learned it.</p><p>I’m not sure I have one.</p><p>I see a lot of discourse about addiction, but, like most discourse, it mostly radiates out from major cities. Major cities are where lots of the wealth is, so they attract a lot of beggars, and therefore a lot of the least functional drug addicts. So successful people living in major cities probably have a mental template of “drug addict” that looks like a raving guy pushing a stolen shopping cart around, or something. And indeed, when I visit major cities I see many such people, and living in a minor city I see a few.</p><p>But drug addiction, and drug use more broadly, is way more complicated than that. It’s fine to want to address the “roving unstable beggars who do lots of petty crime” problem, insofar as that problem exists, without also wanting to help address the “lots of random 25-year-olds suddenly die out of nowhere” problem. But in fact both of these problems fall under the “drug addiction” umbrella, and you can’t make good policy around drug addiction writ large without keeping both in mind.</p><p>Also I guess I just want people to understand that not every heroin addict is either a death of despair or a person suffering from a cocktail of serious untreated mental disorders. In fact, about half the heroin addicts I knew have fully recovered. Maybe the most surprising thing is how the distribution of recovery overlaps with the entire distribution of mid-addiction stability. My friend is totally fine now, and so is the guy who stole stuff and caused lots of problems. Meanwhile, my other ex-roommate is dead, and so is the second-most-problem-causing addict I knew at the time. This stuff just kind of hits a seemingly-random subsection of entire communities, and of the people hit, about half don’t make it. I’m not sure what to do about that. But it’s probably not simple.</p></div></article></div><div id="discussion"><h4>Discussion about this post</h4></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Abandoned/dead projects you think died before their time and why? (144 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Abandoned/dead projects you think died before their time and why? (162 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=45553132</link>
             <guid>45553132</guid>
             <pubDate>Sat, 11 Oct 2025 22:16:18 GMT</pubDate>
@@ -1894,7 +2053,7 @@ He’s been bringing a bunch of ideas from Vale to Mojo</p></div></td></tr></tbo
 <div><p>You understand it just fine, you're just trying to pass you fantasy pod immutable safe future as rational while painting the obvious objections based on the real world as meaningless noise.</p></div></td></tr></tbody></table></td></tr></tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Datastar response to allegations (102 pts)]]></title>
+            <title><![CDATA[Datastar response to allegations (104 pts)]]></title>
             <link>https://data-star.dev/essays/greedy_developer</link>
             <guid>45553033</guid>
             <pubDate>Sat, 11 Oct 2025 21:55:49 GMT</pubDate>
@@ -1910,7 +2069,7 @@ He’s been bringing a bunch of ideas from Vale to Mojo</p></div></td></tr></tbo
 </span></span><span><span id="d40b6197d54d3ee0_line_5"><a href="#d40b6197d54d3ee0_line_5">5</a></span><span>&lt;<span>div</span> data-on-load<span>=</span><span>"el.scrollIntoView()"</span>&gt;&lt;/<span>div</span>&gt;</span></span></code></pre></div></div> <h2 id="timeline-and-philosophy">Timeline and philosophy <a href="#timeline-and-philosophy">#</a></h2> <ul><li>Datastar was available under the MIT license since the beginning.</li><li>Mostly a solo project until Ben, and later Johnny, joined.</li><li>We rewrote the code from scratch at least three times to achieve a rock-solid foundation that will last many years. No Datastar v2 is planned or necessary.</li><li>Started life as a tiny ~3 KB core with docs on writing plugins.</li><li>It still is plugin-first. The v1 line defines what we will support long-term.</li></ul><h2 id="who-is-pro-for?">Who is Pro for? <a href="#who-is-pro-for?">#</a></h2> <p>Hobbyist, student, solo tinkerer? Keep using the free core. You don’t need Pro to build real apps. Pro makes sense if:</p><ul><li>The <a href="https://data-star.dev/reference/datastar_pro#datastar-inspector">Datastar Inspector</a> will save you time.</li><li>You want the convenience that the <a href="https://data-star.dev/reference/datastar_pro#pro-features">Pro plugins</a> provide, even if we don’t think you <em>need</em> them.</li><li>You want to support the project and prefer to purchase over donating (donations are tax deductible in the US).</li><li>You don’t want to write or maintain plugins yourself.</li></ul><p>Pro is a one-time lifetime license purchased from 501(c)(3) nonprofit. We don’t hold shares nor own equity. We steward the project. There is no buyout and no rug pull.</p><h2 id="why-one-bundle">Why one bundle <a href="#why-one-bundle">#</a></h2> <p>We are pricing plugins, <a href="https://data-star.dev/reference/datastar_pro#datastar-inspector">Inspector</a>, <a href="https://data-star.dev/reference/datastar_pro#rocket">Rocket</a>, and <a href="https://data-star.dev/reference/datastar_pro#stellar-css">Stellar CSS</a> together. One price keeps things simple and avoids FOMO. You pay once and get everything we ship under Pro, now and forever. No nickel-and-diming, no price matrix, no guessing what we might hold back. It also removes decision fatigue for teams and makes procurement easier. The goal is to fund the work and draw a clear support boundary, not carve the product into SKUs.</p><h2 id="clear-commitments">Clear commitments <a href="#clear-commitments">#</a></h2> <p>The core stays free, small, and fast. Pro is convenience and tooling, not basic capabilities. Anything Pro can do, you can do with the free version and your own effort (just like everyone else, including us).</p><h2 id="conclusion">Conclusion <a href="#conclusion">#</a></h2> <p>There’s a silent majority that sees the value in our work, and we sincerely thank you. We’ll spend more of our time on Pro since I never want to be accused of this shit again, even when it’s untrue. Building in the open can be rewarding, but the vitriol and entitlement around people telling us how to spend our time and effort is exhausting. </p><p>While I disagree with DHH on many things, he nailed it with this...</p><iframe src="https://www.youtube.com/embed/vagyIcmIGOQ?start=20017" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen=""></iframe><p>Have questions? Hop into <a href="https://discord.gg/bnRNgZjgPh" target="_blank" rel="noopener noreferrer">Discord</a> and see what we’re building for a return to normalcy in web dev.</p><nav><a></a> <a href="https://data-star.dev/essays/v1_and_beyond">Next →</a></nav></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Japan's summers have lengthened by 3 weeks over 42 years, say resaerchers (139 pts)]]></title>
+            <title><![CDATA[Japan's summers have lengthened by 3 weeks over 42 years, say resaerchers (141 pts)]]></title>
             <link>https://english.kyodonews.net/articles/-/62626</link>
             <guid>45552578</guid>
             <pubDate>Sat, 11 Oct 2025 20:51:03 GMT</pubDate>
@@ -1951,7 +2110,7 @@ He’s been bringing a bunch of ideas from Vale to Mojo</p></div></td></tr></tbo
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Indonesia says 22 plants in industrial zone contaminated by caesium 137 (108 pts)]]></title>
+            <title><![CDATA[Indonesia says 22 plants in industrial zone contaminated by caesium 137 (110 pts)]]></title>
             <link>https://www.reuters.com/sustainability/boards-policy-regulation/indonesia-says-22-plants-industrial-zone-near-jakarta-contaminated-by-caesium-2025-10-08/</link>
             <guid>45552199</guid>
             <pubDate>Sat, 11 Oct 2025 19:59:14 GMT</pubDate>
@@ -1959,7 +2118,7 @@ He’s been bringing a bunch of ideas from Vale to Mojo</p></div></td></tr></tbo
 Couldn't get https://www.reuters.com/sustainability/boards-policy-regulation/indonesia-says-22-plants-industrial-zone-near-jakarta-contaminated-by-caesium-2025-10-08/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[Discord hack shows risks of online age checks (166 pts)]]></title>
+            <title><![CDATA[Discord hack shows risks of online age checks (169 pts)]]></title>
             <link>https://news.sky.com/story/discord-hack-shows-dangers-of-online-age-checks-as-internet-policing-hopes-put-to-the-test-13447618</link>
             <guid>45551893</guid>
             <pubDate>Sat, 11 Oct 2025 19:22:03 GMT</pubDate>
@@ -2023,7 +2182,7 @@ Couldn't get https://www.reuters.com/sustainability/boards-policy-regulation/ind
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft only lets you opt out of AI photo scanning 3x a year (645 pts)]]></title>
+            <title><![CDATA[Microsoft only lets you opt out of AI photo scanning 3x a year (657 pts)]]></title>
             <link>https://hardware.slashdot.org/story/25/10/11/0238213/microsofts-onedrive-begins-testing-face-recognizing-ai-for-photos-for-some-preview-users</link>
             <guid>45551504</guid>
             <pubDate>Sat, 11 Oct 2025 18:36:51 GMT</pubDate>
@@ -2079,7 +2238,7 @@ Microsoft's "three times a year" policy also seemed limiting to Klosowski.  "Peo
 	</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rating 26 years of Java changes (202 pts)]]></title>
+            <title><![CDATA[Rating 26 years of Java changes (203 pts)]]></title>
             <link>https://neilmadden.blog/2025/09/12/rating-26-years-of-java-changes/</link>
             <guid>45551450</guid>
             <pubDate>Sat, 11 Oct 2025 18:29:27 GMT</pubDate>
@@ -2393,7 +2552,7 @@ Microsoft's "three times a year" policy also seemed limiting to Klosowski.  "Peo
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tennessee Man Arrested, Gets $2M Bond for Posting Facebook Meme (307 pts)]]></title>
+            <title><![CDATA[Tennessee Man Arrested, Gets $2M Bond for Posting Facebook Meme (310 pts)]]></title>
             <link>https://reason.com/2025/10/10/tennessee-man-arrested-gets-2-million-bond-for-posting-facebook-meme/</link>
             <guid>45551352</guid>
             <pubDate>Sat, 11 Oct 2025 18:17:10 GMT</pubDate>
@@ -2402,7 +2561,7 @@ Microsoft's "three times a year" policy also seemed limiting to Klosowski.  "Peo
 							<p>After the <a href="https://reason.com/2025/09/11/charlie-kirk-assassinated/">murder</a> of conservative activist Charlie Kirk in September, many on the political right set out to <a href="https://reason.com/2025/09/16/the-perverse-incentives-for-snitch-tagging-teachers-who-criticized-charlie-kirk/?nab=0">punish</a> anyone making light of the tragedy, or even simply being insufficiently upset. In one of the more brazen examples, a Tennessee man was arrested, accused of threatening a school shooting, and held on a $2 million bond, for posting a somewhat uncivil meme on Facebook.</p> <p>Larry Bushart, a 61-year-old former police officer, <a href="https://www.wsmv.com/2025/09/22/former-officer-accused-posting-threatening-meme-referencing-school-shooting-tn/">posted</a> the offending meme last month. In <a href="https://www.tennessean.com/story/news/2025/09/23/tennessee-larry-bushart-arrest-charlie-kirk/86313013007/">response</a> to a Facebook post about an upcoming vigil for Kirk, Bushart shared an <a href="https://x.com/aaronterr1/status/1970272191884468241">image</a> of President Donald Trump with the quote, "We have to get over it," which Trump <a href="https://www.nbcnews.com/politics/donald-trump/trump-tells-supporters-get-iowa-school-shooting-move-forward-rcna132610">said</a> in January 2024 after a shooting at Iowa's Perry High School. Text added to the image said, "This seems relevant today."</p> <p>Bushart did not elaborate, but the context seems clear: <em>Why should I care about this shooting, when the sitting president said I should "get over" this other shooting?</em></p> <p>The image was one of <a href="https://wopclive.linkedupradio.com/assets/images/2025/IMG_7383.webp">several</a> Bushart posted, and it was far from the most offensive. Still, it certainly feels crass; as people mourned a brutal public murder, Bushart snidely used the occasion to make a partisan political point. But it's certainly well within the bounds of average social media discourse, and you certainly wouldn't expect it to bring the attention of the local police.</p> <p>"Received a visit from Lexington PD regarding my posted memes," Bushart wrote in a September 21 <a href="https://www.facebook.com/share/p/1BAP29mMvt/">Facebook status</a>. <a href="https://www.tennessean.com/story/news/2025/09/23/tennessee-larry-bushart-arrest-charlie-kirk/86313013007/">According to</a> Sheriff Nick Weems of nearby Perry County, "numerous…teachers, parents and students"&nbsp;somehow interpreted Bushart's meme—with its citation in fine print about a previous school shooting at Perry High School in Perry, Iowa—as a threat to carry out a similar shooting at nearby Perry County High School.</p> <p>According to the Perry County Sheriff's Office <a href="https://isoms.perrycountysheriff.net/portal/Jail?hours=0&amp;lname=B">website</a>, Bushart was arrested the following morning on a charge of Threats of Mass Violence on School Property and Activities—a class E <a href="https://law.justia.com/codes/tennessee/title-39/chapter-16/part-5/section-39-16-517/">felony</a> <a href="https://codes.findlaw.com/tn/title-40-criminal-procedure/tn-code-sect-40-35-111/">punishable</a> by between one and six years in prison and up to a $3,000 fine. Worse, Bushart's bail is set at an astonishing $2 million.</p> <figure><img fetchpriority="high" decoding="async" src="https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1024x238.jpeg" alt="Mug shot and inmate listing for Larry G. Bushart, Jr, 61-year-old white male arrested 9/22/2025 by Perry County Sheriff's Office on charge of Threats of Mass Violence on School Property and Activites, $2 million bond." width="1024" height="238" data-credit="Perry County Sheriff's Office" srcset="https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1024x238.jpeg 1024w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-300x70.jpeg 300w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-768x178.jpeg 768w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1536x356.jpeg 1536w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing.jpeg 1974w" sizes="(max-width: 1024px) 100vw, 1024px" data-old-src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%201024%20238'%3E%3C/svg%3E" data-lazy-srcset="https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1024x238.jpeg 1024w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-300x70.jpeg 300w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-768x178.jpeg 768w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1536x356.jpeg 1536w, https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing.jpeg 1974w" data-lazy-src="https://reason.com/wp-content/uploads/2025/10/larry-bushart-inmate-listing-1024x238.jpeg"><figcaption>Perry County Sheriff's Office</figcaption></figure> <p>Under a Tennessee <a href="https://www.capitol.tn.gov/Bills/114/Bill/SB0464.pdf">law</a> that went <a href="https://williamsonsource.com/tn-laws-that-went-into-effect-july-1-2025/">into effect</a> July 1, anyone posting bond must put up at least 10 percent of the total amount, and bail bondsmen must charge a "premium fee" of at least five percent of the total bond amount. Even just to get out of jail ahead of trial, state law says Bushart would have to pay a bondsman at least $210,000.</p> <p>The Perry County Circuit Court <a href="https://perry.tncrtinfo.com/crCaseForm.aspx?id=ADDFC002-5567-44CA-B209-DA2909E6869F&amp;dsid=fd8e7548">website</a> indicates Bushart had a motion hearing scheduled for October 9, but when reached by phone Friday, a court clerk told <em>Reason</em> the hearing was "reset" for December 4.</p> <p>Bushart posted the Trump meme "to indicate or make the audience think it was referencing our Perry High School," Weems <a href="https://www.tennessean.com/story/news/2025/09/23/tennessee-larry-bushart-arrest-charlie-kirk/86313013007/">told&nbsp;<em>The Tennesseean</em></a> in a statement. "Investigators believe Bushart was fully aware of the fear his post would cause and intentionally sought to create hysteria within the community." Weems <a href="https://wopclive.com/local-news/808311/sheriff-man-arrested-for-mass-violence-threats-following-facebook-post">also told</a> local radio station WOPC the meme "eluded [<em>sic</em>] to a hypothetical shooting at a place called Perry High School."</p> <p>This justification is downright laughable. In its entirety, the post consists of a direct quote of a statement by the then-former president about a newsworthy event, with text providing context, plus a four-word phrase added. Bushart didn't even create the meme: <em>The Tennesseean</em>'s Angele Latham noted it had been "posted numerous times across multiple social media platforms not connected to Bushart going back to 2024."</p> <p>"Quote the President of the United States, go to jail," Adam Steinbaugh, an attorney with the Foundation for Individual Rights and Expression, <a href="https://x.com/adamsteinbaugh/status/1976087431947649466">posted</a> on X.</p> <p>In context, it's clear Bushart meant to suggest that since Trump previously said people should "get over" a school shooting, then they shouldn't be expected to care about the murder of a conservative public figure. It's quite a stretch to suggest this constituted a threat to shoot up a high school. Yes, a nearby high school happened to have a similar name, but that was clearly a coincidence, and there is nothing to suggest Bushart intended to carry out violence against the local school.</p> <p>On social media, some have <a href="https://x.com/politicalmath/status/1976276224197730800">suggested</a> the meme in question was part of a larger pattern indicating Bushart posed a threat. But in his <a href="https://www.tennessean.com/story/news/2025/09/23/tennessee-larry-bushart-arrest-charlie-kirk/86313013007/">statement</a> to <em>The Tennesseean</em>, Weems specifically singled out the Trump meme as the offender, saying while the other posts were "hate memes," they were "not against the law and would be recognized as free speech."</p> <p>Perhaps some teachers, parents, or students really did find Bushart's post threatening—though since it was a reply on a Facebook page for local news, it's not clear how many people even saw it. And even if people did see and interpret it as a threat of violence, that doesn't mean it meets the standard for a "true threat," in violation of the First Amendment.</p> <p>"True threats are not protected speech but not everything is a true threat," David Hudson, professor at Belmont University School of Law, tells <em>Reason</em>. "This seems to me to be heated rhetorical hyperbole, which is an incredibly important concept—or should be—in true threat-type cases."</p> <p>The U.S. Supreme Court created the true threat exception to the First Amendment in the 1969 decision <a href="https://supreme.justia.com/cases/federal/us/394/705/"><em>Watts v. United States</em></a>. Even then, Hudson adds, it made the point of distinguishing between true threats and "crude political hyperbole"—in that case, a protester's remark that if he were drafted into the Army, "the first man I want to get in my sights is" then-President Lyndon Johnson. The court agreed with the plaintiff that it was not a true threat but simply "a kind of very crude offensive method of stating a political opposition to the President."</p> <p>"Suppression of speech as an effective police measure is an old, old device, outlawed by our Constitution," Justice William O. Douglas wrote in a concurring opinion.</p> <p>Bushart's arrest would be humorous if it weren't so serious. He now faces a potential years-long prison sentence for reposting a Facebook meme that doesn't come anywhere close to qualifying as an exception to the First Amendment. Even if the case gets thrown out, he has already spent two weeks in jail and is set to spend two more months until his first hearing.</p>						</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Anthropic's Prompt Engineering Tutorial (179 pts)]]></title>
+            <title><![CDATA[Anthropic's Prompt Engineering Tutorial (201 pts)]]></title>
             <link>https://github.com/anthropics/prompt-eng-interactive-tutorial</link>
             <guid>45551260</guid>
             <pubDate>Sat, 11 Oct 2025 18:06:40 GMT</pubDate>
@@ -2479,7 +2638,7 @@ Microsoft's "three times a year" policy also seemed limiting to Klosowski.  "Peo
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[People regret buying Amazon smart displays after being bombarded with ads (292 pts)]]></title>
+            <title><![CDATA[People regret buying Amazon smart displays after being bombarded with ads (294 pts)]]></title>
             <link>https://arstechnica.com/gadgets/2025/10/people-regret-buying-amazon-smart-displays-after-being-bombarded-with-ads/</link>
             <guid>45551081</guid>
             <pubDate>Sat, 11 Oct 2025 17:41:45 GMT</pubDate>
@@ -3705,14 +3864,6 @@ You can see the tabs opened on your desktop
 
 
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Learn Turbo Pascal – a video series originally released on VHS (123 pts)]]></title>
-            <link>https://www.youtube.com/watch?v=UOtonwG3DXM</link>
-            <guid>45548457</guid>
-            <pubDate>Sat, 11 Oct 2025 11:57:58 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.youtube.com/watch?v=UOtonwG3DXM">https://www.youtube.com/watch?v=UOtonwG3DXM</a>, See on <a href="https://news.ycombinator.com/item?id=45548457">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
         </item>
     </channel>
 </rss>
