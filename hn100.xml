@@ -4,12 +4,682 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 21 Oct 2025 03:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 21 Oct 2025 04:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Today is when the Amazon brain drain sent AWS down the spout (398 pts)]]></title>
+            <title><![CDATA[Building a message queue with only two UNIX signals (106 pts)]]></title>
+            <link>https://leandronsp.com/articles/you-dont-need-kafka-building-a-message-queue-with-only-two-unix-signals</link>
+            <guid>45650178</guid>
+            <pubDate>Mon, 20 Oct 2025 22:22:45 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://leandronsp.com/articles/you-dont-need-kafka-building-a-message-queue-with-only-two-unix-signals">https://leandronsp.com/articles/you-dont-need-kafka-building-a-message-queue-with-only-two-unix-signals</a>, See on <a href="https://news.ycombinator.com/item?id=45650178">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        <p>Have you ever asked yourself what if we could replace any message broker with a very simple one using only two UNIX signals? Well, I’m not surprised if you didn’t. But I did. And I want to share my journey of how I achieved it.</p>
+<p>If you want to learn about UNIX signals, binary operations the easy way, how a message broker works under the hood, and a bit of Ruby, this post is for you.</p>
+<p>And if you came here just because of the clickbait title, I apologize and invite you to keep reading. It’ll be fun, I promise.</p>
+<p><img src="https://leandronsp.com/uploads/3491.png" alt="image"></p>
+<h2>It’s all about UNIX</h2>
+<p>A few days ago, I saw some discussion on the internet about how we could send messages between processes. Many people think of sockets, which are the most common way to send messages, even allowing communication across different machines and networks. Some don’t even realize that pipes are another way to send messages between processes:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>echo</span> <span>'hello'</span> <span>|</span> <span>base64</span>
+</p><p><span>aGVsbG8K</span>
+</p></code></pre>
+<p>Here’s what’s happening:</p>
+<ul>
+<li>The process <code>echo</code> is started with the content “hello”</li>
+<li><code>echo</code> is a program that prints the message to <em>STDOUT</em></li>
+<li>Through the pipe, the content in <em>STDOUT</em> is <strong>sent</strong> directly to the <em>STDIN</em> of the <code>base64</code> process</li>
+<li>The <code>base64</code> process encodes its input to Base64 and then puts the result in <em>STDOUT</em></li>
+</ul>
+<p>Note the word “send”. Yes, anonymous pipes are a form of <strong>IPC (Inter-process communication).</strong> Other forms of IPC in UNIX include:</p>
+<ul>
+<li>named pipes (mkfifo)</li>
+<li>sockets</li>
+<li>regular files</li>
+<li>or even a simple <strong>signal</strong></li>
+</ul>
+<h2>UNIX signals</h2>
+<p>According to <a href="https://leandronsp.com/articles/url">Wikipedia</a>:</p>
+<blockquote>
+<p>A UNIX signal is a standardized message sent to a program to trigger specific behaviour, such as quitting or error handling</p>
+</blockquote>
+<p>There are many signals we can send to a process, including:</p>
+<ul>
+<li>SIGTERM - sends a notification to the process to terminate. It can be “trapped,” which means the process can do some cleanup work before termination, like releasing OS resources and closing file descriptors</li>
+<li>SIGKILL - sends a termination signal that cannot be trapped or ignored, forcing immediate termination</li>
+<li>SIGINT - the interrupt signal, typically sent when you press <code>Ctrl+C</code> in the terminal. It can be trapped, allowing the process to perform cleanup before exiting gracefully</li>
+<li>SIGHUP - the hangup signal, originally sent when a terminal connection was lost. Modern applications often use it to reload configuration files without restarting the process</li>
+<li>SIGQUIT - similar to SIGINT but also generates a core dump for debugging</li>
+<li>SIGSTOP - pauses (suspends) a process. Cannot be trapped or ignored</li>
+<li>SIGCONT - resumes a process that was paused by <em>SIGSTOP</em></li>
+<li>SIGCHLD - sent to a parent process when a child process terminates or stops</li>
+<li><strong>SIGUSR1</strong> and <strong>SIGUSR2</strong> - user-defined signals that applications can use for custom purposes</li>
+</ul>
+<h2>Sending messages using  signals</h2>
+<p>Okay, we know that signals are a primitive form of IPC. UNIX-like systems provide a syscall called <code>kill</code> that sends signals to processes. Historically, this syscall was created solely to terminate processes. But over time, they needed to accommodate other types of signals, so they reused the same syscall for different purposes.</p>
+<p>For instance, let’s create a simple Ruby script <code>sleeper.rb</code> which sleeps for 60 seconds, nothing more:</p>
+<pre><code translate="no" tabindex="0"><p><span>puts</span> <span>"</span><span>Process ID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>puts</span> <span>"</span><span>Sleeping for 60 seconds...</span><span>"</span>
+</p><p><span>sleep</span> <span>60</span>
+</p></code></pre>
+<p>After running we see:</p>
+<pre><code translate="no" tabindex="0"><p>Process ID: 55402
+</p><p>Sleeping for 60 seconds...
+</p></code></pre>
+<p>In another window, we can <strong>send</strong> the <code>SIGTERM</code> signal to the process <code>55402</code> via syscall <code>kill</code>:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>kill</span> <span>-SIGTERM</span> <span>55402</span>
+</p></code></pre>
+<p>And then, in the script session:</p>
+<pre><code translate="no" tabindex="0"><p>[1]    55402 terminated  ruby sleeper.rb
+</p></code></pre>
+<h3>Signal traps</h3>
+<p>In Ruby, we can also <em>trap</em> a signal using the <code>trap</code> method in Ruby:</p>
+<pre><code translate="no" tabindex="0"><p><span>puts</span> <span>"</span><span>Process ID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>puts</span> <span>"</span><span>Sleeping for 60 seconds...</span><span>"</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGTERM</span><span>'</span><span>)</span> <span>do</span> 
+</p><p><span>puts</span> <span>"</span><span>Received SIGTERM, exiting gracefully...</span><span>"</span>
+</p><p><span>exit</span>
+</p><p><span>end</span>
+</p><p><span>sleep</span> <span>60</span>
+</p></code></pre>
+<p>Which in turn, after sending the signal, will gracefully:</p>
+<pre><code translate="no" tabindex="0"><p>Process ID: 55536
+</p><p>Sleeping for 60 seconds...
+</p><p>Received SIGTERM, exiting gracefully...
+</p></code></pre>
+<p>After all, we <em>cannot send messages using signals</em>. They are a primitive way of sending <em>standardized messages</em> which will trigger specific behaviours. At most, we can trap some signals, but nothing more.</p>
+<blockquote>
+<p>Okay Leandro, but what’s the purpose of this article then?</p>
+</blockquote>
+<p><em>Hold on</em>. That’s exactly why I’m here. To prove points by doing useless stuff, like when I <a href="https://leandronsp.com/articles/simulating-oop-in-bash-3mop">simulated OOP in Bash</a> a couple of years ago (it was fun though).</p>
+<p>To understand how we can “hack” UNIX signals and send messages between processes, let’s first talk a bit about <strong>binary operations</strong>. Yes, those “zeros” and “ones” you were scared of when you saw them for the first time. But they don’t bite (🥁 LOL), I promise.</p>
+<h2>What is a message?</h2>
+<p>If we model a message as a sequence of characters, we could say that at a high-level, messages are simply <em>strings</em>. But in memory, they are stored as <strong>bytes</strong>.</p>
+<p>We know that bytes are made of bits. In computer terms, what’s a bit? It’s simply an abstraction representing <strong>only two states</strong>:</p>
+<ul>
+<li>zero</li>
+<li>one</li>
+</ul>
+<p>That’s it. For instance, using <a href="https://leandronsp.com/articles/url">ASCII</a>, we know that the letter “h” has the following codes:</p>
+<ul>
+<li>104 in decimal</li>
+<li><code>0x68</code> in hexadecimal</li>
+<li><code>01101000</code> in binary</li>
+</ul>
+<p>Binary-wise, what if we represented each “0” with a specific signal and each “1” with another? We know that some signals such as SIGTERM, SIGINT, and SIGCONT can be trapped, but intercepting them would harm their original purpose.</p>
+<p>But thankfully, UNIX provides two user-defined signals that are perfect for our hacking experiment.</p>
+<h2>Sending SIGUSR1 and SIGUSR2</h2>
+<p>First things first, let’s trap those signals in the code:</p>
+<pre><code translate="no" tabindex="0"><p><span>puts</span> <span>"</span><span>Process ID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>puts</span> <span>"</span><span>Sleeping forever. Send signals to this process to see how it responds.</span><span>"</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>)</span> <span>do</span> 
+</p><p><span>puts</span> <span>"</span><span>Received SIGUSR1 signal</span><span>"</span>
+</p><p><span>end</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR2</span><span>'</span><span>)</span> <span>do</span>
+</p><p><span>puts</span> <span>"</span><span>Received SIGUSR2 signal</span><span>"</span>
+</p><p><span>end</span>
+</p><p><span>sleep</span>
+</p></code></pre>
+<pre><code translate="no" tabindex="0"><p>Process ID: 56172
+</p><p>Sleeping forever. Send signals to this process to see how it responds.
+</p></code></pre>
+<p>After sending some <code>kill -SIGUSR1 56172</code> and <code>kill -SIGUSR2 56172</code>, we can see that the process prints the following content:</p>
+<pre><code translate="no" tabindex="0"><p>Process ID: 56172
+</p><p>Sleeping forever. Send signals to this process to see how it responds.
+</p><p>Received SIGUSR1 signal
+</p><p>Received SIGUSR2 signal
+</p><p>Received SIGUSR2 signal
+</p><p>Received SIGUSR1 signal
+</p><p>Received SIGUSR1 signal
+</p><p>Received SIGUSR2 signal
+</p></code></pre>
+<p><strong>Signals don’t carry data</strong>. But the example we have is perfect for changing to bits, uh?</p>
+<pre><code translate="no" tabindex="0"><p>Received SIGUSR1 signal # 0
+</p><p>Received SIGUSR2 signal # 1
+</p><p>Received SIGUSR2 signal # 1
+</p><p>Received SIGUSR1 signal # 0
+</p><p>Received SIGUSR2 signal # 1
+</p><p>Received SIGUSR1 signal # 0
+</p><p>Received SIGUSR1 signal # 0
+</p><p>Received SIGUSR1 signal # 0
+</p></code></pre>
+<p>That’s exactly <code>01101000</code>, the binary representation of the letter “h”. We’re simply <strong>encoding</strong> the letter as a binary representation and sending it via signals</p>
+<p>Again, we’re <strong>encoding it as a binary</strong> and sending it <strong>via signals</strong>.</p>
+<p><em>How cool is that</em>?</p>
+<p><img src="https://leandronsp.com/uploads/3299.png" alt="image"></p>
+<h3>Decoding the binary data</h3>
+<p>On the other side, the receiver should be capable of decoding the message and converting it back to the letter “h”:</p>
+<ul>
+<li>sender <em>encodes</em> the message</li>
+<li>receiver <em>decodes</em> the message</li>
+</ul>
+<p>So, how do we decode <code>01101000</code> (the letter “h” in ASCII)? Let’s break it down into a few steps:</p>
+<ol>
+<li>First, we need to see the 8 bits as individual digits in their respective positions</li>
+<li>The rightmost bit is at position 0, whereas the leftmost bit is at position 7. This is how we define the most significant bit (<strong>MSB</strong>, the leftmost) and the least significant bit (<strong>LSB</strong>, the rightmost)</li>
+<li>For this example, we perform a <strong>left shift</strong> operation on each bit and then sum all the values, in this case from MSB to LSB (the order doesn’t matter much for now): <code>(0 &lt;&lt; 7) + (1 &lt;&lt; 6) + (1 &lt;&lt; 5) + (0 &lt;&lt; 4) + ... + (0 &lt;&lt; 0)</code>:<br>
+<em>left shift on <em>zeros</em> will always produce a <em>zero</em></em></li>
+</ol>
+<ul>
+<li><code>0 &lt;&lt; 7</code> = <code>(2 ** 7) * 0</code> = <code>128 * 0</code> = 0</li>
+<li><code>1 &lt;&lt; 6</code> = <code>(2 ** 6) * 1</code> = <code>64 * 1</code> = 64</li>
+</ul>
+<p>Similarly to the remaining bits:</p>
+<ul>
+<li><code>1 &lt;&lt; 5</code> = 32</li>
+<li><code>0 &lt;&lt; 4</code> = 0</li>
+<li><code>1 &lt;&lt; 3</code> = 8</li>
+<li><code>0 &lt;&lt; 2</code> = 0</li>
+<li><code>0 &lt;&lt; 1</code> = 0</li>
+<li><code>0 &lt;&lt; 0</code> = 0</li>
+</ul>
+<p>So, our sum becomes, from MSB to LSB:</p>
+<pre><code translate="no" tabindex="0"><p>MSB                          LSB
+</p><p>0   1    1    0   1   0   0   0
+</p><p>0 + 64 + 32 + 0 + 8 + 0 + 0 + 0 = 104
+</p></code></pre>
+<p>104 is exactly the <strong>decimal representation</strong> of the letter “h” in ASCII.</p>
+<p><em>How wonderful is that?</em></p>
+<h3>Sending the letter “h”</h3>
+<p>Now let’s convert these operations to Ruby code. We’ll write a simple program <code>receiver.rb</code> that receives signals in order from LSB to MSB (positions 0 to 7) and then converts them back to ASCII characters, printing to <code>STDOUT</code>.</p>
+<p>Basically, we’ll <strong>accumulate</strong> bits and whenever we form a complete byte, we’ll decode it to its ASCII representation. The very basic implementation of our <code>accumulate_bit(bit)</code> method would look like as follows:</p>
+<pre><code translate="no" tabindex="0"><p><span>@position</span> <span>=</span> <span>0</span> <span># start with the LSB</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span>
+</p><p><span>def</span> <span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span># The left shift operator (&lt;&lt;) is used to </span>
+</p><p><span># shift the bits of the number to the left.</span>
+</p><p><span>#</span>
+</p><p><span># This is equivalent of: (2 ** @position) * bit</span>
+</p><p><span>@accumulator</span> <span>+=</span> <span>(</span><span>bit</span> <span>&lt;&lt;</span> <span>@position</span><span>)</span>
+</p><p><span>return</span> <span>@accumulator</span> <span>if</span> <span>@position</span> <span>==</span> <span>7</span> <span># stop accumulating after 8 bits (byte)</span>
+</p><p><span>@position</span> <span>+=</span> <span>1</span> <span># move to the next bit position: 0 becomes 1, 1 becomes 2, etc.</span>
+</p><p><span>end</span>
+</p><p><span># Letter "h" in binary is 01101000</span>
+</p><p><span># But we'll send from the LSB to the MSB</span>
+</p><p><span>#</span>
+</p><p><span># 0110 1000 (MSB -&gt; LSB) becomes 0001 0110 (LSB -&gt; MSB)</span>
+</p><p><span># The order doesn't matter that much, it'll depend on </span>
+</p><p><span># the receiver's implementation.</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>0</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>0</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>0</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>1</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>0</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>1</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>1</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>0</span><span>)</span>
+</p><p><span>puts</span> <span>@accumulator</span> <span># should print 104, which is the ASCII code for "h"</span>
+</p></code></pre>
+<p><em>Pay attention to this code. It’s very important and builds the foundation for the next steps. If you didn’t get it, go back and read it again. Try it yourself in the terminal or using your preferred programming language.</em></p>
+<p>Now, how to convert the decimal <code>104</code> to the ASCII character representation? Luckily, Ruby provides a method called <code>chr</code> which does the job:</p>
+<pre><code translate="no" tabindex="0"><p><span>irb</span><span>&gt;</span> <span>puts</span> <span>104</span><span>.</span><span>chr</span>
+</p><p><span>=&gt;</span> <span>"</span><span>h</span><span>"</span>
+</p></code></pre>
+<p>We could do the same job for the rest of the word “hello”, for instance. According to the <a href="https://www.ascii-code.com/">ASCII table</a>, it should be the following:</p>
+<ul>
+<li><code>e</code> in decimal is <code>101</code></li>
+<li><code>l</code> in decimal is <code>108</code></li>
+<li><code>o</code> in decimal is <code>111</code></li>
+</ul>
+<p>Let’s check if Ruby knows that:</p>
+<pre><code translate="no" tabindex="0"><p><span>104</span><span>.</span><span>chr</span>    <span># "h"</span>
+</p><p><span>101</span><span>.</span><span>chr</span>    <span># "e"</span>
+</p><p><span>108</span><span>.</span><span>chr</span>    <span># "l"</span>
+</p><p><span>111</span><span>.</span><span>chr</span>    <span># "o"</span>
+</p></code></pre>
+<p>We can even “decode” the word to the decimal representation in ASCII:</p>
+<pre><code translate="no" tabindex="0"><p><span>irb</span><span>&gt;</span> <span>"</span><span>hello</span><span>"</span><span>.</span><span>bytes</span>
+</p><p><span>=&gt;</span> <span>[</span><span>104</span><span>,</span> <span>101</span><span>,</span> <span>108</span><span>,</span> <span>108</span><span>,</span> <span>111</span><span>]</span>
+</p></code></pre>
+<p>Now, time to finish our receiver implementation to properly print the letter “h”:</p>
+<pre><code translate="no" tabindex="0"><p><span>@position</span> <span>=</span> <span>0</span> <span># start with the LSB</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>)</span> <span>{</span> <span>decode_signal</span><span>(</span><span>0</span><span>)</span> <span>}</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR2</span><span>'</span><span>)</span> <span>{</span> <span>decode_signal</span><span>(</span><span>1</span><span>)</span> <span>}</span>
+</p><p><span>def</span> <span>decode_signal</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>return</span> <span>unless</span> <span>@position</span> <span>==</span> <span>8</span> <span># if not yet accumulated a byte, keep accumulating</span>
+</p><p><span>print</span> <span>"</span><span>Received byte: </span><span>#{</span><span>@accumulator</span><span>}</span><span> (</span><span>#{</span><span>@accumulator</span><span>.</span><span>chr</span><span>}</span><span>)</span><span>\n</span><span>"</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span> <span># reset the accumulator</span>
+</p><p><span>@position</span> <span>=</span> <span>0</span> <span># reset position for the next byte</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span># The left shift operator (&lt;&lt;) is used to </span>
+</p><p><span># shift the bits of the number to the left.</span>
+</p><p><span>#</span>
+</p><p><span># This is equivalent of: (2 ** @position) * bit</span>
+</p><p><span>@accumulator</span> <span>+=</span> <span>(</span><span>bit</span> <span>&lt;&lt;</span> <span>@position</span><span>)</span>
+</p><p><span>@position</span> <span>+=</span> <span>1</span> <span># move to the next bit position: 0 becomes 1, 1 becomes 2, etc.</span>
+</p><p><span>end</span>
+</p><p><span>puts</span> <span>"</span><span>Process ID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>sleep</span>
+</p></code></pre>
+<p><em>Read that code and its comments. It’s very important. Do not continue reading until you really get what’s happening here.</em></p>
+<ul>
+<li>Whenever we get <code>SIGUSR1</code>, we accumulate the bit <code>0</code></li>
+<li>When getting <code>SIGUSR2</code>, accumulate then the bit <code>1</code></li>
+<li>When accumulator reaches  the position<code>8</code>, it means we have a byte. At this moment we should print the ASCII representation using the <code>.chr</code> we seen earlier. Then, reset bit position and accumulator</li>
+</ul>
+<p>Let’s see our receiver in action! Start the receiver in one terminal:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>receiver.rb</span>
+</p><p><span>Process</span> <span>ID:</span> <span>58219</span>
+</p></code></pre>
+<p>Great! Now the receiver is listening for signals. In another terminal, let’s manually send signals<br>
+to form the letter “h” (which is <code>01101000</code> in binary, remember?):</p>
+<pre><code translate="no" tabindex="0"><p>  # Sending from LSB to MSB: 0, 0, 0, 1, 0, 1, 1, 0
+</p><p>  $ kill -SIGUSR1 58219  # 0
+</p><p>  $ kill -SIGUSR1 58219  # 0
+</p><p>  $ kill -SIGUSR1 58219  # 0
+</p><p>  $ kill -SIGUSR2 58219  # 1
+</p><p>  $ kill -SIGUSR1 58219  # 0
+</p><p>  $ kill -SIGUSR2 58219  # 1
+</p><p>  $ kill -SIGUSR2 58219  # 1
+</p><p>  $ kill -SIGUSR1 58219  # 0
+</p></code></pre>
+<p>And in the receiver terminal, we should see:</p>
+<pre><code translate="no" tabindex="0"><p>Received byte: 104 (h)
+</p></code></pre>
+<p><em>How amazing is that?</em> We just sent the letter “h” using only two UNIX signals!</p>
+<p>But wait. Manually sending 8 signals for each character? That’s tedious and error-prone. What if we wanted to send the word “hello”? That’s 5 characters × 8 bits = 40 signals to send manually. No way.</p>
+<p><em>We need a sender.</em></p>
+<h3>Building the sender</h3>
+<p>The sender’s job is the opposite of the receiver: it should encode a message (string) into bits and send them as signals to the receiver process.</p>
+<p>Let’s think about what we need:</p>
+<ol>
+<li>Take a message as input (like “hello”)</li>
+<li>Convert each character to its byte representation</li>
+<li>Extract the 8 bits from each byte</li>
+<li>Send <code>SIGUSR1</code> for bit 0, <code>SIGUSR2</code> for bit 1</li>
+<li>Repeat for all characters</li>
+</ol>
+<p>The tricky part here is the step 3: <strong>how do we extract individual bits from a byte?</strong> To extract the bit at position <code>i</code>, we can use the following formula:</p>
+<pre><code translate="no" tabindex="0"><p>bit = (byte &gt;&gt; i) &amp; 1
+</p></code></pre>
+<p>Let me break this down:</p>
+<ul>
+<li><code>byte &gt;&gt; i</code> performs a <em>right shift</em> by <code>i</code> positions</li>
+<li><code>&amp; 1</code> is a bitwise <code>AND</code> operation that extracts only the <em>rightmost</em> bit</li>
+</ul>
+<p>For the letter “h” (<code>01101000</code> in binary, <code>104</code> in decimal):</p>
+<p><strong>Position 0 (LSB):</strong></p>
+<ul>
+<li><code>(104 &gt;&gt; 0)</code> = <code>104 / (2 ** 0)</code> = <code>104 / 1</code> = 104</li>
+<li><code>01101000</code> &gt;&gt; 0 = <code>01101000</code></li>
+<li><code>01101000</code> &amp; <code>00000001</code> = 0 (<em>one</em> AND <em>zero</em> is <em>zero</em>)</li>
+</ul>
+<p><strong>Position 1:</strong></p>
+<ul>
+<li><code>(104 &gt;&gt; 1)</code> = <code>104 / (2 ** 1)</code> = <code>104 / 2</code> = 52</li>
+<li><code>01101000</code> &gt;&gt; 1 = <code>00110100</code></li>
+<li><code>00110100</code> &amp; <code>00000001</code> = 0</li>
+</ul>
+<p><strong>Position 2:</strong></p>
+<ul>
+<li><code>(104 &gt;&gt; 2)</code> = <code>104 / (2 ** 2)</code> = <code>104 / 4</code> = 26</li>
+<li><code>01101000</code> &gt;&gt; 2 = <code>00011010</code></li>
+<li><code>00011010</code> &amp; <code>00000001</code> = 0</li>
+</ul>
+<p><strong>Position 3:</strong></p>
+<ul>
+<li><code>(104 &gt;&gt; 3)</code> = <code>104 / (2 ** 3)</code> = <code>104 / 8</code> = 13</li>
+<li><code>01101000</code> &gt;&gt; 3 = <code>00001101</code></li>
+<li><code>00001101</code> &amp; <code>00000001</code> = 1 (<em>one</em> AND <em>one</em> equals <em>one</em>)</li>
+</ul>
+<p>And so on for positions 4, 5, 6, and 7. This gives us: <code>0, 0, 0, 1, 0, 1, 1, 0</code> — exactly the bits we need from LSB to MSB!</p>
+<ul>
+<li><code>(104 &gt;&gt; 0) &amp; 1</code> = <code>104 &amp; 1</code> = 0</li>
+<li><code>(104 &gt;&gt; 1) &amp; 1</code> = <code>52 &amp; 1</code> = 0</li>
+<li><code>(104 &gt;&gt; 2) &amp; 1</code> = <code>26 &amp; 1</code> = 0</li>
+<li><code>(104 &gt;&gt; 3) &amp; 1</code> = <code>13 &amp; 1</code> = 1</li>
+<li><code>(104 &gt;&gt; 4) &amp; 1</code> = <code>6 &amp; 1</code> = 0</li>
+<li><code>(104 &gt;&gt; 5) &amp; 1</code> = <code>3 &amp; 1</code> = 1</li>
+<li><code>(104 &gt;&gt; 6) &amp; 1</code> = <code>1 &amp; 1</code> = 1</li>
+<li><code>(104 &gt;&gt; 7) &amp; 1</code> = <code>0 &amp; 1</code> = 0</li>
+</ul>
+<blockquote>
+<p>Pay close attention to this technique. It’s a fundamental operation in low-level programming.</p>
+</blockquote>
+<p>So now time to build the <code>sender.rb</code> which is pretty simple:</p>
+<pre><code translate="no" tabindex="0"><p><span>receiver_pid</span> <span>=</span> <span>ARGV</span><span>[</span><span>0</span><span>]</span><span>.</span><span>to_i</span>
+</p><p><span>message</span> <span>=</span> <span>ARGV</span><span>[</span><span>1</span><span>..</span><span>-</span><span>1</span><span>]</span><span>.</span><span>join</span><span>(</span><span>'</span><span> </span><span>'</span><span>)</span>
+</p><p><span>def</span> <span>encode_byte</span><span>(</span><span>byte</span><span>)</span>
+</p><p><span>8</span><span>.</span><span>times</span><span>.</span><span>map</span> <span>do</span> <span>|</span><span>i</span><span>|</span>
+</p><p><span># Extract each bit from the byte, starting from the LSB</span>
+</p><p><span>(</span><span>byte</span> <span>&gt;&gt;</span> <span>i</span><span>)</span> <span>&amp;</span> <span>1</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>message</span><span>.</span><span>bytes</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>byte</span><span>|</span>
+</p><p><span>encode_byte</span><span>(</span><span>byte</span><span>)</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>bit</span><span>|</span>
+</p><p><span>signal</span> <span>=</span> <span>bit</span> <span>==</span> <span>0</span> <span>?</span> <span>'</span><span>SIGUSR1</span><span>'</span> <span>:</span> <span>'</span><span>SIGUSR2</span><span>'</span>
+</p><p><span>Process</span><span>.</span><span>kill</span><span>(</span><span>signal</span><span>,</span> <span>receiver_pid</span><span>)</span>
+</p><p><span>sleep</span> <span>0.001</span> <span># Delay to allow the receiver to process the signal</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>For each byte (8-bit structure) we extract the bit performing the <em>right shift</em> + <em>AND</em> oprerations. The result is the extracted bit.</p>
+<p>In the receiver window:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>receiver.rb</span>
+</p><p><span>Process</span> <span>ID:</span> <span>68968</span>
+</p></code></pre>
+<p>And in the sender window:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>sender.rb</span> <span>68968</span> <span>h</span>
+</p></code></pre>
+<p>The receiver will print:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>receiver.rb</span>
+</p><p><span>Process</span> <span>ID:</span> <span>68968</span>
+</p><p><span>Received</span> <span>byte:</span> <span>104</span><span></span> <span>(</span><span>h</span><span>)</span>
+</p></code></pre>
+<p><em>Processes sending messages with only two signals!</em> How wonderful is that?</p>
+<h3>Sending the “hello” message</h3>
+<p>Now, sending the hello message is super easy. The sender is already able to send not only a letter but any message using signals:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>sender.rb</span> <span>68968</span> <span>hello</span>
+</p><p><span># And the receiver:</span>
+</p><p><span>Received</span> <span>byte:</span> <span>104</span><span></span> <span>(</span><span>h</span><span>)</span>
+</p><p><span>Received</span> <span>byte:</span> <span>101</span><span></span> <span>(</span><span>e</span><span>)</span>
+</p><p><span>Received</span> <span>byte:</span> <span>108</span><span></span> <span>(</span><span>l</span><span>)</span>
+</p><p><span>Received</span> <span>byte:</span> <span>108</span><span></span> <span>(</span><span>l</span><span>)</span>
+</p><p><span>Received</span> <span>byte:</span> <span>111</span><span></span> <span>(</span><span>o</span><span>)</span>
+</p></code></pre>
+<p>Just change the <code>receiver</code> implementation a little bit:</p>
+<pre><code translate="no" tabindex="0"><p><span>def</span> <span>decode_signal</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>return</span> <span>unless</span> <span>@position</span> <span>==</span> <span>8</span> <span># if not yet accumulated a byte, keep accumulating</span>
+</p><p><span>print</span> <span>@accumulator</span><span>.</span><span>chr</span> <span># print the byte as a character</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span> <span># reset the accumulator</span>
+</p><p><span>@position</span> <span>=</span> <span>0</span> <span># reset position for the next byte</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>And then:</p>
+<pre><code translate="no" tabindex="0"><p><span>$</span> <span>ruby</span> <span>sender.rb</span> <span>96875</span> <span>Hello</span>
+</p><p><span># In the receiver's terminal</span>
+</p><p><span>Process</span> <span>ID:</span> <span>96875</span>
+</p><p><span>Hello</span>
+</p></code></pre>
+<p>However, if we send the message again, the receiver will print everything in the same line:</p>
+<pre><code translate="no" tabindex="0"><p>$ <span>ruby</span> <span>sender</span><span>.</span><span>rb</span> <span>96875</span> <span>Hello</span>
+</p><p>$ <span>ruby</span> <span>sender</span><span>.</span><span>rb</span> <span>96875</span> <span>Hello</span>
+</p><p><span># In the receiver's terminal</span>
+</p><p><span>Process</span> <span>ID</span><span>:</span> <span>96875</span>
+</p><p><span>HelloHello</span>
+</p></code></pre>
+<p>It’s obvious: the receiver doesn’t know where the sender finished the message, so it’s impossible to know where we should stop one message and print the next one on a new line with <code>\n</code>.</p>
+<p>We should then determine how the sender indicates the end of the message. How about being it all <em>zeroes</em> (<code>0000 0000</code>)?</p>
+<ul>
+<li>We send the message: first 5 bytes representing the “hello” message</li>
+<li>Then we send a “NULL terminator”, just one byte <em>0</em> (<code>0000 0000</code>)</li>
+</ul>
+<pre><code translate="no" tabindex="0"><p>0110 1000 # h
+</p><p>0110 0101 # e
+</p><p>0110 1000 # l
+</p><p>0110 1000 # l
+</p><p>0110 1111 # o
+</p><p>0000 0000 # NULL
+</p></code></pre>
+<p>Hence, when the <em>receiver</em> gets a NULL terminator, it will print a line feed <code>\n</code>. Let’s change the <code>sender.rb</code> first:</p>
+<pre><code translate="no" tabindex="0"><p><span>receiver_pid</span> <span>=</span> <span>ARGV</span><span>[</span><span>0</span><span>]</span><span>.</span><span>to_i</span>
+</p><p><span>message</span> <span>=</span> <span>ARGV</span><span>[</span><span>1</span><span>..</span><span>-</span><span>1</span><span>]</span><span>.</span><span>join</span><span>(</span><span>'</span><span> </span><span>'</span><span>)</span>
+</p><p><span>def</span> <span>encode_byte</span><span>(</span><span>byte</span><span>)</span>
+</p><p><span>8</span><span>.</span><span>times</span><span>.</span><span>map</span> <span>do</span> <span>|</span><span>i</span><span>|</span>
+</p><p><span># Extract each bit from the byte, starting from the LSB</span>
+</p><p><span>(</span><span>byte</span> <span>&gt;&gt;</span> <span>i</span><span>)</span> <span>&amp;</span> <span>1</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>message</span><span>.</span><span>bytes</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>byte</span><span>|</span>
+</p><p><span>encode_byte</span><span>(</span><span>byte</span><span>)</span><span>.</span><span>each</span> <span>do</span> <span>|</span><span>bit</span><span>|</span>
+</p><p><span>signal</span> <span>=</span> <span>bit</span> <span>==</span> <span>0</span> <span>?</span> <span>'</span><span>SIGUSR1</span><span>'</span> <span>:</span> <span>'</span><span>SIGUSR2</span><span>'</span>
+</p><p><span>Process</span><span>.</span><span>kill</span><span>(</span><span>signal</span><span>,</span> <span>receiver_pid</span><span>)</span>
+</p><p><span>sleep</span> <span>0.001</span> <span># Delay to allow the receiver to process the signal</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span># Send NULL terminator (0000 0000)</span>
+</p><p><span>8</span><span>.</span><span>times</span> <span>do</span>
+</p><p><span>Process</span><span>.</span><span>kill</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>,</span> <span>receiver_pid</span><span>)</span>
+</p><p><span>sleep</span> <span>0.001</span> <span># Delay to allow the receiver to process the signal</span>
+</p><p><span>end</span>
+</p><p><span>puts</span> <span>"</span><span>Message sent to receiver (PID: </span><span>#{</span><span>receiver_pid</span><span>}</span><span>)</span><span>"</span>
+</p></code></pre>
+<p>Then, the <code>receiver.rb</code>:</p>
+<pre><code translate="no" tabindex="0"><p><span>@position</span> <span>=</span> <span>0</span> <span># start with the LSB</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>)</span> <span>{</span> <span>decode_signal</span><span>(</span><span>0</span><span>)</span> <span>}</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR2</span><span>'</span><span>)</span> <span>{</span> <span>decode_signal</span><span>(</span><span>1</span><span>)</span> <span>}</span>
+</p><p><span>def</span> <span>decode_signal</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>return</span> <span>unless</span> <span>@position</span> <span>==</span> <span>8</span> <span># if not yet accumulated a byte, keep accumulating</span>
+</p><p><span>if</span> <span>@accumulator</span><span>.</span><span>zero?</span> <span># NULL terminator received</span>
+</p><p><span>print</span> <span>"</span><span>\n</span><span>"</span>
+</p><p><span>else</span>
+</p><p><span>print</span> <span>@accumulator</span><span>.</span><span>chr</span> <span># print the byte as a character</span>
+</p><p><span>end</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span> <span># reset the accumulator</span>
+</p><p><span>@position</span> <span>=</span> <span>0</span> <span># reset position for the next byte</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span># The left shift operator (&lt;&lt;) is used to </span>
+</p><p><span># shift the bits of the number to the left.</span>
+</p><p><span>#</span>
+</p><p><span># This is equivalent of: (2 ** @position) * bit</span>
+</p><p><span>@accumulator</span> <span>+=</span> <span>(</span><span>bit</span> <span>&lt;&lt;</span> <span>@position</span><span>)</span>
+</p><p><span>@position</span> <span>+=</span> <span>1</span> <span># move to the next bit position: 0 becomes 1, 1 becomes 2, etc.</span>
+</p><p><span>end</span>
+</p><p><span>puts</span> <span>"</span><span>Process ID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>sleep</span>
+</p></code></pre>
+<p>Output:</p>
+<pre><code translate="no" tabindex="0"><p>$ ruby sender.rb 96875 Hello, World!
+</p><p>$ ruby sender.rb 96875 You're welcome
+</p><p>$ ruby sender.rb 96875 How are you?
+</p><p># Receiver
+</p><p>Process ID: 97176
+</p><p>Hello, World!
+</p><p>You're welcome
+</p><p>How are you?
+</p></code></pre>
+<blockquote>
+<p>OMG Leandro! That’s amazing!</p>
+</blockquote>
+<p><em>Amazing, right?</em> We just built an entire communication system between two processes using one of the most primitive methods available: <strong>UNIX signals.</strong></p>
+<p>The sky’s the limit now! Why not build a <em>full-fledged message broker</em> using this crazy technique?</p>
+<h2>A modest message broker using UNIX signals</h2>
+<p>We’ll break down the development into three components:</p>
+<ol>
+<li><strong>Broker</strong>: the intermediary that routes messages</li>
+<li><strong>Consumer</strong>: processes that receive messages</li>
+<li><strong>Producer</strong>: processes that send messages</li>
+</ol>
+<p><img src="https://leandronsp.com/uploads/3395.png" alt="image"></p>
+<ol>
+<li>Let’s start with the Broker. It should register itself with the producer, then trap incoming signals, decode them, and enqueue the messages for delivery to consumers via outgoing signals:</li>
+</ol>
+<pre><code translate="no" tabindex="0"><p><span>#!/usr/bin/env ruby</span>
+</p><p><span>require_relative</span> <span>'</span><span>signal_codec</span><span>'</span>
+</p><p><span>require_relative</span> <span>'</span><span>consumer</span><span>'</span>
+</p><p><span>class</span> <span>Broker</span> 
+</p><p><span>PID</span> <span>=</span> <span>'</span><span>broker.pid</span><span>'</span><span>.</span><span>freeze</span>
+</p><p><span>def</span> <span>initialize</span>
+</p><p><span>@codec</span> <span>=</span> <span>SignalCodec</span><span>.</span><span>new</span>
+</p><p><span>@queue</span> <span>=</span> <span>Queue</span><span>.</span><span>new</span>
+</p><p><span>@consumer_index</span> <span>=</span> <span>0</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>start</span> 
+</p><p><span>register_broker</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>)</span> <span>{</span> <span>process_bit</span><span>(</span><span>0</span><span>)</span> <span>}</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR2</span><span>'</span><span>)</span> <span>{</span> <span>process_bit</span><span>(</span><span>1</span><span>)</span> <span>}</span>
+</p><p><span>puts</span> <span>"</span><span>Broker PID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>puts</span> <span>"</span><span>Waiting for messages...</span><span>"</span>
+</p><p><span>distribute_messages</span>
+</p><p><span>sleep</span> <span># Keep alive</span>
+</p><p><span>end</span> 
+</p><p><span>private</span>
+</p><p><span>def</span> <span>process_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>@codec</span><span>.</span><span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span> <span>do</span> <span>|</span><span>message</span><span>|</span>
+</p><p><span>@queue</span><span>.</span><span>push</span><span>(</span><span>message</span><span>)</span> <span>unless</span> <span>message</span><span>.</span><span>empty?</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>register_broker</span> 
+</p><p><span>File</span><span>.</span><span>write</span><span>(</span><span>PID</span><span>,</span> <span>Process</span><span>.</span><span>pid</span><span>)</span>
+</p><p><span>at_exit</span> <span>{</span> <span>File</span><span>.</span><span>delete</span><span>(</span><span>PID</span><span>)</span> <span>if</span> <span>File</span><span>.</span><span>exist?</span><span>(</span><span>PID</span><span>)</span> <span>}</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>distribute_messages</span>
+</p><p><span>Thread</span><span>.</span><span>new</span> <span>do</span>
+</p><p><span>loop</span> <span>do</span>
+</p><p><span>sleep</span> <span>0.1</span>
+</p><p><span>next</span> <span>if</span> <span>@queue</span><span>.</span><span>empty?</span>
+</p><p><span>consumers</span> <span>=</span> <span>File</span><span>.</span><span>exist?</span><span>(</span><span>Consumer</span><span>::</span><span>FILE</span><span>)</span> <span>?</span> <span>File</span><span>.</span><span>readlines</span><span>(</span><span>Consumer</span><span>::</span><span>FILE</span><span>)</span><span>.</span><span>map</span><span>(</span><span>&amp;</span><span>:to_i</span><span>)</span> <span>:</span> <span>[</span><span>]</span>
+</p><p><span>next</span> <span>if</span> <span>consumers</span><span>.</span><span>empty?</span>
+</p><p><span>message</span> <span>=</span> <span>@queue</span><span>.</span><span>pop</span><span>(</span><span>true</span><span>)</span> <span>rescue</span> <span>next</span>
+</p><p><span>consumer_pid</span> <span>=</span> <span>consumers</span><span>[</span><span>@consumer_index</span> <span>%</span> <span>consumers</span><span>.</span><span>size</span><span>]</span>
+</p><p><span>@consumer_index</span> <span>+=</span> <span>1</span>
+</p><p><span>puts</span> <span>"</span><span>[SEND] </span><span>#{</span><span>message</span><span>}</span><span> → Consumer </span><span>#{</span><span>consumer_pid</span><span>}</span><span>"</span>
+</p><p><span>@codec</span><span>.</span><span>send_message</span><span>(</span><span>message</span><span>,</span> <span>consumer_pid</span><span>)</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>if</span> <span>__FILE__</span> <span>==</span> <span>$0</span> 
+</p><p><span>broker</span> <span>=</span> <span>Broker</span><span>.</span><span>new</span>
+</p><p><span>broker</span><span>.</span><span>start</span>
+</p><p><span>end</span>
+</p></code></pre>
+<ul>
+<li>The broker registers itself</li>
+<li>Traps incoming signals <code>USR1</code> (bit 0) and <code>USR2</code> (bit 1)</li>
+<li>Enqueues the messages</li>
+<li>Send messages to consumers using outgoing signals (<code>USR1</code> and <code>USR2</code> too)</li>
+</ul>
+<p><em>Note that we’re using a module called <code>SignalCodec</code> which will be explained soon. Basically this module contains all core components to encode/decode signals and perform bitwise operations.</em></p>
+<ol start="2">
+<li>Now the <code>Consumer</code> implementation:</li>
+</ol>
+<pre><code translate="no" tabindex="0"><p><span>#!/usr/bin/env ruby</span>
+</p><p><span>require_relative</span> <span>'</span><span>signal_codec</span><span>'</span>
+</p><p><span>class</span> <span>Consumer</span>
+</p><p><span>FILE</span> <span>=</span> <span>'</span><span>consumers.txt</span><span>'</span><span>.</span><span>freeze</span>
+</p><p><span>def</span> <span>initialize</span>
+</p><p><span>@codec</span> <span>=</span> <span>SignalCodec</span><span>.</span><span>new</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>start</span>
+</p><p><span>register_consumer</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>)</span> <span>{</span> <span>process_bit</span><span>(</span><span>0</span><span>)</span> <span>}</span>
+</p><p><span>trap</span><span>(</span><span>'</span><span>SIGUSR2</span><span>'</span><span>)</span> <span>{</span> <span>process_bit</span><span>(</span><span>1</span><span>)</span> <span>}</span>
+</p><p><span>puts</span> <span>"</span><span>Consumer PID: </span><span>#{</span><span>Process</span><span>.</span><span>pid</span><span>}</span><span>"</span>
+</p><p><span>puts</span> <span>"</span><span>Waiting for messages...</span><span>"</span>
+</p><p><span>sleep</span> <span># Keep alive</span>
+</p><p><span>end</span>
+</p><p><span>private</span>
+</p><p><span>def</span> <span>process_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>@codec</span><span>.</span><span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span> <span>do</span> <span>|</span><span>message</span><span>|</span>
+</p><p><span>puts</span> <span>"</span><span>[RECEIVE] </span><span>#{</span><span>message</span><span>}</span><span>"</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>register_consumer</span>
+</p><p><span>File</span><span>.</span><span>open</span><span>(</span><span>FILE</span><span>,</span> <span>'</span><span>a</span><span>'</span><span>)</span> <span>{</span> <span>|</span><span>f</span><span>|</span> <span>f</span><span>.</span><span>puts</span> <span>Process</span><span>.</span><span>pid</span> <span>}</span>
+</p><p><span>at_exit</span> <span>{</span> <span>deregister_consumer</span> <span>}</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>deregister_consumer</span>
+</p><p><span>if</span> <span>File</span><span>.</span><span>exist?</span><span>(</span><span>FILE</span><span>)</span>
+</p><p><span>consumers</span> <span>=</span> <span>File</span><span>.</span><span>readlines</span><span>(</span><span>FILE</span><span>)</span><span>.</span><span>map</span><span>(</span><span>&amp;</span><span>:strip</span><span>)</span><span>.</span><span>reject</span> <span>{</span> <span>|</span><span>pid</span><span>|</span> <span>pid</span><span>.</span><span>to_i</span> <span>==</span> <span>Process</span><span>.</span><span>pid</span> <span>}</span>
+</p><p><span>File</span><span>.</span><span>write</span><span>(</span><span>FILE</span><span>,</span> <span>consumers</span><span>.</span><span>join</span><span>(</span><span>"</span><span>\n</span><span>"</span><span>)</span><span>)</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>if</span> <span>__FILE__</span> <span>==</span> <span>$0</span>
+</p><p><span>consumer</span> <span>=</span> <span>Consumer</span><span>.</span><span>new</span>
+</p><p><span>consumer</span><span>.</span><span>start</span>
+</p><p><span>end</span>
+</p></code></pre>
+<ul>
+<li>The consumer starts and registers itself with the broker</li>
+<li>Consumer then traps incoming signals (bit 0 and bit 1)</li>
+<li>Decodes and prints messages</li>
+</ul>
+<ol start="3">
+<li>Last but not least, the <code>Producer</code> implementation, which is pretty straightforward:</li>
+</ol>
+<pre><code translate="no" tabindex="0"><p><span>#!/usr/bin/env ruby</span>
+</p><p><span>require_relative</span> <span>'</span><span>signal_codec</span><span>'</span>
+</p><p><span>require_relative</span> <span>'</span><span>broker</span><span>'</span>
+</p><p><span>unless</span> <span>File</span><span>.</span><span>exist?</span><span>(</span><span>Broker</span><span>::</span><span>PID</span><span>)</span>
+</p><p><span>abort</span> <span>"</span><span>Error: Broker not running (</span><span>#{</span><span>Broker</span><span>::</span><span>PID</span><span>}</span><span> not found)</span><span>"</span>
+</p><p><span>end</span>
+</p><p><span>broker_pid</span> <span>=</span> <span>File</span><span>.</span><span>read</span><span>(</span><span>Broker</span><span>::</span><span>PID</span><span>)</span><span>.</span><span>strip</span><span>.</span><span>to_i</span>
+</p><p><span>message</span> <span>=</span> <span>ARGV</span><span>.</span><span>join</span><span>(</span><span>'</span><span> </span><span>'</span><span>)</span>
+</p><p><span>if</span> <span>message</span><span>.</span><span>empty?</span>
+</p><p><span>puts</span> <span>"</span><span>Usage: ruby producer.rb &lt;message&gt;</span><span>"</span>
+</p><p><span>exit</span> <span>1</span>
+</p><p><span>end</span>
+</p><p><span>codec</span> <span>=</span> <span>SignalCodec</span><span>.</span><span>new</span>
+</p><p><span>puts</span> <span>"</span><span>Sending: </span><span>#{</span><span>message</span><span>}</span><span>"</span>
+</p><p><span>codec</span><span>.</span><span>send_message</span><span>(</span><span>message</span><span>,</span> <span>broker_pid</span><span>)</span>
+</p><p><span>puts</span> <span>"</span><span>Message sent to broker (PID: </span><span>#{</span><span>broker_pid</span><span>}</span><span>)</span><span>"</span>
+</p></code></pre>
+<ul>
+<li>Producer receives a ASCII message from the <em>STDIN</em></li>
+<li>Encode and sends the message to the broker via outgoing signals</li>
+</ul>
+<p>So far, this architecture should look familiar. Many broker implementations follow these basic foundations.</p>
+<blockquote>
+<p>Of course, production-ready implementations are far more robust than this one. Here, we’re just poking around with hacking and experimentation</p>
+</blockquote>
+<p>The coolest part is the <code>SignalCodec</code> though:</p>
+<pre><code translate="no" tabindex="0"><p><span>class</span> <span>SignalCodec</span> 
+</p><p><span>SIGNAL_DELAY</span> <span>=</span> <span>0.001</span> <span># Delay between signals to allow processing</span>
+</p><p><span>def</span> <span>initialize</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span>
+</p><p><span>@position</span> <span>=</span> <span>0</span>
+</p><p><span>@buffer</span> <span>=</span> <span>[</span><span>]</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>accumulate_bit</span><span>(</span><span>bit</span><span>)</span>
+</p><p><span>@accumulator</span> <span>+=</span> <span>(</span><span>bit</span> <span>&lt;&lt;</span> <span>@position</span><span>)</span>
+</p><p><span>@position</span> <span>+=</span> <span>1</span>
+</p><p><span>if</span> <span>@position</span> <span>==</span> <span>8</span> <span># Byte is complete</span>
+</p><p><span>if</span> <span>@accumulator</span><span>.</span><span>zero?</span> <span># Message complete - NULL terminator</span>
+</p><p><span>decoded</span> <span>=</span> <span>@buffer</span><span>.</span><span>pack</span><span>(</span><span>"</span><span>C*</span><span>"</span><span>)</span><span>.</span><span>force_encoding</span><span>(</span><span>'</span><span>UTF-8</span><span>'</span><span>)</span>
+</p><p><span>yield</span><span>(</span><span>decoded</span><span>)</span> <span>if</span> <span>block_given?</span>
+</p><p><span>@buffer</span><span>.</span><span>clear</span>
+</p><p><span>else</span> 
+</p><p><span>@buffer</span> <span>&lt;&lt;</span> <span>@accumulator</span>
+</p><p><span>end</span>
+</p><p><span>@position</span> <span>=</span> <span>0</span>
+</p><p><span>@accumulator</span> <span>=</span> <span>0</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>def</span> <span>send_message</span><span>(</span><span>message</span><span>,</span> <span>pid</span><span>)</span>
+</p><p><span>message</span><span>.</span><span>each_byte</span> <span>do</span> <span>|</span><span>byte</span><span>|</span>
+</p><p><span>8</span><span>.</span><span>times</span> <span>do</span> <span>|</span><span>i</span><span>|</span>
+</p><p><span>bit</span> <span>=</span> <span>(</span><span>byte</span> <span>&gt;&gt;</span> <span>i</span><span>)</span> <span>&amp;</span> <span>1</span>
+</p><p><span>signal</span> <span>=</span> <span>bit</span> <span>==</span> <span>0</span> <span>?</span> <span>'</span><span>SIGUSR1</span><span>'</span> <span>:</span> <span>'</span><span>SIGUSR2</span><span>'</span>
+</p><p><span>Process</span><span>.</span><span>kill</span><span>(</span><span>signal</span><span>,</span> <span>pid</span><span>)</span>
+</p><p><span>sleep</span> <span>SIGNAL_DELAY</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span># Send NULL terminator (0000 0000)</span>
+</p><p><span>8</span><span>.</span><span>times</span> <span>do</span>
+</p><p><span>Process</span><span>.</span><span>kill</span><span>(</span><span>'</span><span>SIGUSR1</span><span>'</span><span>,</span> <span>pid</span><span>)</span>
+</p><p><span>sleep</span> <span>SIGNAL_DELAY</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p><p><span>end</span>
+</p></code></pre>
+<p>If you’ve been following along, this shouldn’t be hard to understand, but I’ll break down how this beautiful piece of code works:</p>
+<ul>
+<li>The codec is initialized with the bit position at zero, as well as the accumulator</li>
+<li>A buffer is also initialized to store accumulated bits until a complete byte is formed</li>
+<li>The <code>accumulate_bit</code> method should be familiar from our earlier implementation, but it now accepts a closure (block) that lets the caller decide what to do with each decoded byte</li>
+<li><code>send_message</code> encodes a message into bits and sends them via UNIX signals</li>
+</ul>
+<p>Everything in action:</p>
+<p><img src="https://leandronsp.com/uploads/3170.png" alt="image"></p>
+<p><em>How cool, amazing, wonderful, impressive, astonishing is that?</em></p>
+<h2>Conclusion</h2>
+<p>Yes, we built a message broker using nothing but <strong>UNIX signals</strong> and a bit of Ruby magic. Sure, <strong>it’s not production-ready</strong>, and you definitely shouldn’t use this in your next startup (please don’t), but that was never the point.</p>
+<p>The real takeaway here isn’t the broker itself: it’s understanding how the fundamentals work. We explored binary operations, UNIX signals, and IPC in a hands-on way that most people never bother with.</p>
+<p>We took something “useless” and made it work, just for fun. So next time someone asks you about message brokers, you can casually mention that you once built (or saw) one using just two signals. And if they look at you weird, well, that’s their problem. Now go build something equally useless and amazing. The world needs more hackers who experiment just for the fun of it.</p>
+<p><em>Happy hacking!</em></p>
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Today is when the Amazon brain drain sent AWS down the spout (431 pts)]]></title>
             <link>https://www.theregister.com/2025/10/20/aws_outage_amazon_brain_drain_corey_quinn/</link>
             <guid>45649178</guid>
             <pubDate>Mon, 20 Oct 2025 20:50:03 GMT</pubDate>
@@ -67,7 +737,7 @@
                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[iOS 26.1 lets users control Liquid Glass transparency (154 pts)]]></title>
+            <title><![CDATA[iOS 26.1 lets users control Liquid Glass transparency (159 pts)]]></title>
             <link>https://www.macrumors.com/2025/10/20/ios-26-1-liquid-glass-toggle/</link>
             <guid>45648266</guid>
             <pubDate>Mon, 20 Oct 2025 19:39:46 GMT</pubDate>
@@ -93,7 +763,7 @@ First, Apple says the new 14-inch MacBook Pro offers up to 2× faster SSD perfor
 Neither the MacBook Pro models nor the MacBook Air models are expected to get design changes, with Apple focusing on simple chip upgrades. In the case of the MacBook Pro, a m...</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[J.P. Morgan's OpenAI loan is strange (213 pts)]]></title>
+            <title><![CDATA[J.P. Morgan's OpenAI loan is strange (214 pts)]]></title>
             <link>https://marketunpack.com/j-p-morgans-openai-loan-is-strange/</link>
             <guid>45648258</guid>
             <pubDate>Mon, 20 Oct 2025 19:38:52 GMT</pubDate>
@@ -132,7 +802,7 @@ Neither the MacBook Pro models nor the MacBook Air models are expected to get de
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[When a stadium adds AI to everything, it's worse experience for everyone (122 pts)]]></title>
+            <title><![CDATA[When a stadium adds AI to everything, it's worse experience for everyone (125 pts)]]></title>
             <link>https://a.wholelottanothing.org/bmo-stadium-in-la-added-ai-to-everything-and-what-they-got-was-a-worse-experience-for-everyone/</link>
             <guid>45648249</guid>
             <pubDate>Mon, 20 Oct 2025 19:38:02 GMT</pubDate>
@@ -149,7 +819,7 @@ Neither the MacBook Pro models nor the MacBook Air models are expected to get de
                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Claude Code on the Web (394 pts)]]></title>
+            <title><![CDATA[Claude Code on the Web (407 pts)]]></title>
             <link>https://www.anthropic.com/news/claude-code-on-the-web</link>
             <guid>45647166</guid>
             <pubDate>Mon, 20 Oct 2025 18:12:23 GMT</pubDate>
@@ -157,7 +827,7 @@ Neither the MacBook Pro models nor the MacBook Air models are expected to get de
 <div id="readability-page-1" class="page"><div><article><div><p>Today, we're introducing Claude Code on the web, a new way to delegate coding tasks directly from your browser.</p><p>Now in beta as a research preview, you can assign multiple coding tasks to Claude that run on Anthropic-managed cloud infrastructure, perfect for tackling bug backlogs, routine fixes, or parallel development work.</p><h2 id="run-coding-tasks-in-parallel">Run coding tasks in parallel</h2><p>Claude Code on the web lets you kick off coding sessions without opening your terminal. Connect your GitHub repositories, describe what you need, and Claude handles the implementation. </p><p>Each session runs in its own isolated environment with real-time progress tracking, and you can actively steer Claude to adjust course as it’s working through tasks.</p><p>With Claude Code running in the cloud, you can now <strong>run multiple tasks in parallel</strong> across different repositories from a single interface and <strong>ship faster</strong> with automatic PR creation and clear change summaries.</p><h2 id="flexible-for-every-workflow">Flexible for every workflow</h2><p>The web interface complements your existing Claude Code workflow. Running tasks in the cloud is especially effective for:</p><ul><li>Answering questions about how projects work and how repositories are mapped</li><li>Bugfixes and routine, well-defined tasks</li><li>Backend changes, where Claude Code can use test-driven development to verify changes</li></ul><p>You can also use Claude Code on mobile. As part of this research preview, we’re making Claude Code available on our iOS app so developers can explore coding with Claude on the go. It’s an early preview, and we hope to quickly refine the mobile experience based on your feedback.<br></p><h2 id="security-first-cloud-execution">Security-first cloud execution</h2><p>Every Claude Code task runs in an isolated sandbox environment with network and filesystem restrictions. Git interactions are handled through a secure proxy service that ensures Claude can only access authorized repositories—helping keep your code and credentials protected throughout the entire workflow.</p><p>You can also add custom network configuration to choose what domains Claude Code can connect to from its sandbox. For example, you can allow Claude to download npm packages over the internet so that it can run tests and validate changes.</p><p>Read our <a href="https://www.anthropic.com/engineering/claude-code-sandboxing">engineering blog</a> and <a href="https://docs.claude.com/en/docs/claude-code/sandboxing">documentation</a> for a deep dive on Claude Code’s sandboxing approach.</p><h2 id="getting-started">Getting started</h2><p>Claude Code on the web is available now in research preview for Pro and Max users. Visit <a href="http://claude.com/code">claude.com/code</a> to connect your first repository and start delegating tasks.</p><p>Cloud-based sessions share rate limits with all other Claude Code usage. <a href="https://docs.claude.com/en/docs/claude-code/claude-code-on-the-web">Explore our documentation</a> to learn more.</p></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Peanut allergies have plummeted in children (108 pts)]]></title>
+            <title><![CDATA[Peanut allergies have plummeted in children (110 pts)]]></title>
             <link>https://www.nytimes.com/2025/10/20/well/peanut-allergy-drop.html</link>
             <guid>45647133</guid>
             <pubDate>Mon, 20 Oct 2025 18:09:49 GMT</pubDate>
@@ -165,7 +835,7 @@ Neither the MacBook Pro models nor the MacBook Air models are expected to get de
 Couldn't get https://www.nytimes.com/2025/10/20/well/peanut-allergy-drop.html: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[x86-64 Playground – An online assembly editor and GDB-like debugger (116 pts)]]></title>
+            <title><![CDATA[x86-64 Playground – An online assembly editor and GDB-like debugger (119 pts)]]></title>
             <link>https://x64.halb.it/</link>
             <guid>45646958</guid>
             <pubDate>Mon, 20 Oct 2025 17:55:18 GMT</pubDate>
@@ -209,7 +879,328 @@ everything runs in your browser, and once the Web App loads it will work
 </p> </section>     </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AWS outage shows internet users 'at mercy' of too few providers, experts say (242 pts)]]></title>
+            <title><![CDATA[TernFS – an exabyte scale, multi-region distributed filesystem (102 pts)]]></title>
+            <link>https://www.xtxmarkets.com/tech/2025-ternfs/#posix-shaped</link>
+            <guid>45646691</guid>
+            <pubDate>Mon, 20 Oct 2025 17:36:16 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.xtxmarkets.com/tech/2025-ternfs/#posix-shaped">https://www.xtxmarkets.com/tech/2025-ternfs/#posix-shaped</a>, See on <a href="https://news.ycombinator.com/item?id=45646691">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="maincontent">
+    
+<p><strong>September 2025</strong></p>
+<p>XTX is an algorithmic trading firm: it builds statistical models that produce price forecasts for over 50,000 financial instruments worldwide. We use those forecasts to make trades. As XTX's research efforts to build better models ramped up, the demand for resources kept increasing.</p>
+<p>The firm started out with a couple of desktops and an NFS server, and 10 years later ended up with tens of thousands of high-end GPUs, hundreds of thousands of CPUs, and hundreds of petabytes of storage.</p>
+<p>As compute grew, storage struggled to keep up. We rapidly outgrew NFS first and existing open-source and commercial filesystems later. After evaluating a variety of third-party solutions, we made the decision to implement our own filesystem, which we called TernFS<sup><a href="#f1">[1]</a></sup>.</p>
+
+<p>We have decided to open source our efforts: TernFS is <a href="https://github.com/XTXMarkets/ternfs">available as free software on our public GitHub.</a> This post <a href="#another-filesystem">motivates TernFS</a>, explains its <a href="#high-level">high-level architecture</a>, and then explores some <a href="#important-details">key implementation details</a>. If you just want to spin up a local TernFS cluster, head to the <a href="https://github.com/XTXMarkets/ternfs?tab=readme-ov-file#playing-with-a-local-ternfs-instance">README</a>.</p>
+
+<h2>Another filesystem?</h2>
+<p>There's a reason why every major tech company has developed its own distributed filesystem — they're crucial to running large-scale compute efforts, and liable to cause intense disruption if they malfunction. <sup><a href="#f2">[2]</a></sup></p>
+
+<p>XTX was in the same position, so we designed TernFS to be a one-stop solution for most of our storage needs, going from relatively 'cold' storage of raw market data to short-lived random-access data used to communicate between GPU jobs running on our cluster.</p>
+<p>TernFS:</p>
+<ul>
+<li>Is designed to scale up to tens of exabytes, trillions of files, millions of concurrent clients.</li>
+<li>Stores file contents redundantly to protect against drive failures.</li>
+<li>Has no single point of failure in its metadata services.</li>
+<li>Supports file snapshot to protect against accidental file deletion.</li>
+<li>Can span across multiple regions.</li>
+<li>Is hardware agnostic and uses TCP/IP to communicate.</li>
+<li>Utilizes different types of storage (such as flash vs. hard disks) cost effectively.</li>
+<li>Exposes read/write access through its own API over TCP and UDP, and a Linux kernel filesystem module.</li>
+<li>Requires no external service and has a minimal set of build dependencies. <sup><a href="#f3">[3]</a></sup></li>
+</ul>
+
+<p>Naturally, there are some limitations, the main ones being:</p>
+<ul>
+<li>Files are immutable — once they're written they can't be modified.</li>
+<li>TernFS should not be used for tiny files — our median file size is 2MB.</li>
+<li>The throughput of directory creation and removal is significantly constrained compared to other operations.</li>
+<li>TernFS is permissionless, deferring that responsibility to other services.</li>
+</ul>
+<p>We started designing TernFS in early 2022 and began putting it into production in summer 2023. By mid-2024 all of our machine learning efforts were driven out of TernFS, and we're migrating the rest of the firm's storage needs onto it as well.</p>
+<p>As of September 2025, our TernFS deployment stores more than 500PB across 30,000 disks, 10,000 flash drives, and three data centres. At peak we serve multiple terabytes per second. To this day, we haven't lost a single byte.</p>
+
+<h2>High-level overview</h2>
+<p>Now that the stage is set, we're ready to explain the various components that make up TernFS. TernFS' core API is implemented by four services:</p>
+<ul>
+<li><em>Metadata shards</em> store the directory structure and file metadata.</li>
+<li>The <em>cross-directory coordinator</em> (or CDC) executes cross-shard transactions.</li>
+<li><em>Block services</em> store file contents.</li>
+<li>The <em>registry</em> stores information about all the other services and monitors them.</li>
+</ul>
+<pre><code>
+ A ──► B means "A sends requests to B" 
+                                       
+                                       
+ ┌────────────────┐                    
+ │ Metadata Shard ◄─────────┐          
+ └─┬────▲─────────┘         │          
+   │    │                   │          
+   │    │                   │          
+   │ ┌──┴──┐                │          
+   │ │ CDC ◄──────────┐     │          
+   │ └──┬──┘          │     │          
+   │    │             │ ┌───┴────┐     
+   │    │             └─┤        │     
+ ┌─▼────▼────┐          │ Client │     
+ │ Registry  ◄──────────┤        │     
+ └──────▲────┘          └─┬──────┘     
+        │                 │            
+        │                 │            
+ ┌──────┴────────┐        │            
+ │ Block Service ◄────────┘            
+ └───────────────┘
+
+</code></pre>
+
+<p>In the next few sections, we'll describe the high-level design of each service and then give more background on <a href="#important-details">other relevant implementation details</a>.<sup><a href="#f4">[4]</a></sup></p>
+
+<h3>Metadata</h3>
+<p>To talk about metadata, we first need to explain what metadata <em>is</em> in TernFS. The short answer is: 'everything that is not file contents.' The slightly longer answer is:</p>
+<ul>
+<li>Directory entries, including all files and directory names.</li>
+<li>File metadata including creation/modification/access time, logical file size, and so on.</li>
+<li>The mapping between files and the <a href="#block-services">blocks containing their contents</a>.</li>
+<li>Other ancillary data structures to facilitate maintenance operations.</li>
+</ul>
+<p>TernFS' metadata is split into 256 logical <em>shards</em>. Shards never communicate with each other. This is a general principle in TernFS: each service is disaggregated from the others, deferring to the clients to communicate with each service directly.<sup><a href="#f5">[5]</a></sup></p>
+
+<p>A logical shard is further split into five physical instances, one leader and four followers, in a typical distributed consensus setup. The distributed consensus engine is provided by a purpose-built Raft-like implementation, which we call LogsDB, while RocksDB is used to implement read/write capabilities within a shard instance.</p>
+<p>Currently all reads and writes go through the leader, but it would be trivial to allow clients to read from followers, and with a bit more effort to switch to a write-write setup.</p>
+<pre><code>    ┌─────────┐ ┌─────────┐       ┌───────────┐ 
+    │ Shard 0 │ │ Shard 1 │  ...  │ Shard 255 │ 
+    └─────────┘ │         │       └───────────┘ 
+            ┌───┘         └───────────────────┐ 
+            │                                 │ 
+            │                  ┌────────────┐ │ 
+            │ ┌───────────┐    │ Replica 0  │ │ 
+            │ │           ◄────► (follower) │ │ 
+ ┌────────┐ │ │ Replica 3 ◄──┐ └────────────┘ │ 
+ │ Client ├─┼─► (leader)  ◄─┐│ ┌────────────┐ │ 
+ └────────┘ │ │           ◄┐│└─► Replica 1  │ │ 
+            │ └───────────┘││  │ (follower) │ │ 
+            │              ││  └────────────┘ │ 
+            │              ││  ┌────────────┐ │ 
+            │              │└──► Replica 2  │ │ 
+            │              │   │ (follower) │ │ 
+            │              │   └────────────┘ │ 
+            │              │   ┌────────────┐ │ 
+            │              └───► Replica 4  │ │ 
+            │                  │ (follower) │ │ 
+            │                  └────────────┘ │ 
+            └─────────────────────────────────┘ 
+</code></pre>
+
+<p>Splitting the metadata into 256 shards from the get-go simplifies the design, given that horizontal scaling of metadata requires no rebalancing, just the addition of more metadata servers.</p>
+<p>For instance, our current deployment can serve hundreds of petabytes and more than 100,000 compute nodes with just 10 metadata servers per data centre, with each server housing roughly 25 shard leaders and 100 shard followers.</p>
+<p>Given that the metadata servers are totally decoupled from one another, this means that we can scale metadata performance by 25× trivially, and by 100× if we were to start offloading metadata requests to followers.</p>
+<p>TernFS shards metadata by assigning each directory to a single shard. This is done in a simple round-robin fashion by the <a href="#cdc">cross-directory coordinator</a>. Once a directory is created, all its directory entries and the files in it are housed in the same shard.</p>
+<p>This design decision has downsides: TernFS assumes that the load will be spread across the 256 logical shards naturally. This is not a problem in large deployments, given that they will contain many directories, but it is something to keep in mind.<sup><a href="#f6">[6]</a></sup></p>
+
+
+<h3>Cross-directory transactions</h3>
+<p>Most of the metadata activity is contained within a single shard:</p>
+<ul>
+<li>File creation, same-directory renames, and deletion.</li>
+<li>Listing directory contents.</li>
+<li>Getting attributes of files or directories.</li>
+</ul>
+<p>However, some operations do require coordination between shards, namely directory creation, directory removal, and moving directory entries across different directories.</p>
+<p>The <em>cross-directory coordinator</em> (CDC) performs these distributed transactions using a privileged metadata shard API. The CDC transactions are stateful, and therefore the CDC uses RocksDB and LogsDB much like the metadata shards themselves to persist its state safely.</p>
+<pre><code> ┌────────┐    ┌──────────┐ ┌───────────┐ 
+ │ Client ├─┐  │ Shard 32 │ │ Shard 103 │ 
+ └────────┘ │  └────────▲─┘ └─▲─────────┘ 
+ ┌─────┬────┼───────────┼─────┼─┐         
+ │ CDC │  ┌─▼──────┐    │     │ │         
+ ├─────┘  │ Leader ├────┴─────┘ │         
+ │        └─────▲──┘            │         
+ │              │               │         
+ │       ┌──────┴───────┐       │         
+ │       │              │       │         
+ │ ┌─────▼────┐    ┌────▼─────┐ │         
+ │ │ Follower │ .. │ Follower │ │         
+ │ └──────────┘    └──────────┘ │         
+ └──────────────────────────────┘   
+</code></pre>
+
+<p>The CDC executes transactions in parallel, which increases throughput considerably, but it is still a bottleneck when it comes to creating, removing, or moving directories. This means that TernFS has a relatively low throughput when it comes to CDC operations.<sup><a href="#f7">[7]</a></sup> <a name="block-services"></a></p>
+
+<h3>Block services, or file contents</h3>
+<p>In TernFS, files are split into chunks of data called <em>blocks</em>. Blocks are read and written to by <em>block services</em>. A block service is typically a single drive (be it a hard disk or a flash drive) storing blocks. At XTX a typical storage server will contain around 100 hard disks or 25 flash drives — or in TernFS parlance 100 or 25 block services.<sup><a href="#f8">[8]</a></sup></p>
+
+<p>Read/write access to the block service is provided using a simple TCP API currently implemented by a Go process. This process is hardware agnostic and uses the Go standard library to read and write blocks to a conventional local file system. We originally planned to rewrite the Go process in C++, and possibly write to block devices directly, but the idiomatic Go implementation has proven performant enough for our needs so far. <a name="registry"></a></p>
+<h3>The registry</h3>
+<p>The final piece of the TernFS puzzle is the <em>registry</em>. The registry stores the location of each instance of service (be it a metadata shard, the CDC, or a block storage node). A client only needs to know the address of the registry to mount TernFS — it'll then gather the locations of the other services from it.</p>
+<p>In TernFS all locations are IPv4 addresses. Working with IPv4 directly simplifies the kernel module considerably, since DNS lookups are quite awkward in the Linux kernel. The exception to this rule is addressing the registry itself, for which DNS is used.</p>
+<p>The registry also stores additional information, such as the capacity and available size of each drive, who is a follower or a leader in LogsDB clusters, and so on.</p>
+<p>Predictably, the registry itself is a RocksDB and LogsDB C++ process, given its statefulness. <a name="going-global"></a></p>
+<h3>Going global</h3>
+<p>TernFS tries very hard not to lose data, by storing both metadata and file contents on many different drives and servers. However, we also want to be resilient to the temporary or even permanent loss of one entire data centre. Therefore, TernFS can transparently scale across multiple <em>locations</em>.</p>
+<p>The intended use for TernFS locations is for each location to converge to the same dataset. This means that each location will have to be provisioned with roughly equal resources.<sup><a href="#f9">[9]</a></sup> Both metadata and file contents replication are asynchronous. In general, we judge the event of losing an entire data centre rare enough to tolerate a time window where data is not fully replicated across locations.</p>
+
+<p>Metadata replication is set up so that one location is the metadata primary. Write operations in non-primary locations pay a latency price since they are acknowledged only after they are written to the primary location, replicated, and applied in the originating location. In practice this hasn't been an issue since metadata write latencies are generally overshadowed by writing file contents.</p>
+<p>There is no automated procedure to migrate off a metadata primary location — again, we deem it a rare enough occurrence to tolerate manual intervention. In the future we plan to move from the current protocol to a multi-master protocol where each location can commit writes independently, which would reduce write latencies on secondary locations and remove the privileged status of the primary location.</p>
+<p>File contents, unlike metadata, are written locally to the location the client is writing from. Replication to other locations happens in two ways: proactively and on-demand. Proactive replication is performed by tailing the metadata log and replicating new file contents. On-demand replication happens when a client requests file content which has not been replicated yet. <a name="important-details"></a> <a name="speaking-ternfs"></a></p>
+<h2>Important Details</h2>
+<p>Now that we've laid down the high-level design of TernFS, we can talk about several key implementation details that make TernFS safer, more performant, and more flexible.</p>
+<h3>Talking to TernFS</h3>
+<h4>Speaking TernFS' language</h4>
+<p>The most direct way to talk to TernFS is by using its own API. All TernFS messages are defined using a custom serialization format we call <em>bincode</em>. We chose to develop a custom serialization format since we needed it to work within the confines of the <a href="#posix-shaped">Linux kernel</a> and to be easily chopped into UDP packets.</p>
+<p>We intentionally kept the TernFS API stateless, in the sense that each request executes without regard to previous requests made by the same client. This is in contrast to protocols like NFS, whereby each connection is very stateful, holding resources such as open files, locks, and so on.</p>
+<p>A stateless API dramatically simplifies the state machines that make up the TernFS core services, therefore simplifying their testing. It also forces each request to be idempotent, or in any case have clear retry semantics, since they might have to be replayed, which facilitates testing further.</p>
+<p>It also allows the metadata shards and CDC API to be based on UDP rather than TCP, which makes the server and clients (especially the kernel module) simpler, due to doing away with the need for keeping TCP connections. The block service API is TCP based, since it is used to stream large amounts of contiguous data, and any UDP implementation would have to re-implement a reliable stream protocol. The registry API is also TCP-based, given that it is rarely used by clients, and occasionally needs to return large amounts of data.</p>
+<p>While the TernFS API is simple out-of-the-box, we provide a permissively licensed Go library implementing common tasks that clients might want to perform, such as caching directory policies and retrying requests. This library is used to implement many TernFS processes that are not part of the core TernFS services, such as <a href="#scrubbing">scrubbing</a>, <a href="#snapshots">garbage collection</a>, <a href="#migrations">migrations</a>, and the <a href="#web-ui">web UI</a>.</p>
+
+<h4>Making TernFS POSIX-shaped</h4>
+<p>While the Go library is used for most ancillary tasks, some with high performance requirements, the main way to access TernFS at XTX is through its Linux kernel module.</p>
+<p>This is because, when migrating our machine learning workflows to TernFS, we needed to support a vast codebase working with files directly. This not only meant that we needed to expose TernFS as a normal filesystem, but also that said normal filesystem API needed to be robust and performant enough for our machine learning needs.<sup><a href="#f10">[10]</a></sup></p>
+
+<p>For this reason, we opted to work with Linux directly, rather than using FUSE. Working directly with the Linux kernel not only gave us the confidence that we could achieve our performance requirements but also allowed us to bend the POSIX API to our needs, something that would have been more difficult if we had used FUSE.<sup><a href="#f11">[11]</a></sup></p>
+
+<p>The main obstacle when exposing TernFS as a 'normal' filesystem is that TernFS files are immutable. More specifically, TernFS files are fully written before being 'linked' into the filesystem as a directory entry. This is intentional: it lets us cleanly separate the API for 'under construction' files and 'completed files', and it means that half-written files are not visible.</p>
+<p>However this design is essentially incompatible with POSIX, which endows the user with near-absolute freedom when it comes to manipulating a file. Therefore, the TernFS kernel module is <em>not</em> POSIX-compliant, but rather exposes enough POSIX to allow many programs to work without modifications, but not all.</p>
+<p>In practice this means that programs which write files left-to-right and never modify the files' contents will work out-of-the-box. While this might seem very restrictive, we found that a surprising number of programs worked just fine.<sup><a href="#f12">[12]</a></sup> Programs that did not follow this pattern were modified to first write to a temporary file and then copy the finished file to TernFS.</p>
+
+<p>While we feel that writing our own kernel module was the right approach, it proved to be the trickiest part of TernFS, and we would not have been able to implement it without <a href="#block-proofs">some important safety checks</a> in the TernFS core services.<sup><a href="#f13">[13]</a></sup></p>
+
+<h4>S3 gateway</h4>
+<p>Almost all the storage-related activity at XTX is due to our machine-learning efforts, and for those purposes the TernFS' kernel module has served us well. However, as TernFS proved itself there, we started to look into offering TernFS to the broader firm.</p>
+<p>Doing so through the kernel module presented multiple challenges. For starters installing a custom kernel module on every machine that needed to reach TernFS is operationally cumbersome. Moreover, while all machine-learning happens in clusters housed in the same data centre as TernFS itself, we wanted to expose TernFS in a way that's more amenable to less local networks, for instance by removing the need for UDP. Finally, TernFS does not have any built-in support for permissions or authentication, which is a requirement in multi-tenant scenarios.</p>
+<p>To solve all these problems, we implemented a gateway for TernFS, which exposes a TernFS subtree using the S3 API. The gateway is a simple Go process turning S3 calls into TernFS API calls. The S3 gateway is not currently open sourced since it is coupled to authentication services internal to XTX, but we have open sourced a minimal S3 gateway to serve as a starting point for third-party contributors to build their own.</p>
+<p>We've also planned an NFS gateway to TernFS, but we haven't had a pressing enough need yet to complete it.</p>
+
+<h4>The web UI and the JSON interface</h4>
+<p>Finally, a view of TernFS is provided by its web UI. The web UI is a stateless Go program which exposes most of the state of TernFS in an easy-to-use interface. This state includes the full filesystem contents (both metadata and file contents), the status of each service including information about decommissioned block services, and so on.</p>
+<p>Moreover, the web UI also exposes the <a href="#speaking-ternfs">direct TernFS API</a> in JSON form, which is very useful for small scripts and curl-style automation that does not warrant a full-blown Go program.</p>
+
+<h3>Directory Policies</h3>
+<p>To implement some of the functionality we'll describe below, TernFS adopts a system of per-directory policies.</p>
+<p>Policies are used for all sorts of decisions, including:</p>
+<ul>
+<li><a href="#reed-solomon">How to redundantly store files.</a></li>
+<li><a href="#drive-type-picking">On which type of drive to store files.</a></li>
+<li><a href="#snapshots">How long to keep files around after deletion.</a></li>
+</ul>
+<p>Each of the topics above (and a few more we haven't mentioned) correspond to a certain policy <em>tag</em>. The body of the policies are stored in the metadata together with the other directory attributes.</p>
+<p>Policies are inherited: if a directory does not contain a certain policy tag, it transitively inherits from the parent directory. TernFS clients store a cache of policies to allow for traversal-free policy lookup for most directories.</p>
+<h3>Keeping blocks in check</h3>
+<p>A filesystem is no good if it loses, leaks, corrupts, or otherwise messes up its data. TernFS deploys a host of measures to minimize the chance of anything going wrong. So far, these have worked: we've never lost data in our production deployment of TernFS. This section focuses on the measures in place to specifically safeguard files' blocks.</p>
+<h4>Against bitrot, or CRC32-C</h4>
+<p>The first and possibly most obvious measure consists of aggressively checksumming all TernFS' data. The metadata is automatically checksummed by RocksDB, and every block is stored in a format interleaving 4KiB pages with 4byte CRC32-C checksums.</p>
+<p>CRC32-C was picked since it is a high-quality checksum and implemented on most modern silicon.<sup><a href="#f14">[14]</a></sup> It also exhibits some desirable properties when used together with <a href="#block-proofs">Reed-Solomon coding</a>.</p>
+
+<p>4KiB was picked since it is the read boundary used by Linux filesystems and is fine-grained while still being large enough to render the storage overhead of the 4byte checksums negligible.</p>
+<p>Interleaving the CRCs with the block contents does not add any safety, but it does improve operations in two important ways. First, it allows for safe partial reads: clients can demand only a few pages from a block which is many megabytes in size and still check the reads against its checksum. Second, it allows <a href="#scrubbing">scrubbing</a> files locally on the server which hosts the blocks, without communicating with other services at all.</p>
+
+<h4>Storing files redundantly, or Reed-Solomon codes</h4>
+<p>We've been talking about files being split into blocks, but we haven't really explained <em>how</em> files become blocks.</p>
+<p>The first thing we do to a file is split it into <em>spans</em>. Spans are at most 100MiB and are present just to divide files into sections of a manageable size.</p>
+<p>Then each span is divided into D <em>data blocks</em>, and P <em>parity blocks</em>. D and P are determined by the corresponding <a href="#directory-policies">directory policy</a> in which the file is created. When D is 1, the entire contents of the span become a single block, and that block is stored D+P times. This scheme is equivalent to a simple mirroring scheme and allows it to lose up to P blocks before losing file data.</p>
+<p>While wasteful, mirroring the entire contents of the file can be useful for very hot files, since TernFS clients will pick a block at random to read from, thereby sharing the read load across many block services. And naturally files which we do not care much for can be stored with D = 1 and P = 0, without any redundancy.</p>
+<p>That said, most files will not be stored using mirroring but rather using Reed-Solomon coding. Other resources can be consulted to understand the <a href="https://mazzo.li/posts/reed-solomon.html">high-level idea</a> and the <a href="https://www.corsix.org/content/reed-solomon-for-software-raid">low-level details</a> of Reed-Solomon coding, but the gist is it allows us to split a span into D equally sized blocks (some padding might be necessary), and then generate P blocks of equal size such that up to any P blocks can be lost while retaining the ability to reconstruct all the other blocks.</p>
+<p>As mentioned, D and P are fully configurable, but at XTX we tend to use D = 10 and P = 4, which allows us to lose up to any four drives for any file.</p>
+
+<h4>Drive type picking</h4>
+<p>We now know how to split files into a bunch of blocks. The next question is: which drives to pick to store the blocks on. The first decision is which kind of drive to use. At XTX we separate drives into two broad categories for this purpose — flash and spinning disks.</p>
+<p>When picking between these two, we want to balance two needs: minimizing the cost of hardware by utilizing hard disks if we can <sup><a href="#f15">[15]</a></sup>, and maximizing hard disk productivity by having them reading data most of the time, rather than seeking.</p>
+
+<p>To achieve that, directory policies offer a way to tune how large each block will be, and to tune which drives will be picked based on block size. This allows us to configure TernFS so that larger files that can be read sequentially are stored on hard disks, while random-access or small files are stored on flash. <sup><a href="#f16">[16]</a></sup></p>
+
+<p>Currently this system is not adaptive, but we found that in practice it's easy to carve out sections of the filesystem which are not read sequentially. We have a default configuration which assumes sequential reads and then uses hard disks down to roughly 2.5MB blocks, below which hard disks stop being productive enough and blocks start needing to be written to flash. <a name="block-service-picking"></a></p>
+<h4>Block service picking</h4>
+<p>OK, we now know what type of drive to select for our files, but we still have tens of thousands of individual drives to pick from. Picking the 'right' individual drive requires some sophistication.</p>
+<p>The first thing to note is that drive failures or unavailability are often correlated. For instance, at XTX a single server handles 102 spinning disks. If the server is down, faulty, or needs to be decommissioned, it'll render its 102 disks temporarily or permanently unavailable.</p>
+<p>It's therefore wise to spread a file's blocks across many servers. To achieve this, each TernFS block service (which generally corresponds to a single drive) has a <em>failure domain</em>. When picking block services in which to store the blocks for a given file, TernFS will make sure that each block is in a separate failure domain. In our TernFS deployment a failure domain corresponds to a server, but other users might wish to tie it to some other factor as appropriate.</p>
+<p>TernFS also tries hard to avoid write bottlenecks by spreading the current write load across many disks. Moreover, since new drives can be added at any time, it tries to converge to a situation where each drive is roughly equally filled by assigning writing more to drives with more available space.</p>
+<p>Mechanically this is achieved by having each shard periodically request a set of block services to use for writing from the registry. When handing out block services to shards, the registry selects block services according to several constraints:</p>
+<ul>
+<li>It never gives block services from the same failure domain to the same shard</li>
+<li>It minimizes the variance in how many shards each block service is currently assigned to</li>
+<li>It prioritizes block services which have more available space.</li>
+</ul>
+<p>Then when a client wants to write a new span, requiring D+P blocks, the shard simply selects D+P block services randomly amongst the ones it last received from the registry.</p>
+<p>One concept currently absent from TernFS is what is often known as 'copyset replication'. When assigning disks to files at random (even with the caveat of failure domains) the probability of rendering at least one file unreadable quickly becomes a certainty as more and more drives fail:</p>
+<p><img src="https://www.xtxmarkets.com/assets/tech/2025-ternfs-faileddisks.png" alt="Probability of data loss vs Failed disks" title="Probability of data loss vs Failed disks"></p>
+
+<p>Copysets reduce the likelihood of data loss occurring by choosing blocks out of a limited number of sets of drives, as opposed to picking the drives randomly. This dramatically reduces the probability of data loss<sup><a href="#f17">[17]</a></sup>.  They are generally a good idea, but we haven't found them to be worthwhile, for a few reasons.</p>
+
+<p>First, evacuating a 20TB drive takes just a few minutes, and in the presence of multiple failed drives the migrator process evacuates first the files which are present in multiple failed drives to get ahead of possible data loss. This means that for TernFS to lose data within a single data centre tens of drives would have to fail within a matter of seconds.</p>
+<p>More importantly, our TernFS deployment is replicated across three data centres. This replication eliminates the chance of losing data due to 'independent' drive failures — thousands of drives would need to fail at once. Obviously, data centre wide events <em>can</em> cause a large proportion of the drives within it to fail, but having such an event in three data centres at once is exceedingly unlikely.</p>
+<p>Finally, copysets are not without drawbacks or complications. Assigning drives at random is an optimal strategy when it comes to evacuating drives quickly, since the files with blocks in the drives to be evacuated will be evenly spread over the rest of the filesystem, and since we only ever need to replace the failed blocks given that we're not constrained by fitting the new set of blocks in predetermined copysets. This means that the evacuation procedure will not be bottlenecked by drive throughput, which is what enables evacuation to finish in a matter of minutes. Moreover, the algorithm to distribute drives to shards is significantly simpler and more flexible than if it needed to care about copysets.</p>
+<p>However, users that wish to deploy TernFS within a single data centre might wish to implement some form of copyset replication. Such a change would be entirely contained to the registry and would not change any other component.</p>
+
+<h4>Block Proofs</h4>
+<p>We now have a solid scheme to store files redundantly (thanks to Reed-Solomon codes) and protect against bitrot (thanks to the checksums). However, said schemes are only as good as their implementation.</p>
+<p>As previously mentioned, TernFS clients communicate their intention to write a file to metadata servers, the metadata servers select block services that the blocks should be written to, and the clients then write the blocks to block services independently of the metadata services. The same happens when a client wants to erase blocks: the client first communicates its intentions to delete the blocks to the right metadata shard and then performs the erasing itself.</p>
+<p>This poses a challenge. While verifying the correctness of the core TernFS services is feasible, verifying all clients is not, but we'd still like to prevent buggy clients from breaking key invariants of the filesystem.</p>
+<p>Buggy clients can wreak havoc in several ways:</p>
+<ul>
+<li>They can <em>leak data</em> by writing blocks to block services that are not referenced anywhere in the metadata.</li>
+<li>They can <em>lose data</em> by erasing blocks which are still referenced in metadata.</li>
+<li>They can <em>corrupt data</em> by telling the metadata services they'll write something and then writing something else.</li>
+</ul>
+<p>We address all these points by using what we call <em>block proofs</em>. To illustrate how block proofs work, it's helpful to go through the steps required to write new data to a file.</p>
+<ol>
+<li>When a client is creating a file, it'll do so by adding its <a href="#reed-solomon">file spans</a> one-by-one. For each span the client wants to add it sends an 'initiate span creation' request to the right metadata shard. This request contains both the overall checksum of the span, and the checksum of each block in it (including parity blocks).</li>
+<li>The metadata shard checks the consistency of the checksum of the span and of its blocks, something it can do thanks to <a href="https://mazzo.li/posts/rs-crc.html">some desirable mathematical properties</a> of CRCs.</li>
+<li>The shard picks block services for the blocks to be written in and returns this information to the client together with a signature for each 'block write' instruction.</li>
+<li>The client forwards this signature to the block services, which will refuse to write the block without it. Crucially, the cryptographic signature ranges over a unique identity for the block (ensuring we only write the block we mean to write), together with its checksum, ensuring we don't write the wrong data.<sup><a href="#f18">[18]</a></sup></li>
+<li>After committing the block to disk, the block service returns a 'block written' signature to the client.</li>
+<li>Finally, the client forwards the block written signature back to the shard, which certifies that the span has been written only when it has received the signatures for all the blocks that make up the span. <sup><a href="#f19">[19]</a></sup></li>
+</ol>
+
+<p>Similarly, when a client wants to delete a span, it first asks the metadata shard to start doing so. The metadata shard marks the span as 'in deletion' and returns a bunch of 'block erase' signatures to the client. The client then forwards the signatures to the block services that hold the blocks, which delete the blocks, and return a 'block erased' signature. The clients forward these signatures back to the metadata shards, which can then forget about the span entirely.</p>
+
+<p>We use AES to generate the signatures for simplicity but note that the goal here is not protecting ourselves from malicious clients — just buggy ones. The keys used for the signature are not kept secret, and CRC32-C is not a secure checksum. That said, we've found this scheme enormously valuable in the presence of <a href="#posix-shaped">complex clients</a>. We spent considerable efforts making the core services very simple so we could then take more implementation risks in the clients, with the knowledge that we would have a very low chance of corrupting the filesystem itself.</p>
+
+<h4>Scrubbing</h4>
+<p>Finally, if things go wrong, we need to notice. The most common failure mode for a drive is for it to fail entirely, in which case our internal hardware monitoring system will pick it up and migrate from it automatically. The more insidious (and still very common) case is a single sector failing in a drive, which will only be noticed when we try to read the block involving that sector.</p>
+<p>This is acceptable for files which are read frequently, but some files might be very 'cold' but still very important.</p>
+<p>Consider the case of raw market data taps which are immediately converted to some processed, lossy format. While we generally will use the file containing the processed data, it's paramount to store the raw market data forever so that if we ever want to include more information from the original market data, we can. So important cold files might go months or even years without anyone reading them, and in the meantime, we might find that enough blocks have been corrupted to render them unreadable.<sup><a href="#f20">[20]</a></sup></p>
+
+<p>To make sure this does not happen, a process called the <em>scrubber</em> continuously reads every block that TernFS stores, and replaces blocks with bad sectors before they can cause too much damage.</p>
+
+<h3>Snapshots and garbage collection</h3>
+<p>We've talked at length about what TernFS does to try to prevent data loss due to hardware failure or bugs in clients. However, the most common type of data loss is due to human error — the <code>rm —rf / home/alice/notes.txt</code> scenario.</p>
+<p>To protect against these scenarios, TernFS implements a lightweight snapshotting system. When files or directories are deleted, their contents aren't actually deleted. Instead, a weak reference to them is created. We call such weak references <em>snapshot</em> directory entries.</p>
+<p>Snapshot entries are not be visible through the kernel module or the S3 gateway, but are visible through <a href="#speaking-ternfs">the direct API</a>, and at XTX we have developed internal tooling to easily recover deleted files through it.<sup><a href="#f21">[21]</a></sup> Deleted files are also visible through the TernFS web UI.</p>
+
+<p>Given that 'normal' file operations do not delete files, but rather make them a snapshot, the task of freeing up space is delegated to an external Go process, the <em>garbage collector</em>. The garbage collector traverses the filesystem and removes expired snapshots, which involves deleting their blocks permanently. Snapshot expiry is predictably regulated by <a href="#directory-policies">directory policies</a>.</p>
+<h3>Keeping TernFS healthy</h3>
+<p>This last section covers how we (humans of XTX) notice problems in TernFS, and how TernFS self-heals when things go wrong — both key topics if we want to ensure no data loss and notice performance problems early.</p>
+<h4>Performance metrics</h4>
+<p>TernFS exposes a plethora of performance metrics through the HTTP <a href="https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/">InfluxDB line protocol</a>. While connecting TernFS to a service which ingests these metrics is optional, it is <em>highly</em> recommended for any production service.</p>
+<p>Moreover, the kernel module exposes many performance metrics itself through DebugFS.</p>
+<p>Both types of metrics, especially when used in tandem, have proved invaluable to resolve performance problems quickly.</p>
+<h4>Logging and alerts</h4>
+<p>TernFS services log their output to files in a simple line-based format. The internal logging API is extremely simple and includes support for syslog levels out-of-the-box. At XTX we run TernFS as normal systemd services and use journalctl to view logs.</p>
+<p>As with metrics, the kernel module includes various logging facilities as well. The first type of logging is just through dmesg, but the kernel module also includes numerous tracepoints for low-overhead opt-in logging of many operations.</p>
+<p>TernFS is also integrated with XTX's internal alerting system, called <em>XMon</em>, to page on call developers when things go wrong. XMon is not open source, but all the alerts are also rendered as error lines in logs. <sup><a href="#f22">[22]</a></sup> We plan to eventually move to having alerts feed off performance metrics, which would make them independent from XMon, although we don't have plans to do so in the short-term. <a name="migrations"></a></p>
+
+<h4>Migrations</h4>
+<p>Finally, there's the question of what to do when drives die — and they will die, frequently, when you have 50,000 of them. While drives dying is not surprising, we've been surprised at the variety of different drive failures. <sup><a href="#f23">[23]</a></sup> A malfunctioning drive might:</p>
+
+<ul>
+<li>Produce IO errors when reading specific files. This is probably due to a single bad sector.</li>
+<li>Produce IO errors when reading or writing anything. This might happen because enough bad sectors have gone bad and the drive cannot remap them, or for a variety of other reasons.</li>
+<li>Return wrong data. This is usually caught by the built-in error correction codes in the hard drives, but not always.</li>
+<li>Lie about data being successfully persisted. This can manifest in a variety of ways: file size being wrong on open, file contents being partially zero'd out, and so on.</li>
+<li>Disappear from the mount list, only to reappear when the machine is rebooted, but missing some data.</li>
+</ul>
+<p>When clients fail to read from a drive, they'll automatically fall back on other drives to reconstruct the missing data, which is extremely effective in hiding failures from the end-user. That said, something needs to be done about the bad drives, and <a href="#block-service-picking">done quickly to avoid permanent data loss</a>.</p>
+<p>The TernFS registry allows marking drives as faulty. Faulty drives are then picked up by the <em>migrator</em>, a Go process which waits for bad drives and then stores all its blocks onto freshly picked block services.</p>
+<p>TernFS also tries to mark drives as bad automatically using a simple heuristic based on the rate of IO errors the drive is experiencing. The number of drives automatically marked as faulty is throttled to avoid having this check go awry and mark the whole cluster as faulty, which would not be catastrophic but would still be messy to deal with.</p>
+<p>Moreover, drives that are faulty in subtle ways might not be picked up by the heuristics, which means that occasionally a sysadmin will need to mark a drive as faulty manually, after which the migrator will evacuate them.</p>
+<h2>Closing thoughts</h2>
+<p>At XTX we feel strongly about utilizing our resources efficiently. When it comes to software, this means having software that gets close to some theoretical optimum when it comes to total cost of ownership. This culture was borne out by competing hard for technological excellence when doing on-exchange trading at first, and by our ever-growing hardware costs as our business has grown later.</p>
+<p>Such idealized tools might not exist or be available yet, in which case we're happy to be the tool makers. TernFS is a perfect example of this and we're excited to open source this component of our business for the community.</p>
+<p>Crucially, the cost of implementation of a new solution is often overblown compared to the cost of tying yourself to an ill-fitting, expensive third-party solution. Designing and implementing a solution serving exactly your needs allows for much greater simplicity. If the requirements do change, as often happens, changes can be implemented very quickly, again only catering to your needs.</p>
+<p>That said, we believe that TernFS' set of trade-offs are widely shared across many organizations dealing with large-scale storage workloads, and we hope we'll contribute to <a href="https://xkcd.com/927/">at least slowing down the seemingly constant stream of new filesystems</a>.</p>
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[AWS outage shows internet users 'at mercy' of too few providers, experts say (243 pts)]]></title>
             <link>https://www.theguardian.com/technology/2025/oct/20/amazon-web-services-aws-outage-hits-dozens-websites-apps</link>
             <guid>45646649</guid>
             <pubDate>Mon, 20 Oct 2025 17:32:46 GMT</pubDate>
@@ -217,7 +1208,7 @@ everything runs in your browser, and once the Web App loads it will work
 <div id="readability-page-1" class="page"><div id="maincontent"><p>Experts have warned of the perils of relying on a small number of companies for operating the global internet after a glitch at Amazon’s cloud computing service brought down apps and websites around the world.</p><p>The affected platforms included <a href="https://www.theguardian.com/technology/snapchat" data-link-name="in body link" data-component="auto-linked-tag">Snapchat</a>, Roblox, Signal and Duolingo as well as a host of Amazon-owned operations including its main retail site and the Ring doorbell company.</p><p>More than 2,000 companies worldwide have been affected, according to Downdetector, a site that monitors internet outages, with 8.1m reports of problems from users including 1.9m reports in the US, 1m in the UK and 418,000 in Australia.</p><p>In the UK, Lloyds bank was affected, as well as its subsidiaries Halifax and Bank of Scotland, while there were also problems accessing the HM Revenue and Customs website on Monday morning. Also in the UK, Ring users complained on social media that their doorbells were not working.</p><p>In the UK alone, reports of problems on individual apps ran into the tens of thousands for each platform. Other affected platforms around the world included Wordle, Coinbase, Duolingo, Slack, Pokémon Go, Epic Games, PlayStation Network and Peloton.</p><p>By 10.30am UK time, Amazon was reporting that the problem, which first emerged at about 8am, was being resolved as AWS was “seeing significant signs of recovery”.</p><p>However, after reporting further positive progress by late morning in the UK, Amazon still appeared to be struggling to overcome the glitch this afternoon as it acknowledged it was still experiencing elevated errors.</p><p>“We can confirm significant API errors and connectivity issues across multiple services … We are investigating,” AWS said in an update around 7am Pacific time and 3pm UK time.</p><p>To aid the recovery, AWS said it was putting in place limits on the number of requests that could be made on its platform.</p><p>Experts said the outage underlined the dangers of the internet’s reliance on a small number of tech companies, with Amazon, Microsoft and Google playing a key role in the cloud market.</p><p>Dr Corinne Cath-Speth, the head of digital at human rights organisation Article 19, said: “We urgently need diversification in cloud computing. The infrastructure underpinning democratic discourse, independent journalism and secure communications cannot be dependent on a handful of companies.”</p><p>Cori Crider, the executive director of the Future of Technology<em> </em>Institute, a thinktank that supports a sovereign technology framework for Europe, said: “The UK can’t keep leaving its critical infrastructure at the mercy of US tech giants. With Amazon Web Services down, we’ve seen the lights go out across the modern economy – from banking to communications.”</p><p>Madeline Carr, professor of global politics and cybersecurity at University College London, said it was “hard to disagree” with warnings about the over-reliance of the global internet on a small number of companies.</p><p>“The counter-argument is that it’s these large hyper-scaling companies that have the financial resources to provide a secure, global and resilient service. But most people outside those companies would argue that is a risky position for the world to be in.”</p><p>Last year, airports, healthcare services and businesses worldwide were hit by the “largest outage in history”, caused by a botched software upgrade from cybersecurity company CrowdStrike that <a href="https://www.theguardian.com/australia-news/article/2024/jul/19/microsoft-windows-pcs-outage-blue-screen-of-death" data-link-name="in body link">hit Microsoft’s Windows operating system</a>.</p><p>Amazon reported that the problem on Monday originated in the east coast of the US at Amazon Web Services, a unit that provides vital web infrastructure for a host of companies, which rent out space on Amazon servers. AWS is the world’s largest cloud computing platform.</p><p>Shortly after midnight (PDT) in the US (8am BST) on Monday, Amazon confirmed “increased error rates and latencies” for AWS services in a region on the east coast of the US. The ripple effect hit services around the world, with Downdetector reporting problems with the same sites in multiple continents.</p><p>Cisco’s Thousand Eyes, a service that <a href="https://www.thousandeyes.com/outages/" data-link-name="in body link">tracks internet outages</a>, also reported a surge in problems on Monday morning, with many of them located in Virginia, the location of Amazon’s US-East-1 region, where AWS said the problems began and where AWS has a number of datacentres.</p><p>Experts said the outage appeared to be an IT issue rather than a cyber-attack. AWS’s online health dashboard referred to DynamoDB, its database system where AWS customers store their data. Amazon appeared to rule out foul play, saying the root cause was an internal subsystem responsible for monitoring its load balancers, which prevent traffic from overloading its servers.</p><p>“The incident appears to have been caused by some accident within AWS, rather than being the result of any malicious intent,” said Steven Murdoch, a professor of security engineering at University College London.</p><p>The UK government has said it is in contact with Amazon over the outage.</p><p>A spokesperson said:<em> </em>“We are aware of an incident affecting Amazon Web Services, and several online services which rely on their infrastructure. Through our established incident response arrangements, we are in contact with the company, who are working to restore services as quickly as possible.”</p><p>The House of Commons’ treasury committee in the UK has written to the economic secretary to the Treasury, Lucy Rigby, to ask why the government had not yet designated Amazon a “critical third party” to the UK’s financial services sector – which would expose the tech firm to financial regulatory oversight.</p><p>The committee chair, Meg Hillier, pointed out that Amazon had recently told the committee that financial services customers were using AWS to support their “resilience” and that AWS offered “multiple layers of protection”.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dutch spy services have restricted intelligence-sharing with the United States (253 pts)]]></title>
+            <title><![CDATA[Dutch spy services have restricted intelligence-sharing with the United States (254 pts)]]></title>
             <link>https://intelnews.org/2025/10/20/01-3416/</link>
             <guid>45646572</guid>
             <pubDate>Mon, 20 Oct 2025 17:25:45 GMT</pubDate>
@@ -249,7 +1240,7 @@ everything runs in your browser, and once the Web App loads it will work
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Chess grandmaster Daniel Naroditsky has passed away (308 pts)]]></title>
+            <title><![CDATA[Chess grandmaster Daniel Naroditsky has passed away (310 pts)]]></title>
             <link>https://old.reddit.com/r/chess/comments/1obnbmu/grandmaster_daniel_naroditsky_has_passed_away/</link>
             <guid>45646561</guid>
             <pubDate>Mon, 20 Oct 2025 17:24:58 GMT</pubDate>
@@ -311,7 +1302,7 @@ everything runs in your browser, and once the Web App loads it will work
 </div></form><ul><li><a href="https://old.reddit.com/r/chess/comments/1obnbmu/grandmaster_daniel_naroditsky_has_passed_away/nkh9m1q/" data-event-action="permalink" rel="nofollow">permalink</a></li><li>embed</li><li>save</li><li>report</li><li>reply</li></ul></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Production RAG: what I learned from processing 5M+ documents (319 pts)]]></title>
+            <title><![CDATA[Production RAG: what I learned from processing 5M+ documents (325 pts)]]></title>
             <link>https://blog.abdellatif.io/production-rag-processing-5m-documents</link>
             <guid>45645349</guid>
             <pubDate>Mon, 20 Oct 2025 15:55:36 GMT</pubDate>
@@ -341,7 +1332,7 @@ everything runs in your browser, and once the Web App loads it will work
 <p>We put all our learning into an open-source project: <a target="_blank" rel="noopener noreferrer" href="https://github.com/agentset-ai/agentset">agentset-ai/agentset</a> under an MIT license. Feel free to <a target="_blank" rel="noopener noreferrer" href="mailto:abdellatif@agentset.ai">reach out</a> if you have any questions.</p></article></section><!--$--><!--/$--><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Postman which I thought worked locally on my computer, is down (277 pts)]]></title>
+            <title><![CDATA[Postman which I thought worked locally on my computer, is down (318 pts)]]></title>
             <link>https://status.postman.com</link>
             <guid>45645172</guid>
             <pubDate>Mon, 20 Oct 2025 15:40:40 GMT</pubDate>
@@ -1074,7 +2065,7 @@ everything runs in your browser, and once the Web App loads it will work
         </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Commodore 64 Ultimate (133 pts)]]></title>
+            <title><![CDATA[Commodore 64 Ultimate (135 pts)]]></title>
             <link>https://www.commodore.net/product-page/commodore-64-ultimate-basic-beige-batch1</link>
             <guid>45644654</guid>
             <pubDate>Mon, 20 Oct 2025 14:55:52 GMT</pubDate>
@@ -1122,7 +2113,7 @@ everything runs in your browser, and once the Web App loads it will work
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[BERT Is Just a Single Text Diffusion Step (357 pts)]]></title>
+            <title><![CDATA[BERT Is Just a Single Text Diffusion Step (367 pts)]]></title>
             <link>https://nathan.rs/posts/roberta-diffusion/</link>
             <guid>45644328</guid>
             <pubDate>Mon, 20 Oct 2025 14:31:16 GMT</pubDate>
@@ -1217,7 +2208,7 @@ this period the Non @-@ Parliamentaryist Party won its influence in Britain in
 Sinclair, Lewis questioned, and debated the need to describe " The New Britain "</code></pre><p>The output looks surprisingly coherent! Most of the quirks present are actually just quirks from the formatting of WikiText (spaces around punctuation <code>"</code>, turning hyphens <code>-</code> into <code>@-@</code>).</p><p>Below is a comparison between our diffusion model and GPT-2:</p><p><img alt="RoBERTa Diffusion vs GPT" src="https://nathan.rs/images/roberta-diffusion-gpt.gif"></p><p>We see GPT-2’s output is more coherent and slightly faster (~9 seconds vs ~13) but I’m pleasantly surprised with how good my simple implementation was. It is a good proof of concept, and with new approaches like AR-Diffusion and Skip-Step Diffusion (and a more optimized implementation), the quality and speed can be drastically improved.</p><h2 id="conclusion">Conclusion<a href="#conclusion">#</a></h2><hr><p>We’ve seen that masked language models like RoBERTa, originally designed for fill-in-the-blank tasks, can be repurposed into fully generative engines by interpreting variable-rate masking as a discrete diffusion process. By gradually corrupting text with <code>&lt;MASK&gt;</code> tokens and training the model to iteratively denoise at increasing mask intensities, we effectively turn the standard MLM objective into a step-by-step generation procedure.</p><p>Even without architectural changes, a fine-tuned RoBERTa can generate coherent looking text after slightly modifying the training objective, validating the idea that BERT-style models are essentially just text diffusion models trained on one masking rate.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Servo v0.0.1 Released (479 pts)]]></title>
+            <title><![CDATA[Servo v0.0.1 Released (482 pts)]]></title>
             <link>https://github.com/servo/servo</link>
             <guid>45643357</guid>
             <pubDate>Mon, 20 Oct 2025 12:55:30 GMT</pubDate>
@@ -1330,7 +2321,7 @@ tools</a> to
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Alibaba Cloud says it cut Nvidia AI GPU use by 82% with new pooling system (362 pts)]]></title>
+            <title><![CDATA[Alibaba Cloud says it cut Nvidia AI GPU use by 82% with new pooling system (369 pts)]]></title>
             <link>https://www.tomshardware.com/tech-industry/semiconductors/alibaba-says-new-pooling-system-cut-nvidia-gpu-use-by-82-percent</link>
             <guid>45643163</guid>
             <pubDate>Mon, 20 Oct 2025 12:31:22 GMT</pubDate>
@@ -2251,175 +3242,6 @@ python run_dpsk_ocr.py</pre></div>
             <pubDate>Mon, 20 Oct 2025 04:42:08 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://neal.fun/space-elevator/">https://neal.fun/space-elevator/</a>, See on <a href="https://news.ycombinator.com/item?id=45640226">Hacker News</a></p>
 Couldn't get https://neal.fun/space-elevator/: Error: Request failed with status code 403]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Entire Linux Network stack diagram (2024) (502 pts)]]></title>
-            <link>https://zenodo.org/records/14179366</link>
-            <guid>45639995</guid>
-            <pubDate>Mon, 20 Oct 2025 03:33:11 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://zenodo.org/records/14179366">https://zenodo.org/records/14179366</a>, See on <a href="https://news.ycombinator.com/item?id=45639995">Hacker News</a></p>
-<div id="readability-page-1" class="page"><article>
-          
-
-              
-
-              
-
-              <div id="record-info" aria-label="Publication date and version number">
-                    <p><span title="Publication date">
-                        Published November 18, 2024
-                      </span>
-                      <span> | Version v7</span>
-                    </p>
-                    <p><span role="note" aria-label="Resource type">
-                          Poster
-                        </span>
-                      
-
-                      <span role="note" data-tooltip="The record and files are publicly accessible." data-inverted="" aria-label="Access status">
-                        
-                          
-                        
-                        <span aria-label="The record and files are publicly accessible.">
-                          Open
-                        </span>
-                      </span>
-                    </p>
-                  </div>
-              <section id="record-title-section" aria-label="Record title and creators">
-  <ul>
-    
-    <li>
-      1.
-
-      
-
-      Ericsson Nikola Tesla
-    </li>
-  
-
-    </ul>
-</section>
-
-
-
-  <section id="description" aria-label="Record description">
-    <h2 id="description-heading">Description</h2>
-    
-    <div>
-      <p>Diagram of entire Linux Network Stack, including:</p>
-<ul>
-<li>Virtualization and Linux containers:
-<ul>
-<li>Emulation and Paravirtualization.</li>
-</ul>
-</li>
-<li>Network sockets.</li>
-<li>Network stack:
-<ul>
-<li>Upper layer of Network stack (TCP, UDP).</li>
-<li>Low layer of Network stack with GRO, RPS, RFS and GSO.</li>
-</ul>
-</li>
-<li>Network Scheduler.</li>
-<li>NetFilter and traffic controll:
-<ul>
-<li>Bridge and Bond interfaces.</li>
-<li>Tap interface, ...</li>
-</ul>
-</li>
-<li>Device Driver:
-<ul>
-<li>Queue.</li>
-<li>NAPI.</li>
-<li>IRQ handler.</li>
-</ul>
-</li>
-<li>Network functions accelerated by NIC:
-<ul>
-<li>Checksum offload, VLAN, VxLAN, GRE, TSO, LRO,&nbsp;RSS, ...</li>
-</ul>
-</li>
-<li>Network card.</li>
-</ul>
-<p>All (above) sections (layers) include tips for optimizations and/or statistics.</p>
-
-<p>This diagram is part of the book:&nbsp;</p>
-<p><strong>Operativni sustavi i računalne mreže - Linux u primjeni</strong></p>
-<p>https://doi.org/10.5281/zenodo.8119310</p>
-    </div>
-  </section>
-
-
-<section id="record-files" aria-label="Files"><h2 id="files-heading">Files</h2>
-            
-  <div href="#files-preview-accordion-panel">
-    <h3>
-      <p><span id="preview-file-title">Linux Network Stack - EN.pdf</span>
-        
-      </p>
-    </h3>
-    
-  </div>
-  <div href="#files-list-accordion-panel">
-    <h3>
-      <p>
-        Files
-        <small> (5.4 MB)</small>
-        
-      </p>
-    </h3>
-
-    
-  </div>
-
-    </section>
-              
-
-  <section id="additional-details" aria-label="Additional record details">
-
-
-
-
-
-
-
-
-
-
-
-  <h2 id="record-details-heading">Additional details</h2>
-
-  
-
-  
-
-  
-
-  
-    
-      
-    
-    
-  
-
-  
-
-  
-
-  
-
-  
-
-
-
-  
-
-  </section>
-    
-    
-  
-        </article></div>]]></description>
         </item>
     </channel>
 </rss>
