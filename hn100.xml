@@ -4,12 +4,641 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Mon, 17 Nov 2025 09:30:05 GMT</lastBuildDate>
+        <lastBuildDate>Mon, 17 Nov 2025 10:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[A new chapter begins for EV batteries with the expiry of key LFP patents (134 pts)]]></title>
+            <title><![CDATA[Building a Simple Search Engine That Works (110 pts)]]></title>
+            <link>https://karboosx.net/post/4eZxhBon/building-a-simple-search-engine-that-actually-works</link>
+            <guid>45950720</guid>
+            <pubDate>Mon, 17 Nov 2025 03:52:50 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://karboosx.net/post/4eZxhBon/building-a-simple-search-engine-that-actually-works">https://karboosx.net/post/4eZxhBon/building-a-simple-search-engine-that-actually-works</a>, See on <a href="https://news.ycombinator.com/item?id=45950720">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        <article itemscope="" itemtype="https://schema.org/BlogPosting">
+            
+
+            <div itemprop="articleBody">
+                <h2>Why Build Your Own?</h2>
+<p>Look, I know what you're thinking. "Why not just use Elasticsearch?" or "What about Algolia?" Those are valid options, but they come with complexity. You need to learn their APIs, manage their infrastructure, and deal with their quirks.</p>
+<p>Sometimes you just want something that:</p>
+<ul>
+<li>Works with your existing database</li>
+<li>Doesn't require external services</li>
+<li>Is easy to understand and debug</li>
+<li>Actually finds relevant results</li>
+</ul>
+<p>That's what I built. A search engine that uses your existing database, respects your current architecture, and gives you full control over how it works.</p>
+<hr>
+<h2>The Core Idea</h2>
+<p>The concept is simple: <strong>tokenize everything, store it, then match tokens when searching</strong>.</p>
+<p>Here's how it works:</p>
+<ol>
+<li><strong>Indexing</strong>: When you add or update content, we split it into tokens (words, prefixes, n-grams) and store them with weights</li>
+<li><strong>Searching</strong>: When someone searches, we tokenize their query the same way, find matching tokens, and score the results</li>
+<li><strong>Scoring</strong>: We use the stored weights to calculate relevance scores</li>
+</ol>
+<p>The magic is in the tokenization and weighting. Let me show you what I mean.</p>
+<hr>
+<h2>Building Block 1: The Database Schema</h2>
+<p>We need two simple tables: <code>index_tokens</code> and <code>index_entries</code>.</p>
+<h3>index_tokens</h3>
+<p>This table stores all unique tokens with their tokenizer weights. Each token name can have multiple records with different weights—one per tokenizer.</p>
+<pre><code>// index_tokens table structure
+id | name    | weight
+---|---------|-------
+1  | parser  | 20     // From WordTokenizer
+2  | parser  | 5      // From PrefixTokenizer
+3  | parser  | 1      // From NGramsTokenizer
+4  | parser  | 10     // From SingularTokenizer
+</code></pre>
+<p>Why store separate tokens per weight? Different tokenizers produce the same token with different weights. For example, "parser" from WordTokenizer has weight 20, but "parser" from PrefixTokenizer has weight 5. We need separate records to properly score matches.</p>
+<p>The unique constraint is on <code>(name, weight)</code>, so the same token name can exist multiple times with different weights.</p>
+<h3>index_entries</h3>
+<p>This table links tokens to documents with field-specific weights.</p>
+<pre><code>// index_entries table structure
+id | token_id | document_type | field_id | document_id | weight
+---|----------|---------------|----------|-------------|-------
+1  | 1        | 1             | 1        | 42          | 2000
+2  | 2        | 1             | 1        | 42          | 500
+</code></pre>
+<p>The <code>weight</code> here is the final calculated weight: <code>field_weight × tokenizer_weight × ceil(sqrt(token_length))</code>. This encodes everything we need for scoring. We will talk about scoring later in the post.</p>
+<p>We add indexes on:</p>
+<ul>
+<li><code>(document_type, document_id)</code> - for fast document lookups</li>
+<li><code>token_id</code> - for fast token lookups</li>
+<li><code>(document_type, field_id)</code> - for field-specific queries</li>
+<li><code>weight</code> - for filtering by weight</li>
+</ul>
+<p>Why this structure? Simple, efficient, and leverages what databases do best.</p>
+<hr>
+<h2>Building Block 2: Tokenization</h2>
+<p>What is tokenization? It's breaking text into searchable pieces. The word "parser" becomes tokens like <code>["parser"]</code>, <code>["par", "pars", "parse", "parser"]</code>, or <code>["par", "ars", "rse", "ser"]</code> depending on which tokenizer we use.</p>
+<p>Why multiple tokenizers? Different strategies for different matching needs. One tokenizer for exact matches, another for partial matches, another for typos.</p>
+<p>All tokenizers implement a simple interface:</p>
+<pre><code>interface TokenizerInterface
+{
+    public function tokenize(string $text): array;  // Returns array of Token objects
+    public function getWeight(): int;               // Returns tokenizer weight
+}
+</code></pre>
+<p>Simple contract, easy to extend.</p>
+<h3>Word Tokenizer</h3>
+<p>This one is straightforward—it splits text into individual words. "parser" becomes just <code>["parser"]</code>. Simple, but powerful for exact matches.</p>
+<p>First, we normalize the text. Lowercase everything, remove special characters, normalize whitespace:</p>
+<pre><code>class WordTokenizer implements TokenizerInterface
+{
+    public function tokenize(string $text): array
+    {
+        // Normalize: lowercase, remove special chars
+        $text = mb_strtolower(trim($text));
+        $text = preg_replace('/[^a-z0-9]/', ' ', $text);
+        $text = preg_replace('/\s+/', ' ', $text);
+</code></pre>
+<p>Next, we split into words and filter out short ones:</p>
+<pre><code>        // Split into words, filter short ones
+        $words = explode(' ', $text);
+        $words = array_filter($words, fn($w) =&gt; mb_strlen($w) &gt;= 2);
+</code></pre>
+<p>Why filter short words? Single-character words are usually too common to be useful. "a", "I", "x" don't help with search.</p>
+<p>Finally, we return unique words as Token objects:</p>
+<pre><code>        // Return as Token objects with weight
+        return array_map(
+            fn($word) =&gt; new Token($word, $this-&gt;weight),
+            array_unique($words)
+        );
+    }
+}
+</code></pre>
+<p>Weight: 20 (high priority for exact matches)</p>
+<h3>Prefix Tokenizer</h3>
+<p>This generates word prefixes. "parser" becomes <code>["par", "pars", "parse", "parser"]</code> (with min length 4). This helps with partial matches and autocomplete-like behavior.</p>
+<p>First, we extract words (same normalization as WordTokenizer):</p>
+<pre><code>class PrefixTokenizer implements TokenizerInterface
+{
+    public function __construct(
+        private int $minPrefixLength = 4,
+        private int $weight = 5
+    ) {}
+    
+    public function tokenize(string $text): array
+    {
+        // Normalize same as WordTokenizer
+        $words = $this-&gt;extractWords($text);
+</code></pre>
+<p>Then, for each word, we generate prefixes from the minimum length to the full word:</p>
+<pre><code>        $tokens = [];
+        foreach ($words as $word) {
+            $wordLength = mb_strlen($word);
+            // Generate prefixes from min length to full word
+            for ($i = $this-&gt;minPrefixLength; $i &lt;= $wordLength; $i++) {
+                $prefix = mb_substr($word, 0, $i);
+                $tokens[$prefix] = true; // Use associative array for uniqueness
+            }
+        }
+</code></pre>
+<p>Why use an associative array? It ensures uniqueness. If "parser" appears twice in the text, we only want one "parser" token.</p>
+<p>Finally, we convert the keys to Token objects:</p>
+<pre><code>        return array_map(
+            fn($prefix) =&gt; new Token($prefix, $this-&gt;weight),
+            array_keys($tokens)
+        );
+    }
+}
+</code></pre>
+<p>Weight: 5 (medium priority)</p>
+<p>Why min length? Avoid too many tiny tokens. Prefixes shorter than 4 characters are usually too common to be useful.</p>
+<h3>N-Grams Tokenizer</h3>
+<p>This creates character sequences of a fixed length (I use 3). "parser" becomes <code>["par", "ars", "rse", "ser"]</code>. This catches typos and partial word matches.</p>
+<p>First, we extract words:</p>
+<pre><code>class NGramsTokenizer implements TokenizerInterface
+{
+    public function __construct(
+        private int $ngramLength = 3,
+        private int $weight = 1
+    ) {}
+    
+    public function tokenize(string $text): array
+    {
+        $words = $this-&gt;extractWords($text);
+</code></pre>
+<p>Then, for each word, we slide a window of fixed length across it:</p>
+<pre><code>        $tokens = [];
+        foreach ($words as $word) {
+            $wordLength = mb_strlen($word);
+            // Sliding window of fixed length
+            for ($i = 0; $i &lt;= $wordLength - $this-&gt;ngramLength; $i++) {
+                $ngram = mb_substr($word, $i, $this-&gt;ngramLength);
+                $tokens[$ngram] = true;
+            }
+        }
+</code></pre>
+<p>The sliding window: for "parser" with length 3, we get:</p>
+<ul>
+<li>Position 0: "par"</li>
+<li>Position 1: "ars"</li>
+<li>Position 2: "rse"</li>
+<li>Position 3: "ser"</li>
+</ul>
+<p>Why this works? Even if someone types "parsr" (typo), we still get "par" and "ars" tokens, which match the correctly spelled "parser".</p>
+<p>Finally, we convert to Token objects:</p>
+<pre><code>        return array_map(
+            fn($ngram) =&gt; new Token($ngram, $this-&gt;weight),
+            array_keys($tokens)
+        );
+    }
+}
+</code></pre>
+<p>Weight: 1 (low priority, but catches edge cases)</p>
+<p>Why 3? Balance between coverage and noise. Too short and you get too many matches, too long and you miss typos.</p>
+<h3>Normalization</h3>
+<p>All tokenizers do the same normalization:</p>
+<ul>
+<li>Lowercase everything</li>
+<li>Remove special characters (keep only alphanumerical)</li>
+<li>Normalize whitespace (multiple spaces to single space)</li>
+</ul>
+<p>This ensures consistent matching regardless of input format.</p>
+<hr>
+<h2>Building Block 3: The Weight System</h2>
+<p>We have three levels of weights working together:</p>
+<ol>
+<li><strong>Field weights</strong>: Title vs content vs keywords</li>
+<li><strong>Tokenizer weights</strong>: Word vs prefix vs n-gram (stored in index_tokens)</li>
+<li><strong>Document weights</strong>: Stored in index_entries (calculated: <code>field_weight × tokenizer_weight × ceil(sqrt(token_length))</code>)</li>
+</ol>
+<h3>Final Weight Calculation</h3>
+<p>When indexing, we calculate the final weight like this:</p>
+<pre><code>$finalWeight = $fieldWeight * $tokenizerWeight * ceil(sqrt($tokenLength));
+</code></pre>
+<p>For example:</p>
+<ul>
+<li>Title field: weight 10</li>
+<li>Word tokenizer: weight 20</li>
+<li>Token "parser": length 6</li>
+<li>Final weight: <code>10 × 20 × ceil(sqrt(6)) = 10 × 20 × 3 = 600</code></li>
+</ul>
+<p>Why use <code>ceil(sqrt())</code>? Longer tokens are more specific, but we don't want weights to blow up with very long tokens. "parser" is more specific than "par", but a 100-character token shouldn't have 100x the weight. The square root function gives us diminishing returns—longer tokens still score higher, but not linearly. We use <code>ceil()</code> to round up to the nearest integer, keeping weights as whole numbers.</p>
+<h3>Tuning Weights</h3>
+<p>You can adjust weights for your use case:</p>
+<ul>
+<li>Increase field weights for titles if titles are most important</li>
+<li>Increase tokenizer weights for exact matches if you want to prioritize exact matches</li>
+<li>Adjust the token length function (ceil(sqrt), log, or linear) if you want longer tokens to matter more or less</li>
+</ul>
+<p>You can see exactly how weights are calculated and adjust them as needed.</p>
+<hr>
+<h2>Building Block 4: The Indexing Service</h2>
+<p>The indexing service takes a document and stores all its tokens in the database.</p>
+<h3>The Interface</h3>
+<p>Documents that can be indexed implement <code>IndexableDocumentInterface</code>:</p>
+<pre><code>interface IndexableDocumentInterface
+{
+    public function getDocumentId(): int;
+    public function getDocumentType(): DocumentType;
+    public function getIndexableFields(): IndexableFields;
+}
+</code></pre>
+<p>To make a document searchable, you implement these three methods:</p>
+<pre><code>class Post implements IndexableDocumentInterface
+{
+    public function getDocumentId(): int
+    {
+        return $this-&gt;id ?? 0;
+    }
+    
+    public function getDocumentType(): DocumentType
+    {
+        return DocumentType::POST;
+    }
+    
+    public function getIndexableFields(): IndexableFields
+    {
+        $fields = IndexableFields::create()
+            -&gt;addField(FieldId::TITLE, $this-&gt;title ?? '', 10)
+            -&gt;addField(FieldId::CONTENT, $this-&gt;content ?? '', 1);
+        
+        // Add keywords if present
+        if (!empty($this-&gt;keywords)) {
+            $fields-&gt;addField(FieldId::KEYWORDS, $this-&gt;keywords, 20);
+        }
+        
+        return $fields;
+    }
+}
+</code></pre>
+<p>Three methods to implement:</p>
+<ul>
+<li><code>getDocumentType()</code>: returns the document type enum</li>
+<li><code>getDocumentId()</code>: returns the document ID</li>
+<li><code>getIndexableFields()</code>: builds fields with weights using fluent API</li>
+</ul>
+<p>You can index documents:</p>
+<ul>
+<li>On create/update (via event listeners)</li>
+<li>Via commands: <code>app:index-document</code>, <code>app:reindex-documents</code></li>
+<li>Via cron (for batch reindexing)</li>
+</ul>
+<h3>How It Works</h3>
+<p>Here's the indexing process, step by step.</p>
+<p>First, we get the document information:</p>
+<pre><code>class SearchIndexingService
+{
+    public function indexDocument(IndexableDocumentInterface $document): void
+    {
+        // 1. Get document info
+        $documentType = $document-&gt;getDocumentType();
+        $documentId = $document-&gt;getDocumentId();
+        $indexableFields = $document-&gt;getIndexableFields();
+        $fields = $indexableFields-&gt;getFields();
+        $weights = $indexableFields-&gt;getWeights();
+</code></pre>
+<p>The document provides its fields and weights via the <code>IndexableFields</code> builder.</p>
+<p>Next, we remove the existing index for this document. This handles updates—if the document changed, we need to reindex it:</p>
+<pre><code>        // 2. Remove existing index for this document
+        $this-&gt;removeDocumentIndex($documentType, $documentId);
+        
+        // 3. Prepare batch insert data
+        $insertData = [];
+</code></pre>
+<p>Why remove first? If we just add new tokens, we'll have duplicates. Better to start fresh.</p>
+<p>Now, we process each field. For each field, we run all tokenizers:</p>
+<pre><code>        // 4. Process each field
+        foreach ($fields as $fieldIdValue =&gt; $content) {
+            if (empty($content)) {
+                continue;
+            }
+            
+            $fieldId = FieldId::from($fieldIdValue);
+            $fieldWeight = $weights[$fieldIdValue] ?? 0;
+            
+            // 5. Run all tokenizers on this field
+            foreach ($this-&gt;tokenizers as $tokenizer) {
+                $tokens = $tokenizer-&gt;tokenize($content);
+</code></pre>
+<p>For each tokenizer, we get tokens. Then, for each token, we find or create it in the database and calculate the final weight:</p>
+<pre><code>                foreach ($tokens as $token) {
+                    $tokenValue = $token-&gt;value;
+                    $tokenWeight = $token-&gt;weight;
+                    
+                    // 6. Find or create token in index_tokens
+                    $tokenId = $this-&gt;findOrCreateToken($tokenValue, $tokenWeight);
+                    
+                    // 7. Calculate final weight
+                    $tokenLength = mb_strlen($tokenValue);
+                    $finalWeight = (int) ($fieldWeight * $tokenWeight * ceil(sqrt($tokenLength)));
+                    
+                    // 8. Add to batch insert
+                    $insertData[] = [
+                        'token_id' =&gt; $tokenId,
+                        'document_type' =&gt; $documentType-&gt;value,
+                        'field_id' =&gt; $fieldId-&gt;value,
+                        'document_id' =&gt; $documentId,
+                        'weight' =&gt; $finalWeight,
+                    ];
+                }
+            }
+        }
+</code></pre>
+<p>Why batch insert? Performance. Instead of inserting one row at a time, we collect all rows and insert them in one query.</p>
+<p>Finally, we batch insert everything:</p>
+<pre><code>        // 9. Batch insert for performance
+        if (!empty($insertData)) {
+            $this-&gt;batchInsertSearchDocuments($insertData);
+        }
+    }
+</code></pre>
+<p>The <code>findOrCreateToken</code> method is straightforward:</p>
+<pre><code>    private function findOrCreateToken(string $name, int $weight): int
+    {
+        // Try to find existing token with same name and weight
+        $sql = "SELECT id FROM index_tokens WHERE name = ? AND weight = ?";
+        $result = $this-&gt;connection-&gt;executeQuery($sql, [$name, $weight])-&gt;fetchAssociative();
+        
+        if ($result) {
+            return (int) $result['id'];
+        }
+        
+        // Create new token
+        $insertSql = "INSERT INTO index_tokens (name, weight) VALUES (?, ?)";
+        $this-&gt;connection-&gt;executeStatement($insertSql, [$name, $weight]);
+        
+        return (int) $this-&gt;connection-&gt;lastInsertId();
+    }
+}
+</code></pre>
+<p>Why find or create? Tokens are shared across documents. If "parser" already exists with weight 20, we reuse it. No need to create duplicates.</p>
+<p>The key points:</p>
+<ul>
+<li>We remove old index first (handles updates)</li>
+<li>We batch insert for performance (one query instead of many)</li>
+<li>We find or create tokens (avoids duplicates)</li>
+<li>We calculate final weight on the fly</li>
+</ul>
+<hr>
+<h2>Building Block 5: The Search Service</h2>
+<p>The search service takes a query string and finds relevant documents. It tokenizes the query the same way we tokenized documents during indexing, then matches those tokens against the indexed tokens in the database. The results are scored by relevance and returned as document IDs with scores.</p>
+<h3>How It Works</h3>
+<p>Here's the search process, step by step.</p>
+<p>First, we tokenize the query using all tokenizers:</p>
+<pre><code>class SearchService
+{
+    public function search(DocumentType $documentType, string $query, ?int $limit = null): array
+    {
+        // 1. Tokenize query using all tokenizers
+        $queryTokens = $this-&gt;tokenizeQuery($query);
+        
+        if (empty($queryTokens)) {
+            return [];
+        }
+</code></pre>
+<p>If the query produces no tokens (e.g., only special characters), we return empty results.</p>
+<h3>Why Tokenize the Query Using the Same Tokenizers?</h3>
+<p>Different tokenizers produce different token values. If we index with one set and search with another, we'll miss matches.</p>
+<p>Example:</p>
+<ul>
+<li>Indexing with PrefixTokenizer creates tokens: "par", "pars", "parse", "parser"</li>
+<li>Searching with only WordTokenizer creates token: "parser"</li>
+<li>We'll find "parser", but we won't find documents that only have "par" or "pars" tokens</li>
+<li>Result: Incomplete matches, missing relevant documents!</li>
+</ul>
+<p><strong>The solution</strong>: Use the same tokenizers for both indexing and searching. Same tokenization strategy = same token values = complete matches.</p>
+<p>This is why the <code>SearchService</code> and <code>SearchIndexingService</code> both receive the same set of tokenizers.</p>
+<p>Next, we extract unique token values. Multiple tokenizers might produce the same token value, so we deduplicate:</p>
+<pre><code>        // 2. Extract unique token values
+        $tokenValues = array_unique(array_map(
+            fn($token) =&gt; $token instanceof Token ? $token-&gt;value : $token,
+            $queryTokens
+        ));
+</code></pre>
+<p>Why extract values? We search by token name, not by weight. We need the unique token names to search for.</p>
+<p>Then, we sort tokens by length (longest first). This prioritizes specific matches:</p>
+<pre><code>        // 3. Sort tokens (longest first - prioritize specific matches)
+        usort($tokenValues, fn($a, $b) =&gt; mb_strlen($b) &lt;=&gt; mb_strlen($a));
+</code></pre>
+<p>Why sort? Longer tokens are more specific. "parser" is more specific than "par", so we want to search for "parser" first.</p>
+<p>We also limit the token count to prevent DoS attacks with huge queries:</p>
+<pre><code>        // 4. Limit token count (prevent DoS with huge queries)
+        if (count($tokenValues) &gt; 300) {
+            $tokenValues = array_slice($tokenValues, 0, 300);
+        }
+</code></pre>
+<p>Why limit? A malicious user could send a query that produces thousands of tokens, causing performance issues. We keep the longest 300 tokens (already sorted).</p>
+<p>Now, we execute the optimized SQL query. The <code>executeSearch()</code> method builds the SQL query and executes it:</p>
+<pre><code>        // 5. Execute optimized SQL query
+        $results = $this-&gt;executeSearch($documentType, $tokenValues, $limit);
+</code></pre>
+<p>Inside <code>executeSearch()</code>, we build the SQL query with parameter placeholders, execute it, filter low-scoring results, and convert to SearchResult objects:</p>
+<pre><code>private function executeSearch(DocumentType $documentType, array $tokenValues, int $tokenCount, ?int $limit, int $minTokenWeight): array
+{
+    // Build parameter placeholders for token values
+    $tokenPlaceholders = implode(',', array_fill(0, $tokenCount, '?'));
+    
+    // Build the SQL query (shown in full in "The SQL Query" section below)
+    $sql = "SELECT sd.document_id, ... FROM index_entries sd ...";
+    
+    // Build parameters array
+    $params = [
+        $documentType-&gt;value,  // document_type
+        ...$tokenValues,       // token values for IN clause
+        $documentType-&gt;value,  // for subquery
+        ...$tokenValues,       // token values for subquery
+        $minTokenWeight,      // minimum token weight
+        // ... more parameters
+    ];
+    
+    // Execute query with parameter binding
+    $results = $this-&gt;connection-&gt;executeQuery($sql, $params)-&gt;fetchAllAssociative();
+    
+    // Filter out results with low normalized scores (below threshold)
+    $results = array_filter($results, fn($r) =&gt; (float) $r['score'] &gt;= 0.05);
+    
+    // Convert to SearchResult objects
+    return array_map(
+        fn($result) =&gt; new SearchResult(
+            documentId: (int) $result['document_id'],
+            score: (float) $result['score']
+        ),
+        $results
+    );
+}
+</code></pre>
+<p>The SQL query does the heavy lifting: finds matching documents, calculates scores, and sorts by relevance. We use raw SQL for performance and full control—we can optimize the query exactly how we need it.</p>
+<p>The query uses JOINs to connect tokens and documents, subqueries for normalization, aggregation for scoring, and indexes on token name, document type, and weight. We use parameter binding for security (prevents SQL injection).</p>
+<p>We'll see the full query in the next section.</p>
+<p>The main <code>search()</code> method then returns the results:</p>
+<pre><code>        // 5. Return results
+        return $results;
+    }
+}
+</code></pre>
+<h3>The Scoring Algorithm</h3>
+<p>The scoring algorithm balances multiple factors. Let's break it down step by step.</p>
+<p>The base score is the sum of all matched token weights:</p>
+<pre><code>SELECT 
+    sd.document_id,
+    SUM(sd.weight) as base_score
+FROM index_entries sd
+INNER JOIN index_tokens st ON sd.token_id = st.id
+WHERE 
+    sd.document_type = ?
+    AND st.name IN (?, ?, ?)  -- Query tokens
+GROUP BY sd.document_id
+</code></pre>
+<ul>
+<li><code>sd.weight</code>: from index_entries (field_weight × tokenizer_weight × ceil(sqrt(token_length)))</li>
+</ul>
+<p>Why not multiply by <code>st.weight</code>? The tokenizer weight is already included in <code>sd.weight</code> during indexing. The <code>st.weight</code> from <code>index_tokens</code> is used only in the full SQL query's WHERE clause for filtering (ensures at least one token with weight &gt;= minTokenWeight).</p>
+<p>This gives us the raw score. But we need more than that.</p>
+<p>We add a token diversity boost. Documents matching more unique tokens score higher:</p>
+<pre><code>(1.0 + LOG(1.0 + COUNT(DISTINCT sd.token_id))) * base_score
+</code></pre>
+<p>Why? A document matching 5 different tokens is more relevant than one matching the same token 5 times. The LOG function makes this boost logarithmic—matching 10 tokens doesn't give 10x the boost.</p>
+<p>We also add an average weight quality boost. Documents with higher quality matches score higher:</p>
+<pre><code>(1.0 + LOG(1.0 + AVG(sd.weight))) * base_score
+</code></pre>
+<p>Why? A document with high-weight matches (e.g., title matches) is more relevant than one with low-weight matches (e.g., content matches). Again, LOG makes this logarithmic.</p>
+<p>We apply a document length penalty. Prevents long documents from dominating:</p>
+<pre><code>base_score / (1.0 + LOG(1.0 + doc_token_count.token_count))
+</code></pre>
+<p>Why? A 1000-word document doesn't automatically beat a 100-word document just because it has more tokens. The LOG function makes this penalty logarithmic—a 10x longer document doesn't get 10x the penalty.</p>
+<p>Finally, we normalize by dividing by the maximum score:</p>
+<pre><code>score / GREATEST(1.0, max_score) as normalized_score
+</code></pre>
+<p>This gives us a 0-1 range, making scores comparable across different queries.</p>
+<p>The full formula looks like this:</p>
+<pre><code>SELECT 
+    sd.document_id,
+    (
+        SUM(sd.weight) *                                  -- Base score
+        (1.0 + LOG(1.0 + COUNT(DISTINCT sd.token_id))) * -- Token diversity boost
+        (1.0 + LOG(1.0 + AVG(sd.weight))) /              -- Average weight quality boost
+        (1.0 + LOG(1.0 + doc_token_count.token_count))   -- Document length penalty
+    ) / GREATEST(1.0, max_score) as score                -- Normalization
+FROM index_entries sd
+INNER JOIN index_tokens st ON sd.token_id = st.id
+INNER JOIN (
+    SELECT document_id, COUNT(*) as token_count
+    FROM index_entries
+    WHERE document_type = ?
+    GROUP BY document_id
+) doc_token_count ON sd.document_id = doc_token_count.document_id
+WHERE 
+    sd.document_type = ?
+    AND st.name IN (?, ?, ?)  -- Query tokens
+    AND sd.document_id IN (
+        SELECT DISTINCT document_id
+        FROM index_entries sd2
+        INNER JOIN index_tokens st2 ON sd2.token_id = st2.id
+        WHERE sd2.document_type = ?
+        AND st2.name IN (?, ?, ?)
+        AND st2.weight &gt;= ?  -- Ensure at least one token with meaningful weight
+    )
+GROUP BY sd.document_id
+ORDER BY score DESC
+LIMIT ?
+</code></pre>
+<p>Why the subquery with <code>st2.weight &gt;= ?</code>? This ensures we only include documents that have at least one matching token with a meaningful tokenizer weight. Without this filter, a document matching only low-priority tokens (like n-grams with weight 1) would be included even if it doesn't match any high-priority tokens (like words with weight 20). This subquery filters out documents that only match noise. We want documents that match at least one meaningful token.</p>
+<p>Why this formula? It balances multiple factors for relevance. Exact matches score high, but so do documents matching many tokens. Long documents don't dominate, but high-quality matches do.</p>
+<p>If no results with weight 10, we retry with weight 1 (fallback for edge cases).</p>
+<h3>Converting IDs to Documents</h3>
+<p>The search service returns <code>SearchResult</code> objects with document IDs and scores:</p>
+<pre><code>class SearchResult
+{
+    public function __construct(
+        public readonly int $documentId,
+        public readonly float $score
+    ) {}
+}
+</code></pre>
+<p>But we need actual documents, not just IDs. We convert them using repositories:</p>
+<pre><code>// Perform search
+$searchResults = $this-&gt;searchService-&gt;search(
+    DocumentType::POST,
+    $query,
+    $limit
+);
+
+// Get document IDs from search results (preserving order)
+$documentIds = array_map(fn($result) =&gt; $result-&gt;documentId, $searchResults);
+
+// Get documents by IDs (preserving order from search results)
+$documents = $this-&gt;documentRepository-&gt;findByIds($documentIds);
+</code></pre>
+<p>Why preserve order? The search results are sorted by relevance score. We want to keep that order when displaying results.</p>
+<p>The repository method handles the conversion:</p>
+<pre><code>public function findByIds(array $ids): array
+{
+    if (empty($ids)) {
+        return [];
+    }
+    
+    return $this-&gt;createQueryBuilder('d')
+        -&gt;where('d.id IN (:ids)')
+        -&gt;setParameter('ids', $ids)
+        -&gt;orderBy('FIELD(d.id, :ids)')  // Preserve order from IDs array
+        -&gt;getQuery()
+        -&gt;getResult();
+}
+</code></pre>
+<p>The <code>FIELD()</code> function preserves the order from the IDs array, so documents appear in the same order as search results.</p>
+<hr>
+<h2>The Result: What You Get</h2>
+<p>What you get is a search engine that:</p>
+<ul>
+<li><strong>Finds relevant results quickly</strong> (leverages database indexes)</li>
+<li><strong>Handles typos</strong> (n-grams catch partial matches)</li>
+<li><strong>Handles partial words</strong> (prefix tokenizer)</li>
+<li><strong>Prioritizes exact matches</strong> (word tokenizer has highest weight)</li>
+<li><strong>Works with existing database</strong> (no external services)</li>
+<li><strong>Easy to understand and debug</strong> (everything is transparent)</li>
+<li><strong>Full control over behavior</strong> (adjust weights, add tokenizers, modify scoring)</li>
+</ul>
+<hr>
+<h2>Extending the System</h2>
+<p>Want to add a new tokenizer? Implement <code>TokenizerInterface</code>:</p>
+<pre><code>class StemmingTokenizer implements TokenizerInterface
+{
+    public function tokenize(string $text): array
+    {
+        // Your stemming logic here
+        // Return array of Token objects
+    }
+    
+    public function getWeight(): int
+    {
+        return 15; // Your weight
+    }
+}
+</code></pre>
+<p>Register it in your services configuration, and it's automatically used for both indexing and searching.</p>
+<p>Want to add a new document type? Implement <code>IndexableDocumentInterface</code>:</p>
+<pre><code>class Comment implements IndexableDocumentInterface
+{
+    public function getIndexableFields(): IndexableFields
+    {
+        return IndexableFields::create()
+            -&gt;addField(FieldId::CONTENT, $this-&gt;content ?? '', 5);
+    }
+}
+</code></pre>
+<p>Want to adjust weights? Change the configuration. Want to modify scoring? Edit the SQL query. Everything is under your control.</p>
+<hr>
+<h2>Conclusion</h2>
+<p>So there you have it. A simple search engine that actually works. It's not fancy, and it doesn't need a lot of infrastructure, but for most use cases, it's perfect.</p>
+<p>The key insight? Sometimes the best solution is the one you understand. No magic, no black boxes, just straightforward code that does what it says.</p>
+<p>You own it, you control it, you can debug it. And that's worth a lot.</p>
+
+            </div>
+
+            
+        </article>
+
+        
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[A new chapter begins for EV batteries with the expiry of key LFP patents (141 pts)]]></title>
             <link>https://www.shoosmiths.com/insights/articles/a-new-chapter-begins-for-ev-batteries-with-the-expiry-of-key-lfp-patents</link>
             <guid>45949655</guid>
             <pubDate>Sun, 16 Nov 2025 23:58:21 GMT</pubDate>
@@ -29,7 +658,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[PicoIDE – An open IDE/ATAPI drive emulator (108 pts)]]></title>
+            <title><![CDATA[PicoIDE – An open IDE/ATAPI drive emulator (117 pts)]]></title>
             <link>https://picoide.com/</link>
             <guid>45949352</guid>
             <pubDate>Sun, 16 Nov 2025 23:19:24 GMT</pubDate>
@@ -127,7 +756,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Britney Spears' Guide to Semiconductor Physics (216 pts)]]></title>
+            <title><![CDATA[Britney Spears' Guide to Semiconductor Physics (227 pts)]]></title>
             <link>https://britneyspears.ac/lasers.htm</link>
             <guid>45949326</guid>
             <pubDate>Sun, 16 Nov 2025 23:15:20 GMT</pubDate>
@@ -196,7 +825,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 <hr></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Goldman Sachs asks in biotech Report: Is curing patients a sustainable business? (199 pts)]]></title>
+            <title><![CDATA[Goldman Sachs asks in biotech Report: Is curing patients a sustainable business? (201 pts)]]></title>
             <link>https://www.cnbc.com/2018/04/11/goldman-asks-is-curing-patients-a-sustainable-business-model.html</link>
             <guid>45949247</guid>
             <pubDate>Sun, 16 Nov 2025 23:01:24 GMT</pubDate>
@@ -204,7 +833,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 <div id="readability-page-1" class="page"><div id="RegularArticle-ArticleBody-5" data-module="ArticleBody" data-test="articleBody-2" data-analytics="RegularArticle-articleBody-5-2"><div id="ArticleBody-InlineImage-104324084" data-test="InlineImage"><p>Yuri Arcurs | Getty Images</p></div><div><p>Goldman Sachs analysts attempted to address a touchy subject for biotech companies, especially those involved in the pioneering "gene therapy" treatment: cures could be bad for business in the long run. </p><p>"Is curing patients a sustainable business model?" analysts ask in an April 10 report entitled "The Genome Revolution."</p><p>"The potential to deliver 'one shot cures' is one of the most attractive aspects of gene therapy, genetically-engineered cell therapy and gene editing. However, such treatments offer a very different outlook with regard to recurring revenue versus chronic therapies," analyst Salveen Richter wrote in the note to clients Tuesday. "While this proposition carries tremendous value for patients and society, it could represent a challenge for genome medicine developers looking for sustained cash flow."</p></div><div id="Placeholder-ArticleBody-Video-105119182" data-test="VideoPlaceHolder" role="region" tabindex="0" data-vilynx-id="7000012181" aria-labelledby="Placeholder-ArticleBody-Video-105119182"><p><img src="https://image.cnbcfm.com/api/v1/image/105119335-2ED1-PL-MegT-040918.jpg?v=1529477963&amp;w=750&amp;h=422&amp;vtcrop=y" alt="Biotech shares soar on dealmaking, drug progress"><span></span><span></span></p></div><div><p>Richter cited <span data-test="QuoteInBody" id="RegularArticle-QuoteInBody-1"><a href="https://www.cnbc.com/quotes/GILD/">Gilead Sciences'</a><span><span id="-WatchlistDropdown" data-analytics-id="-WatchlistDropdown"></span></span></span> treatments for hepatitis C, which achieved cure rates of more than 90 percent. The company's U.S. sales for these hepatitis C treatments peaked at $12.5 billion in 2015, but have been falling ever since. Goldman estimates the U.S. sales for these treatments will be less than $4 billion this year, according to a table in the report.</p><p>"GILD is a case in point, where the success of its hepatitis C franchise has gradually exhausted the available pool of treatable patients," the analyst wrote. "In the case of infectious diseases such as hepatitis C, curing existing patients also decreases the number of carriers able to transmit the virus to new patients, thus the incident pool also declines … Where an incident pool remains stable (eg, in cancer) the potential for a cure poses less risk to the sustainability of a franchise."</p><p>The analyst didn't immediately respond to a request for comment.</p><p>The report suggested three potential solutions for biotech firms:</p><div><p>"Solution 1: Address large markets: Hemophilia is a $9-10bn WW market (hemophilia A, B), growing at ~6-7% annually."</p><p> "Solution 2: Address disorders with high incidence: Spinal muscular atrophy (SMA) affects the cells (neurons) in the spinal cord, impacting the ability to walk, eat, or breathe."</p><p> "Solution 3: Constant innovation and portfolio expansion: There are hundreds of inherited retinal diseases (genetics forms of blindness) … Pace of innovation will also play a role as future programs can offset the declining revenue trajectory of prior assets."</p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Neuroscientists track the neural activity underlying an “aha” (104 pts)]]></title>
+            <title><![CDATA[Neuroscientists track the neural activity underlying an “aha” (108 pts)]]></title>
             <link>https://www.quantamagazine.org/how-your-brain-creates-aha-moments-and-why-they-stick-20251105/</link>
             <guid>45948792</guid>
             <pubDate>Sun, 16 Nov 2025 21:57:13 GMT</pubDate>
@@ -265,7 +894,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Peter Thiel sells off all Nvidia stock, stirring bubble fears (187 pts)]]></title>
+            <title><![CDATA[Peter Thiel sells off all Nvidia stock, stirring bubble fears (188 pts)]]></title>
             <link>https://www.thestreet.com/investing/peter-thiel-dumps-top-ai-stock-stirring-bubble-fears</link>
             <guid>45948477</guid>
             <pubDate>Sun, 16 Nov 2025 21:19:08 GMT</pubDate>
@@ -273,7 +902,7 @@ Splung.com Physics</a> is a website for students of physics with sections on: me
 Couldn't get https://www.thestreet.com/investing/peter-thiel-dumps-top-ai-stock-stirring-bubble-fears: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[The Pragmatic Programmer: 20th Anniversary Edition (2023) (136 pts)]]></title>
+            <title><![CDATA[The Pragmatic Programmer: 20th Anniversary Edition (2023) (144 pts)]]></title>
             <link>https://www.ahalbert.com/technology/2023/12/19/the_pragmatic_programmer.html</link>
             <guid>45948254</guid>
             <pubDate>Sun, 16 Nov 2025 20:46:30 GMT</pubDate>
@@ -515,7 +1144,7 @@ Should you write tests? Yes. But after you’ve been doing it for 30 years, feel
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I have recordings proving Coinbase knew about breach months before disclosure (506 pts)]]></title>
+            <title><![CDATA[I have recordings proving Coinbase knew about breach months before disclosure (528 pts)]]></title>
             <link>https://jonathanclark.com/posts/coinbase-breach-timeline.html</link>
             <guid>45948058</guid>
             <pubDate>Sun, 16 Nov 2025 20:18:10 GMT</pubDate>
@@ -934,7 +1563,7 @@ Return-Path: &lt;01000194436f122c-535a7ce0-f493-41c2-b966-dcaa1a9e6b57-000000@am
                 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[62 chapter open-source Zig book (585 pts)]]></title>
+            <title><![CDATA[62 chapter open-source Zig book (616 pts)]]></title>
             <link>https://www.zigbook.net</link>
             <guid>45947810</guid>
             <pubDate>Sun, 16 Nov 2025 19:44:27 GMT</pubDate>
@@ -942,7 +1571,7 @@ Return-Path: &lt;01000194436f122c-535a7ce0-f493-41c2-b966-dcaa1a9e6b57-000000@am
 <div id="readability-page-1" class="page"><div><div><div><p><img alt="Zig Logo" loading="lazy" width="240" height="240" decoding="async" data-nimg="1" src="https://www.zigbook.net/assets/zig-logo-light.svg"></p></div><div><h2>Learning Zig is not just about adding a language to your resume.</h2><p>It is about fundamentally changing how you think about software.</p></div><div><p>“You came for syntax.</p><p>You'll leave with a philosophy.”</p></div><p>61 chapters • Project-based • Zero AI • Written by @zigbook</p></div><div><div><div><p>zsh — zigbook.net</p></div><div><p>Welcome to Zigbook 🦎</p><p>Ready to transform how you think about software?</p><p>Exec: zig build zigbook</p><p><span>zigbook %</span><span>$ </span><span></span><span></span></p></div></div><div><p><span></span><span>Interactive terminal • Type to get started</span></p></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tracking users with favicons, even in incognito mode (296 pts)]]></title>
+            <title><![CDATA[Tracking users with favicons, even in incognito mode (302 pts)]]></title>
             <link>https://github.com/jonasstrehle/supercookie</link>
             <guid>45947770</guid>
             <pubDate>Sun, 16 Nov 2025 19:39:52 GMT</pubDate>
@@ -1260,7 +1889,7 @@ More about this <a href="https://supercookie.me/workwise#content-scalability-per
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dark Pattern Games (227 pts)]]></title>
+            <title><![CDATA[Dark Pattern Games (240 pts)]]></title>
             <link>https://www.darkpattern.games</link>
             <guid>45947761</guid>
             <pubDate>Sun, 16 Nov 2025 19:38:49 GMT</pubDate>
@@ -1274,7 +1903,7 @@ More about this <a href="https://supercookie.me/workwise#content-scalability-per
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The fate of "small" open source (209 pts)]]></title>
+            <title><![CDATA[The fate of "small" open source (220 pts)]]></title>
             <link>https://nolanlawson.com/2025/11/16/the-fate-of-small-open-source/</link>
             <guid>45947639</guid>
             <pubDate>Sun, 16 Nov 2025 19:21:13 GMT</pubDate>
@@ -1787,7 +2416,7 @@ Interactive element picker. Click to select, Cmd/Ctrl+Click for multi-select, En
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Z3 API in Python: From Sudoku to N-Queens in Under 20 Lines (120 pts)]]></title>
+            <title><![CDATA[Z3 API in Python: From Sudoku to N-Queens in Under 20 Lines (122 pts)]]></title>
             <link>https://ericpony.github.io/z3py-tutorial/guide-examples.htm</link>
             <guid>45947301</guid>
             <pubDate>Sun, 16 Nov 2025 18:38:37 GMT</pubDate>
@@ -2882,7 +3511,7 @@ You may also initialize Z3Py manually using the command:
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I finally understand Cloudflare Zero Trust tunnels (205 pts)]]></title>
+            <title><![CDATA[I finally understand Cloudflare Zero Trust tunnels (219 pts)]]></title>
             <link>https://david.coffee/cloudflare-zero-trust-tunnels</link>
             <guid>45946865</guid>
             <pubDate>Sun, 16 Nov 2025 17:39:43 GMT</pubDate>
@@ -2995,7 +3624,7 @@ ingress:
 </section><p>If you liked this post, consider<!-- --> <a href="https://buttondown.com/seangoedecke" target="_blank">subscribing</a> <!-- -->to email updates about my new posts, or<!-- --> <a href="https://news.ycombinator.com/submitlink?u=https://www.seangoedecke.com/ai-products/&amp;t=Only%20three%20kinds%20of%20AI%20products%20actually%20work" target="_blank">sharing it on Hacker News</a>.<!-- --> Here's a preview of a related post that shares tags with this one.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dissecting Flock Safety: The Cameras Tracking You Are a Security Nightmare [video] (176 pts)]]></title>
+            <title><![CDATA[Dissecting Flock Safety: The Cameras Tracking You Are a Security Nightmare [video] (181 pts)]]></title>
             <link>https://www.youtube.com/watch?v=uB0gr7Fh6lY</link>
             <guid>45945960</guid>
             <pubDate>Sun, 16 Nov 2025 15:50:54 GMT</pubDate>
@@ -3003,7 +3632,7 @@ ingress:
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[FPGA Based IBM-PC-XT (170 pts)]]></title>
+            <title><![CDATA[FPGA Based IBM-PC-XT (173 pts)]]></title>
             <link>https://bit-hack.net/2025/11/10/fpga-based-ibm-pc-xt/</link>
             <guid>45945784</guid>
             <pubDate>Sun, 16 Nov 2025 15:26:24 GMT</pubDate>
@@ -3147,7 +3776,7 @@ ingress:
 			</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Heretic: Automatic censorship removal for language models (552 pts)]]></title>
+            <title><![CDATA[Heretic: Automatic censorship removal for language models (574 pts)]]></title>
             <link>https://github.com/p-e-w/heretic</link>
             <guid>45945587</guid>
             <pubDate>Sun, 16 Nov 2025 15:00:24 GMT</pubDate>
@@ -4946,81 +5575,6 @@ This is shameful and extremely unprofessional, at best. This disregard for basic
             <pubDate>Sun, 16 Nov 2025 10:38:41 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.bbc.com/news/articles/c051y3d7myzo">https://www.bbc.com/news/articles/c051y3d7myzo</a>, See on <a href="https://news.ycombinator.com/item?id=45944056">Hacker News</a></p>
 <div id="readability-page-1" class="page"><article><p data-component="headline-block"><h2>UK's first small nuclear power station to be built in north Wales </h2></p><div data-testid="byline-new" data-component="byline-block"><p><span data-testid="byline-new-contributors"><p><span>Gareth Lewis,</span><span data-testid="byline-new-contributors-contributor-0-role-location">Wales political editor</span><span> and </span></p><p><span>Steffan Messenger,</span><span data-testid="byline-new-contributors-contributor-1-role-location">Wales environment correspondent</span></p></span></p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/0f77/live/492b9290-c07e-11f0-ae46-bd64331f0fd4.jpg.webp" loading="eager" alt="Getty Images The Wylfa site, taken from a road with part of the tarmac visible as well as hedges and grass."><span>Getty Images</span></p></div><p data-component="caption-block"><figcaption>Work will begin next year at the Wylfa site (pictured above), with the aim of generating power by the mid 2030s</figcaption></p></figure><div data-component="text-block"><p>A first-of-its-kind nuclear power station is to be built on Anglesey, bringing up to 3,000 jobs and billions of pounds of investment.</p><p>The plant at Wylfa, on the Welsh island's northern coast, will have the UK's first three small modular reactors (SMR), although the site could potentially hold up to eight.</p><p>Work is due to start next year with the aim of generating power by the mid 2030s.</p><p>Prime Minister Sir Keir Starmer said Britain was once a world leader in nuclear power but "years of neglect and inertia has meant places like Anglesey have been let down and left behind. Today, that changes."</p></div><div data-component="text-block"><p>The project, which could power about three million homes, will be built by publicly owned Great British Energy-Nuclear and is backed by a £2.5bn investment from the UK government.</p><p>Visiting a further education college in north Wales on Thursday, Sir Keir said the development would bring jobs for "decades to come" and that work would begin "virtually straight away".</p><p>Wales' First Minister Eluned Morgan, who said she had been "pressing the case at every opportunity for Wylfa's incredible benefits".</p><p><a target="_self" href="https://www.bbc.co.uk/news/articles/c62614wejk5o">SMRs work similarly to large reactors</a>, using a nuclear reaction to generate heat that produces electricity - but are a fraction of the size, with about a third of the generating output.</p><p>Ed Miliband, Secretary of State for Energy and Climate Change, called the announcement "exciting" and said Britain is in the race for new reactors.</p><p>Speaking on <a target="_self" href="https://www.bbc.co.uk/programmes/m002ly09">BBC Radio Wales Breakfast</a>, Miliband added they hope to "work with local colleges to make sure that there are local skills providers, skills training opportunities, so local people get these jobs".</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/4a94/live/4f832c80-c087-11f0-924c-87dcfe4462ba.jpg.webp" loading="lazy" alt="Rolls-Royce An computer generated artists impression of the what the site will look like. A silver building surrounded by green area, trees and a car park which sits in front of it. "><span>Rolls-Royce</span></p></div></figure><div data-component="text-block"><p>Simon Bowen, chair of Great British Energy-Nuclear, hailed an "historic moment for the UK".</p><p>Llinos Medi, the MP for Ynys Môn, the Welsh name for Anglesey, said it was a "game-changer" for the area "but only if local people see real and lasting benefits".</p><p>Mims Davies MP, the Shadow Secretary of State for Wales, said it will bring much-needed jobs and investment but "the current plan will only generate a fraction of the power that a Gigawatt-powered plant would".</p><p>Anthony Slaughter, leader of Wales Green Party, said the project was "an expensive distraction from the clean, fast and cheap renewables already available to us". </p><p>He added "a fast, ambitious roll-out of solar, wind and wave energy that will create jobs and cut energy bills" was needed. </p><p>The Federation of Small Businesses (FSB) Wales said the plant would bring a "once in a generation" boost for jobs, supply chains and regional infrastructure.</p></div><div data-component="text-block"><p>Great British Energy-Nuclear has also been tasked with identifying potential sites across the UK for another large-scale nuclear power plant, similar to those being built at Hinkley Point in Somerset and Sizewell in Suffolk, which can power the equivalent of six million homes.</p><p>The company will report back by autumn 2026, officials said.</p><p>It is not clear whether the SMR plans, which are smaller and more straightforward to build, rule Wylfa out after it was designated the preferred location in 2024 by the previous UK Conservative government.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/3e3c/live/80b115b0-c06e-11f0-8669-5560f5c90fbe.png.webp" loading="lazy" alt="Map showing the location of nuclear power stations in the UK. The operational reactors are: Torness on the east coast of Scotland, Hartlepool, Sizewell and the Heysham 1 and 2 reactors. Three reactors are being defuelled: Hunterston on the west coast of Scotland, Hinkley Point and Dungeness. The map shows the location of the newly-announced reactor at Wylfa on the north coast of Wales."></p></div></figure><p data-component="subheadline-block"><h2>'Nuclear equivalent of an Ikea chair'</h2></p><div data-component="text-block"><p>Prof Simon Middleburgh, director of the Nuclear Futures Institute at Bangor University, said the SMRs would be "built in a modular manner in factories and shipped to the site to be put together a bit like an Ikea chair".</p><p>There were "a few more hurdles to go through", he cautioned - from securing regulatory approval, building the factories required to construct the SMRs and training the workforce that will run them.</p><p>Opponents of the project point to the fact that a long-term storage facility for the UK's nuclear waste is yet to be agreed upon and say investment in renewable energy schemes - wind, wave and tidal - is what Anglesey needs.</p><p>Dylan Morgan, of the People Against Wylfa-B campaign group, said the proposed SMRs were "an unnecessarily big development of an unproven technology".</p><p>The government sees them as a secure, reliable, affordable and low carbon energy system and is convinced that, with investment, SMRs will create thousands of jobs and boost manufacturing.</p><p>Wylfa beat competition from a site at Oldbury in Gloucestershire, with the reactors designed by Rolls-Royce, subject to final contracts, which are expected later this year.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/1c60/live/23c98650-c0a2-11f0-b2d5-133186eb0524.jpg.webp" loading="lazy" alt="PA Media Energy Secretary Ed Milliband, Chancellor of the Exchequer Rachel Reeves, Simon Bowen, Interim Chair for Great British Energy - Nuclear (GBE-N), Prime Minister Sir Keir Starmer, First Minister of Wales Eluned Morgan and Science and Technology Secretary Liz Kendall look at maps of the Wylfa plant during a visit to an engineering workshop at Coleg Menai in Anglesey. The UK's first small modular reactor (SMR) nuclear power station will be built at Wylfa in North Wales by publicly owned Great British Energy-Nuclear and is backed by £2.5 billion investment from the Government. "><span>PA Media</span></p></div><p data-component="caption-block"><figcaption>Ministers saw maps of the Wylfa plant during a visit to Coleg Menai on Anglesey</figcaption></p></figure><div data-component="text-block"><p>The UK government said the plant would help provide energy independence.</p><p>The decision to opt for small modular reactors at Wylfa was criticised by the US ambassador Warren Stephens, who said he was "extremely disappointed".</p><p>He had urged ministers to commit to a large-scale plant, with US firm Westinghouse having reportedly presented plans for a new gigawatt station at the site.</p><p>Downing Street said the decision to build the power station in Wales "doesn't close the door" to a US manufacturer working on a future project.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/865e/live/60898420-c05a-11f0-ae46-bd64331f0fd4.png.webp" loading="lazy" alt="Graphic showing the difference between SMRs and large nuclear reactors"></p></div></figure><div data-component="text-block"><p>The old nuclear power plant at Wylfa was switched off in 2015 and previous plans for a large-scale replacement fell through in 2021.</p><p>The company behind the scheme – the Japanese industrial giant Hitachi - cited spiralling costs and a failure to reach agreement with the UK government over funding.</p></div><div data-component="text-block"><p>There is a huge political component to the announcement, with Labour's leadership in Westminster keen to show it means business on big investment in infrastructure projects.</p><p>In Wales, the first minister has been pushing hard for Wylfa - and the announcement comes six months before the Senedd election.</p><p>Eluned Morgan has been trying to strike a balance: differentiating the Welsh party from UK Labour, while pushing for extra funding, further devolution of powers and big investment announcements from her UK colleagues.</p><p>She has certainly got the latter, although plenty of other issues such as reform to how Wales is funded and devolution of the Crown Estate – which owns much of the Welsh coastline and is vital to future wind power – remain unresolved.</p></div><figure><div data-component="image-block"><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20251110-152207-94080fba49-web-2.33.2-3/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/28dd/live/ab78e300-c06d-11f0-8669-5560f5c90fbe.png.webp" loading="lazy" alt="Thin, green banner promoting the Future Earth newsletter with text saying, “The world’s biggest climate news in your inbox every week”. There is also a graphic of an iceberg overlaid with a green circular pattern."></p></div></figure></article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[I don’t need a Steam Machine (130 pts)]]></title>
-            <link>https://brainbaking.com/post/2025/11/why-i-dont-need-a-steam-machine/</link>
-            <guid>45943992</guid>
-            <pubDate>Sun, 16 Nov 2025 10:21:07 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://brainbaking.com/post/2025/11/why-i-dont-need-a-steam-machine/">https://brainbaking.com/post/2025/11/why-i-dont-need-a-steam-machine/</a>, See on <a href="https://news.ycombinator.com/item?id=45943992">Hacker News</a></p>
-<div id="readability-page-1" class="page"><article>
-			    <div>
-			  		<p>For those of you who are living under a rock, Valve announced <a href="https://store.steampowered.com/sale/steammachine">three new hardware devices</a> joining their Steam Deck line-up: a new controller, a VR headset, and the GameCube—no wait, GabeCube—no wait, Steam Machine. The shiny little cube is undoubtedly Valve’s (second) attempt to break into the console market. This time, it might just work.</p>
-<p>The hardware is ready to arrive in at your living room spring next year. The biggest question is: will it arrive at <em>our</em> living room? Reading all the hype has certainly enthused me (e.g. Brendon’s <a href="https://wavelengths.online/posts/the-steam-machine-is-the-future">The Steam Machine is the Future</a>, PC Gamer’s <a href="https://www.pcgamer.com/hardware/vr-hardware/steamos-launching-for-arm-fex-translation-layer/">Valve is all over ARM</a>, Eurogamer’s <a href="https://www.eurogamer.net/tech-steam-machine-preview-a-powerful-customisable-mini-pc-for-couch-gaming">Steam Machine preview</a>, ResetEra’s <a href="https://www.resetera.com/threads/the-steam-hardware-family-officially-expands-in-early-2026-steam-controller-steam-machine-steam-frame.1351453/">Steam Hardware thread</a>); especially the part where the Machine is just a PC that happens to be tailored towards console gaming. According to Valve, you can install anything you want on it—it’s just SteamOS just like your trusty Deck, meaning you can boot into KDE and totally do your thing. Except that this shiny little cube is six times as powerful. I’m sure Digital Foundry will validate that next year.</p>
-<figure><a href="https://brainbaking.com/post/2025/11/why-i-dont-need-a-steam-machine/steam-machine.jpg">
-		<img src="https://brainbaking.com/post/2025/11/why-i-dont-need-a-steam-machine/steam-machine.jpg" loading="lazy" title="Valve's newly announced Steam Machine: a mysterious looking sleek black box." data-pagefind-index-attrs="title">
-	</a>
-	
-		<figcaption>Valve's newly announced Steam Machine: a mysterious looking sleek black box.</figcaption></figure>
-
-<p>However, this post isn’t about specs, expectations, or dreams: it’s about tempering my own enthusiasm. I’d like to tell myself why I don’t really need a Steam Machine. The following list will hopefully make it easier to say no when the buy buttons become available.</p>
-<ul>
-<li><em>You’re a retro gamer.</em> <br>You don’t need the power of six Steam Decks. To do what, run DOSBox?</li>
-<li><em>Your TV doesn’t support 4K</em>.<br>Again, no need for those 4K 60 FPS.</li>
-<li><em>You generally dislike AAA games.</em> <br>With The Steam Machine, you might be able to finally properly run <em>DOOM Eternal</em> and all of the <em>Assassin’s Creed</em> games. That you don’t like playing.</li>
-<li><em>You don’t have time to play games anyway.</em><br>Ouch, that hurts but it’s not untrue.</li>
-<li><em>The TV will be occupied anyway.</em><br>The Steam Machine is not a Switch: you can’t switch to handheld mode. When are you going to play on the Machine if the TV is being used to watch your wife’s favourite shows?</li>
-<li><em>You already have too many gaming related hardware pieces.</em><br>That’ll mean you’ll have to divide your time by an even bigger number to devote an equal amount to playing them.</li>
-<li><em>There’s no room for yet another nondescript box under the TV.</em><br>See above: why don’t you first try to do something with that SNES Mini and PlayStation Mini besides letting it collect dust?</li>
-<li><em>You’re a physical gamer.</em><br>This is Steam. There will be no insertion of cartridges, no blowing of carts, and no staring at game collections on a shelf.</li>
-<li><em>It’s Steam, not Good Old Games.</em><br>Sure it can run GOG games but the Machine is primarily designed to run Steam. You avoid purchasing from Steam like the plague, yet you’re willing to buy a Machine dedicated to it? Are you crazy?</li>
-<li><em>The last time you booted Steam was over a year ago.</em><br>Don’t tell me you’re suddenly interested in running the platform on a dedicated machine.</li>
-<li><em>You don’t have time to fiddle with configuration.</em><br>Button and trackpad mappings to get the controls just right enough to play strategy games designed to be played with keyboard and mouse will only leave you frustrated.</li>
-<li><em>Your MacBook can emulate Windows games just fine.</em><br>You recently bought CrossOver and played <em>Wizordum</em> and older Windows 98/XP stuff on it. It even runs <em>Against The Storm</em> flawlessly. No need for Proton or whatever.</li>
-<li><em>In two years, you’ll upgrade your M1 to an M4+: there’s the power upgrade.</em><br>If CrossOver is struggling to run that particular game you so badly want to play, it’ll be buttery smooth in a few years. You’re going to do the laptop upgrade anyway regardless of the Steam Machine.</li>
-<li><em>You already have a huge gaming backlog.</em><br>Thanks to your buddy Joel you bought too many physical Switch games that are still waiting to be touched. Are you really ready to open up another can of worms?</li>
-<li><em>You dislike a digital backlog.</em><br>It’s easy to have hundreds of games on there: see your GOG purchases. Why don’t you try to count the ones that you actually played, let alone finished.</li>
-<li><em>You’re not going to use the Machine to run office software.</em><br>Your laptop and other retro machines are good enough at handling that task. What are you really going to do with this cube besides gaming?</li>
-<li><em>Those cool looking indie games will be released for Switch in due time anyway.</em><br>Remember <em>Pizza Tower</em>? It’s out on Switch now. Remember to buy the cart on Fangamer, together with the <em>Anton Blast</em> one.</li>
-<li><em>It’s rumoured to cost more than</em> <code>€600</code>.<br>Save that money for a Switch 2 if the games are starting to become interesting to justify that upgrade, as currently, they’re not. Also, see the backlog point above.</li>
-<li><em>All HDMI ports both on the TV and your external monitors are occupied</em>.<br>Unless you’re willing to constantly switch cables, you’ll need to invest in a HDMI switch. Another <code>€100+</code>.</li>
-<li><em>You can’t buy this without buying the Steam Controller.</em><br>That’s easily another <code>€80+</code> you already spent buying the Mobapad controller for your Switch as a replacement for the semi-broken Joy Cons.</li>
-<li><em>You can’t buy this as an expense on the company.</em><br>You’re closing down the company, remember. (More on that later)</li>
-<li><em>The cool looking LED and programmable front display don’t justify an expensive purchase.</em><br>After the initial excitement wears off, the LED will become annoying and you’ll simply turn it off.</li>
-</ul>
-<p>So you see, I don’t really need a Steam Machine…</p>
-<p>Fuck it, I’m getting one.</p>
-
-
-		  			<p>
-			        
-			        	
-                
-                    <kbd><a href="https://brainbaking.com/categories/retro">retro</a></kbd>
-                
-                &nbsp;
-			        
-				    
-				    	
-					    <span>
-					        
-					            <kbd><a href="https://brainbaking.com/tags/steam" title="Tag: steam">steam</a></kbd>&nbsp;
-					        
-					            <kbd><a href="https://brainbaking.com/tags/games" title="Tag: games">games</a></kbd>&nbsp;
-					        
-					    </span>
-					</p>
-				    
-			  	</div>
-			</article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Maybe You're Not Actually Trying (357 pts)]]></title>
-            <link>https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying</link>
-            <guid>45943979</guid>
-            <pubDate>Sun, 16 Nov 2025 10:14:25 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying">https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying</a>, See on <a href="https://news.ycombinator.com/item?id=45943979">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div dir="auto"><p>Two things happened for me over the holidays five years ago: I went to rehab, and I acquired a cyberstalker. These were not entirely independent events. The stalker was someone in India who’d started following me when I was playing poker, who came to believe we had a close personal relationship and that my tweets were coded messages to him. When I stopped tweeting for two months, he became convinced something had happened to me, so he tracked down my email and phone number and started spamming me with messages demanding to know where I was.</p><p>By the time I realized this was happening, he’d already escalated to the point that I was clearly never going to respond. I started blocking him on different platforms, but he’d just create another account or phone number, or find some other way in. He messaged me dozens of times a day, alternating between threats and pleas. When he reached out to my company six months later to apply for a job, I learned his real name and used it to track down an old friend of his to ask for help — but the friend told me he was afraid to intervene because he didn’t want to become a target himself. I decided that there was nothing I could do from the other side of the world, and resigned myself to waiting him out.</p><p>Only he never tired. Years went by and I never responded, and still he messaged me multiple times a day. The messages became more disturbing, more pornographic, more violent. He told me he would come find me in Berkeley and hurt me. Finally, last November, in the span of a few days, he sent me an image of his brand new passport and a visa application, which he said he planned to use to travel here, and successfully extorted money from my brother by spoofing my phone number and pretending to have kidnapped me.</p><div data-attrs="{&quot;url&quot;:&quot;https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share&quot;,&quot;text&quot;:&quot;Share&quot;}" data-component-name="CaptionedButtonToDOM"><p>Thanks for reading Useful Fictions! This post is public so feel free to share it.</p><p data-attrs="{&quot;url&quot;:&quot;https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share&quot;,&quot;text&quot;:&quot;Share&quot;}" data-component-name="ButtonCreateButton"><a href="https://usefulfictions.substack.com/p/maybe-youre-not-actually-trying?utm_source=substack&amp;utm_medium=email&amp;utm_content=share&amp;action=share" rel=""><span>Share</span></a></p></div><p><em>Enough! </em><span>I thought, and snapped into action. Except that I didn’t. Instead, I curled up in a ball and cried, and told friends who suggested contacting the police that there was no point, that no one would be able to help as long as I was here and he was in India.</span></p><p>But my husband was insistent that there had to be a better answer, and asked me to let him intervene on my behalf. In short order, he was in contact with the FBI, the US consulate in India, and, with the help of his friend Govind, who has family there, the local police where the stalker lived. Within months, the situation had resolved, and he will never set foot on American soil.</p><p>One of the interesting things about all of this is that there was nothing particularly inventive about the strategies my husband deployed. They were more or less exactly the strategies I would have come up with if I’d been put in charge of a similar situation in someone else’s life. Why did it take another person getting involved for me to realize I wasn’t Actually Trying?</p><p>I think what happened is this: When the stalker entered my life, I was at a low point in personal capacity — broke, alone, addled, etc. My approach towards him at that point (ignore, hoping he’d stop) was the only one that seemed available given my spiritual and psychological resources at the time. But my orientation to the problem became fixed in time at that point of low agency, and it never occurred to me to revisit it as my capacity for action increased.</p><p><span>I think we are all like this. </span><strong>People are not just high-agency or low-agency in a global sense, across their entire lives. Instead, people are selectively agentic.</strong></p><p>Let’s say that life is divided up into three theaters: work, relationships with others (all kinds) and relationship to self (physical health, introspection, emotional development, all of it). I think it’s the rule, rather than the exception, that people are stuck at an earlier stage of development in at least one area. There is one theater of life where they’re not Actually Trying — where they’re approaching serious problems with the resourcefulness of a teenager, though they are now capable adults.</p><p>In my particular corner of the world, there are tons of high-achievers in work. These are ingenious people shaping the world through innovations in science, technology, and policy. But many of them haven’t applied the same ingenuity to their interior experience or relationships. These are people who could successfully launch a product in a foreign country with little instruction, but who complain that there aren’t any fun people to meet on the dating apps.</p><p><strong>It seems like, by default, you are stuck with whatever level of resourcefulness you brought to a problem the first time you encountered it and failed to fix it.</strong></p><p>Let’s say you tried therapy when you were 20, and it didn’t help with your high levels of anxiety. When you think about your anxiety, as the years go by, you think, “hard problem, tried the main solution, didn’t work out.” Perhaps you just accept anxiety as a fixed trait, and your friends playfully rib you about it, which is nice but makes it seem even more like a static part of your identity. But you’re not 20 anymore. You’re, say, a 32-year-old CTO, and when a vital project at your startup doesn’t respond to your first approach, you vigorously try another, and another, trying to learn from every failure. That same persistence and curiosity don’t get applied to the anxiety that makes you suffer at work, though.</p><p><span>You don’t think, </span><em>oh, I could probably</em><span>:</span></p><ul><li><p>Check on my nutrition and sleep, in a serious way</p></li><li><p>Look into supplements and medication</p></li><li><p>Throw some resources at improving my rest and recovery</p></li><li><p>Ask all of my friends about the best anxiety treatments they’ve ever heard of, or the best coaches/therapists they’ve ever worked with</p></li><li><p>Research any emerging therapies designed for people like me</p></li></ul><p><span>Instead of doing those things, you just put up with it. Or, worse, you fight through your anxiety using an earlier solution that required willpower, and the exertion of willpower makes you feel like you’re trying. </span><strong>But the feeling of effort doesn’t mean that you’re Actually Trying.</strong></p><p><span>There is a relevant concept from Alexander Technique that I love, “faulty sensory appreciation,” which I learned about from </span><a href="https://expandingawareness.org/" rel="">Michael Ashcroft</a><span>. The concept is that habitual tension distorts your sensory impressions—rigid stillness via bodily tension starts to feel like “good posture,” whereas relaxed uprightness feels strange, to the extent you might feel like your back is at a weird angle when you’re actually standing up tall. The right way feels like the wrong way. Apparently, this is demonstrated by having Alexander students lie in a position where your legs tell you that you shouldn’t be able to stand up — and then the instructor says, “by the way, you can stand up from here,” and you do.</span></p><p><span>Similarly, people who are being selectively agentic often have a kind of faulty sensory appreciation. Perhaps relationships </span><em>feel hard </em><span>for you, they take willpower, so it’s tempting to believe that you’re Actually Trying, that you’ve brought the full weight of your genius to bear on the problem. You might even take some pride in the struggle. Like rigid posture, the strain feels like correctness. But struggling is not evidence that you’ve tried everything. To the contrary, the continuous need for willpower may be the sign of a badly-engineered life.</span></p><p><span>I’d recommend assuming there’s some area of your life where you are, without realizing it, frozen in time, and that locating it matters quite a bit. Look across the three theaters of your life: work, relationships, and self-relationship, and take note of the biggest issues you face. Know that you might be looking for something that doesn’t feel like an </span><em>issue </em><span>— it might just feel like sadness or anger</span><em>, </em><span>like the sadness of not being seen, or the frustration of not feeling like your work is meaningful. Once you’ve surfaced something, ask yourself: Have I done my best to come up with a set of potential solutions, using all the resources I have? Am I doing as well by myself as I would by any friend who came to me with the same problem? How do I know I’m Actually Trying?</span></p><p><em><strong><a href="https://mailchi.mp/44578760e686/book-preorder-signup" rel="">Sign up to be notified</a><span> when my book, You Can Just Do Things, is available for purchase.</span></strong></em></p></div></div>]]></description>
         </item>
     </channel>
 </rss>
