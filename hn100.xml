@@ -4,12 +4,266 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 22 Nov 2025 14:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 22 Nov 2025 15:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Superman copy found in mum's attic is most valuable comic ever at $9.12M (271 pts)]]></title>
+            <title><![CDATA[Agent design is still hard (111 pts)]]></title>
+            <link>https://lucumr.pocoo.org/2025/11/21/agents-are-hard/</link>
+            <guid>46013935</guid>
+            <pubDate>Sat, 22 Nov 2025 11:27:24 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://lucumr.pocoo.org/2025/11/21/agents-are-hard/">https://lucumr.pocoo.org/2025/11/21/agents-are-hard/</a>, See on <a href="https://news.ycombinator.com/item?id=46013935">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        
+  
+
+  
+  <p data-date="2025-11-21T00:00:00">written on November 21, 2025</p>
+  
+
+  <p>I felt like it might be a good time to write about some new things I’ve
+learned.  Most of this is going to be about building agents, with a little bit
+about using agentic coding tools.</p>
+<p>TL;DR: Building agents is still messy.  SDK abstractions break once you hit
+real tool use.  Caching works better when you manage it yourself, but differs
+between models.  Reinforcement ends up doing more heavy lifting than expected,
+and failures need strict isolation to avoid derailing the loop.  Shared state
+via a file-system-like layer is an important building block.  Output tooling is
+surprisingly tricky, and model choice still depends on the task.</p>
+<h2>Which Agent SDK To Target?</h2>
+<p>When you build your own agent, you have the choice of targeting an underlying
+SDK like the OpenAI SDK or the Anthropic SDK, or you can go with a higher level
+abstraction such as the Vercel AI SDK or Pydantic.  The choice we made a while
+back was to adopt the Vercel AI SDK but only the provider abstractions, and to
+basically <a href="https://ai-sdk.dev/cookbook/node/manual-agent-loop">drive the agent loop
+ourselves</a>.  At this point
+<a href="https://earendil.com/">we</a> would not make that choice again.  There is
+absolutely nothing wrong with the Vercel AI SDK, but when you are trying to
+build an agent, two things happen that we originally didn’t anticipate:</p>
+<p>The first is that the differences between models are significant enough that
+you will need to build your own agent abstraction.  We have not found any of
+the solutions from these SDKs that build the right abstraction for an agent.  I
+think this is partly because, despite the basic agent design being just a loop,
+there are subtle differences based on the tools you provide.  These differences
+affect how easy or hard it is to find the right abstraction (cache control,
+different requirements for reinforcement, tool prompts, provider-side tools,
+etc.).  Because the right abstraction is not yet clear, using the original SDKs
+from the dedicated platforms keeps you fully in control.  With some of these
+higher-level SDKs you have to build on top of their existing abstractions,
+which might not be the ones you actually want in the end.</p>
+<p>We also found it incredibly challenging to work with the Vercel SDK when it
+comes to dealing with provider-side tools.  The attempted unification of
+messaging formats doesn’t quite work.  For instance, the web search tool from
+Anthropic routinely destroys the message history with the Vercel SDK, and we
+haven’t yet fully figured out the cause.  Also, in Anthropic’s case, cache
+management is much easier when targeting their SDK directly instead of the
+Vercel one.  The error messages when you get things wrong are much clearer.</p>
+<p>This might change, but right now we would probably not use an abstraction when
+building an agent, at least until things have settled down a bit.  The benefits
+do not yet outweigh the costs for us.</p>
+<p>Someone else might have figured it out.  If you’re reading this and think I’m
+wrong, please drop me a mail.  I want to learn.</p>
+<h2>Caching Lessons</h2>
+<p>The different platforms have very different approaches to caching.  A lot has
+been said about this already, but Anthropic makes you pay for caching.  It
+makes you manage cache points explicitly, and this really changes the way you
+interact with it from an agent engineering level.  I initially found the manual
+management pretty dumb.  Why doesn’t the platform do this for me?  But I’ve
+fully come around and now vastly prefer explicit cache management.  It makes
+costs and cache utilization much more predictable.</p>
+<p>Explicit caching allows you to do certain things that are much harder
+otherwise.  For instance, you can split off a conversation and have it run in
+two different directions simultaneously.  You also have the opportunity to do
+context editing.  The optimal strategy here is unclear, but you clearly have a
+lot more control, and I really like having that control.  It also makes it much
+easier to understand the cost of the underlying agent.  You can assume much
+more about how well your cache will be utilized, whereas with other platforms
+we found it to be hit and miss.</p>
+<p>The way we do caching in the agent with Anthropic is pretty straightforward.
+One cache point is after the system prompt.  Two cache points are placed at the
+beginning of the conversation, where the last one moves up with the tail of the
+conversation.  And then there is some optimization along the way that you can
+do.</p>
+<p>Because the system prompt and the tool selection now have to be mostly static,
+we feed a dynamic message later to provide information such as the current
+time.  Otherwise, this would trash the cache.  We also leverage reinforcement
+during the loop much more.</p>
+<h2>Reinforcement In The Agent Loop</h2>
+<p>Every time the agent runs a tool you have the opportunity to not just return
+data that the tool produces, but also to feed more information back into the
+loop.  For instance, you can remind the agent about the overall objective and
+the status of individual tasks.  You can also provide hints about how the tool
+call might succeed when a tool fails.  Another use of reinforcement is to
+inform the system about state changes that happened in the background.  If you
+have an agent that uses parallel processing, you can inject information after
+every tool call when that state changed and when it is relevant for completing
+the task.</p>
+<p>Sometimes it’s enough for the agent to self-reinforce.  In Claude Code, for
+instance, the todo write tool is a self-reinforcement tool.  All it does is
+take from the agent a list of tasks that it thinks it should do and echo out
+what came in.  It’s basically just an echo tool; it really doesn’t do anything
+else.  But that is enough to drive the agent forward better than if the only
+task and subtask were given at the beginning of the context and too much has
+happened in the meantime.</p>
+<p>We also use reinforcements to inform the system if the environment changed
+during execution in a way that’s problematic for the agent.  For instance, if
+our agent fails and retries from a certain step forward but the recovery
+operates off broken data, we inject a message informing it that it might want
+to back off a couple of steps and redo an earlier step.</p>
+<h2>Isolate Failures</h2>
+<p>If you expect a lot of failures during code execution, there is an opportunity
+to hide those failures from the context.  This can happen in two ways.  One is
+to run tasks that might require iteration individually.  You would run them in
+a subagent until they succeed and only report back the success, plus maybe a
+brief summary of approaches that did not work.  It is helpful for an agent to
+learn about what did not work in a subtask because it can then feed that
+information into the next task to hopefully steer away from those failures.</p>
+<p>The second option doesn’t exist in all agents or foundation models, but with
+Anthropic you can do context editing.  So far we haven’t had a lot of success
+with context editing, but we believe it’s an interesting thing we would love to
+explore more.  We would also love to learn if people have success with it.
+What is interesting about context editing is that you should be able to
+preserve tokens for further down the iteration loop.  You can take out of the
+context certain failures that didn’t drive towards successful completion of the
+loop, but only negatively affected certain attempts during execution.  But as
+with the point I made earlier: it is also useful for the agent to understand
+what didn’t work, but maybe it doesn’t require the full state and full output
+of all the failures.</p>
+<p>Unfortunately, context editing will automatically invalidate caches.  There is
+really no way around it.  So it can be unclear when the trade-off of doing that
+compensates for the extra cost of trashing the cache.</p>
+<h2>Sub Agents / Sub Inference</h2>
+<p>As I mentioned a couple of times on this blog already, most of our agents are
+based on code execution and code generation.  That really requires a common
+place for the agent to store data.  Our choice is a file system—in our case a
+virtual file system—but that requires different tools to access it.  This is
+particularly important if you have something like a subagent or subinference.</p>
+<p>You should try to build an agent that doesn’t have dead ends.  A dead end is
+where a task can only continue executing within the sub-tool that you built.
+For instance, you might build a tool that generates an image, but is only able
+to feed that image back into one more tool.  That’s a problem because you might
+then want to put those images into a zip archive using the code execution tool.
+So there needs to be a system that allows the image generation tool to write
+the image to the same place where the code execution tool can read it.  In
+essence, that’s a file system.</p>
+<p>Obviously it has to go the other way around too.  You might want to use the
+code execution tool to unpack a zip archive and then go back to inference to
+describe all the images so that the next step can go back to code execution and
+so forth.  The file system is the mechanism that we use for that.  But it does
+require tools to be built in a way that they can take file paths to the virtual
+file system to work with.</p>
+<p>So basically an <code>ExecuteCode</code> tool would have access to the same file system as
+the <code>RunInference</code> tool which could take a <code>path</code> to a file on that same
+virtual file system.</p>
+<h2>The Use Of An Output Tool</h2>
+<p>One interesting thing about how we structured our agent is that it does not
+represent a chat session.  It will eventually communicate something to the user
+or the outside world, but all the messages that it sends in between are usually
+not revealed.  The question is: how does it create that message?  We have one
+tool which is the output tool.  The agent uses it explicitly to communicate to
+the human.  We then use a prompt to instruct it when to use that tool.  In our
+case the output tool sends an email.</p>
+<p>But that turns out to pose a few other challenges.  One is that it’s
+surprisingly hard to steer the wording and tone of that output tool compared to
+just using the main agent loop’s text output as the mechanism to talk to the
+user.  I cannot say why this is, but I think it’s probably related to how these
+models are trained.</p>
+<p>One attempt that didn’t work well was to have the output tool run another quick
+LLM like Gemini 2.5 Flash to adjust the tone to our preference.  But this
+increases latency and actually reduces the quality of the output.  In part, I
+think the model just doesn’t word things correctly and the subtool doesn’t have
+sufficient context.  Providing more slices of the main agentic context into the
+subtool makes it expensive and also didn’t fully solve the problem.  It also
+sometimes reveals information in the final output that we didn’t want to be
+there, like the steps that led to the end result.</p>
+<p>Another problem with an output tool is that sometimes it just doesn’t call the
+tool.  One of the ways in which we’re forcing this is we remember if the output
+tool was called.  If the loop ends without the output tool, we inject a
+reinforcement message to encourage it to use the output tool.</p>
+<h2>Model Choice</h2>
+<p>Overall our choices for models haven’t dramatically changed so far.  I think
+Haiku and Sonnet are still the best tool callers available, so they make for
+excellent choices in the agent loop.  They are also somewhat transparent with
+regards to what the RL looks like.  The other obvious choices are the Gemini
+models.  We so far haven’t found a ton of success with the GPT family of models
+for the main loop.</p>
+<p>For the individual sub-tools, which in part might also require inference, our
+current choice is Gemini 2.5 if you need to summarize large documents or work
+with PDFs and things like that.  That is also a pretty good model for
+extracting information from images, in particular because the Sonnet family of
+models likes to run into a safety filter which can be annoying.</p>
+<p>There’s also probably the very obvious realization that token cost alone
+doesn’t really define how expensive an agent.  A better tool caller will do the
+job in fewer tokens.  There are some cheaper models available than sonnet
+today, but they are not <em>necessarily</em> cheaper in a loop.</p>
+<p>But all things considered, not that much has changed in the last couple of
+weeks.</p>
+<h2>Testing and Evals</h2>
+<p>We find testing and evals to be the hardest problem here.  This is not entirely
+surprising, but the agentic nature makes it even harder.  Unlike prompts, you
+cannot just do the evals in some external system because there’s too much you
+need to feed into it.  This means you want to do evals based on observability
+data or instrumenting your actual test runs.  So far none of the solutions we
+have tried have convinced us that they found the right approach here.
+Unfortunately, I have to report that at the moment we haven’t found something
+that really makes us happy.  I hope we’re going to find a solution for this
+because it is becoming an increasingly frustrating aspect of building an agent.</p>
+<h2>Coding Agent Updates</h2>
+<p>As for my experience with coding agents, not really all that much has changed.
+The main new development is that I’m trialing <a href="https://ampcode.com/">Amp</a> more.
+In case you’re curious why: it’s not that it’s objectively a better agent than
+what I’m using, but I really quite like the way they’re thinking about agents
+from what they’re posting.  The interactions of the different sub agents like
+the Oracle with the main loop is beautifully done, and not many other harnesses
+do this today.  It’s also a good way for me to validate how different agent
+designs work.  Amp, similar to Claude Code, really feels like a product built
+by people who also use their own tool.  I do not feel every other agent in the
+industry does this.</p>
+<h2>Quick Stuff I Read And Found</h2>
+<p>That’s just a random assortment of things that I feel might also be worth
+sharing:</p>
+<ul>
+<li><a href="https://mariozechner.at/posts/2025-11-02-what-if-you-dont-need-mcp/">What if you don’t need MCP at
+all?</a>:
+Mario argues that many MCP servers are overengineered and include large
+toolsets that consume lots of context.  He proposes a minimalist approach for
+browser-agent use-cases by relying on simple CLI tools (e.g., start, navigate,
+evaluate JS, screenshot) executed via Bash, which keeps token usage small and
+workflows flexible.  I <a href="https://github.com/mitsuhiko/agent-commands/tree/main/skills/web-browser">built a Claude/Amp Skill out of
+it</a>.</li>
+<li><a href="https://nolanlawson.com/2025/11/16/the-fate-of-small-open-source/">The fate of “small” open
+source</a>:
+The author argues that the age of tiny, single-purpose open-source libraries is
+coming to an end, largely because built-in platform APIs and AI tools can now
+generate simple utilities on demand.  <a href="https://lucumr.pocoo.org/2025/1/24/build-it-yourself/">Thank fucking
+god</a>.</li>
+<li><a href="https://x.com/mitsuhiko/status/1991997262810218983">Tmux is love</a>.  There is
+no article that goes with it, but the TLDR is that Tmux is great.  If you
+have anything that remotely looks like an interactive system that an agent
+should work with, you should <a href="https://github.com/mitsuhiko/agent-commands/tree/main/skills/tmux">give it some Tmux
+skills</a>.</li>
+<li><a href="https://lucumr.pocoo.org/2025/11/22/llm-apis/">LLM APIs are a Synchronization Problem</a>.  This was a
+separate realization that was too long for this post, so I wrote a separate one.</li>
+</ul>
+
+
+  
+  <p>This entry was tagged
+    
+      <a href="https://lucumr.pocoo.org/tags/ai/">ai</a>
+  
+
+  </p><p>
+    <a href="https://lucumr.pocoo.org/2025/11/21/agents-are-hard.md" id="copy-markdown">copy as</a> / <a href="https://lucumr.pocoo.org/2025/11/21/agents-are-hard.md" id="view-markdown">view</a> markdown
+  </p>
+  
+  
+
+      </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Superman copy found in mum's attic is most valuable comic ever at $9.12M (282 pts)]]></title>
             <link>https://www.bbc.com/news/articles/c8e9rp0knj6o</link>
             <guid>46012328</guid>
             <pubDate>Sat, 22 Nov 2025 05:21:53 GMT</pubDate>
@@ -17,7 +271,78 @@
 <div id="readability-page-1" class="page"><div data-component="text-block"><p>While cleaning out their late mother's California attic last Christmas, three brothers made a life-changing discovery under a pile of faded newspapers: one of the first Superman comics ever made. </p><p>An original copy of the June 1939 first edition on the Man of Steel's adventures, it was in a remarkably pristine condition.</p><p>Now it has become the highest-priced comic book ever sold, fetching $9.12m (£7m) at auction.  </p><p>Texas-based Heritage Auctions, which hosted Thursday's sale, called it the "pinnacle of comic collecting".</p></div><div data-component="text-block"><p>The brothers found six comic books, including Superman #1, in the attic underneath a stack of newspapers inside a cardboard box and surrounded by cobwebs in 2024, Heritage said in a press release. </p><p>They waited a few months before contacting the auction house, but once they did, Heritage Auctions vice-president Lon Allen visited them in San Francisco within days, according to the auction house. </p><p>The brothers, who have chosen to withhold their names, are "in their 50s and 60s, and their mom had always told them she had an expensive comics collection but never showed them", Mr Allen said in Heritage's press release. </p><p>"It's a twist on the old 'Mom threw away my comics' story."</p><p>Their mother had held on to the comic books since she and her brother bought them between the Great Depression and the beginning of World War Two, Heritage said.</p><p>Mr Allen added that the cool northern California climate was perfect for preserving old paper. </p><p>"If it had been in an attic here in Texas, it would have been ruined," he said.</p><p>That helped CGC, a large third-party comics grading service, give this copy of Superman #1 a 9.0 rating on a 10-point scale, topping the previous record of 8.5. </p><p>And at its sale price of over $9m, including buyer's premium, Superman #1 easily beat the previous highest-priced comic book ever sold by $3m. </p><p>Action Comics No. 1, the 1938 work that first introduced Superman, sold for $6m last year.</p><p>The youngest brother said in Heritage's press release that the box had remained forgotten in the back of attic. </p><p>"As the years unfolded, life brought about a series of losses and changes," he said. "The demands of everyday survival took centre stage, and the box of comics, once set aside with care and intention, was forgotten. Until last Christmas."</p><p>He added: "This isn't simply a story about old paper and ink. This was never just about a collectible. </p><p>"This is a testament to memory, family and the unexpected ways the past finds its way back to us."</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How I learned Vulkan and wrote a small game engine with it (2024) (129 pts)]]></title>
+            <title><![CDATA[Moss Survives 9 Months in Space Vacuum (111 pts)]]></title>
+            <link>https://scienceclock.com/moss-survives-9-months-in-space-vacuum/</link>
+            <guid>46011978</guid>
+            <pubDate>Sat, 22 Nov 2025 03:57:29 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://scienceclock.com/moss-survives-9-months-in-space-vacuum/">https://scienceclock.com/moss-survives-9-months-in-space-vacuum/</a>, See on <a href="https://news.ycombinator.com/item?id=46011978">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div itemprop="articleBody">
+<p>Mosses are already known for coping with harsh radiation, dehydration, and long <a href="https://scienceclock.com/mars-ice-could-preserve-traces-of-ancient-life-study-suggests/">freezes</a>. Now scientists have pushed them even further by exposing their spore capsules to open space for nine months, and most of them survived.</p>
+
+
+
+<p>The team worked with spreading earthmoss (<a href="https://en.wikipedia.org/wiki/Physcomitrella_patens" target="_blank" rel="noopener"><em>Physcomitrium patens</em></a>), a small moss species used widely as a plant model by researchers. Its spore-containing capsules were mounted on the outside of the International Space Station (ISS), where they experienced direct solar radiation, vacuum conditions, and sharp temperature swings during each orbit.</p>
+
+
+
+<p>Under those conditions, cells usually break down quickly. So the researchers were surprised by what came back. “We expected almost zero survival, but the result was the opposite,” <a href="https://www.eurekalert.org/news-releases/1105940?" target="_blank" rel="noopener">says</a> Hokkaido University biologist Tomomichi Fujita. More than 80 percent of the spores still germinated once they returned to Earth.</p>
+
+
+
+<p><strong>Also Read: </strong><a href="https://scienceclock.com/microbe-that-could-turn-martian-dust-into-oxygen/"><strong>Microbe That Could Turn Martian Dust into Oxygen</strong></a></p>
+
+
+
+
+<p>The team detected a small drop in chlorophyll a, but the other pigments remained stable. The spores grew normally in follow-up tests, showing no signs of major stress from their time in orbit.</p>
+
+
+
+<p>This kind of toughness fits with the evolutionary history of mosses. <a href="https://en.wikipedia.org/wiki/Bryophyte" target="_blank" rel="noopener">Bryophytes</a> — the group that includes mosses, liverworts, and hornworts — were among the first plants to move from water onto land about 500 million years ago. Their spores had to withstand drying and direct sunlight long before soils existed, which may explain why their protective structures still hold up so well today.</p>
+
+
+<div>
+<figure><img decoding="async" width="525" height="700" src="https://scienceclock.com/wp-content/uploads/2025/11/Low-Res_Germinated-moss-spores-after-space-exposure-CREDIT-Dr.-Chang-hyun-Maeng-and-Maika-Kobayashi-rotated.jpg" alt="Low-Res_Germinated moss spores after space exposure CREDIT Dr. Chang-hyun Maeng and Maika Kobayashi" srcset="https://scienceclock.com/wp-content/uploads/2025/11/Low-Res_Germinated-moss-spores-after-space-exposure-CREDIT-Dr.-Chang-hyun-Maeng-and-Maika-Kobayashi-rotated.jpg 525w, https://scienceclock.com/wp-content/uploads/2025/11/Low-Res_Germinated-moss-spores-after-space-exposure-CREDIT-Dr.-Chang-hyun-Maeng-and-Maika-Kobayashi-225x300.jpg 225w" sizes="(max-width: 525px) 100vw, 525px"><figcaption>Germinated moss spores after their time in open space (Image: Dr. Chang-hyun Maeng and Maika Kobayashi)</figcaption></figure></div>
+
+
+<p>The results place moss spores alongside the few organisms known to tolerate direct <a href="https://scienceclock.com/category/space/">space</a> exposure, including tardigrades and certain microbes. Their survival also adds to ongoing discussions about what types of <a href="https://scienceclock.com/category/life/">life</a> might endure extreme environments beyond Earth.</p>
+
+
+
+<p>According to the researchers, this durability could matter for future experiments on the Moon or Mars. Mosses need very little soil and can pull nutrients directly from rock, making them candidates for early ecosystem tests in <a href="https://scienceclock.com/aliens-got-bored-and-stopped-searching-humans-says-scientist/">extraterrestrial</a> settings.</p>
+
+
+
+
+<p>“Ultimately, we hope this work opens a new frontier toward constructing ecosystems in extraterrestrial environments such as&nbsp;the <a href="https://scienceclock.com/saturns-moon-enceladus-signals-organic-molecules-key-to-lifes-chemistry/">Moon</a>&nbsp;and&nbsp;Mars,”&nbsp;<a href="https://www.eurekalert.org/news-releases/1105940?" target="_blank" rel="noopener">says</a>&nbsp;Fujita.</p>
+
+
+
+<p>The research was published in <em>iScience</em>. Read the study <a href="https://doi.org/10.1016/j.isci.2025.113827" target="_blank" rel="noopener">here</a>.</p>
+
+
+
+<hr>
+
+
+
+
+
+
+
+<!-- CONTENT END 1 -->
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Sharper MRI scans may be on horizon thanks to new physics-based model (102 pts)]]></title>
+            <link>https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model</link>
+            <guid>46010806</guid>
+            <pubDate>Sat, 22 Nov 2025 00:30:26 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model">https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model</a>, See on <a href="https://news.ycombinator.com/item?id=46010806">Hacker News</a></p>
+Couldn't get https://news.rice.edu/news/2025/sharper-mri-scans-may-be-horizon-thanks-new-physics-based-model: Error: Request failed with status code 406]]></description>
+        </item>
+        <item>
+            <title><![CDATA[How I learned Vulkan and wrote a small game engine with it (2024) (132 pts)]]></title>
             <link>https://edw.is/learning-vulkan/</link>
             <guid>46010329</guid>
             <pubDate>Fri, 21 Nov 2025 23:28:40 GMT</pubDate>
@@ -1361,7 +1686,7 @@ struct MeshDrawCommand {
 <div id="readability-page-1" class="page"><div><tr><td><span>City</span>Livermore</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Alameda</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Albany</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Berkeley</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Dublin</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Emeryville</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Fremont</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Hayward</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Newark</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Oakland</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Piedmont</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Pleasanton</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>San Leandro</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Union City</td><td><span>County</span>Alameda County</td></tr><tr><td><span>City</span>Antioch</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Brentwood</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Clayton</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Concord</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Danville</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>El Cerrito</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Hercules</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Lafayette</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Martinez</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Moraga</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Oakley</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Orinda</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Pinole</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Pittsburg</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Pleasant Hill</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Richmond</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>San Pablo</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>San Ramon</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Walnut Creek</td><td><span>County</span>Contra Costa County</td></tr><tr><td><span>City</span>Agoura Hills</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Arcadia</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Artesia</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Azusa</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Baldwin Park</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Bellflower</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Bradbury</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Burbank</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Calabasas</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Cerritos</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Claremont</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Covina</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Diamond Bar</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Duarte</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>El Monte</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Glendora</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Hawaiian Gardens</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Hidden Hills</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Industry</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Irwindale</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>La Cañada Flintridge</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>La Habra Heights</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>La Mirada</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>La Puente</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>La Verne</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Lakewood</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Lomita</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Malibu</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Monrovia</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Montebello</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Norwalk</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Palos Verdes Estates</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Pasadena</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Pico Rivera</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Pomona</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Rancho Palos Verdes</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Rolling Hills</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Rolling Hills Estates</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Rosemead</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>San Dimas</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>San Fernando</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>San Gabriel</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>San Marino</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Santa Clarita</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Santa Fe Springs</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Sierra Madre</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Signal Hill</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>South El Monte</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>South Pasadena</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Temple City</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Walnut</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>West Covina</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Westlake Village</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Whittier</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Alhambra</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Bell</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Bell Gardens</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Carson</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Commerce</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Compton</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Downey</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>El Segundo</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Gardena</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Glendale</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Hermosa Beach</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Long Beach</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Los Angeles</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Manhattan Beach</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Monterey Park</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Paramount</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Redondo Beach</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Santa Monica</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>South Gate</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Torrance</td><td><span>County</span>&nbsp;Los Angeles County</td></tr><tr><td><span>City</span>Belvedere</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Corte Madera</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Fairfax</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Larkspur</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Mill Valley</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Novato</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Ross</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>San Anselmo</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>San Rafael</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Sausalito</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>Tiburon</td><td><span>County</span>Marin County</td></tr><tr><td><span>City</span>American Canyon</td><td><span>County</span>Napa County</td></tr><tr><td><span>City</span>Calistoga</td><td><span>County</span>Napa County</td></tr><tr><td><span>City</span>Napa</td><td><span>County</span>Napa County</td></tr><tr><td><span>City</span>St. Helena</td><td><span>County</span>Napa County</td></tr><tr><td><span>City</span>Yountville</td><td><span>County</span>Napa County</td></tr><tr><td><span>City</span>Aliso Viejo</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Anaheim</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Brea</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Buena Park</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Costa Mesa</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Cypress</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Dana Point</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Fountain Valley</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Fullerton</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Garden Grove</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Huntington Beach</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Irvine Orange</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>La Habra Orange</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>La Palma Orange</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Laguna Beach</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Laguna Hills</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Laguna Niguel</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Laguna Woods</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Lake Forest</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Los Alamitos</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Mission Viejo</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Newport Beach</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Orange</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Placentia</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Rancho Santa Margarita</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>San Clemente</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>San Juan Capistrano</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Santa Ana</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Seal Beach</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Stanton</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Tustin</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Villa Park</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Westminster</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Yorba Linda</td><td><span>County</span>Orange County</td></tr><tr><td><span>City</span>Corona</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Eastvale</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Jurupa Valley</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Lake Elsinore</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Murrieta</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Norco</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Pechanga Reservation</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Riverside</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Temecula</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Wildomar</td><td><span>County</span>Riverside County</td></tr><tr><td><span>City</span>Citrus Heights</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Elk Grove</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Folsom</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Galt</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Isleton</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Rancho Cordova</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Sacramento</td><td><span>County</span>Sacramento County</td></tr><tr><td><span>City</span>Chino Hills</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Fontana</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Montclair</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Ontario</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Rancho Cucamonga</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Rialto</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Upland</td><td><span>County</span>San Bernardino County</td></tr><tr><td><span>City</span>Barona Reservation</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Capitan Grande</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Carlsbad</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Chula Vista</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Coronado</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Del Mar</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>El Cajon</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Encinitas</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Escondido</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Imperial Beach</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>La Mesa</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Lemon Grove</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>National City</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Oceanside</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Poway</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>San Diego</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>San Marcos</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Santee</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Solana Beach</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Sycuan Reservation</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>Vista</td><td><span>County</span>San Diego County</td></tr><tr><td><span>City</span>San Francisco</td><td><span>County</span>San Francisco County</td></tr><tr><td><span>City</span>Half Moon</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Brisbane</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Burlingame</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>East Palo Alto</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Foster City</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Menlo Park</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Pacifica</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Redwood City</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>San Mateo</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>South San Francisco</td><td><span>County</span>San Mateo County</td></tr><tr><td><span>City</span>Milpitas</td><td><span>County</span>Santa Clara County</td></tr><tr><td><span>City</span>Mountain View</td><td><span>County</span>Santa Clara County</td></tr><tr><td><span>City</span>Palo Alto Santa</td><td><span>County</span>Santa Clara County</td></tr><tr><td><span>City</span>San Jose</td><td><span>County</span>Santa Clara County</td></tr><tr><td><span>City</span>Sunnyvale</td><td><span>County</span>Santa Clara County</td></tr><tr><td><span>City</span>Unincorporated Area (Lexington<br>Hills area, overlapping Santa<br>Clara and Santa Cruz Counties)</td><td><span>County</span>Santa Cruz County</td></tr><tr><td><span>City</span>Benicia</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Dixon</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Fairfield</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Rio Vista</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Suisun City</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Vacaville</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Vallejo</td><td><span>County</span>&nbsp;Solano County</td></tr><tr><td><span>City</span>Cloverdale</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Cotati</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Dry Creek Rancheria</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Healdsburg</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Lytton Rancheria</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Petaluma</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Rohnert Park</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Santa Rosa</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Sebastopol</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Sonoma</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Stewarts Point Rancheria</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Windsor</td><td><span>County</span>Sonoma County</td></tr><tr><td><span>City</span>Camarillo</td><td><span>County</span>Ventura County</td></tr><tr><td><span>City</span>Moorpark</td><td><span>County</span>Ventura County</td></tr><tr><td><span>City</span>Simi Valley</td><td><span>County</span>Ventura County</td></tr><tr><td><span>City</span>Thousand Oaks</td><td><span>County</span>Ventura County</td></tr><tr><td><span>City</span>Davis</td><td><span>County</span>&nbsp;Yolo County</td></tr><tr><td><span>City</span>Rumsey Indian Rancheria</td><td><span>County</span>&nbsp;Yolo County</td></tr><tr><td><span>City</span>West Sacramento Yolo</td><td><span>County</span>&nbsp;Yolo County</td></tr><tr><td><span>City</span>Winters</td><td><span>County</span>&nbsp;Yolo County</td></tr><tr><td><span>City</span>Woodland</td><td><span>County</span>&nbsp;Yolo County</td></tr></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Personal blogs are back, should niche blogs be next? (412 pts)]]></title>
+            <title><![CDATA[Personal blogs are back, should niche blogs be next? (441 pts)]]></title>
             <link>https://disassociated.com/personal-blogs-back-niche-blogs-next/</link>
             <guid>46009894</guid>
             <pubDate>Fri, 21 Nov 2025 22:40:28 GMT</pubDate>
@@ -1369,7 +1694,7 @@ struct MeshDrawCommand {
 &lt;Not HTML&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Is Matrix Multiplication Ugly? (111 pts)]]></title>
+            <title><![CDATA[Is Matrix Multiplication Ugly? (114 pts)]]></title>
             <link>https://mathenchant.wordpress.com/2025/11/21/is-matrix-multiplication-ugly/</link>
             <guid>46009660</guid>
             <pubDate>Fri, 21 Nov 2025 22:17:11 GMT</pubDate>
@@ -1570,7 +1895,7 @@ struct MeshDrawCommand {
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[LAPD helicopter tracker with real-time operating costs (176 pts)]]></title>
+            <title><![CDATA[LAPD helicopter tracker with real-time operating costs (185 pts)]]></title>
             <link>https://lapdhelicoptertracker.com/</link>
             <guid>46009591</guid>
             <pubDate>Fri, 21 Nov 2025 22:11:07 GMT</pubDate>
@@ -1578,7 +1903,7 @@ struct MeshDrawCommand {
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Pixar: The Early Days A never-before-seen 1996 interview (130 pts)]]></title>
+            <title><![CDATA[Pixar: The Early Days A never-before-seen 1996 interview (137 pts)]]></title>
             <link>https://stevejobsarchive.com/stories/pixar-early-days</link>
             <guid>46008769</guid>
             <pubDate>Fri, 21 Nov 2025 20:45:06 GMT</pubDate>
@@ -2110,7 +2435,7 @@ In this footage, Steve reveals the long game behind Pixar’s seeming overnight 
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Discontinuation of ARM Notebook with Snapdragon X Elite SoC (159 pts)]]></title>
+            <title><![CDATA[Discontinuation of ARM Notebook with Snapdragon X Elite SoC (168 pts)]]></title>
             <link>https://www.tuxedocomputers.com/en/Discontinuation-of-ARM-notebooks-with-Snapdragon-X-Elite-SoC.tuxedo</link>
             <guid>46008156</guid>
             <pubDate>Fri, 21 Nov 2025 19:46:34 GMT</pubDate>
@@ -2135,7 +2460,7 @@ In this footage, Steve reveals the long game behind Pixar’s seeming overnight 
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Helping Valve to Power Up Steam Devices (664 pts)]]></title>
+            <title><![CDATA[Helping Valve to Power Up Steam Devices (686 pts)]]></title>
             <link>https://www.igalia.com/2025/11/helpingvalve.html</link>
             <guid>46006616</guid>
             <pubDate>Fri, 21 Nov 2025 17:29:59 GMT</pubDate>
@@ -2205,7 +2530,7 @@ In this footage, Steve reveals the long game behind Pixar’s seeming overnight 
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Solving Fizz Buzz with Cosines (175 pts)]]></title>
+            <title><![CDATA[Solving Fizz Buzz with Cosines (180 pts)]]></title>
             <link>https://susam.net/fizz-buzz-with-cosines.html</link>
             <guid>46006598</guid>
             <pubDate>Fri, 21 Nov 2025 17:28:25 GMT</pubDate>
@@ -2934,7 +3259,7 @@ for n in range(1, 101):
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[You can make PS2 games in JavaScript (282 pts)]]></title>
+            <title><![CDATA[You can make PS2 games in JavaScript (286 pts)]]></title>
             <link>https://jslegenddev.substack.com/p/you-can-now-make-ps2-games-in-javascript</link>
             <guid>46006082</guid>
             <pubDate>Fri, 21 Nov 2025 16:42:19 GMT</pubDate>
@@ -3055,7 +3380,7 @@ Screen.display(() =&gt; {
 });</code></pre><p>Finally, my Hello World example was finished.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!iHMb!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png" data-component-name="Image2ToDOM" rel=""><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!iHMb!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 424w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 848w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 1272w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!iHMb!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png" width="1456" height="743" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:743,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:470324,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://jslegenddev.substack.com/i/173484675?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!iHMb!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 424w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 848w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 1272w, https://substackcdn.com/image/fetch/$s_!iHMb!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73c41646-137d-4ea2-b0a7-c0328f119829_1912x976.png 1456w" sizes="100vw" loading="lazy"></picture></div></a></figure></div><p>Now that you’ve been introduced to Athena, you might be tempted to try it out for yourself. In that case, I really recommend looking at the Sonic infinite runner Athena port’s code as you’ll learn a lot about concepts that I did not have time to cover here.</p><p><span>Link to the repo here : </span><a href="https://github.com/DevWill-hub/Sonic-Infinite-Runner-PS2" rel="">https://github.com/DevWill-hub/Sonic-Infinite-Runner-PS2</a></p><p><span>Link to my Athena template : </span><a href="https://github.com/JSLegendDev/Athena-PS2-Template" rel="">https://github.com/JSLegendDev/Athena-PS2-Template</a></p><p><span>Link to the Athena project : </span><a href="https://github.com/DanielSant0s/AthenaEnv" rel="">https://github.com/DanielSant0s/AthenaEnv</a></p><p><span>Additionally, I recommend joining the official Athena discord where you’ll be more likely to receive help when stuck. You can join here : </span><a href="https://discord.gg/cZUH5U93US" rel="">https://discord.gg/cZUH5U93US</a></p><p>Before wrapping up this post, you might have found strange that nothing was mentioned about 3D considering that the PS2 was mostly known for its 3D games.</p><p>This is for 2 reasons. First, I’m a novice in terms of 3D game develoment, I have never done it before. Second, to my understanding, Athena has both 2D and 3D capabilities but version 4 which has more of a 3D focus is currently in development. I thought it would have been preferable to wait until v4 was stable before diving into PS2 3D gamedev in JavaScript.</p><p>However, there are a few 3D demos you can check if you’re interested. </p><p>Links down below.</p><ul><li><p><a href="https://github.com/ps2devnoob/3D-Robot-DEMO-PS2" rel="">https://github.com/ps2devnoob/3D-Robot-DEMO-PS2</a></p></li><li><p><a href="https://github.com/ps2devnoob/BurnTrack-PS2-DEMO" rel="">https://github.com/ps2devnoob/BurnTrack-PS2-DEMO</a></p></li><li><p><a href="https://github.com/ps2devnoob/AthenaENV-PS2-Samples" rel="">https://github.com/ps2devnoob/AthenaENV-PS2-Samples</a></p></li></ul><p>To conclude, Athena is a cool project allowing you to make real PS2 games in JavaScript. If you learned something new and enjoy technical posts like this one, I recommend subscribing to not miss out on future releases.</p><p>In the meantime, if you feel inclined, you can read the post below.</p></div></article></div><div id="discussion"><h4>Discussion about this post</h4></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Wealthfolio 2.0- Open source investment tracker. Now Mobile and Docker (557 pts)]]></title>
+            <title><![CDATA[Show HN: Wealthfolio 2.0- Open source investment tracker. Now Mobile and Docker (574 pts)]]></title>
             <link>https://wealthfolio.app/?v=2.0</link>
             <guid>46006016</guid>
             <pubDate>Fri, 21 Nov 2025 16:34:52 GMT</pubDate>
@@ -3295,760 +3620,6 @@ Simple swing stock trading tracker with performance analytics and calendar views
 
 <p>The question isn’t whether the open hobby electronics maker community survives. It’s whether Arduino does.</p>
 					</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Make product worse, get money (124 pts)]]></title>
-            <link>https://dynomight.net/worse/</link>
-            <guid>46005388</guid>
-            <pubDate>Fri, 21 Nov 2025 15:23:20 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://dynomight.net/worse/">https://dynomight.net/worse/</a>, See on <a href="https://news.ycombinator.com/item?id=46005388">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-<article>
-  <header>
-    <img src="https://dynomight.net/img/worse/club_night.jpg">
-    
-
-  </header>  
-
-  <section>
-    
-
-    <p>I <a href="https://dynomight.net/dating/">recently asked</a> why people seem to hate dating apps so much. In response, 80% of you emailed me some version of the following theory:</p>
-
-<blockquote>
-  <p>The thing about dating apps is that if they do a good job and match people up, then the matched people will quit the app and stop paying. So they have an incentive to string people along but not to actually help people find long-term relationships.</p>
-</blockquote>
-
-<p>May I explain why I don’t find this type of theory very helpful?</p>
-
-<p>I’m not saying that I think it’s wrong, mind you. Rather, my objection is that while the theory is phrased in terms of dating apps, the same basic pattern applies to basically anyone who is trying to make money by doing anything.</p>
-
-<p>For example, consider a pizza restaurant. Try these theories on for size:</p>
-
-<ul>
-  <li>
-    <p><strong>Pizza:</strong> “The thing about pizza restaurants is that if they use expensive ingredients or labor-intensive pizza-making techniques, then it costs more to make pizza. So they have an incentive to use low-cost ingredients and labor-saving shortcuts.”</p>
-  </li>
-  <li>
-    <p><strong>Pizza II:</strong> “The thing about pizza restaurants is that if they have nice tables separated at a comfortable distance, then they can’t fit as many customers. So they have an incentive to use tiny tables and cram people in cheek by jowl.”</p>
-  </li>
-  <li>
-    <p><strong>Pizza III:</strong> “The thing about pizza restaurants is that if they sell big pizzas, then people will eat them and stop being hungry, meaning they don’t buy additional pizza. So they have an incentive to serve tiny low-calorie pizzas.”</p>
-  </li>
-</ul>
-
-<p>See what I mean? You can construct similar theories for other domains, too:</p>
-
-<ul>
-  <li>
-    <p><strong>Cars:</strong> “The thing about automakers is that making cars safe is expensive. So they have an incentive to make unsafe cars.”</p>
-  </li>
-  <li>
-    <p><strong>Videos:</strong> “The thing about video streaming is that high-resolution video uses more expensive bandwidth. So they have an incentive to use low-resolution.”</p>
-  </li>
-  <li>
-    <p><strong>Blogging:</strong> “The thing about bloggers is that research is time-consuming. So they have an incentive to be sloppy about the facts.”</p>
-  </li>
-  <li>
-    <p><strong>Durability:</strong> “The thing about {lightbulb, car, phone, refrigerator, cargo ship} manufacturing is that if you make a {lightbulb, car, phone, refrigerator, cargo ship} that lasts a long time, then people won’t buy new ones. So there’s an incentive to make {lightbulbs, cars, phones, refrigerators, cargo ships} that break quickly.”</p>
-  </li>
-</ul>
-
-<p>All these theories can be thought of as instances of two general patterns:</p>
-
-<ul>
-  <li>
-    <p><strong>Make product worse, get money:</strong> “The thing about selling goods or services is that making goods or services better costs money. So people have an incentive to make goods and services worse.”</p>
-  </li>
-  <li>
-    <p><strong>Raise price, get money:</strong> “The thing about selling goods and services is that if you raise prices, then you get more money. So people have an incentive to raise prices.”</p>
-  </li>
-</ul>
-
-<p>Are these theories wrong? Not exactly. But it sure seems like something is missing.</p>
-
-<p>I’m sure most pizza restauranteurs would be thrilled to sell lukewarm 5 cm cardboard discs for $300 each. They do in fact have an incentive to do that, just as predicted by these theories! Yet, in reality, pizza restaurants usually sell pizzas that are made out of food. So clearly these theories aren’t telling the whole story.</p>
-
-<p>Say you have a lucrative business selling 5 cm cardboard discs for $300. I am likely to think, “I like money. Why don’t I sell pizzas that are only <em>mostly</em> cardboard, but also partly made of flour? And why don’t I sell them for $200, so I can steal Valued Reader’s customers?” But if I did that, then someone else would probably set prices at only $100, or even introduce cardboard-free pizzas, and this would continue until hitting some kind of equilibrium.</p>
-
-<p>Sure, producers want to charge infinity dollars for things that cost them zero dollars to make. But <em>consumers</em> want to pay zero dollars for stuff that’s infinitely valuable. It’s in the conflict between these desires that all interesting theories live.</p>
-
-<p>This is why I don’t think it’s helpful to point out that people have an incentive to make their products worse. Of course they do. The interesting question is, why are they able to get away with it?</p>
-
-<h2 id="reasons-stuff-is-bad">Reasons stuff is bad</h2>
-
-<p><strong>First reason stuff is bad: People are cheap</strong></p>
-
-<p>Why are seats so cramped on planes? Is it because airlines are greedy? Sure. But while they might be greedy, I don’t think they’re dumb. If you do a little math, you can calculate that if airlines were to remove a single row of seats, they could add perhaps 2.5 cm (1 in) of extra legroom for everyone, while only decreasing the number of paying customers by around 3%. (This is based on a 737 with single-class, but you get the idea.)</p>
-
-<p>So why don’t airlines rip out a row of seats, raise prices by 3% and enjoy the reduced costs for fuel and customer service? The only answer I can see is that people, on average, aren’t actually willing to pay 3% more for 2.5 cm more legroom. We want a worse but cheaper product, and so that’s what we get.</p>
-
-<p>I think this is the most common reason stuff is “bad”. It’s why Subway sandwiches are so soggy, why video games are so buggy, and why IKEA furniture and Primark clothes fall apart so quickly.</p>
-
-<p>It’s good when things are bad for this reason. Or at least, that’s the premise of capitalism: When companies cut costs, that’s the invisible hand redirecting resources to maximize social value, or whatever. Companies may be motivated by greed. And you may not like it, since you want to pay zero dollars for infinite value. But this is markets working as designed.</p>
-
-<p><strong>Second reason stuff is bad: Information asymmetries</strong></p>
-
-<p>Why is it that almost every book / blog / podcast about longevity is such garbage? Well, we don’t actually know many things that will reliably increase longevity. And those things are mostly all boring / hard / non-fun. And even if you do all of them, it probably only adds a couple of years in expectation. And telling people these facts is not a good way to find suckers who will pay you lots of money for your unproven supplements / seminars / etc.</p>
-
-<p>True! But it doesn’t explain why all longevity stuff is so bad. Why don’t honest people tell the true story and drive all the hucksters out of business? I suspect the answer is that unless you have a <em>lot</em> of scientific training and do a <em>lot</em> of research, it’s basically impossible to figure out just how huckstery all the hucksters really are.</p>
-
-<p>I think this same basic phenomenon explains why some supplements contain heavy metals, why some food contains microplastics, why restaurants use so much butter and salt, why rentals often have crappy insulation, and why most cars <a href="https://danluu.com/car-safety/">seem to only be safe along dimensions included in crash test scores</a>. When consumers can’t tell good from evil, evil triumphs.</p>
-
-<p><strong>Third reason stuff is bad: People have bad taste</strong></p>
-
-<p>Sometimes stuff is bad because people just don’t appreciate the stuff you consider good. Examples are definitionally controversial, but I think this includes restaurants in cities where all restaurants are bad, <a href="https://www.lesswrong.com/posts/NvGGp3ASHXtt7xXdZ/why-is-american-mass-market-tea-so-terrible">North American tea</a>, and travel pants. This reason has a blurry boundary with information asymmetries, as seen in <a href="https://dynomight.net/humidifiers/">ultrasonic humidifiers</a> or products that use Sucralose instead of aspartame for “safety”.</p>
-
-<p><strong>Fourth reason stuff is bad: Pricing power</strong></p>
-
-<p>Finally, sometimes stuff is bad because markets aren’t working. Sometimes a company is selling a product but has some kind of “moat” that makes it hard for anyone else to compete with them, e.g. because of some technological or regulatory barrier, control of some key resource or location, intellectual property, a beloved brand, or network effects.</p>
-
-<p>If that’s true, then those companies don’t have to worry as much about someone else stealing their business, and so (because everyone is axiomatically greedy) they will find ways to make their product cheaper and/or raise prices up until the price is equal to the full value it provides to the marginal consumer.</p>
-
-<h2 id="conclusion">Conclusion</h2>
-
-<p>Why is food so expensive at sporting events? Yes, people have no alternatives. But people know food is expensive at sporting events. And they don’t like it. Instead of selling water for $17, why don’t venues sell water for $2 and raise ticket prices instead? I don’t know. Probably something complicated, like that expensive food allows you to extract extra money from rich people without losing business from non-rich people.</p>
-
-<p>So <em>of course</em> dating apps would love to string people along for years instead of finding them long-term relationships, so they keep paying money each month. I wouldn’t be surprised if some people at those companies have literally thought, “Maybe we should string people along for years instead of finding them long-term relationships, so they keep paying money each month, I love money so much.”</p>
-
-<p>But if they are actually doing that (which is unclear to me) or if they are bad in some other way, then how do they get away with it? Why doesn’t someone else create a competing app that’s better and thereby steal all their business? It seems like the answer has to be either “because that’s impossible” or “because people don’t really want that”. That’s where the mystery begins.</p>
-
-
-  </section>
-
-  <hr>
-
-  
-
-  <section>
-    
-    
-    <p>Comments at
-      
-        <a href="https://lemmy.world/post/39071832">lemmy</a> or 
-        <a href="https://dynomight.substack.com/p/worse">substack</a>.
-      
-      
-
-  </p></section>
-  <hr>
-  <section>
-
-    <!-- <h3>related internet content opportunities</h3> -->
-
-<span>Related</span>
-<p>
-    <a href="https://dynomight.net/dating/">Dating: A mysterious constellation of facts</a> · 
-    
-          <a href="https://dynomight.net/#life">life</a>
-    
-          <a href="https://dynomight.net/#economics">economics</a>
-    
-    </p>
-
-      <p>
-    <a href="https://dynomight.net/blood/">So much blood</a> · 
-    
-          <a href="https://dynomight.net/#conspiracy">conspiracy</a>
-    
-          <a href="https://dynomight.net/#economics">economics</a>
-    
-    </p>
-
-      <p>
-    <a href="https://dynomight.net/money/">Trading stuff for money</a> · 
-    
-          <a href="https://dynomight.net/#philosophy">philosophy</a>
-    
-          <a href="https://dynomight.net/#economics">economics</a>
-    
-    </p>
-
-      <p>
-    <a href="https://dynomight.net/ideas/">Rewarding ideas</a> · 
-    
-          <a href="https://dynomight.net/#economics">economics</a>
-    
-    </p>
-
-      
-
-  </section>
-  <hr>
-  
-
-</article>
-
-
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[XBMC 4.0 for the Original Xbox (171 pts)]]></title>
-            <link>https://www.xbox-scene.info/articles/announcing-xbmc-40-for-the-original-xbox-r64/</link>
-            <guid>46005349</guid>
-            <pubDate>Fri, 21 Nov 2025 15:18:05 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.xbox-scene.info/articles/announcing-xbmc-40-for-the-original-xbox-r64/">https://www.xbox-scene.info/articles/announcing-xbmc-40-for-the-original-xbox-r64/</a>, See on <a href="https://news.ycombinator.com/item?id=46005349">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section data-controller="core.front.core.lightboxedImages"><p>
-	<a data-fileext="jpg" data-fileid="2240" href="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-home-xbox.jpg.19d04babb8ddd813d97e500d631b9444.jpg" rel=""><img alt="xbmc-home-xbox.thumb.jpg.9419356ccc76cf1651ab4cdf77de794d.jpg" data-fileid="2240" data-ratio="56.25" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-home-xbox.thumb.jpg.9419356ccc76cf1651ab4cdf77de794d.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>
-</p>
-
-<p>
-	<span><em>A Major Modernization of the Killer App That Started It All</em></span>
-</p>
-
-<p>
-	A new version of Xbox Media Center (XBMC),&nbsp;<strong>version 4.0</strong>, has been released.&nbsp;This version marks a significant update to the long-standing media center platform for the Original Xbox. This marks the first major advancement to the software since 2016 and represents a renewed commitment to preserving, modernizing, and extending the capabilities of one of the most <em>iconic</em>&nbsp;console homebrew applications ever created.
-</p>
-
-<p>
-	XBMC has a long and influential history. In 2002, XboxMediaPlayer (XMP) was released and turned the console into a powerful multimedia device fit for the living room in an era when connecting a computer to a TV was quite novel. Later that same year, XMP merged with YAMP and became Xbox Media Player 2.0. A few years later, the software evolved into Xbox Media Center, or XBMC, which introduced a new interface, a plugin system powered by Python, and a robust skinning engine.
-</p>
-
-<p>
-	XBMC eventually became so capable that it outgrew the Xbox entirely. By 2007, developers were working on PC ports and in 2010, the project split into two branches: one for general computers while the Xbox version became <em>XBMC4Xbox</em>, and each codebase was maintained from then on by separate teams. XBMC was later renamed to <a href="https://kodi.tv/" rel="external nofollow">Kodi</a> in 2014 and continues to be one of the most popular media center applications available. Even <a href="https://www.plex.tv/" rel="external nofollow">Plex</a> traces its roots back to XBMC. Plex began as <em>OSXBMC</em>, a Mac port of XBMC in late 2007, before becoming its own project in 2008. This means the Original Xbox helped shape not one but <em>two</em> of the biggest media center apps used today.
-</p>
-
-<p>
-	The last official release of XBMC4Xbox arrived in <a href="https://www.xbmc4xbox.org.uk/2016/02/xbmc4xbox-3-5-3-is-out/" rel="external nofollow">February 2016</a> with version 3.5.3. Although the community never declared the project dead, meaningful updates became scarce. XBMC 4.0 continues that legacy by bringing a modern interface, updating it to be more inline with Kodi's modern codebase, and backporting features to the original 64MB RAM / Pentium-III hardware where it all began.
-</p>
-
-<p>
-	This project is distinct and separate from <a href="https://github.com/Rocky5/XBMC4Gamers" rel="external nofollow">XBMC4Gamers</a>, the games-focused variation of XBMC4Xbox (v3.5.3) by developer Rocky5.
-</p>
-
-<h2>
-	A Modern Interface Powered by Estuary
-</h2>
-
-<p>
-	One of the most notable advancements in XBMC 4.0 is the introduction of the <strong>Estuary</strong> user interface (skin).
-</p>
-
-<p>
-	Estuary, originally released in 2017 with Kodi v17 ("<a href="https://kodi.wiki/view/Archive:Kodi_v17_(Krypton)_changelog" rel="external nofollow">Krypton</a>"), provides a clean and modern layout that improves navigation and readability over past skins. Bringing Estuary to the Xbox required extensive updates to the underlying GUI framework, including a port of the more contemporary <em>GUIlib</em> engine. This allows the platform to support modern skinning standards and makes future skin ports much more straightforward. After the initial work of porting GUIlib was done, porting Estuary to the Xbox was a relatively simple process of tweaking a handful of configuration files and adding contextual features specific to the Xbox. The result is a modern, intuitive front end that retains the performance and responsiveness required on legacy hardware.
-</p>
-
-<p>
-	Firing up an Xbox made in 2001 and being greeted by the same interface as what you'd find if you were to download Kodi today onto your PC feels like a bit of magic, and helps keep this beloved classic console relevant and useful well into the modern era.
-</p>
-
-<video controls="" data-video-embed="">
-		<source type="video/mp4" data-video-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-overview(1).mp4.29f8da2750ab41c36f1a525113b4a611.mp4"><a data-fileext="mp4" data-fileid="2242" href="https://www.xbox-scene.info/applications/core/interface/file/attachment.php?id=2242&amp;key=fad1aba1084372c0331238456b7ce8a9" rel="">XBMC-overview(1).mp4</a>
-	</video>
-
-
-<h2>
-	Expanded Games Library Support
-</h2>
-
-<p>
-	XBMC 4.0 introduces a fully realized games library system. This enhancement brings the same level of metadata support found in the Movies and Music sections to Xbox and emulated games. Titles can now display artwork, descriptions, and other metadata, transforming the games section into a polished and user-friendly library. XBMC’s longstanding support for trainers remains intact, giving users the option to apply gameplay modifications for compatible titles. Emulated game collections benefit as well, with the ability to browse ROM libraries and launch them directly in a user’s preferred emulator.
-</p>
-
-<p>
-	<a data-fileext="png" data-fileid="2239" href="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-games.png.832ea5b6856323ad43adf46b7965d6c0.png" rel=""><img alt="xbmc-games.thumb.png.15d95fa0ae488c06b61535bbe4450b84.png" data-fileid="2239" data-ratio="56.60" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-games.thumb.png.15d95fa0ae488c06b61535bbe4450b84.png" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>&nbsp;<a data-fileext="png" data-fileid="2238" href="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-games2.png.1cd18c9321c93d4607f21fb1a415d1be.png" rel=""><img alt="xbmc-games2.thumb.png.2446d1967e49fc3c04c067b276122387.png" data-fileid="2238" data-ratio="56.60" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/xbmc-games2.thumb.png.2446d1967e49fc3c04c067b276122387.png" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>&nbsp;<a data-fileext="jpg" data-fileid="2248" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-emulators.jpg.6a7a4334b6729c10d329cafc1bd14a60.jpg" rel=""><img alt="XBMC-emulators.thumb.jpg.7257c8c9aba9c864cf1df933a0072201.jpg" data-fileid="2248" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-emulators.thumb.jpg.7257c8c9aba9c864cf1df933a0072201.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>
-</p>
-
-<h2>
-	Online Scrapers and Metadata Support
-</h2>
-
-<p>
-	XBMC 4.0 restores full functionality to metadata scrapers for movies and television. This allows users to build rich media libraries complete with artwork, plot summaries, cast listings, and other information retrieved directly from online sources. XBMC 4.0 handles these tasks efficiently, even on the Xbox’s limited memory and processing power. Video playback continues to support 480p and 720p content, enabling the console to serve as a surprisingly capable media device for its age. Similar to Kodi, XBMC 4.0 supports filtering, building playlists, watch progress history for media, and intelligent handling of TV shows with seasons.
-</p>
-
-<video controls="" data-video-embed="">
-		<source type="video/mp4" data-video-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-Videos-Demo.mp4.0936a52a21eb4f9cf78f8aa93f1a1f8a.mp4"><a data-fileext="mp4" data-fileid="2241" href="https://www.xbox-scene.info/applications/core/interface/file/attachment.php?id=2241&amp;key=49aa88211941b267f205ebe904748b23" rel="">XBMC-Videos-Demo.mp4</a>
-	</video>
-
-
-<p>
-	Aside from scrapers for multimedia, support for rich library capabilities for games has also been added. XBMC has always been a media-first app, and now users can enjoy the library experience that they've come to love for media now in the context of their games library <em>(more info below)</em>.
-</p>
-
-<h2>
-	Improved Task Scheduling and Multitasking
-</h2>
-
-<p>
-	Despite the constraints of the Xbox’s single-threaded 733MHz CPU, XBMC 4.0 includes improvements to task scheduling that allow multiple activities to run concurrently. Background library updates, metadata scraping, and audio/video playback can occur while users navigate and use other parts of the interface. These optimizations help ensure a fluid experience without compromising performance. Much work has been done "under the hood" to keep XBMC on task and within memory budgets while achieving multi-tasking on a console that wasn't exactly designed with it in mind. Users who own RAM and/or CPU upgraded consoles can also take advantage of the extra overhead, as XBMC 4.0 makes use of the extra horsepower for an even smoother experience. Utilizing an SSD with higher UDMA speeds will also yield an improvement in overall responsiveness.
-</p>
-
-<h2>
-	Music Experience and Visualizers
-</h2>
-
-<p>
-	Music playback has always been a strong element of XBMC, and version 4.0 maintains that focus. The Original Xbox is capable of high quality audio output, and XBMC continues to support lossless codecs such as FLAC. The release includes compatibility with various audio visualizers, including MilkDrop, which remains one of the most visually impressive and customizable audio visualization engines available. These features allow XBMC 4.0 to function not only as a media organizer, but also as an immersive audio display system.
-</p>
-
-<p>
-	An online repository has been established and will be maintained moving forward where users can download legacy and newly-released&nbsp;add-ons as they become available. This repository is&nbsp;accessible without additional setup, right out of the box!
-</p>
-
-<p>
-	<a data-fileext="jpg" data-fileid="2243" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music.jpg.c304f3be158479bd160908308db9e0ed.jpg" rel=""><img alt="XBMC-music.thumb.jpg.3f4ed355dc9f3ed04db5aa577df654e6.jpg" data-fileid="2243" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music.thumb.jpg.3f4ed355dc9f3ed04db5aa577df654e6.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>&nbsp;<a data-fileext="jpg" data-fileid="2244" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music2.jpg.0472050e0f3ce038a5751aedbe02e065.jpg" rel=""><img alt="XBMC-music2.thumb.jpg.256c38a610650ca49cddef1d5c6017a7.jpg" data-fileid="2244" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music2.thumb.jpg.256c38a610650ca49cddef1d5c6017a7.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>&nbsp;<a data-fileext="jpg" data-fileid="2245" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music3.jpg.8d3c60493e80903644f9b4b51464e8c0.jpg" rel=""><img alt="XBMC-music3.thumb.jpg.fc6de207e86f9123f0e49d31c57b4f14.jpg" data-fileid="2245" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-music3.thumb.jpg.fc6de207e86f9123f0e49d31c57b4f14.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>
-</p>
-
-<h2>
-	Add-ons and Python Support
-</h2>
-
-<p>
-	XBMC 4.0 continues to offer an extendable architecture powered by Python-based add-ons. While the current release uses Python 2.7 for compatibility, work is underway to transition to Python 3.4.10 in the future, which may provide a path for backporting many newer Kodi add-ons. Even in its current state, XBMC 4.0 already supports a variety of community-developed add-ons that extend the system’s functionality, including tools for online video playback (i.e. YouTube), online weather services, and enhanced media organization.
-</p>
-
-<p>
-	<a data-fileext="jpg" data-fileid="2247" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-addons-youtube.jpg.988ff74c9730614473d528ee8e419a40.jpg" rel=""><img alt="XBMC-addons-youtube.thumb.jpg.42ee3ef857ee34dd8ac8c74a1090dfb9.jpg" data-fileid="2247" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-addons-youtube.thumb.jpg.42ee3ef857ee34dd8ac8c74a1090dfb9.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png">&nbsp;</a><a data-fileext="jpg" data-fileid="2246" href="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-addons-weather.jpg.ef6fb42b52e1f0b899a271f125086b4a.jpg" rel=""><img alt="XBMC-addons-weather.thumb.jpg.f347831366e1612b9b71dcde644a58c7.jpg" data-fileid="2246" data-ratio="56.40" width="1000" data-src="https://www.xbox-scene.info/uploads/monthly_2025_11/XBMC-addons-weather.thumb.jpg.f347831366e1612b9b71dcde644a58c7.jpg" src="https://www.xbox-scene.info/applications/core/interface/js/spacer.png"></a>
-</p>
-
-<h2>
-	Updated Settings, Network Services, and System Tools
-</h2>
-
-<p>
-	The settings interface has been revised to provide more clarity and control. The update includes:
-</p>
-
-<ul>
-	<li>
-		<p>
-			Playback options, including episode progression, crossfade behavior, and subtitle handling
-		</p>
-	</li>
-	<li>
-		<p>
-			Library management tools
-		</p>
-	</li>
-	<li>
-		<p>
-			Network features, such as SMB, FTP, UPnP sharing, web server access, and Insignia-compatible DNS options
-		</p>
-	</li>
-	<li>
-		<p>
-			Comprehensive interface customization options
-		</p>
-	</li>
-	<li>
-		<p>
-			Multiple user profiles with individual library settings
-		</p>
-	</li>
-	<li>
-		<p>
-			Advanced system controls for video calibration, display modes, input devices, and power management
-		</p>
-	</li>
-	<li>
-		<p>
-			A robust System Information section for diagnostics, with info geared towards the Original Xbox
-		</p>
-	</li>
-	<li>
-		<p>
-			A flexible File Manager with support for network protocols including FTP, SMB, WebDAV, and more
-		</p>
-	</li>
-</ul>
-
-<p>
-	Users may also take advantage of an online add-ons repository, offering the same experience modern Kodi provides with being able to download add-ons to extend functionality of the app with things like online multimedia providers, weather, skins, visualizers, and more. Developers can submit new add-ons to the official repository via <a href="https://github.com/xbmc4xbox/xbmc4xbox.github.io" rel="external nofollow">Github</a>.
-</p>
-
-<h2>
-	Continuing the Legacy
-</h2>
-
-<p>
-	XBMC has been a staple of the Original Xbox's homebrew scene since its inception in the early 2000's. This new update is a revival of the platform that helped shape the landscape of home media software and helps revitalize a codebase that has been somewhat stagnant for many years. This release honors that heritage while modernizing the experience for a new generation of enthusiasts and preserving the functionality of the Original Xbox as a versatile and capable media center.
-</p>
-
-<p>
-	Although the hardware is decades old, the renewed effort behind XBMC 4.0 demonstrates that the platform still has room to grow and tricks up its sleeve. With ongoing development and a codebase designed with modern Kodi compatibility in mind, XBMC 4.0 represents a significant step forward into the continued development on the Original Xbox.
-</p>
-
-<p>
-	The development team looks forward to continuing this work and expanding the possibilities of the Original Xbox for years to come. This version is the first of many to come, with lots of things cooking in the background. Keep an eye out for future releases by joining the <strong><a href="https://www.xbox-scene.info/discord/invite/XboxScene/" rel="">Xbox-Scene Discord</a></strong> and turning on notifications in the <strong><a href="https://discord.com/channels/770816616937160745/1440261544276394075" rel="external nofollow">xbmc-news</a></strong> channel or by periodically checking the project's Github page.
-</p>
-
-<h2>
-	Downloads
-</h2>
-
-<p>
-	XBMC 4.0 (and subsequent releases) builds along with source code are available via Github:
-</p>
-
-<p>
-	<span><a href="https://github.com/antonic901/xbmc4xbox-redux/releases/tag/nightly" rel="external nofollow">Download XBMC 4.0</a></span>
-</p>
-
-<p>
-	Main project page:&nbsp;<em><a href="https://github.com/antonic901/xbmc4xbox-redux" rel="external nofollow">Click Here</a></em>
-</p>
-
-<p>
-	<em>Note: XBMC 4.0 is is in active development! This means updates will be released in a more frequent manner for the time being until things settle down. Check the nightly builds section on Github for the most up-to-date version.</em>
-</p>
-
-<h2>
-	Contributions
-</h2>
-
-<p>
-	XBMC is open source software and welcomes contributions.
-</p>
-
-<ul>
-	<li>
-		<strong>Coding:</strong> Developers can help XBMC by <strong><a href="https://github.com/antonic901/xbmc4xbox-redux/issues" rel="external nofollow">fixing a bug</a></strong>, adding new features, making our technology smaller and faster and making development easier for others. XBMC's codebase consists mainly of C++ with small parts written in a variety of coding languages. Our add-ons mainly consist of python and XML.
-	</li>
-	<li>
-		<strong>Helping users:</strong> Our support process relies on enthusiastic contributors like you to help others get the most out of XBMC. The #1 priority is always answering questions in our <strong><a href="https://discord.com/channels/770816616937160745/1050581194401652736" rel="external nofollow">support forums</a></strong>. Everyday new people discover XBMC, and everyday they are virtually guaranteed to have questions.
-	</li>
-	<li>
-		<strong>Localization:</strong> Translate <strong>XBMC</strong>, <strong>add-ons, skins etc.</strong> into your native language.
-	</li>
-	<li>
-		<strong>Add-ons:</strong> <strong>Add-ons</strong> are what make XBMC the most extensible and customizable entertainment hub available. <strong><a href="https://kodi.tv/create-an-addon" rel="external nofollow">Get started building an add-on</a></strong>.
-	</li>
-</ul>
-
-<h2>
-	Support and Bug Reporting
-</h2>
-
-<p>
-	Need help?
-</p>
-
-<p>
-	Support can be found in the <a href="https://discord.com/channels/770816616937160745/1050581194401652736" rel="external nofollow">XBMC -&gt; General</a> channel within the <a href="https://discord.gg/VcdSfajQGK" rel="external nofollow">Xbox-Scene Discord server</a>.
-</p>
-
-<h2>
-	Credits and Disclaimers
-</h2>
-
-<ul>
-	<li>
-		<strong>Nikola Antonić</strong> -&nbsp;Primary Developer, Project Lead
-	</li>
-	<li>
-		<strong>astarivi</strong> -&nbsp;Contributor&nbsp;(cURL, wolfSSL), Tester, Debugger
-	</li>
-	<li>
-		<strong>EqUiNoX</strong> - Contrubitor, Tester
-	</li>
-	<li>
-		<strong>Rocky5</strong> - Contributor, Tester
-	</li>
-	<li>
-		<strong>.lavenderStarlight+</strong> -&nbsp;Add-ons / Skins Development, Tester
-	</li>
-	<li>
-		<strong>GoTeamScotch</strong> - Tester, Feedback
-	</li>
-	<li>
-		<strong>Haguero</strong> - Tester, Feedback
-	</li>
-</ul>
-
-
-
-<p>
-	XBMC is <strong>GPLv2 licensed</strong>. You may use, distribute and copy it under the license terms.&nbsp;XBMC is licensed under the same terms as Kodi. For detailed information on the licensing, please refer to the <a href="https://github.com/xbmc/xbmc/tree/master/LICENSES#kodis-licensing-rules" rel="external nofollow">Kodi license</a>.
-</p>
-
-<p>
-	This project, XBMC version 4.0 (and upcoming releases), is distinct from and is not affiliated with Team Kodi of The Kodi Foundation, or its members.&nbsp;
-</p>
-</section></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[We should all be using dependency cooldowns (393 pts)]]></title>
-            <link>https://blog.yossarian.net/2025/11/21/We-should-all-be-using-dependency-cooldowns</link>
-            <guid>46005111</guid>
-            <pubDate>Fri, 21 Nov 2025 14:50:36 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://blog.yossarian.net/2025/11/21/We-should-all-be-using-dependency-cooldowns">https://blog.yossarian.net/2025/11/21/We-should-all-be-using-dependency-cooldowns</a>, See on <a href="https://news.ycombinator.com/item?id=46005111">Hacker News</a></p>
-<div id="readability-page-1" class="page">
-
-<h2>ENOSUCHBLOG</h2>
-<h2><em>Programming, philosophy, pedaling.</em></h2>
-
-<ul>
-    <li><a href="https://blog.yossarian.net/">Home</a></li>
-    <li><a href="https://blog.yossarian.net/tags">Tags</a></li>
-    <li><a href="https://blog.yossarian.net/series">Series</a></li>
-    <li><a href="https://blog.yossarian.net/favorites">Favorites</a></li>
-    <li><a href="https://blog.yossarian.net/archive">Archive</a></li>
-    
-    <li><a href="https://yossarian.net/">Main Site</a></li>
-    <li><a href="https://yossarian.net/til">TILs</a></li>
-    
-</ul>
-
-<hr>
-
-
-
-<h2>
-  <p>
-    <span><em>Nov 21, 2025</em></span>
-
-    &nbsp; &nbsp;
-
-    
-      <span>
-        Tags:
-        
-        
-          <a href="https://blog.yossarian.net/tags#oss">oss</a>,
-        
-          <a href="https://blog.yossarian.net/tags#security">security</a>
-        
-      </span>
-    
-
-    &nbsp; &nbsp;
-
-    
-  </p>
-</h2>
-
-
-
-
-
-
-<hr>
-
-
-<p><strong>TL;DR</strong>: Dependency cooldowns are a free, easy, and <strong>incredibly effective</strong>
-way to mitigate the <em>large majority</em> of open source supply chain attacks.
-More individual projects should apply cooldowns (via tools like Dependabot
-and Renovate) to their dependencies, and packaging ecosystems should invest
-in first-class support for cooldowns directly in their package managers.</p>
-
-<hr>
-
-<p>“Supply chain security” is a serious problem. It’s also <strong>seriously overhyped</strong>,
-in part because dozens of vendors have a vested financial interest in
-convincing your that their <em>framing</em> of the underlying problem<sup id="fnref:problem"><a href="#fn:problem" rel="footnote" role="doc-noteref">1</a></sup> is (1)
-correct, and (2) worth your money.</p>
-
-<p>What’s consternating about this is that most open source supply chain
-attacks have the same basic structure:</p>
-
-<ol>
-  <li>
-    <p>An attacker compromises a popular open source project, typically via
-a stolen credential or CI/CD vulnerabilty (such as <a href="https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/">“pwn requests”</a> in
-GitHub Actions).</p>
-  </li>
-  <li>
-    <p>The attacker introduces a malicious change to the project and uploads
-it somewhere that will have <strong>maximum effect</strong> (PyPI, npm, GitHub releases,
-&amp;c., depending on the target).</p>
-
-    <p>At this point, the <em>clock has started</em>, as the attacker has moved
- into the public.</p>
-  </li>
-  <li>
-    <p>Users pick up the compromised version of the project via automatic
-dependency updates or a lack of dependency pinning.</p>
-  </li>
-  <li>
-    <p>Meanwhile, the aforementioned vendors are scanning public indices
-as well as customer repositories for signs of compromise, and
-provide alerts upstream (e.g. to PyPI).</p>
-
-    <p>Notably, vendors are <em>incentivized</em> to report quickly and loudly upstream,
- as this increases the perceived value of their services in a crowded
- field.</p>
-  </li>
-  <li>
-    <p>Upstreams (PyPI, npm, &amp;c.) remove or disable the compromised package
-version(s).</p>
-  </li>
-  <li>
-    <p>End-user remediation begins.</p>
-  </li>
-</ol>
-
-<p>The key thing to observe is that the gap between (1) and (2) can be very large<sup id="fnref:gap"><a href="#fn:gap" rel="footnote" role="doc-noteref">2</a></sup>
-(weeks or months), while the gap between (2) and (5) is <strong>typically very small</strong>:
-hours or days. This means that, once the attacker has moved into the actual
-exploitation phase, their <em>window of opportunity</em> to cause damage is pretty limited.</p>
-
-<p><img src="https://blog.yossarian.net/assets/supply-chain-attack-timeline.png" alt="Figure: a not very scientific visualization of the phases above."></p>
-
-<p>We can see this with numerous prominent supply chain attacks over the last 18 months<sup id="fnref:filippo"><a href="#fn:filippo" rel="footnote" role="doc-noteref">3</a></sup>:</p>
-
-<table>
-  <thead>
-    <tr>
-      <th>Attack</th>
-      <th>Approx. Window of Opportunity</th>
-      <th>References</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>xz-utils</td>
-      <td>≈ 5 weeks<sup id="fnref:outlier"><a href="#fn:outlier" rel="footnote" role="doc-noteref">4</a></sup></td>
-      <td><a href="https://research.swtch.com/xz-timeline">Source</a></td>
-    </tr>
-    <tr>
-      <td>Ultralytics (phase 1)</td>
-      <td>12 hours</td>
-      <td><a href="https://blog.yossarian.net/2024/12/06/zizmor-ultralytics-injection#appendix-rough-timeline-of-events">Source</a></td>
-    </tr>
-    <tr>
-      <td>Ultralytics (phase 2)</td>
-      <td>1 hour</td>
-      <td><a href="https://blog.yossarian.net/2024/12/06/zizmor-ultralytics-injection#appendix-rough-timeline-of-events">Source</a></td>
-    </tr>
-    <tr>
-      <td>tj-actions</td>
-      <td>3 days</td>
-      <td><a href="https://www.legitsecurity.com/blog/github-actions-tj-actions-changed-files-attack">Source</a></td>
-    </tr>
-    <tr>
-      <td>chalk</td>
-      <td>&lt; 12 hours</td>
-      <td><a href="https://cycode.com/blog/npm-debug-chalk-supply-chain-attack-the-complete-guide/">Source</a></td>
-    </tr>
-    <tr>
-      <td>Nx</td>
-      <td>4 hours</td>
-      <td><a href="https://www.stepsecurity.io/blog/supply-chain-security-alert-popular-nx-build-system-package-compromised-with-data-stealing-malware">Source</a></td>
-    </tr>
-    <tr>
-      <td>rspack</td>
-      <td>1 hour</td>
-      <td><a href="https://github.com/web-infra-dev/rspack/releases/tag/v1.1.8">Source</a></td>
-    </tr>
-    <tr>
-      <td>num2words</td>
-      <td>&lt; 12 hours</td>
-      <td><a href="https://blog.pypi.org/posts/2025-07-31-incident-report-phishing-attack/#impact-analysis">Source</a></td>
-    </tr>
-    <tr>
-      <td>Kong Ingress Controller</td>
-      <td>≈ 10 days</td>
-      <td><a href="https://konghq.com/blog/product-releases/december-2024-unauthorized-kong-ingress-controller-3-4-0-build">Source</a></td>
-    </tr>
-    <tr>
-      <td>web3.js</td>
-      <td>5 hours</td>
-      <td><a href="https://threats.wiz.io/all-incidents/solana-web3js-supply-chain-attack">Source</a></td>
-    </tr>
-  </tbody>
-</table>
-
-<p>(Each of these attacks has significant downstream effect, of course, but only
-<em>within</em> their window of opportunity. Subsequent compromises from each, like
-<a href="https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack">Shai-Hulud</a>, represent <em>new</em> windows of opportunity where the attackers regrouped
-and pivoted onto the <em>next</em> set of compromised credentials.)</p>
-
-<p>My takeaway from this: some windows of opportunity are bigger, but the <em>majority</em>
-of them are under a week long. Consequently, ordinary developers can <em>avoid
-the bulk</em> of these types of attacks by instituting <strong>cooldowns</strong> on their dependencies.</p>
-
-<h2 id="cooldowns">Cooldowns</h2>
-
-<p>A “cooldown” is exactly what it sounds like: a window of time between when a dependency
-is published and when it’s considered suitable for use. The dependency is public during
-this window, meaning that “supply chain security” vendors can work their magic
-while the rest of us wait any problems out.</p>
-
-<p>I <strong>love</strong> cooldowns for several reasons:</p>
-
-<ul>
-  <li>
-    <p>They’re empirically effective, per above. They won’t stop <em>all</em> attackers,
-but they <em>do</em> stymie the majority of high-visibiity, mass-impact supply chain
-attacks that have become more common.</p>
-  </li>
-  <li>
-    <p>They’re <em>incredibly</em> easy to implement. Moreover, they’re <strong>literally free</strong>
-to implement in most cases: most people can use <a href="https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference#cooldown-">Dependabot’s functionality</a>,
-<a href="https://docs.renovatebot.com/key-concepts/minimum-release-age/">Renovate’s functionality</a>, or the functionality build directly into their
-package manager<sup id="fnref:pkgmanager"><a href="#fn:pkgmanager" rel="footnote" role="doc-noteref">5</a></sup>.</p>
-
-    <p>This is how simple it is in Dependabot:</p>
-
-    <div><pre><code><table><tbody><tr><td><pre>1
-2
-3
-4
-5
-6
-7
-8
-9
-</pre></td><td><pre>  <span>version</span><span>:</span> <span>2</span>
-
-  <span># update once a week, with a 7-day cooldown</span>
-  <span>-</span> <span>package-ecosystem</span><span>:</span> <span>github-actions</span>
-    <span>directory</span><span>:</span> <span>/</span>
-    <span>schedule</span><span>:</span>
-      <span>interval</span><span>:</span> <span>weekly</span>
-    <span>cooldown</span><span>:</span>
-      <span>default-days</span><span>:</span> <span>7</span>
-</pre></td></tr></tbody></table></code></pre></div>
-
-    <p>(Rinse and repeat for other ecosystems as needed.)</p>
-  </li>
-  <li>
-    <p>Cooldowns <strong>enforce positive behavior</strong> from supply chain security vendors:
-vendors are still incentivized to discover and report attacks quickly,
-but are <em>not</em> as incentivized to emit volumes of blogspam about “critical”
-attacks on largely underfunded open source ecosystems.</p>
-  </li>
-</ul>
-
-<h2 id="concluding--assorted-thoughts">Concluding / assorted thoughts</h2>
-
-<p>In the very small sample set above, 8/10 attacks had windows of opportunity
-of less than a week. Setting a cooldown of 7 days would have prevented
-the vast majority of these attacks from reaching end users (and causing
-knock-on attacks, which several of these were). Increasing the cooldown to 14
-days would have prevented all but 1 of these attacks<sup id="fnref:apt"><a href="#fn:apt" rel="footnote" role="doc-noteref">6</a></sup>.</p>
-
-<p>Cooldowns are, obviously, <strong>not a panacea</strong>: some attackers <em>will</em> evade detection,
-and delaying the inclusion of potentially malicious dependencies by a week
-(or two) does not fundamentally alter the fact that supply chain security is a
-<em>social trust</em> problem, not a purely technical one. Still, an 80-90% reduction
-in exposure through a technique that is free and easy seems hard to beat.</p>
-
-<p>Related to the above, it’s unfortunate that cooldowns aren’t baked <em>directly</em>
-into more packaging ecosystems: Dependabot and Renovate are great, but
-<em>even better</em> would be if the package manager itself (as the source of ground
-truth) could enforce cooldowns directly (including of dependencies not
-introduced or bumped through automated flows).</p>
-
-<hr>
-
-
-
-
-<hr>
-
-
-
-
-  
-
-
-
-
-
-
-</div>]]></description>
         </item>
     </channel>
 </rss>
