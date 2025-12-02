@@ -4,12 +4,12 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 02 Dec 2025 18:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 02 Dec 2025 19:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Bun has been acquired by Anthropic (160 pts)]]></title>
+            <title><![CDATA[Bun has been acquired by Anthropic (538 pts)]]></title>
             <link>https://bun.com/blog/bun-joins-anthropic</link>
             <guid>46124267</guid>
             <pubDate>Tue, 02 Dec 2025 18:05:44 GMT</pubDate>
@@ -17,7 +17,185 @@
 &lt;Not HTML&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Peter Thiel's Apocalyptic Worldview Is a Dangerous Fantasy (161 pts)]]></title>
+            <title><![CDATA[100k TPS over a billion rows: the unreasonable effectiveness of SQLite (114 pts)]]></title>
+            <link>https://andersmurphy.com/2025/12/02/100000-tps-over-a-billion-rows-the-unreasonable-effectiveness-of-sqlite.html</link>
+            <guid>46124205</guid>
+            <pubDate>Tue, 02 Dec 2025 17:59:53 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://andersmurphy.com/2025/12/02/100000-tps-over-a-billion-rows-the-unreasonable-effectiveness-of-sqlite.html">https://andersmurphy.com/2025/12/02/100000-tps-over-a-billion-rows-the-unreasonable-effectiveness-of-sqlite.html</a>, See on <a href="https://news.ycombinator.com/item?id=46124205">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article><hgroup><p><time datetime="2025-12-02T00:00:00+00:00">02 Dec 2025</time></p></hgroup><hr><p>SQLite doesn't have MVCC! It only has a single writer! SQLite is for phones and mobile apps (and the occasional airliner)! For web servers use a proper database like Postgres! In this article I'll go over why  being embedded and a single writer are not deficiencies but actually allow SQLite to scale so unreasonably well.</p><h2 id="prelude">Prelude</h2><p>For the code examples I will be using Clojure. But, what they cover should be applicable to most programming language.</p><p>The machine these benchmarks run on has the following specs:</p><ul><li>MacBook Pro (2021)</li><li>Chip: Apple M1 Pro</li><li>Memory: 16 GB</li></ul><p>These benchmarks are not meant to be perfect or even optimal. They are merely to illustrate that it's relatively easy to achieve decent write throughput with SQLite. Usual benchmark disclaimers apply. </p><h2 id="defining_tps">Defining TPS</h2><p>When I say TPS I don't mean writes/updates per second. I'm talking about transactions per second, specifically interactive transactions that are common when building web applications. By interactive transactions I mean transactions where you execute some queries, run some application code and then execute more queries. For example:</p><pre><code>BEGIN;
+UPDATE accounts SET balance = balance - 100.00
+    WHERE name = 'Alice';
+-- some application code runs
+UPDATE accounts SET balance = balance + 100.00
+    WHERE name = 'Bob';
+COMMIT;
+</code></pre><p>Transactions are useful because they let you rollback the state of your changes if your application encounters a problem.</p><h2 id="the_benchmark_harness">The benchmark harness</h2><p>To simulate requests we spin up <code>n</code> virtual threads (green threads) that each execute a function <code>f</code> this is analogous to handlers on a web server and will give us similar contention. Worth noting that this is high burst. I.e we will reach <code>n</code> level concurrent requests as fast as the system can spin up the virtual threads.</p><pre><code><span>(</span>defmacro <strong>tx-per-second</strong> [n &amp; body]
+  `<span>(</span>let [ids#   <span>(</span>range 0 ~n<span>)</span>
+         start# <span>(</span>. System <span>(</span>nanoTime<span>))</span>]
+     <span>(</span>-&gt;&gt; ids#
+       <span>;; Futures are using virtual threads so blocking is not slow
+</span>       <span>(</span>mapv <span>(</span>fn [_#] <span>(</span>future ~@body<span>)))</span>
+       <span>(</span>run! deref<span>))</span>
+     <span>(</span>int <span>(</span>/ ~n <span>(</span>/ <span>(</span>double <span>(</span>- <span>(</span>. System <span>(</span>nanoTime<span>))</span> start#<span>))</span> 1000000000.0<span>)))))</span>
+</code></pre><p>For the Clojure programmers among you <code>future</code> has been altered to use virtual threads. So, we can spin up millions if we need to.</p><pre><code><span>;; Make futures use virtual threads
+</span><span>(</span>set-agent-send-executor!
+  <span>(</span>Executors/newVirtualThreadPerTaskExecutor<span>))</span>
+<span>(</span>set-agent-send-off-executor!
+  <span>(</span>Executors/newVirtualThreadPerTaskExecutor<span>))</span>
+</code></pre><p>We'll be using Postgres  as our network database (I'm using Postgres, but the same applies to MySQL etc) with a high performance connection pool optimised for our number of cores. </p><pre><code><span>(</span>defonce <strong>pg-db</strong>
+  <span>(</span>jdbc/with-options
+    <span>(</span>connection/-&gt;pool
+      HikariDataSource
+      {:dbtype          "postgres"
+       :dbname          "thedb"
+       :username        <span>(</span>System/getProperty "user.name"<span>)</span>
+       :password        ""
+       :minimumIdle     8
+       :maximumPoolSize 8}<span>)</span>
+    {}<span>))</span>
+</code></pre><p>We'll be using SQLite with a single writer connection and a number of reader connections equal to our number of cores.</p><pre><code><span>(</span>defonce <strong>lite-db</strong>
+  <span>(</span>d/init-db! "database.db"
+    {:pool-size 8
+     :pragma {:cache_size         15625
+              :page_size          4096
+              :journal_mode       "WAL"
+              :synchronous        "NORMAL"
+              :temp_store         "MEMORY"
+              :busy_timeout       5000}}<span>))</span>
+</code></pre><p>Our databases will have a simple schema:</p><pre><code><span>(</span>jdbc/execute! pg-db
+  ["CREATE TABLE IF NOT EXISTS account<span>(</span>id INT PRIMARY KEY, balance INT<span>)</span>"]<span>)</span>
+<span>(</span>d/q <span>(</span>lite-db :writer<span>)</span>
+  ["CREATE TABLE IF NOT EXISTS account<span>(</span>id PRIMARY KEY, balance INT<span>)</span>"]<span>)</span>
+</code></pre><p>And each contain a billion rows:</p><pre><code><span>(</span>-&gt;&gt; <span>(</span>range 0 <span>(</span>* 1000 1000 1000<span>))</span>
+  <span>(</span>partition-all 32000<span>)</span>
+  <span>(</span>run!
+    <span>(</span>fn [batch]
+      <span>(</span>jdbc-sql/insert-multi! pg-db :account
+        <span>(</span>mapv <span>(</span>fn [id] {:id id :balance 1000000000}<span>)</span> batch<span>)))))</span>
+        
+<span>(</span>-&gt;&gt; <span>(</span>range 0 <span>(</span>* 1000 1000 1000<span>))</span>
+  <span>(</span>partition-all 100000<span>)</span>
+  <span>(</span>run!
+    <span>(</span>fn [batch]
+      <span>(</span>d/with-write-tx [tx <span>(</span>lite-db :writer<span>)</span>]
+        <span>(</span>run!
+          <span>(</span>fn [id]
+            <span>(</span>d/q tx
+              ["INSERT INTO account<span>(</span>id, balance<span>)</span> VALUES <span>(</span>?,?<span>)</span>" id 1000000000]<span>))</span>
+          batch<span>)))))</span>
+</code></pre><p>Our user distribution will follow a <a href="https://en.wikipedia.org/wiki/Power_law">power law</a>. I.e the top X percent will be involved in most of the transactions. We have a billion users, so in practice most of those won't be active, or be active rarely. <code>0.9995</code> means 99.95% of transactions will be done by 0.05% of users. This still means around 100000 unique active users at any given time. </p><p>The reason we are using a power law, is that's a very common distribution for a lot of real products. If you think about a credit card payment system, in the context of retail, the largest number of transactions are most likely with a few large retailers (Amazon, Walmart etc).</p><pre><code><span>(</span>defn <strong>pareto-user</strong> []
+  <span>(</span>rand-pareto <span>(</span>* 1000 1000 1000<span>)</span> 0.9995<span>))</span>
+</code></pre><p><code>rand-pareto</code> turns a random distribution into a power law distribution.</p><pre><code><span>(</span>defn <strong>rand-pareto</strong> [r p]
+  <span>(</span>let [a <span>(</span>/ <span>(</span>Math/log <span>(</span>- 1.0 p<span>))</span> <span>(</span>Math/log p<span>))</span>
+        x <span>(</span>rand<span>)</span>
+        y <span>(</span>/ <span>(</span>- <span>(</span>+ <span>(</span>Math/pow x a<span>)</span> 1.0<span>)</span>
+               <span>(</span>Math/pow <span>(</span>- 1.0 x<span>)</span> <span>(</span>/ 1.0 a<span>)))</span>
+            2.0<span>)</span>]
+    <span>(</span>long <span>(</span>* r y<span>))))</span>
+</code></pre><h2 id="network_database">Network database</h2><p>Let's start with a network database.</p><pre><code><span>(</span>tx-per-second 100000
+  <span>(</span>jdbc/with-transaction [tx pg-db]
+    <span>(</span>jdbc/execute! tx <span>(</span>credit-random-account<span>))</span>
+    <span>(</span>jdbc/execute! tx <span>(</span>debit-random-account<span>))))</span>
+    
+<span>;; =&gt; 13756 TPS
+</span></code></pre><p>A respectable 13756 TPS.</p><p>However, normally a network database will not be on the same server as our application. So let's simulate some network latency. Let's say you have 5ms latency between your app server and your database.</p><pre><code><span>(</span>tx-per-second 10000
+  <span>(</span>jdbc/with-transaction [tx pg-db]
+    <span>(</span>jdbc/execute! tx <span>(</span>credit-random-account<span>))</span>
+    <span>(</span>Thread/sleep 5<span>)</span>
+    <span>(</span>jdbc/execute! tx <span>(</span>debit-random-account<span>))))</span>
+    
+<span>;; =&gt; 1214 TPS
+</span></code></pre><p><em>Note: virtual threads do not sleep a real thread. They instead park allowing the underlying carrier thread to resume another virtual thread.</em></p><p>What if we increase that latency to 10ms?</p><pre><code><span>(</span>tx-per-second 10000
+  <span>(</span>jdbc/with-transaction [tx pg-db]
+    <span>(</span>jdbc/execute! tx <span>(</span>credit-random-account<span>))</span>
+    <span>(</span>Thread/sleep 10<span>)</span>
+    <span>(</span>jdbc/execute! tx <span>(</span>debit-random-account<span>))))</span>
+    
+<span>;; =&gt; 702 TPS
+</span></code></pre><p>But, wait our transactions are not serialisable, which they need to be if we want consistent transaction processing (SQLite is isolation serialisable by design). We better fix that and handle retries.</p><pre><code><span>(</span>tx-per-second 10000
+  <span>(</span>loop []
+    <span>(</span>let [result
+          <span>(</span>try
+            <span>(</span>jdbc/with-transaction [tx pg-db {:isolation :serializable}]
+              <span>(</span>jdbc/execute! tx <span>(</span>credit-random-account<span>))</span>
+              <span>(</span>Thread/sleep 10<span>)</span>
+              <span>(</span>jdbc/execute! tx  <span>(</span>debit-random-account<span>)))</span>
+            <span>(</span>catch Exception _ nil<span>))</span>]
+      <span>(</span>when-not result <span>(</span>recur<span>)))))</span>
+
+<span>;; =&gt; 660 TPS
+</span></code></pre><p>What if the interactive transaction has an extra query (an extra network hop)?</p><pre><code><span>(</span>tx-per-second 10000
+  <span>(</span>loop []
+    <span>(</span>let [result
+          <span>(</span>try
+            <span>(</span>jdbc/with-transaction [tx pg-db {:isolation :serializable}]
+              <span>(</span>jdbc/execute! tx <span>(</span>credit-random-account<span>))</span>
+              <span>(</span>Thread/sleep 10<span>)</span>
+              <span>(</span>jdbc/execute! tx  <span>(</span>debit-random-account<span>))</span>
+              <span>(</span>Thread/sleep 10<span>)</span>
+              <span>(</span>jdbc/execute! tx  <span>(</span>debit-random-account<span>)))</span>
+            <span>(</span>catch Exception _ nil<span>))</span>]
+      <span>(</span>when-not result <span>(</span>recur<span>)))))</span>
+
+<span>;; =&gt; 348 TPS
+</span></code></pre><p>348 TPS! What's going on here? <a href="https://en.wikipedia.org/wiki/Power_law">Amdoahl's Law</a> strikes!</p><blockquote><p>the overall performance improvement gained by optimizing a single part of a system is limited by the fraction of time that the improved part is actually used. </p></blockquote><p>We're holding transactions with row locks across a network with high contention because of the power law. What's terrifying about this is no amount of additional (cpu/servers/memory) is going to save us. This is a hard limit caused by the network. What's worse, in any unexpected increase in latency will exacerbate the problem. Which also means you can't have application servers in different data centres than your database (because of the increased latency). </p><p>I learnt this the hard way building an emoji based tipping bot for discord. At the time I didn't understand why we were hitting this hard limit in TPS. We ended up sacrificing the convenience of interactive transactions and moving everything into stored procedures (meaning no locks across the network). However, in a lot of domains this isn't possible.</p><h2 id="embedded_means_no_network">Embedded means no network</h2><p>Let's see how SQLite fares.</p><pre><code><span>(</span>tx-per-second 1000000
+  <span>(</span>d/with-write-tx [tx <span>(</span>lite-db :writer<span>)</span>]
+    <span>(</span>d/q tx <span>(</span>credit-random-account<span>))</span>
+    <span>(</span>d/q tx <span>(</span>debit-random-account<span>))))</span>
+
+<span>;; =&gt; 44096 TPS
+</span></code></pre><p>44096 TPS! By eliminating the network SQLite massively reduces the impact of Amdahl's law.</p><h2 id="single_writer_lets_you_batch">Single writer lets you batch</h2><p>We don't need to stop there though. Because, SQLite is a single writer we can batch. <a href="https://github.com/andersmurphy/sqlite4clj">sqlite4clj</a> provides a convenient dynamic batching function. Batch size grows dynamically with the workload and producers don't have to block when the consumer is busy. Effectively it self optimises for latency and throughput.</p><pre><code><span>(</span>defn <strong>batch-fn</strong> [db batch]
+  @<span>(</span>on-pool! lite-write-pool
+     <span>(</span>d/with-write-tx [tx db]
+       <span>(</span>run! <span>(</span>fn [thunk] <span>(</span>thunk tx<span>))</span> batch<span>))))</span>
+       
+<span>(</span>defonce <strong>tx!</strong>
+  <span>(</span>b/async-batcher-init! lite-db
+    {:batch-fn #'batch-fn}<span>))</span>
+</code></pre><p><em>Note: to Clojure/Java programmers we're using a thread pool as SQLite should be treated as CPU not IO, so we don't want it starving our virtual threads (io green threads).</em></p><pre><code><span>(</span>tx-per-second 1000000
+  @<span>(</span>tx!
+     <span>(</span>fn [tx]
+       <span>(</span>d/q tx <span>(</span>credit-random-account<span>))</span>
+       <span>(</span>d/q tx <span>(</span>debit-random-account<span>)))))</span>
+       
+<span>;; =&gt; 186157 TPS
+</span></code></pre><p>But, wait I hear you cry! That's cheating we now don't have isolated transaction failure. Batching is sacrificing fine grained transaction. You're right! Let's fix that.</p><pre><code><span>(</span>tx-per-second 1000000
+  @<span>(</span>tx!
+     <span>(</span>fn  [tx]
+       <span>(</span>d/q tx ["SAVEPOINT inner_tx"]<span>)</span>
+       <span>(</span>try
+         <span>(</span>d/q tx <span>(</span>credit-random-account<span>))</span>
+         <span>(</span>d/q tx <span>(</span>debit-random-account<span>))</span>
+         <span>(</span>catch Throwable _
+           <span>(</span>d/q tx ["ROLLBACK inner_tx"]<span>)))</span>
+       <span>(</span>d/q tx ["RELEASE inner_tx"]<span>))))</span>
+       
+<span>;; =&gt; 121922 TPS
+</span></code></pre><p>SQLite supports nested transactions with <code>SAVEPOINT</code> this lets us have fine-grained transaction rollback whilst still batching our writes. If a transaction fails it won't cause the batch to fail. The only case where the whole batch will fail is in the case of power loss/or a hard crash.</p><h2 id="what_about_concurrent_reads%3F">What about concurrent reads?</h2><p>Generally systems have a mix of reads and writes, somewhere in the region of 75% reads to 25% writes. So let's add some writes.</p><pre><code><span>(</span>tx-per-second 1000000
+  <span>(</span>on-pool! lite-read-pool
+    <span>(</span>d/q <span>(</span>lite-db :reader<span>)</span>
+      ["select * from account where id = ? limit 1" <span>(</span>pareto-user<span>)</span>]<span>))</span>
+  <span>(</span>on-pool! lite-read-pool
+    <span>(</span>d/q <span>(</span>lite-db :reader<span>)</span>
+      ["select * from account where id = ? limit 1" <span>(</span>pareto-user<span>)</span>]<span>))</span>
+  <span>(</span>on-pool! lite-read-pool
+    <span>(</span>d/q <span>(</span>lite-db :reader<span>)</span>
+      ["select * from account where id = ? limit 1" <span>(</span>pareto-user<span>)</span>]<span>))</span>
+  @<span>(</span>tx!
+     <span>(</span>fn  [tx]
+       <span>(</span>d/q tx ["SAVEPOINT inner_tx"]<span>)</span>
+       <span>(</span>try
+         <span>(</span>d/q tx <span>(</span>credit-random-account<span>))</span>
+         <span>(</span>d/q tx <span>(</span>debit-random-account<span>))</span>
+         <span>(</span>catch Throwable _
+           <span>(</span>d/q tx ["ROLLBACK inner_tx"]<span>)))</span>
+       <span>(</span>d/q tx ["RELEASE inner_tx"]<span>))))</span>
+       
+<span>;; =&gt; 102545 TPS
+</span></code></pre><p>102545 TPS!</p><p><em>Note: to Clojure/Java programmers we're using a separate read thread pool so that reads don't starve writes.</em></p><h2 id="tps_report">TPS Report</h2><table><thead><tr><th></th><th>Postgres</th><th>SQLite</th></tr></thead><tbody><tr><td>no network</td><td>13756</td><td>44096</td></tr><tr><td>5ms</td><td>1214</td><td>n/a</td></tr><tr><td>10ms</td><td>702</td><td>n/a</td></tr><tr><td>10ms serializable</td><td>660</td><td>n/a</td></tr><tr><td>batch</td><td>n/a</td><td>186157</td></tr><tr><td>batch savepoint</td><td>n/a</td><td>121922</td></tr><tr><td>batch savepoint + reads</td><td>n/a</td><td>102545</td></tr></tbody></table><h2 id="conclusion">Conclusion</h2><p>Hopefully, this post helps illustrate the unreasonable effectiveness of SQLite as well as the challenges you can run in with Amdahl's law and network databases like postgres.</p><p>The full benchmark code <a href="https://github.com/andersmurphy/clj-cookbook/tree/master/sqlite-vs-postgres">can be found here</a>.</p><p><strong>Further Reading:</strong></p><p>If you want to learn more about Amdahl's law, power laws and how they interact with network databases I highly recommend listening to <a href="https://www.youtube.com/watch?v=9oyhNDv882U">this interview with Joran Greef</a> and watching his talk <a href="https://www.youtube.com/watch?v=yKgfk8lTQuE">1000x: The Power of an Interface for Performance by Joran Dirk Greef</a>.   </p><p>If you want to read about how much further you can scale SQLite checkout <a href="https://use.expensify.com/blog/scaling-sqlite-to-4m-qps-on-a-single-server">Scaling SQLite to 4M QPS on a single server (EC2 vs Bare Metal)</a>.</p><p>If you're thinking of running SQLite in production and wondering how to create streaming replicas, backups and projections checkout <a href="https://litestream.io/">litestream</a>.</p><p>If you still don't think a single machine can handle your workload it's worth reading <a href="https://www.usenix.org/system/files/conference/hotos15/hotos15-paper-mcsherry.pdf">Scalability! But at what COST?</a>.</p><p><strong>Thanks to</strong> Everyone on the <a href="https://discord.gg/bnRNgZjgPh">Datastar discord</a> who read drafts of this and gave me feedback.</p><p><strong>Discussion</strong></p><ul><li><a href="https://news.ycombinator.com/item?id=46124205">hackernews</a></li><li><a href="https://www.reddit.com/r/Clojure/comments/1pchdr3/sqlite4clj_100k_tps_over_a_billion_rows_the/">reddit</a></li></ul></article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Peter Thiel's Apocalyptic Worldview Is a Dangerous Fantasy (170 pts)]]></title>
             <link>https://jacobin.com/2025/11/peter-thiel-palantir-apocalypse-antichrist</link>
             <guid>46122851</guid>
             <pubDate>Tue, 02 Dec 2025 16:23:27 GMT</pubDate>
@@ -53,7 +231,7 @@
 </section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Is 2026 Next Year? (114 pts)]]></title>
+            <title><![CDATA[Is 2026 Next Year? (124 pts)]]></title>
             <link>https://www.google.com/search?q=is+2026+next+year&amp;oq=is+2026+next+year</link>
             <guid>46122071</guid>
             <pubDate>Tue, 02 Dec 2025 15:20:11 GMT</pubDate>
@@ -61,7 +239,7 @@
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Mistral 3 family of models released (430 pts)]]></title>
+            <title><![CDATA[Mistral 3 family of models released (493 pts)]]></title>
             <link>https://mistral.ai/news/mistral-3</link>
             <guid>46121889</guid>
             <pubDate>Tue, 02 Dec 2025 15:01:53 GMT</pubDate>
@@ -146,7 +324,233 @@
 <p dir="ltr"><strong>Together, let’s turn understanding into action.</strong></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Proximity to coworkers increases long-run development, lowers short-term output (2023) (136 pts)]]></title>
+            <title><![CDATA[Zig's new plan for asynchronous programs (111 pts)]]></title>
+            <link>https://lwn.net/SubscriberLink/1046084/4c048ee008e1c70e/</link>
+            <guid>46121539</guid>
+            <pubDate>Tue, 02 Dec 2025 14:31:16 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://lwn.net/SubscriberLink/1046084/4c048ee008e1c70e/">https://lwn.net/SubscriberLink/1046084/4c048ee008e1c70e/</a>, See on <a href="https://news.ycombinator.com/item?id=46121539">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+<p>
+The designers of the
+<a href="https://ziglang.org/">
+Zig programming language</a> have been working to find a
+suitable design for asynchronous code for some time.
+Zig is a carefully minimalist language, and its
+<a href="https://ziglang.org/documentation/0.5.0/#Async-Functions">
+initial design</a> for
+asynchronous I/O did not fit well with its other
+features. Now, the project has
+<a href="https://zig.show/episodes/41/">
+announced</a> (in a Zig SHOWTIME video) a new approach to asynchronous I/O that
+promises to solve the
+<a href="https://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/">
+function coloring</a> problem, and allows writing code that will execute
+correctly using either synchronous or asynchronous I/O.
+</p>
+
+<p>
+In many languages (including Python, JavaScript, and Rust), asynchronous code
+uses special syntax. This can make it difficult to reuse code between
+synchronous and asynchronous parts of a program, introducing a number of headaches for
+library authors. Languages that don't make a syntactical distinction (such as
+Haskell) essentially solve the problem by making everything asynchronous, which
+typically requires the language's runtime to bake in ideas about how programs
+are allowed to execute.
+</p>
+
+<p>
+Neither of those options was deemed suitable for Zig. Its designers wanted to
+find an approach that did not add too much complexity to the language, that
+still permitted fine control over asynchronous operations, and that still made
+it relatively painless to actually write high-performance event-driven I/O. The
+new approach solves this by hiding asynchronous operations behind a new generic
+interface,
+<a href="https://ziglang.org/documentation/master/std/#std.Io">
+<tt>Io</tt></a>.
+</p>
+
+<blockquote>
+The staff here at LWN.net really appreciate the subscribers who make
+our work possible. Is there a chance we could interest you in <a href="https://lwn.net/Promo/daroc2/claim">becoming one of them</a>?
+</blockquote>
+<p>
+Any function that needs to perform an I/O operation will need to have access to
+an instance of the interface. Typically, that is provided by passing the
+instance to the function as a parameter, similar to Zig's
+<a href="https://ziglang.org/documentation/master/std/#std.mem.Allocator">
+<tt>Allocator</tt></a>
+interface for memory allocation. The standard library will include two built-in
+implementations of the interface: <tt>Io.Threaded</tt> and <tt>Io.Evented</tt>.
+The former uses synchronous
+operations except where explicitly asked to run things in parallel (with a
+special function; see below), in which
+case it uses threads. The latter (which is still a work-in-progress) uses an
+event loop and asynchronous I/O. Nothing in the design prevents a Zig programmer
+from implementing their own version, however, so Zig's users retain their fine
+control over how their programs execute.
+</p>
+
+<p>
+Loris Cro, one of Zig's community organizers,
+wrote <a href="https://kristoff.it/blog/zig-new-async-io/">
+an explanation</a> of the new behavior to justify the approach.
+Synchronous code is not much changed,
+other than using the standard library functions that have moved under
+<tt>Io</tt>, he explained. Functions like the example below, which don't involve explicit
+asynchronicity, will continue to work. This example creates a file, sets the
+file to close at the end of the function, and then writes a buffer of data to
+the file. It uses Zig's <tt>try</tt> keyword to handle errors, and
+<tt>defer</tt> to ensure the file is closed. The return type, <tt>!void</tt>,
+indicates that it could return an error, but doesn't return any data:
+</p>
+
+<pre>    const std = @import("std");
+    const Io = std.Io;
+
+    fn saveFile(io: Io, data: []const u8, name: []const u8) !void {
+        const file = try Io.Dir.cwd().createFile(io, name, .{});
+        defer file.close(io);
+        try file.writeAll(io, data);
+    }
+</pre>
+
+<p>
+If this function is given an instance of <tt>Io.Threaded</tt>, it will create
+the file, write data to it, and then close it using ordinary system calls. If it
+is given an instance of <tt>Io.Evented</tt>, it will instead use
+<a href="https://man7.org/linux/man-pages/man7/io_uring.7.html">
+io_uring</a>,
+<a href="https://en.wikipedia.org/wiki/Kqueue">
+kqueue</a>, or some other asynchronous backend suitable to the target operating
+system. In doing so, it might pause the current execution and go work on a
+different asynchronous function.
+Either way, the operation is guaranteed to be complete by the time
+<tt>writeAll()</tt> returns.
+A library author writing a function that involves I/O doesn't need to
+care about which of these things the ultimate user of the library chooses to do.
+</p>
+
+<p>
+On the other hand, suppose that a program wanted to save two files. These
+operations could profitably be done in parallel. If a library author wanted to
+enable that, they could use the <tt>Io</tt> interface's <tt>async()</tt>
+function to express that it does not matter which order the two files are saved in:
+</p>
+
+<pre>    fn saveData(io: Io, data: []const u8) !void {
+        // Calls saveFile(io, data, "saveA.txt")
+        var a_future = io.async(saveFile, .{io, data, "saveA.txt"});
+        var b_future = io.async(saveFile, .{io, data, "saveB.txt"});
+
+        const a_result = a_future.await(io);
+        const b_result = b_future.await(io);
+
+        try a_result;
+        try b_result;
+
+        const out: Io.File = .stdout();
+        try out.writeAll(io, "save complete");
+    }
+</pre>
+
+<p>
+When using an <tt>Io.Threaded</tt> instance, the <tt>async()</tt> function
+doesn't actually do anything asynchronously — it just runs the provided function
+right away. So, with that version of the interface, the function first saves
+file A and then file B. With an <tt>Io.Evented</tt> instance, the operations are
+actually asynchronous, and the program can save both files at once.
+</p>
+
+<p>
+The real advantage of this approach is that it turns asynchronous code into a
+performance optimization. The first version of a program or library can write
+normal straight-line code. Later, if asynchronicity proves to be useful for
+performance, the author can come back and write it using asynchronous
+operations. If the ultimate user of the function has not enabled asynchronous
+execution, nothing changes. If they have, though, the function becomes faster
+transparently — nothing about the function signature or how it interacts with
+the rest of the code base changes.
+</p>
+
+<p>
+One problem, however, is with programs where two parts are actually required to
+execute simultaneously for correctness. For example, suppose that a program
+wants to listen for connections on a port and simultaneously respond to user
+input. In that scenario, it wouldn't be correct to wait for a connection and
+only then ask for user input. For that use case, the <tt>Io</tt> interface
+provides a separate function, <tt>asyncConcurrent()</tt> that explicitly asks for
+the provided function to be run in parallel. <tt>Io.Threaded</tt> uses a thread
+in a thread pool to accomplish this. <tt>Io.Evented</tt> treats it exactly the
+same as a normal call to <tt>async()</tt>.
+</p>
+
+<pre>    const socket = try openServerSocket(io);
+    var server = try io.asyncConcurrent(startAccepting, .{io, socket});
+    defer server.cancel(io) catch {};
+
+    try handleUserInput(io);
+</pre>
+
+<p>
+If the programmer uses <tt>async()</tt> where they should have used
+<tt>asyncConcurrent()</tt>, that is a bug. Zig's new model does not (and cannot)
+prevent programmers from writing incorrect code, so there are still some
+subtleties to keep in mind when adapting existing Zig code to use the new
+interface.
+</p>
+
+<p>
+The style of code that results from this design is a bit more verbose than
+languages that give asynchronous functions special syntax, but Andrew Kelley,
+creator of the language, <a href="https://ziglang.org/devlog/2025/#2025-10-15">said</a> that "<q>it reads
+like standard, idiomatic Zig code.</q>" In particular, he noted that this
+approach lets the programmer use all of Zig's typical control-flow primitives,
+such as <tt>try</tt> and <tt>defer</tt>; it doesn't introduce any new language
+features specific to asynchronous code.
+</p>
+
+<p>
+To demonstrate this,
+Kelley gave an example of using the new interface to implement asynchronous DNS
+resolution. The standard
+<a href="https://www.man7.org/linux/man-pages/man3/getaddrinfo.3.html">
+<tt>getaddrinfo()</tt></a>
+function for querying DNS information falls short because, although it makes
+requests to multiple servers (for IPv4 and IPv6) in parallel, it waits for all of the queries to
+complete before returning an answer. Kelley's example Zig code returns the first
+successful answer, canceling the other inflight requests.
+</p>
+
+<p>
+Asynchronous I/O in Zig is far from done, however. <tt>Io.Evented</tt> is still experimental, and
+doesn't have implementations for all supported operating systems yet. A third
+kind of <tt>Io</tt>, one that is compatible with WebAssembly, is
+<a href="https://github.com/ziglang/zig/issues/23446">planned</a> (although, as
+that issue details, implementing it depends on some other new language
+features). The original
+<a href="https://github.com/ziglang/zig/pull/25592">pull request for <tt>Io</tt></a> lists 24
+planned follow-up items, most of which still need work.
+</p>
+
+<p>
+Still, the overall design of asynchronous code in Zig appears to be set. Zig has
+not yet had its 1.0 release, because the community is still experimenting with
+the correct way to implement many features. Asynchronous I/O was one of the
+larger remaining priorities (along with native code generation, which was also
+enabled by default for debug builds on some architectures this year). Zig seems
+to be steadily working its way toward a finished design — which should decrease
+the number of times Zig programmers are asked to rewrite their I/O because the
+interface has changed
+<a href="https://ziglang.org/download/0.15.1/release-notes.html#Writergate">
+again</a>.
+</p><br clear="all">
+               <br clear="all">
+               <hr>
+            </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Proximity to coworkers increases long-run development, lowers short-term output (2023) (151 pts)]]></title>
             <link>https://pallais.scholars.harvard.edu/publications/power-proximity-coworkers-training-tomorrow-or-productivity-today</link>
             <guid>46121243</guid>
             <pubDate>Tue, 02 Dec 2025 14:01:05 GMT</pubDate>
@@ -158,7 +562,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Python Data Science Handbook (130 pts)]]></title>
+            <title><![CDATA[Python Data Science Handbook (150 pts)]]></title>
             <link>https://jakevdp.github.io/PythonDataScienceHandbook/</link>
             <guid>46120611</guid>
             <pubDate>Tue, 02 Dec 2025 12:38:28 GMT</pubDate>
@@ -171,7 +575,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A series of vignettes from my childhood and early career (110 pts)]]></title>
+            <title><![CDATA[A series of vignettes from my childhood and early career (116 pts)]]></title>
             <link>https://www.jasonscheirer.com/weblog/vignettes/</link>
             <guid>46120549</guid>
             <pubDate>Tue, 02 Dec 2025 12:28:34 GMT</pubDate>
@@ -246,7 +650,7 @@
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Addressing the adding situation (226 pts)]]></title>
+            <title><![CDATA[Addressing the adding situation (230 pts)]]></title>
             <link>https://xania.org/202512/02-adding-integers</link>
             <guid>46120181</guid>
             <pubDate>Tue, 02 Dec 2025 11:30:29 GMT</pubDate>
@@ -281,7 +685,7 @@ or by buying CE products in the <a href="https://shop.compiler-explorer.com/">Co
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Man unexpectedly cured of HIV after stem cell transplant (139 pts)]]></title>
+            <title><![CDATA[Man unexpectedly cured of HIV after stem cell transplant (141 pts)]]></title>
             <link>https://www.newscientist.com/article/2506595-man-unexpectedly-cured-of-hiv-after-stem-cell-transplant/</link>
             <guid>46119699</guid>
             <pubDate>Tue, 02 Dec 2025 10:20:34 GMT</pubDate>
@@ -312,7 +716,7 @@ or by buying CE products in the <a href="https://shop.compiler-explorer.com/">Co
                     <section data-component-name="article-topics"><p>Topics:</p></section>                </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Advent of Compiler Optimisations 2025 (277 pts)]]></title>
+            <title><![CDATA[Advent of Compiler Optimisations 2025 (290 pts)]]></title>
             <link>https://xania.org/202511/advent-of-compiler-optimisation</link>
             <guid>46119500</guid>
             <pubDate>Tue, 02 Dec 2025 09:51:42 GMT</pubDate>
@@ -331,7 +735,7 @@ or by buying CE products in the <a href="https://shop.compiler-explorer.com/">Co
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Comparing AWS Lambda ARM64 vs. x86_64 Performance Across Runtimes in Late 2025 (106 pts)]]></title>
+            <title><![CDATA[Comparing AWS Lambda ARM64 vs. x86_64 Performance Across Runtimes in Late 2025 (110 pts)]]></title>
             <link>https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-performance-across-multiple-runtimes-in-late-2025/</link>
             <guid>46119214</guid>
             <pubDate>Tue, 02 Dec 2025 09:11:41 GMT</pubDate>
@@ -339,7 +743,7 @@ or by buying CE products in the <a href="https://shop.compiler-explorer.com/">Co
 Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-performance-across-multiple-runtimes-in-late-2025/: Error: getaddrinfo ENOTFOUND chrisebert.net]]></description>
         </item>
         <item>
-            <title><![CDATA[How Brian Eno Created Ambient 1: Music for Airports (2019) (166 pts)]]></title>
+            <title><![CDATA[How Brian Eno Created Ambient 1: Music for Airports (2019) (171 pts)]]></title>
             <link>https://reverbmachine.com/blog/deconstructing-brian-eno-music-for-airports/</link>
             <guid>46118722</guid>
             <pubDate>Tue, 02 Dec 2025 07:46:47 GMT</pubDate>
@@ -384,7 +788,7 @@ Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-perform
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rootless Pings in Rust (110 pts)]]></title>
+            <title><![CDATA[Rootless Pings in Rust (111 pts)]]></title>
             <link>https://bou.ke/blog/rust-ping/</link>
             <guid>46118432</guid>
             <pubDate>Tue, 02 Dec 2025 07:01:03 GMT</pubDate>
@@ -454,7 +858,7 @@ Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-perform
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple Releases Open Weights Video Model (381 pts)]]></title>
+            <title><![CDATA[Apple Releases Open Weights Video Model (397 pts)]]></title>
             <link>https://starflow-v.github.io</link>
             <guid>46117802</guid>
             <pubDate>Tue, 02 Dec 2025 05:10:01 GMT</pubDate>
@@ -2019,7 +2423,7 @@ Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-perform
 </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Decreasing Certificate Lifetimes to 45 Days (124 pts)]]></title>
+            <title><![CDATA[Decreasing Certificate Lifetimes to 45 Days (133 pts)]]></title>
             <link>https://letsencrypt.org/2025/12/02/from-90-to-45.html</link>
             <guid>46117126</guid>
             <pubDate>Tue, 02 Dec 2025 03:24:44 GMT</pubDate>
@@ -2057,7 +2461,7 @@ Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-perform
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What will enter the public domain in 2026? (427 pts)]]></title>
+            <title><![CDATA[What will enter the public domain in 2026? (443 pts)]]></title>
             <link>https://publicdomainreview.org/features/entering-the-public-domain/2026/</link>
             <guid>46117112</guid>
             <pubDate>Tue, 02 Dec 2025 03:23:10 GMT</pubDate>
@@ -2065,7 +2469,7 @@ Couldn't get https://chrisebert.net/comparing-aws-lambda-arm64-vs-x86_64-perform
 <div id="readability-page-1" class="page"><div><p>At the start of each year, on January 1st, a new crop of works enter the public domain and become free to enjoy, share, and reuse for any purpose. Due to differing copyright laws around the world, there is no one single public domain — and here we focus on three of the most prominent. Newly entering the public domain in 2026 will be:</p><ul><li>works by <a href="https://en.wikipedia.org/wiki/2026_in_public_domain#Entering_the_public_domain_in_countries_with_life_+_70_years">people who died in 1955</a>, for countries with a copyright term of “life plus 70 years” (e.g. UK, Russia, most of EU and South America);</li><li>works by <a href="https://en.wikipedia.org/wiki/2026_in_public_domain#Entering_the_public_domain_in_countries_with_life_+_50_years">people who died in 1975</a>, for countries with a term of “life plus 50 years” (e.g. New Zealand, and most of Africa and Asia);</li><li><a href="https://en.wikipedia.org/wiki/1930_in_film">films</a> and <a href="https://en.wikipedia.org/wiki/1930_in_literature#New_books">books</a> (incl. artworks featured) published in 1930 for the United States.</li></ul><p>In our advent-style calendar below, find our top pick of what lies in store for 2026. Each day, as we move through December, we’ll open a new window to reveal our highlights! By public domain day on January 1st they will all be unveiled — look out for a special blogpost from us on that day. (And, of course, if you want to dive straight in and explore the vast swathe of new entrants for yourself, just visit the links above).</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Reverse math shows why hard problems are hard (153 pts)]]></title>
+            <title><![CDATA[Reverse math shows why hard problems are hard (155 pts)]]></title>
             <link>https://www.quantamagazine.org/reverse-mathematics-illuminates-why-hard-problems-are-hard-20251201/</link>
             <guid>46116724</guid>
             <pubDate>Tue, 02 Dec 2025 02:35:47 GMT</pubDate>
@@ -4094,261 +4498,6 @@ user_pref("pdfjs.enableGuessAltText", false);
 <p>Edit: A few days after that, OpenAI released this other <a href="https://openai.com/index/expanding-on-sycophancy/">post</a>, with slightly more detail. The most interesting part is that they previously weren’t using thumbs up or thumbs down data from ChatGPT <em>at all</em> for RL.</p>
 <p>I gave a <a href="https://www.youtube.com/watch?v=DRyb3jA0ZOM">five-minute interview</a> on ABC News about this topic, if you’d like to hear me talk about it.</p>
 </section><p>If you liked this post, consider<!-- --> <a href="https://buttondown.com/seangoedecke" target="_blank">subscribing</a> <!-- -->to email updates about my new posts, or<!-- --> <a href="https://news.ycombinator.com/submitlink?u=https://www.seangoedecke.com/ai-sycophancy/&amp;t=Sycophancy%20is%20the%20first%20LLM%20%22dark%20pattern%22" target="_blank">sharing it on Hacker News</a>.<!-- --> Here's a preview of a related post that shares tags with this one.</p></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Why I stopped using JSON for my APIs (150 pts)]]></title>
-            <link>https://aloisdeniel.com/blog/better-than-json</link>
-            <guid>46111469</guid>
-            <pubDate>Mon, 01 Dec 2025 18:58:50 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://aloisdeniel.com/blog/better-than-json">https://aloisdeniel.com/blog/better-than-json</a>, See on <a href="https://news.ycombinator.com/item?id=46111469">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><!--[--><!----><p>Or why I stopped using JSON for my APIs</p>
-<p>If you develop or use an API, there’s a 99% chance it exchanges data encoded in <strong>JSON</strong>. It has become the de facto standard for the modern web. And yet, for almost ten years, whenever I develop servers—whether for personal or professional projects—I do <strong>not</strong> use JSON.</p>
-<p>And I find it surprising that JSON is so omnipresent when there are <strong>far more efficient alternatives</strong>, sometimes better suited to a truly modern development experience. Among them: <strong>Protocol Buffers</strong>, or Protobuf.</p>
-<p>In this article, I’d like to explain why.</p>
-<h2>Serialization</h2>
-<p>Before going any further, let’s put the topic back into context.</p>
-<p>An <strong>API</strong> (Application Programming Interface) is a set of rules that allow two systems to communicate. In the web world, <strong>REST</strong> APIs—those using the HTTP protocol and its methods (GET, POST, PUT, DELETE…)—are by far the most widespread.</p>
-<p>When a client sends a request to a server, it transmits a message containing:</p>
-<ul>
-<li><strong>headers</strong>, including the well-known <code>Content-Type</code>, which indicates the message format (JSON, XML, Protobuf, etc.);</li>
-<li>a <strong>body</strong> (payload), which contains the data itself;</li>
-<li>a <strong>response status</strong>.</li>
-</ul>
-<p><strong>Serialization</strong> is the process of turning a data structure into a sequence of bytes that can be transmitted. JSON, for example, serializes data as human-readable text.</p>
-<h2>Why is JSON so common?</h2>
-<p>There are many reasons for its popularity:</p>
-<h3>Human-readable</h3>
-<p>JSON is easy to understand, even for non-developers.
-A simple <code>console.log()</code> is often enough to inspect most data.</p>
-<h3>Perfectly integrated into the web</h3>
-<p>It was propelled by JavaScript, then massively adopted by backend frameworks.</p>
-<h3>Flexible</h3>
-<p>You can add a field, remove one, or change a type “on the fly.”
-Useful… sometimes too much.</p>
-<h3>Tools everywhere</h3>
-<p>Need to inspect JSON? Any text editor will do.
-Need to send a request? Curl is enough.
-Result: massive adoption, rich ecosystem.</p>
-<hr>
-<p>However, despite these advantages, another format offers me better efficiency—<strong>for both developers and end users</strong>.</p>
-<h2>Protobuf: ever heard of it?</h2>
-<p>There’s a strong chance you’ve never really worked with <strong>Protobuf</strong>.
-Yet this format was created as early as <strong>2001</strong> at Google and made public in <strong>2008</strong>.</p>
-<p>It’s heavily used inside Google and in many modern infrastructures—especially for inter-service communication in microservice architectures.</p>
-<p>So why is it so discreet in public API development?</p>
-<p>Perhaps because Protobuf is often associated with <strong>gRPC</strong>, and developers think they must use both together (<em>which is false</em>). Maybe also because it’s a binary format, making it feel less “comfortable” at first glance.</p>
-<p>But here’s why I personally use it almost everywhere.</p>
-<h2>Proto — Strong typing and modern tooling</h2>
-<p>With JSON, you often send ambiguous or non-guaranteed data.
-You may encounter:</p>
-<ul>
-<li>a missing field,</li>
-<li>an incorrect type,</li>
-<li>a typo in a key,</li>
-<li>or simply an undocumented structure.</li>
-</ul>
-<p>With Protobuf, that’s impossible.
-Everything starts with a <strong><code>.proto</code> file</strong> that defines the structure of messages precisely.</p>
-<h2>Example of a Proto3 file</h2>
-<pre><code>syntax = <span>"proto3"</span>;
-
-<span>message </span><span>User</span> {
-  <span>int32</span> id = <span>1</span>;
-  <span>string</span> name = <span>2</span>;
-  <span>string</span> email = <span>3</span>;
-  <span>bool</span> isActive = <span>4</span>;
-}
-</code></pre><p>Each field has:</p>
-<ul>
-<li>a <strong>strict type</strong> (<code>string</code>, <code>int32</code>, <code>bool</code>…)</li>
-<li>a <strong>numeric identifier</strong> (1, 2, 3…)</li>
-<li>a <strong>stable name</strong> (<code>name</code>, <code>email</code>…)</li>
-</ul>
-<p>This file is then used to automatically generate code in your preferred language.</p>
-<h2>Code generation</h2>
-<p>You use <code>protoc</code>:</p>
-<pre><code>protoc --dart_out=lib user.proto
-</code></pre><p>and you automatically get the following in your Dart code:</p>
-<pre><code><span>final</span> user = User()
-  ..id = <span>42</span>
-  ..name = <span>"Alice"</span>
-  ..email = <span>"alice@example.com"</span>
-  ..isActive = <span>true</span>;
-
-<span>final</span> bytes = user.writeToBuffer();       <span>// Binary serialization</span>
-<span>final</span> sameUser = User.fromBuffer(bytes);  <span>// Deserialization</span>
-</code></pre><p>No manual validation.
-No JSON parsing.
-No risk of type errors.</p>
-<p>And this mechanism works with:</p>
-<ul>
-<li>Dart</li>
-<li>TypeScript</li>
-<li>Kotlin</li>
-<li>Swift</li>
-<li>C#</li>
-<li>Go</li>
-<li>Rust</li>
-<li>and many more…</li>
-</ul>
-<p>It represents a <strong>huge</strong> time saver and brings exceptional maintainability comfort.</p>
-<h2>Buffer — Ultra-efficient binary serialization</h2>
-<p>Another major strength of Protobuf:
-<strong>it’s a binary format</strong>, designed to be compact and fast.</p>
-<p>Let’s compare with JSON.</p>
-<h3>Example JSON message</h3>
-<pre><code><span>{</span>
-  <span>"id"</span><span>:</span> <span>42</span><span>,</span>
-  <span>"name"</span><span>:</span> <span>"Alice"</span><span>,</span>
-  <span>"email"</span><span>:</span> <span>"alice@example.com"</span><span>,</span>
-  <span>"isActive"</span><span>:</span> <span><span>true</span></span>
-<span>}</span>
-</code></pre><p>Size: 78 bytes (depending on whitespace).</p>
-<h3>The same message in Protobuf binary</h3>
-<p>→ About <strong>23 bytes</strong>.
-Roughly <strong>3× more compact</strong>, and often much more depending on structure.</p>
-<p>Why?
-Because Protobuf uses:</p>
-<ul>
-<li>compact “varint” encoding for numbers</li>
-<li>no textual keys (they’re replaced by numeric tags)</li>
-<li>no spaces, no JSON overhead</li>
-<li>optimized optional fields</li>
-<li>a very efficient internal structure</li>
-</ul>
-<p>Results:</p>
-<ul>
-<li>less bandwidth</li>
-<li>faster response times</li>
-<li>savings on mobile data</li>
-<li>direct impact on user experience</li>
-</ul>
-<h2>Example: a tiny Dart server using Shelf that returns Protobuf</h2>
-<p>To make things more concrete, let’s build a <strong>minimal HTTP server in Dart</strong> using the <code>shelf</code> package, and return our <code>User</code> object serialized as <strong>Protobuf</strong>, with the correct <code>Content-Type</code>.</p>
-<p>We’ll assume you already have the previously generated code for the <code>User</code> type.</p>
-<h2>Create a simple Shelf server</h2>
-<p>Create a file <code>bin/server.dart</code>:</p>
-<pre><code><span>import</span> <span>'dart:io'</span>;
-
-<span>import</span> <span>'package:shelf/shelf.dart'</span>;
-<span>import</span> <span>'package:shelf/shelf_io.dart'</span> <span>as</span> shelf_io;
-<span>import</span> <span>'package:shelf_router/shelf_router.dart'</span>;
-
-<span>import</span> <span>'package:your_package_name/user.pb.dart'</span>; <span>// Adjust the path to your generated file</span>
-
-<span>void</span> main(<span>List</span>&lt;<span>String</span>&gt; args) <span>async</span> {
-  <span>final</span> router = Router()
-    ..<span>get</span>(<span>'/user'</span>, _getUserHandler);
-
-  <span>final</span> handler = <span>const</span> Pipeline()
-      .addMiddleware(logRequests())
-      .addHandler(router);
-
-  <span>final</span> server = <span>await</span> shelf_io.serve(handler, InternetAddress.anyIPv4, <span>8080</span>);
-  <span>print</span>(<span>'Server listening on http://<span>${server.address.host}</span>:<span>${server.port}</span>'</span>);
-}
-
-Response _getUserHandler(Request request) {
-  <span>final</span> user = User()
-    ..id = <span>42</span>
-    ..name = <span>'Alice'</span>
-    ..email = <span>'alice@example.com'</span>
-    ..isActive = <span>true</span>;
-
-  <span>final</span> bytes = user.writeToBuffer();
-
-  <span>return</span> Response.ok(
-    bytes,
-    headers: {
-      <span>'content-type'</span>: <span>'application/protobuf'</span>,
-    },
-  );
-}
-</code></pre><p>Key points:</p>
-<ul>
-<li><code>User()</code> comes from the generated Protobuf code.</li>
-<li><code>writeToBuffer()</code> serializes the object into Protobuf binary.</li>
-<li>The <code>Content-Type</code> header is set to <code>application/protobuf</code>, allowing clients to know they must decode Protobuf instead of JSON.</li>
-</ul>
-<h2>Calling the Protobuf API from Dart (using <code>http</code>)</h2>
-<p>Once your server returns a Protobuf-encoded <code>User</code>, you can retrieve and decode it directly from Dart.
-All you need is:</p>
-<ul>
-<li>the <code>http</code> package</li>
-<li>the generated Protobuf classes (<code>user.pb.dart</code>)</li>
-</ul>
-<p>Create a Dart file (e.g. <code>bin/client.dart</code>):</p>
-<pre><code><span>import</span> <span>'package:http/http.dart'</span> <span>as</span> http;
-
-<span>import</span> <span>'package:your_package_name/user.pb.dart'</span>; <span>// Adjust path</span>
-
-Future&lt;<span>void</span>&gt; main() <span>async</span> {
-  <span>final</span> uri = <span>Uri</span>.parse(<span>'http://localhost:8080/user'</span>);
-
-  <span>final</span> response = <span>await</span> http.<span>get</span>(
-    uri,
-    headers: {
-      <span>'Accept'</span>: <span>'application/protobuf'</span>,
-    },
-  );
-
-  <span>if</span> (response.statusCode == <span>200</span>) {
-    <span>// Decode the Protobuf bytes</span>
-    <span>final</span> user = User.fromBuffer(response.bodyBytes);
-
-    <span>print</span>(<span>'User received:'</span>);
-    <span>print</span>(<span>'  id       : <span>${user.id}</span>'</span>);
-    <span>print</span>(<span>'  name     : <span>${user.name}</span>'</span>);
-    <span>print</span>(<span>'  email    : <span>${user.email}</span>'</span>);
-    <span>print</span>(<span>'  isActive : <span>${user.isActive}</span>'</span>);
-  } <span>else</span> {
-    <span>print</span>(<span>'Request failed: <span>${response.statusCode}</span>'</span>);
-  }
-}
-</code></pre><p>With this setup, both the server and the client rely on <strong>the same Protobuf definition</strong>, ensuring that data structures stay perfectly aligned without manual validation or JSON parsing. The same <code>.proto</code> file generates strongly typed code on both sides, making it impossible for the client and server to “disagree” about the shape or type of the data.</p>
-<p>And this is not limited to Dart: the exact same approach works seamlessly if your server is written in <strong>Go</strong>, <strong>Rust</strong>, <strong>Kotlin</strong>, <strong>Swift</strong>, <strong>C#</strong>, <strong>TypeScript</strong>, or any language supported by the Protobuf compiler. Protobuf acts as a shared contract, giving you end-to-end type safety and consistent, compact data serialization across your entire stack.</p>
-<h2>However… JSON still keeps one important advantage</h2>
-<p>You <em>can</em> decode Protobuf messages, of course—but unlike JSON, you don’t see human-readable field names. Instead, you see numeric field identifiers and wire types. The data is meaningful, but without the corresponding <code>.proto</code> schema you can only interpret it at a structural level, not semantically. You can see the fields, but you don’t know what they <em>represent</em>.</p>
-<h3>Human-friendly debugging</h3>
-<p>JSON can be read and understood immediately.</p>
-<pre><code><span>{</span>
-  <span>"id"</span><span>:</span> <span>42</span><span>,</span>
-  <span>"name"</span><span>:</span> <span>"Alice"</span><span>,</span>
-  <span>"email"</span><span>:</span> <span>"alice@example.com"</span><span>,</span>
-  <span>"isActive"</span><span>:</span> <span><span>true</span></span>
-<span>}</span>
-</code></pre><p>A Protobuf payload, being binary, can’t be interpreted in a meaningful, human-readable way without knowing the schema behind it.</p>
-<pre><code>1: 42
-2: "Alice"
-3: "alice@example.com"
-4: true
-</code></pre><p>This doesn’t prevent you from working with Protobuf, but it does add some complexity:</p>
-<ul>
-<li>requires specialized tooling</li>
-<li>schemas must be maintained and versioned</li>
-<li>decoding tools are essential</li>
-</ul>
-<p>For me, the trade-off is well worth it given the performance and efficiency benefits Protobuf provides.</p>
-<h2>Conclusion</h2>
-<p>I hope this article makes you want to try Protobuf. It’s an incredibly mature, extremely performant tool, but still too invisible in the world of public APIs.</p>
-<p>And even though Protobuf is often associated with <strong>gRPC</strong>, nothing forces you to use both. Protobuf can work independently, on any traditional HTTP API.</p>
-<p>If you’re looking for:</p>
-<ul>
-<li>more performance,</li>
-<li>more robustness,</li>
-<li>fewer errors,</li>
-<li>and a genuinely enjoyable development experience,</li>
-</ul>
-<p>then I strongly encourage you to try Protobuf on your next project.</p>
-<!----><!--]--></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Intel could return to Apple computers in 2027 (130 pts)]]></title>
-            <link>https://www.theverge.com/news/832366/intel-apple-m-chip-low-end-processor</link>
-            <guid>46111284</guid>
-            <pubDate>Mon, 01 Dec 2025 18:46:17 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.theverge.com/news/832366/intel-apple-m-chip-low-end-processor">https://www.theverge.com/news/832366/intel-apple-m-chip-low-end-processor</a>, See on <a href="https://news.ycombinator.com/item?id=46111284">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><div><p><a href="https://www.theverge.com/authors/andrew-j-hawkins"><img alt="Andrew J. Hawkins" data-chromatic="ignore" loading="lazy" width="36" height="36" decoding="async" data-nimg="1" srcset="https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195793/ANDREW_HAWKINS.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=48 1x, https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195793/ANDREW_HAWKINS.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=96 2x" src="https://platform.theverge.com/wp-content/uploads/sites/2/chorus/author_profile_images/195793/ANDREW_HAWKINS.0.jpg?quality=90&amp;strip=all&amp;crop=0%2C0%2C100%2C100&amp;w=96"></a></p><div><p><span aria-expanded="false" aria-haspopup="true" role="button" tabindex="0"><span id="follow-author-standard_article_details-dmcyOmF1dGhvclByb2ZpbGU6MTIy"><span><span><svg width="9" height="9" viewBox="0 0 9 9" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Follow"><path d="M5 0H4V4H0V5H4V9H5V5H9V4H5V0Z"></path></svg></span></span><span>Andrew J. Hawkins</span></span></span></p> <p><span>is transportation editor with 10+ years of experience who covers EVs, public transportation, and aviation. His work has appeared in The New York Daily News and City &amp; State.</span></p></div></div><div id="zephr-anchor"><p>Will Apple turn to Intel for production of its M-series chips in 2027? That’s what supply chain analyst Ming-Chi Kuo predicted on X Friday. Citing his latest industry surveys, Kuo says that Intel’s chances of becoming Apple’s latest “advanced-node supplier… has improved significantly” in recent weeks.</p><div><p>Any deal with Intel would be significant considering <a href="https://www.theverge.com/2013/5/16/4337954/intel-could-have-been-inside-the-original-iphone-says-outgoing-ceo">the chipmaker famously missed out on supplying its own processors for the original iPhone</a>. Apple now has a deal with Taiwan-based TSMC to supply silicon chips for its iPhone, iPad and Mac products.</p></div><p>Kuo says that Apple has a non-disclosure agreement with Intel to acquire <a href="https://www.tomshardware.com/pc-components/cpus/intel-foundry-roadmap-update-new-18a-pt-variant-that-enables-3d-die-stacking-14a-process-node-enablement">the company’s 18AP PDK 0.9.1GA chips</a>. At this point, the company is waiting on Intel to deliver the PDK 1.0/1.1 kit, which is supposed to arrive in the first quarter of 2026. If everything stays on track, Intel could start shipping Apple’s lowest-end M-series processor, built on the 18AP advanced node, sometime in the second or third quarter of 2027, Kuo says. But that timing still depends on how smoothly things go once Apple actually gets the PDK 1.0/1.1 kit.</p><p>Kuo theorizes that a deal with Intel could help Apple demonstrate to the Trump administration that its committed to “buying American” by rerouting its supply chain to include more US-based companies. For Intel, a deal could signal that <a href="https://www.theverge.com/news/713388/intel-q2-2025-leave-germany-poland-costa-rica">the company’s worst days are passed</a>. “Looking ahead, the 14A node and beyond could capture more orders from Apple and other tier-one customers, turning Intel’s long-term outlook more positive,” Kuo writes.</p><p>Could Apple strike a deal with Intel? And what would happen if it decided to use the chipmaker’s 18AP processors for its entry-level M-series?</p><div><p><span><strong>Follow topics and authors</strong> from this story to see more like this in your personalized homepage feed and to receive email updates.</span></p><ul><li id="follow-author-article_footer-dmcyOmF1dGhvclByb2ZpbGU6MTIy"><span aria-expanded="false" aria-haspopup="true" role="button" tabindex="0"><span><span><svg width="9" height="9" viewBox="0 0 9 9" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Follow"><path d="M5 0H4V4H0V5H4V9H5V5H9V4H5V0Z"></path></svg></span><span>Andrew J. Hawkins</span></span></span></li><li></li><li></li><li></li><li></li></ul></div></div></div></div>]]></description>
         </item>
     </channel>
 </rss>
