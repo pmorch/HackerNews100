@@ -4,12 +4,895 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 14 Dec 2025 01:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 14 Dec 2025 02:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Want to sway an election? Here’s how much fake online accounts cost (133 pts)]]></title>
+            <title><![CDATA[Linux Sandboxes and Fil-C (108 pts)]]></title>
+            <link>https://fil-c.org/seccomp</link>
+            <guid>46259064</guid>
+            <pubDate>Sat, 13 Dec 2025 22:58:29 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://fil-c.org/seccomp">https://fil-c.org/seccomp</a>, See on <a href="https://news.ycombinator.com/item?id=46259064">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+        
+        <main>
+
+
+<p>Memory safety and sandboxing are two different things. It's reasonable to think of them as orthogonal: you could have memory safety but not be sandboxed, or you could be sandboxed but not memory safe.</p>
+
+<ul>
+<li><p>Example of <strong>memory safe</strong> <em>but not</em> <strong>sandboxed</strong>: a pure Java program that opens files on the filesystem for reading and writing and accepts filenames from the user. The OS will allow this program to overwrite any file that the user has access to. This program can be quite dangerous even if it is memory safe. Worse, imagine that the program didn't have any code to open files for reading and writing, but also had no sandbox to prevent those syscalls from working. If there was a bug in the memory safety enforcement of this program (say, because of a bug in the Java implementation), then an attacker could cause this program to overwrite any file if they succeeded at <a href="https://en.wikipedia.org/wiki/Weird_machine">achieving code execution via weird state</a>.</p></li>
+<li><p>Example of <strong>sandboxed</strong> <em>but not</em> <strong>memory safe</strong>: a program written in assembly that starts by requesting that the OS revoke all of its capabilities beyond just pure compute. If the program did want to open a file or write to it, then the kernel will kill the process, based on the earlier request to have this capability revoked. This program could have lots of memory safety bugs (because it's written in assembly), but even if it did, then the attacker cannot make this program overwrite any file unless they find some way to bypass the sandbox.</p></li>
+</ul>
+
+<p>In practice, sandboxes have holes by design. A typical sandbox allows the program to send and receive messages to broker processes that have higher privileges. So, an attacker may first use a memory safety bug to make the sandboxed process send malicious messages, and then use those malicious messages to break into the brokers.</p>
+
+<p><strong>The best kind of defense is to have both a sandbox and memory safety.</strong> This document describes how to combine sandboxing and Fil-C's memory safety by explaining what it takes to port OpenSSH's seccomp-based Linux sandbox code to Fil-C.</p>
+
+<h2>Background</h2>
+
+<p><a href="https://fil-c.org/how.html">Fil-C is a memory safe implementation of C and C++</a> and this site <a href="https://fil-c.org/documentation.html">has a lot of documentation about it</a>. Unlike most memory safe languages, Fil-C enforces safety down to where your code meets Linux syscalls and the <a href="https://fil-c.org/runtime.html">Fil-C runtime</a> is robust enough that it's possible to use it in <a href="https://fil-c.org/pizlix.html">low-level system components like <code>init</code> and <code>udevd</code></a>. <a href="https://fil-c.org/programs_that_work.html">Lots of programs work in Fil-C</a>, including OpenSSH, which makes use of seccomp-BPF sandboxing.</p>
+
+<p>This document focuses on how OpenSSH uses seccomp and other technologies on Linux to build a sandbox around its <a href="http://www.citi.umich.edu/u/provos/ssh/privsep.html">unprivileged <code>sshd-session</code> process</a>. Let's review what tools Linux gives us that OpenSSH uses:</p>
+
+<ul>
+<li><p><code>chroot</code> to restrict the process's view of the filesystem.</p></li>
+<li><p>Running the process with the <code>sshd</code> user and group, and giving that user/group no privileges.</p></li>
+<li><p><code>setrlimit</code> to prevent opening files, starting processes, or writing to files.</p></li>
+<li><p>seccomp-BPF syscall filter to reduce the attack surface by allowlisting only the set of syscalls that are legitimate for the unprivileged process. Syscalls not in the allowlist will crash the process with <code>SIGSYS</code>.</p></li>
+</ul>
+
+<p><a href="https://chromium.googlesource.com/chromium/src/+/0e94f26e8/docs/linux_sandboxing.md">The Chromium developers</a> and <a href="https://wiki.mozilla.org/Security/Sandbox/Seccomp">the Mozilla developers</a> both have excellent notes about how to do sandboxing on Linux using seccomp. <a href="https://www.kernel.org/doc/html/v4.19/userspace-api/seccomp_filter.html">Seccomp-BPF is a well-documented kernel feature</a> that can be used as part of a larger sandboxing story.</p>
+
+<p>Fil-C makes it easy to use <code>chroot</code> and different users and groups. The syscalls that are used for that part of the sandbox are trivially allowed by Fil-C and no special care is required to use them.</p>
+
+<p>Both <code>setrlimit</code> and seccomp-BPF require special care because the Fil-C runtime starts threads, allocates memory, and performs synchronization. This document describes what you need to know to make effective use of those sandboxing technologies in Fil-C. First, I describe how to build a sandbox that prevents thread creation without breaking Fil-C's use of threads. Then, I describe what tweaks I had to make to OpenSSH's seccomp filter. Finally, I describe how the Fil-C runtime implements the syscalls used to install seccomp filters.</p>
+
+<h2>Preventing Thread Creation Without Breaking The Fil-C Runtime</h2>
+
+<p>The Fil-C runtime uses <a href="https://fil-c.org/fugc.html">multiple background threads for garbage collection</a> and has the ability to automatically shut those threads down when they are not in use. If the program wakes up and starts allocating memory again, then those threads are automatically restarted.</p>
+
+<p>Starting threads violates the "no new processes" rule that OpenSSH's <code>setrlimit</code> sandbox tries to achieve (since threads are just lightweight processes on Linux). It also relies on syscalls like <code>clone3</code> that are not part of OpenSSH's seccomp filter allowlist.</p>
+
+<p>It would be a regression to the sandbox to allow process creation just because the Fil-C runtime relies on it. Instead, I added a new API to <a href="https://fil-c.org/stdfil.html"><code>&lt;stdfil.h&gt;</code></a>:</p>
+
+<pre><code>void zlock_runtime_threads(void);
+</code></pre>
+
+<p>This forces the runtime to immediately create whatever threads it needs, and to disable shutting them down on demand. Then, I added a call to <code>zlock_runtime_threads()</code> in OpenSSH's <code>ssh_sandbox_child</code> function before either the <code>setrlimit</code> or seccomp-BPF sandbox calls happen.</p>
+
+<h2>Tweaks To The OpenSSH Sandbox</h2>
+
+<p>Because the use of <code>zlock_runtime_threads()</code> prevents subsequent thread creation from happening, most of the OpenSSH sandbox just works. I did not have to change how OpenSSH uses <code>setrlimit</code>. I did change the following about the seccomp filter:</p>
+
+<ul>
+<li><p>Failure results in <code>SECCOMP_RET_KILL_PROCESS</code> rather than <code>SECCOMP_RET_KILL</code>. This ensures that Fil-C's background threads are also killed if a sandbox violation occurs.</p></li>
+<li><p><code>MAP_NORESERVE</code> is added to the <code>mmap</code> allowlist, since the Fil-C allocator uses it. This is not a meaningful regression to the filter, since <code>MAP_NORESERVE</code> is not a meaningful capability for an attacker to have.</p></li>
+<li><p><code>sched_yield</code> is allowed. This is not a dangerous syscall (it's semantically a no-op). The Fil-C runtime uses it as part of its lock implementation.</p></li>
+</ul>
+
+<p>Nothing else had to change, since the filter already allowed all of the <code>futex</code> syscalls that Fil-C uses for synchronization.</p>
+
+<h2>How Fil-C Implements <code>prctl</code></h2>
+
+<p>The OpenSSH seccomp filter is installed using two <code>prctl</code> calls. First, we <code>PR_SET_NO_NEW_PRIVS</code>:</p>
+
+<pre><code>if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+        debug("%s: prctl(PR_SET_NO_NEW_PRIVS): %s",
+            __func__, strerror(errno));
+        nnp_failed = 1;
+}
+</code></pre>
+
+<p>This prevents additional privileges from being acquired via <code>execve</code>. It's required that unprivileged processes that install seccomp filters first set the <code>no_new_privs</code> bit.</p>
+
+<p>Next, we <code>PR_SET_SECCOMP, SECCOMP_MODE_FILTER</code>:</p>
+
+<pre><code>if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &amp;preauth_program) == -1)
+        debug("%s: prctl(PR_SET_SECCOMP): %s",
+            __func__, strerror(errno));
+else if (nnp_failed)
+        fatal("%s: SECCOMP_MODE_FILTER activated but "
+            "PR_SET_NO_NEW_PRIVS failed", __func__);
+</code></pre>
+
+<p>This installs the seccomp filter in <code>preauth_program</code>. Note that this will fail in the kernel if the <code>no_new_privs</code> bit is not set, so the fact that OpenSSH reports a fatal error if the filter is installed without <code>no_new_privs</code> is just healthy paranoia on the part of the OpenSSH authors.</p>
+
+<p>The trouble with both syscalls is that they affect the calling <em>thread</em>, not all threads in the process. Without special care, Fil-C runtime's background threads would not have the <code>no_new_privs</code> bit set and would not have the filter installed. This would mean that if an attacker busted through Fil-C's memory safety protections (in the unlikely event that they found a bug in Fil-C itself!), then they could use those other threads to execute syscalls that bypass the filter!</p>
+
+<p>To prevent even this unlikely escape, the Fil-C runtime's wrapper for <code>prctl</code> implements <code>PR_SET_NO_NEW_PRIVS</code> and <code>PR_SET_SECCOMP</code> by <em>handshaking</em> all runtime threads using this internal API:</p>
+
+<pre><code>/* Calls the callback from every runtime thread. */
+PAS_API void filc_runtime_threads_handshake(void (*callback)(void* arg), void* arg);
+</code></pre>
+
+<p>The callback performs the requested <code>prctl</code> from each runtime thread. This ensures that the <code>no_new_privs</code> bit and the filter are installed on all threads in the Fil-C process.</p>
+
+<p>Additionally, because of ambiguity about what to do if the process has multiple user threads, these two <code>prctl</code> commands will trigger a Fil-C safety error if the program has multiple user threads.</p>
+
+<h2>Conclusion</h2>
+
+<p>The best kind of protection if you're serious about security is to combine memory safety with sandboxing. This document shows how to achieve this using Fil-C and the sandbox technologies available on Linux, all without regressing the level of protection that those sandboxes enforce or the memory safety guarantees of Fil-C.</p>
+        </main>
+    </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Recovering Anthony Bourdain's (really) lost Li.st's (122 pts)]]></title>
+            <link>https://sandyuraz.com/blogs/bourdain/</link>
+            <guid>46258163</guid>
+            <pubDate>Sat, 13 Dec 2025 21:18:01 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://sandyuraz.com/blogs/bourdain/">https://sandyuraz.com/blogs/bourdain/</a>, See on <a href="https://news.ycombinator.com/item?id=46258163">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+<p>
+🥐 At least 2 days ago
+</p>
+<p>
+Loved reading through <em>GReg TeChnoLogY</em> <a href="https://bourdain.greg.technology/" title="">Anthony Bourdain’s Lost Li.st’s</a> and seeing the list of lost Anthony Bourdain li.st’s made me think on whether at least <strong>some</strong> of them we can recover.
+</p>
+<p>
+Having worked in security and crawling space for majority of my career—I don’t have the access nor permission to use the proprietary storages—I thought we might be able to find something from publicly available crawl archives.
+</p>
+
+<h2 id="common-crawl">Common Crawl</h2>
+<p>
+If <em>Internet Archive</em> had the partial list that Greg published, what about the <em>Common Crawl</em>? Reading through their <a href="https://commoncrawl.org/get-started" title="">documentation</a>, it seems straightforward enough to get prefix index for Tony’s lists and grep for any sub-paths.
+</p>
+<p>
+Putting something up with help of Claude to prove my theory, we have <code>commoncrawl_search.py</code> that makes a single index request to a specific dataset and if any hits discovered, retrieve them from the public s3 bucket—since they are small straight-up HTML documents, seems even more feasible than I had initially thought.
+</p>
+<p>
+Simply have a python version around 3.14.2 and install the dependencies from <code>requirements.txt</code>. Run the below and we are in business. Now, below, you’ll find the command I ran and then some manual archeological effort to prettify the findings.
+</p></div><div>
+
+<div>
+<p>NOTE</p>
+<p>Images <strong>have been lost</strong>. Other avenues had struck no luck. I’ll try again later.</p>
+</div>
+<p>
+Any and all emphasis, missing punctuation, cool grammar is all by Anthony Bourdain. The only modifications I have made is to the layout, to represent <code>li.st</code> as closely as possible with <strong>no changes to the content.</strong>
+</p>
+<div>
+<p>NOTE</p>
+<p>If you see these blocks, that’s me commenting if pictures have been lost.</p>
+</div>
+<h2 id="recovering-what-we-lost">Recovering what we lost</h2>
+<p>
+From Greg’s page, let’s go and try each entry one by one, I’ll put the table of what I wasn’t able to find in <strong>Common Crawl</strong>, but I would assume exists elsewhere—I’d be happy to take another look. And no, none of this above has been written by AI, only the code since I don’t really care about <code>warcio</code> encoding or writing the same python requests method for the Nth time. Enjoy!
+</p>
+<h2 id="things-i-no-longer-have-time-or-patience-for">Things I No Longer Have Time or Patience For</h2>
+
+<div>
+<ol>
+
+<li>
+<p>
+Cocaine
+</p>
+</li>
+
+<li>
+<p>
+True Detective
+</p>
+</li>
+
+<li>
+<p>
+Scripps Howard
+</p>
+</li>
+
+<li>
+<p>
+Dinners where it takes the waiter longer to describe my food than it takes me to eat it.
+</p>
+</li>
+
+<li>
+<p>
+Beer nerds
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="nice-views">Nice Views</h2>
+
+<p>
+I admit it: my life doesn’t suck. Some recent views I’ve enjoyed
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Montana at sunset : There’s pheasant cooking behind the camera somewhere. To the best of my recollection some very nice bourbon. And it IS a big sky .
+</p>
+</li>
+
+<li>
+<p>
+Puerto Rico: Thank you Jose Andres for inviting me to this beautiful beach!
+</p>
+</li>
+
+<li>
+<p>
+Naxos: drinking ouzo and looking at this. Not a bad day at the office .
+</p>
+</li>
+
+<li>
+<p>
+LA: My chosen final resting place . Exact coordinates .
+</p>
+</li>
+
+<li>
+<p>
+Istanbul: raki and grilled lamb and this ..
+</p>
+</li>
+
+<li>
+<p>
+Borneo: The air is thick with hints of durian, sambal, coconut..
+</p>
+</li>
+
+<li>
+<p>
+Chicago: up early to go train #Redzovic
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="if-i-were-trapped-on-a-desert-island-with-only-three-tv-series">If I Were Trapped on a Desert Island With Only Three Tv Series</h2>
+
+<div>
+<ol>
+
+<li>
+<p>
+The Wire
+</p>
+</li>
+
+<li>
+<p>
+Tinker, Tailor, Soldier, Spy (and its sequel : Smiley’s People)
+</p>
+</li>
+
+<li>
+<p>
+Edge of Darkness (with Bob Peck and Joe Don Baker )
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="the-film-nobody-ever-made">The Film Nobody Ever Made</h2>
+
+<p>
+Dreamcasting across time with the living and the dead, this untitled, yet to be written masterwork of cinema, shot, no doubt, by Christopher Doyle, lives only in my imagination.
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+This guy
+</p>
+</li>
+
+<li>
+<p>
+And this guy
+</p>
+</li>
+
+<li>
+<p>
+All great films need:
+</p>
+</li>
+
+<li>
+<p>
+The Oscar goes to..
+</p>
+</li>
+
+<li>
+<p>
+And
+</p>
+</li>
+</ol>
+</div>
+
+<div>
+<p>NOTE</p>
+<p>Sorry, each item had a picture attached, they’re gone.</p>
+</div>
+<h2 id="i-want-them-back">I Want Them Back</h2>
+
+<p>
+If you bought these vinyls from an emaciated looking dude with an eager, somewhat distracted expression on his face somewhere on upper Broadway sometime in the mid 80’s, that was me . I’d like them back. In a sentimental mood.
+</p>
+<div>
+<p>NOTE</p>
+<p>There were 11 images here.</p>
+</div>
+<h2 id="objects-of-desire">Objects of Desire</h2>
+
+<p>
+material things I feel a strange, possibly unnatural attraction to and will buy (if I can) if I stumble across them in my travels. I am not a paid spokesperson for any of this stuff .
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Vintage Persol sunglasses : This is pretty obvious. I wear them a lot. I collect them when I can. Even my production team have taken to wearing them.
+</p>
+</li>
+
+<li>
+<p>
+19th century trepanning instruments: I don’t know what explains my fascination with these devices, designed to drill drain-sized holes into the skull often for purposes of relieving "pressure" or "bad humours". But I can’t get enough of them. Tip: don’t get a prolonged headache around me and ask if I have anything for it. I do.
+</p>
+</li>
+
+<li>
+<p>
+Montagnard bracelets: I only have one of these but the few that find their way onto the market have so much history. Often given to the indigenous mountain people ’s Special Forces advisors during the very early days of America’s involvement in Vietnam .
+</p>
+</li>
+
+<li>
+<p>
+Jiu Jitsi Gi’s: Yeah. When it comes to high end BJJ wear, I am a total whore. You know those people who collect limited edition Nikes ? I’m like that but with Shoyoroll . In my defense, I don’t keep them in plastic bags in a display case. I wear that shit.
+</p>
+</li>
+
+<li>
+<p>
+Voiture: You know those old school, silver plated (or solid silver) blimp like carts they roll out into the dining room to carve and serve your roast? No. Probably not. So few places do that anymore. House of Prime Rib does it. Danny Bowein does it at Mission Chinese. I don’t have one of these. And I likely never will. But I can dream.
+</p>
+</li>
+
+<li>
+<p>
+Kramer knives: I don’t own one. I can’t afford one . And I’d likely have to wait for years even if I could afford one. There’s a long waiting list for these individually hand crafted beauties. But I want one. Badly. http://www.kramerknives.com/gallery/
+</p>
+</li>
+
+<li>
+<p>
+R. CRUMB : All of it. The collected works. These Taschen volumes to start. I wanted to draw brilliant, beautiful, filthy comix like Crumb until I was 13 or 14 and it became clear that I just didn’t have that kind of talent. As a responsible father of an 8 year old girl, I just can’t have this stuff in the house. Too dark, hateful, twisted. Sigh...
+</p>
+</li>
+
+<li>
+<p>
+THE MAGNIFICENT AMBERSONS : THE UNCUT, ORIGINAL ORSON WELLES VERSION: It doesn’t exist. Which is why I want it. The Holy Grail for film nerds, Welles’ follow up to CITIZEN KANE shoulda, coulda been an even greater masterpiece . But the studio butchered it and re-shot a bullshit ending. I want the original. I also want a magical pony.
+</p>
+</li>
+</ol>
+</div>
+
+<div>
+<p>NOTE</p>
+<p>Each bulleted point had an image too.</p>
+</div>
+<h2 id="four-spy-novels-by-real-spies-and-one-not-by-a-spy">Four Spy Novels by Real Spies and One Not by a Spy</h2>
+
+<p>
+I like good spy novels. I prefer them to be realistic . I prefer them to be written by real spies. If the main character carries a gun, I’m already losing interest. Spy novels should be about betrayal.
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Ashenden–Somerset Maugham<br>Somerset wrote this bleak, darkly funny, deeply cynical novel in the early part of the 20th century. It was apparently close enough to the reality of his espionage career that MI6 insisted on major excisions. Remarkably ahead of its time in its atmosphere of futility and betrayal.
+</p>
+</li>
+
+<li>
+<p>
+The Man Who Lost the War–WT Tyler<br>WT Tyler is a pseudonym for a former "foreign service" officer who could really really write. This one takes place in post-war Berlin and elsewhere and was, in my opinion, wildly under appreciated. See also his Ants of God.
+</p>
+</li>
+
+<li>
+<p>
+The Human Factor–Graham Greene<br>Was Greene thinking of his old colleague Kim Philby when he wrote this? Maybe. Probably. See also Our Man In Havana.
+</p>
+</li>
+
+<li>
+<p>
+The Tears of Autumn -Charles McCarry<br>A clever take on the JFK assassination with a Vietnamese angle. See also The Miernik Dossier and The Last Supper
+</p>
+</li>
+
+<li>
+<p>
+Agents of Innocence–David Ignatius<br>Ignatius is a journalist not a spook, but this one, set in Beirut, hewed all too closely to still not officially acknowledged events. Great stuff.
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="hotel-slut--that-s-me">Hotel Slut (That’s Me)</h2>
+
+<p>
+I wake up in a lot of hotels, so I am fiercely loyal to the ones I love. A hotel where I know immediately wher I am when I open my eyes in the morning is a rare joy. Here are some of my favorites
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+CHATEAU MARMONT ( LA) : if I have to die in a hotel room, let it be here. I will work in LA just to stay at the Chateau.
+</p>
+</li>
+
+<li>
+<p>
+CHILTERN FIREHOUSE (London): Same owner as the Chateau. An amazing Victorian firehouse turned hotel. Pretty much perfection
+</p>
+</li>
+
+<li>
+<p>
+THE RALEIGH (Miami): The pool. The pool!
+</p>
+</li>
+
+<li>
+<p>
+LE CONTINENTAL (Saigon): For the history.
+</p>
+</li>
+
+<li>
+<p>
+HOTEL OLOFSSON (Port au Prince): Sagging, creaky and leaky but awesome .
+</p>
+</li>
+
+<li>
+<p>
+PARK HYATT (Tokyo): Because I’m a film geek.
+</p>
+</li>
+
+<li>
+<p>
+EDGEWATER INN (Seattle): kind of a lumber theme going on...ships slide right by your window. And the Led Zep "Mudshark incident".
+</p>
+</li>
+
+<li>
+<p>
+THE METROPOLE (Hanoi): there’s a theme developing: if Graham Greene stayed at a hotel, chances are I will too.
+</p>
+</li>
+
+<li>
+<p>
+GRAND HOTEL D'ANGKOR (Siem Reap): I’m a sucker for grand, colonial era hotels in Asia.
+</p>
+</li>
+
+<li>
+<p>
+THE MURRAY (Livingston,Montana): You want the Peckinpah suite
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="steaming-hot-porn">Steaming Hot Porn</h2>
+
+<p>
+from my phone
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Bun Bo Hue
+</p>
+</li>
+
+<li>
+<p>
+Kuching Laksa
+</p>
+</li>
+
+<li>
+<p>
+Pot au Feu
+</p>
+</li>
+
+<li>
+<p>
+Jamon
+</p>
+</li>
+
+<li>
+<p>
+Linguine
+</p>
+</li>
+
+<li>
+<p>
+Meat
+</p>
+</li>
+
+<li>
+<p>
+Dessert
+</p>
+</li>
+
+<li>
+<p>
+Light Lunch
+</p>
+</li>
+
+<li>
+<p>
+Meat on a Stick
+</p>
+</li>
+
+<li>
+<p>
+Oily Little Fish
+</p>
+</li>
+
+<li>
+<p>
+Snack
+</p>
+</li>
+
+<li>
+<p>
+Soup
+</p>
+</li>
+
+<li>
+<p>
+Homage
+</p>
+</li>
+</ol>
+</div>
+
+<div>
+<p>NOTE</p>
+<p>Pictures in each have not been recovered.</p>
+</div>
+<h2 id="5-photos-on-my-phone--chosen-at-random">5 Photos on My Phone, Chosen at Random</h2>
+
+<p>
+Not TOO random
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Madeline
+</p>
+</li>
+
+<li>
+<p>
+Beirut
+</p>
+</li>
+
+<li>
+<p>
+Musubi
+</p>
+</li>
+
+<li>
+<p>
+BudaeJiggae
+</p>
+</li>
+
+<li>
+<p>
+Dinner
+</p>
+</li>
+</ol>
+</div>
+
+<div>
+<p>NOTE</p>
+<p>Shame, indeed, no pictures, there was one for each.</p>
+</div>
+<h2 id="people-i-d-like-to-be-for-a-day">People I’d Like to Be for a Day</h2>
+
+<div>
+<ol>
+
+<li>
+<p>
+Bootsy Collins
+</p>
+</li>
+
+<li>
+<p>
+Bill Murray
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="i-m-hungry-and-would-be-very-happy-to-eat-any-of-this-right-now">I’m Hungry and Would Be Very Happy to Eat Any of This Right Now</h2>
+
+<div>
+<ol>
+
+<li>
+<p>
+Spaghetti a la bottarga . I would really, really like some of this. Al dente, lots of chili flakes
+</p>
+</li>
+
+<li>
+<p>
+A big, greasy double cheeseburger. No lettuce. No tomato. Potato bun.
+</p>
+</li>
+
+<li>
+<p>
+A street fair sausage and pepper hero would be nice. Though shitting like a mink is an inevitable and near immediate outcome
+</p>
+</li>
+
+<li>
+<p>
+Some uni. Fuck it. I’ll smear it on an English muffin at this point.
+</p>
+</li>
+
+<li>
+<p>
+I wonder if that cheese is still good?
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="observations-from-a-beach">Observations From a Beach</h2>
+
+<p>
+In which my Greek idyll is Suddenly invaded by professional nudists
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+Endemic FUPA. Apparently a prerequisite for joining this outfit.
+</p>
+</li>
+
+<li>
+<p>
+Pistachio dick
+</p>
+</li>
+
+<li>
+<p>
+70’s bush
+</p>
+</li>
+
+<li>
+<p>
+T-shirt and no pants. Leading one to the obvious question : why bother?
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="guilty-pleasures">Guilty Pleasures</h2>
+
+<div>
+<ol>
+
+<li>
+<p>
+Popeye’s Mac and Cheese
+</p>
+</li>
+
+<li>
+<p>
+The cheesy crust on the side of the bowl of Onion Soup Gratinee
+</p>
+</li>
+
+<li>
+<p>
+Macaroons . Not macarons . Macaroons
+</p>
+</li>
+
+<li>
+<p>
+Captain Crunch
+</p>
+</li>
+
+<li>
+<p>
+Double Double Animal Style
+</p>
+</li>
+
+<li>
+<p>
+Spam Musubi
+</p>
+</li>
+
+<li>
+<p>
+Aerosmith
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="some-new-york-sandwiches">Some New York Sandwiches</h2>
+
+<p>
+Before he died, Warren Zevon dropped this wisdom bomb: "Enjoy every sandwich". These are a few locals I’ve particularly enjoyed:
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+PASTRAMI QUEEN: (1125 Lexington Ave. ) Pastrami Sandwich. Also the turkey with Russian dressing is not bad. Also the brisket.
+</p>
+</li>
+
+<li>
+<p>
+EISENBERG'S SANDWICH SHOP: ( 174 5th Ave.) Tuna salad on white with lettuce. I’d suggest drinking a lime Rickey or an Arnold Palmer with that.
+</p>
+</li>
+
+<li>
+<p>
+THE JOHN DORY OYSTER BAR: (1196 Broadway) the Carta di Musica with Bottarga and Chili is amazing. Is it a sandwich? Yes. Yes it is.
+</p>
+</li>
+
+<li>
+<p>
+RANDOM STREET FAIRS: (Anywhere tube socks and stale spices are sold. ) New York street fairs suck. The same dreary vendors, same bad food. But those nasty sausage and pepper hero sandwiches are a siren song, luring me, always towards the rocks. Shitting like a mink almost immediately after is guaranteed but who cares?
+</p>
+</li>
+
+<li>
+<p>
+BARNEY GREENGRASS : ( 541 Amsterdam Ave.) Chopped Liver on rye. The best chopped liver in NYC.
+</p>
+</li>
+</ol>
+</div>
+
+<h2 id="great-dead-bars-of-new-york">Great Dead Bars of New York</h2>
+
+<p>
+A work in progress
+</p>
+<div>
+<ol>
+
+<li>
+<p>
+SIBERIA in any of its iterations. The one on the subway being the best
+</p>
+</li>
+
+<li>
+<p>
+LADY ANNES FULL MOON SALOON a bar so nasty I’d bring out of town visitors there just to scare them
+</p>
+</li>
+
+<li>
+<p>
+THE LION'S HEAD old school newspaper hang out
+</p>
+</li>
+
+<li>
+<p>
+KELLY'S on 43rd and Lex. Notable for 25 cent drafts and regularly and reliably serving me when I was 15
+</p>
+</li>
+
+<li>
+<p>
+THE TERMINAL BAR legendary dive across from port authority
+</p>
+</li>
+
+<li>
+<p>
+BILLY'S TOPLESS (later, Billy’s Stopless) an atmospheric, working class place, perfect for late afternoon drinking where nobody hustled you for money and everybody knew everybody. Great all-hair metal jukebox . Naked breasts were not really the point.
+</p>
+</li>
+
+<li>
+<p>
+THE BAR AT HAWAII KAI. tucked away in a giant tiki themed nightclub in Times Square with a midget doorman and a floor show. Best place to drop acid EVER.
+</p>
+</li>
+
+<li>
+<p>
+THE NURSERY after hours bar decorated like a pediatrician’s office. Only the nursery rhyme characters were punk rockers of the day.
+</p>
+</li>
+</ol>
+</div>
+</div><div>
+
+<h2 id="lost-page">Lost page</h2>
+<p>
+It was surprising to see that only one page was not recoverable from the common crawl.
+</p></div><div>
+
+<h2 id="what-s-next">What’s next?</h2>
+<p>
+I’ve enjoyed this little project tremendously—a little archeology project. Can we declare victory for at least this endeavor? Hopefully, we would be able to find images, but that’s a little tougher, since that era’s cloudfront is fully gone.
+</p>
+<p>
+What else can we work on restoring and setting up some sort of a public archive to store them? I made this a <a href="https://github.com/thecsw/bourdain" title="">git repository</a> for the sole purpose so that anyone interested can contribute their interest and passion for these kinds of projects.
+</p>
+<p>
+Thank you and until next time! <b>◼︎</b>
+</p>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Want to sway an election? Here’s how much fake online accounts cost (139 pts)]]></title>
             <link>https://www.science.org/content/article/want-sway-election-here-s-how-much-fake-online-accounts-cost</link>
             <guid>46257871</guid>
             <pubDate>Sat, 13 Dec 2025 20:48:09 GMT</pubDate>
@@ -17,7 +900,7 @@
 Couldn't get https://www.science.org/content/article/want-sway-election-here-s-how-much-fake-online-accounts-cost: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Why Twilio Segment moved from microservices back to a monolith (159 pts)]]></title>
+            <title><![CDATA[Why Twilio Segment moved from microservices back to a monolith (173 pts)]]></title>
             <link>https://www.twilio.com/en-us/blog/developers/best-practices/goodbye-microservices</link>
             <guid>46257714</guid>
             <pubDate>Sat, 13 Dec 2025 20:30:34 GMT</pubDate>
@@ -477,7 +1360,195 @@ Couldn't get https://www.science.org/content/article/want-sway-election-here-s-h
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[VPN location claims don't match real traffic exits (234 pts)]]></title>
+            <title><![CDATA[I fed 24 years of my blog posts to a Markov model (104 pts)]]></title>
+            <link>https://susam.net/fed-24-years-of-posts-to-markov-model.html</link>
+            <guid>46257607</guid>
+            <pubDate>Sat, 13 Dec 2025 20:19:53 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://susam.net/fed-24-years-of-posts-to-markov-model.html">https://susam.net/fed-24-years-of-posts-to-markov-model.html</a>, See on <a href="https://news.ycombinator.com/item?id=46257607">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+<p>By <b>Susam Pal</b> on 13 Dec 2025</p>
+<p>
+  Yesterday I shared a little program called <em>Mark V. Shaney
+  Junior</em> at
+  <a href="https://github.com/susam/mvs">github.com/susam/mvs</a>.  It
+  is a minimal implementation of a Markov text generator inspired by
+  the legendary Mark V. Shaney program from the 1980s.  If you don't
+  know about Mark V. Shaney, read more about it on the Wikipedia
+  article <a href="https://en.wikipedia.org/wiki/Mark_V._Shaney">Mark
+  V. Shaney</a>.
+</p>
+<p>
+  It is a very small program with only about
+  <a href="https://github.com/susam/mvs/blob/main/mvs">30 lines of
+  Python</a> that favours simplicity over efficiency.  As a hobby, I
+  often engage in exploratory programming where I write computer
+  programs not to solve a specific problem but simply to explore a
+  particular idea or topic for the sole purpose of recreation.  I must
+  have written small programs to explore Markov chains for various
+  kinds of state spaces over a dozen times by now.  Every time, I just
+  pick my last experimental code and edit it to encode the new state
+  space I am exploring.  That's usually my general approach to such
+  one-off programs.  I have hundreds of tiny little experimental
+  programs lying on my disk at any given time.
+</p>
+<p>
+  Once in a while, I get the itch to take one of those exploratory
+  programs, give it some finishing touches, wrap it up in a nice Git
+  repo along with a <code>README.md</code>, <code>CHANGES.md</code>
+  and the whole shebang and share it on
+  <a href="https://github.com/susam">github.com/susam</a> and
+  <a href="https://codeberg.org/susam">codeberg.org/susam</a>.  The
+  Mark V. Shaney Junior program that I shared yesterday happened to be
+  one such exercise.
+</p>
+<p>
+  If you scroll down the
+  <a href="https://github.com/susam/mvs#readme">README</a> of this
+  project, you'll find some nice examples of the gibberish produced by
+  this program.  The first few examples there are the result of
+  training the model on <em>A Christmas Carol</em> by Charles Dickens,
+  one of my favourite authors.  It is often said that Dickens never
+  used fewer words when more would suffice.  So I thought there
+  couldn't be a better piece of text when it comes to testing out my
+  tiny Markov model.  I'll not reproduce the generated text examples
+  here for the sake of brevity.  If you are interested to take a look,
+  just head over to the
+  <a href="https://github.com/susam/mvs#gibberish-examples">Gibberish</a>
+  section of the README.
+</p>
+<p>
+  Soon after sharing the project, I wondered what kind of gibberish it
+  would produce if I fed all 24 years of my blog
+  <a href="https://susam.net/pages.html">posts and pages</a> into the program.
+  Well, here's one of the results:
+</p>
+<pre><samp>$ <kbd>./mvs &lt; susam.txt</kbd>
+while a query replace operation is approved by the user. The above
+variable defines the build job. It can be incredibly useful while
+working on assembly language and machine code. In fact, all internal
+resources like the result to refine the search prompt changes from
+bck-i-search: to fwd-i-search:. Now type C-SPC (i.e. ctrl+space) to
+set a mark causes Emacs to use 32-bit registers like EBP, ESP,
+etc. Thus the behaviour is undefined. Such code may behave differently
+when compiled with the readily available GNU tools like the shape
+of 8. Flipping "P" horizontally makes it a proper quine: cat $0</samp>
+</pre>
+<p>
+  This is the text that comes out after the program consumes over 200
+  posts consisting of about 200,000 words.  My blog also has
+  a <a href="https://susam.net/comments/">comments section</a> with over 500
+  comments consisting of about 40,000 words.  All comments were
+  excluded while training the model.  Here is another output example:
+</p>
+<pre><samp>$ <kbd>./mvs &lt; susam.txt</kbd>
+enjoy asking "what happens if" and then type M-x zap-up-to-char RET
+b. The buffer for this specific video, the actual fare for 8.3 km and
+11 are all written from scratch. No prior knowledge is expected to
+slow down in future. For now, I will add a statement like x =
+0.999... , the inner corner square as discussed in the code segment
+into the REPL window. Unlike Slimv, Vlime can work with and debug
+executable files, it can be more convenient. M-x: Execute Extended
+Command The key sequence M-q invokes the command cat and type TAB to
+indent the</samp>
+</pre>
+<p>
+  Here is a particularly incoherent but amusing one:
+</p>
+<pre><samp>$ <kbd>./mvs &lt; susam.txt</kbd>
+Then open a new Lisp source file and the exact answer could harm
+students' self-esteem. Scientists have arbitrarily assumed that an
+integral domain. However, the string and comment text. To demonstrate
+how a build job can trigger itself, pass input to standard output or
+standard error), Eshell automatically runs the following command in
+Vim and Emacs will copy the message length limit of 512 characters,
+etc. For example, while learning to play the game between normal mode
+to move the point is on an old dictionary lying around our house and
+that is moving to the small and supportive community</samp>
+</pre>
+<p>
+  No, I have never said anywhere that opening a Lisp source file could
+  harm anyone's self-esteem.  The text generator has picked up the
+  'Lisp source file' phrase from my
+  <a href="https://susam.net/lisp-in-vim.html">Lisp in Vim</a> post and the
+  'self-esteem' bit from the <a href="https://susam.net/from-perl-to-pi.html">From Perl
+  to Pi</a> post.
+</p>
+<p>
+  By default, this program looks at trigrams (all sequences of three
+  adjacent words) and creates a map where the first two words of the
+  trigram are inserted as the key and the third word is appended to
+  its list value.  This map is the model.  In this way, the model
+  captures each pair of adjacent words along with the words that
+  immediately follow each pair.  The text generator then chooses a key
+  (a pair of words) at random and looks for a word which follows.  If
+  there are multiple followers, it picks one at random.  That is
+  pretty much the whole algorithm.  There isn't much more to it.  It
+  is as simple as it gets.  For that reason, I often describe a simple
+  Markov model like this as the 'hello, world' for language models.
+</p>
+<p>
+  Of course, in 2025, given the overwhelming popularity of large
+  language models (LLMs), Markov models like this look unimpressive.
+  Unlike LLMs, a simple Markov model cannot capture global structure
+  or long-range dependencies within the text.  It relies entirely on
+  local word transition statistics.  Also, these days, one hardly
+  needs a Markov model to generate gibberish; social media provides an
+  ample supply.  Nevertheless, I think the simplicity of its design
+  and implementation serves as a good entry point into language
+  models.
+</p>
+<p>
+  In my implementation, the number of words in the key of the map can
+  be set via command line arguments.  By default, it is 2 as described
+  above.  This value is also known as the order of the model.  So by
+  default the order is 2.  If we increase it to, say, 3 or 4, the
+  generated text becomes a little more coherent.  Here is one such
+  example:
+</p>
+<pre><samp>$ <kbd>./mvs 4 &lt; susam.txt</kbd>
+It is also possible to search for channels by channel names. For
+example, on Libera Chat, to search for all channels with 'python' in
+its name, enter the IRC command: /msg alis list python. Although I
+have used Libera Chat in the examples above, there are plenty of
+infinite fields, so they must all be integral domains too. Consider
+the field of rational numbers Q. Another quick way to arrive at this
+fact is to observe that when one knight is placed on a type D square,
+only two positions for the second knight such that the two knights
+attack</samp>
+</pre>
+<p>
+  Except for a couple of abrupt and meaningless transitions, the text
+  is mostly coherent.  We need to be careful about not increasing the
+  order too much.  In fact, if we increase the order of the model to
+  5, the generated text becomes very dry and factual because it begins
+  to quote large portions of the blog posts verbatim.  Not much fun
+  can be had with that.
+</p>
+<p>
+  Before I end this post, let me present one final example where I ask
+  it to generate text from an initial prompt:
+</p>
+<pre><samp>$ <kbd>./mvs 2 100 'Finally we' &lt; susam.txt</kbd>
+Finally we divide this number by a feed aggregrator for Emacs-related
+blogs. The following complete key sequences describe the effects of
+previous evaluations shall have taken a simple and small to contain
+bad content. This provides an interactive byte-compiled Lisp function
+in MATLAB and GNU bash 5.1.4 on Debian is easily reproducible in
+Windows XP. Older versions might be able to run that server for me it
+played a significant burden on me as soon as possible. C-u F: Visit
+the marked files or directories in the sense that it was already
+initiated and we were to complete the proof.</samp>
+</pre>
+<p>
+  Apparently, this is how I would sound if I ever took up speaking
+  gibberish!
+</p>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[VPN location claims don't match real traffic exits (257 pts)]]></title>
             <link>https://ipinfo.io/blog/vpn-location-mismatch-report</link>
             <guid>46257339</guid>
             <pubDate>Sat, 13 Dec 2025 19:46:19 GMT</pubDate>
@@ -501,7 +1572,7 @@ Couldn't get https://www.science.org/content/article/want-sway-election-here-s-h
 <p>The median error between ProbeNet and the legacy datasets was roughly 3,100 km<strong>. </strong>On the ProbeNet side, we have strong latency evidence that our measured country is the right one:</p><ul><li><strong>The median minimum RTT</strong> to a probe in the measured country was <strong>0.27 ms</strong>.</li><li>About <strong>90%</strong> of these locations had a <strong>sub-millisecond</strong> RTT from at least one probe.</li></ul><p>That’s what you expect when traffic is genuinely in that country, not thousands of kilometers away.</p><h3 id="an-ip-example-you-can-test-yourself">An IP Example You Can Test Yourself</h3><p>This behavior is much more tangible if you can see it on a single IP.&nbsp;</p><p>Here's <a href="https://ipinfo.io/74.118.126.154?ref=ipinfo.io"><u>one VPN exit IP</u></a> where ProbeNet places the server in the United Kingdom, backed by sub-millisecond RTT from local probes, while other widely used legacy IP datasets place the same IP in Mauritius, 9,691 kilometers away.</p><p><strong>🇬🇧 United Kingdom vs 🇲🇺 Mauritius (ProtonVPN)</strong></p><figure><img src="https://ipinfo.io/blog/content/images/2025/12/location-alert.png" alt="" loading="lazy" width="697" height="86" srcset="https://ipinfo.io/blog/content/images/size/w600/2025/12/location-alert.png 600w, https://ipinfo.io/blog/content/images/2025/12/location-alert.png 697w"></figure><figure><img src="https://ipinfo.io/blog/content/images/2025/12/location-evidence.png" alt="" loading="lazy" width="1574" height="648" srcset="https://ipinfo.io/blog/content/images/size/w600/2025/12/location-evidence.png 600w, https://ipinfo.io/blog/content/images/size/w1000/2025/12/location-evidence.png 1000w, https://ipinfo.io/blog/content/images/2025/12/location-evidence.png 1574w" sizes="(min-width: 720px) 720px"></figure><p>If you want to check this yourself, you can plug it into a public measurement tool like <a href="https://ping.sx/?ref=ipinfo.io"><u>https://ping.sx/</u></a> and run pings or traceroutes from different regions. Tools like this one provide a clear visual for where latency is lowest.</p><p>ProbeNet uses the same basic idea, but at a different scale: we maintain a network of 1,200+ points of presence (PoPs) around the world, so we can usually get even closer to the real physical location than public tools with smaller networks.</p><p>If you’d like to play with more real IPs (not necessarily VPNs) where ProbeNet and IPinfo get the country right and other datasets don’t, you can find a fuller set of examples on our IP geolocation <a href="http://ipinfo.io/accuracy/?ref=ipinfo.io"><u>accuracy page</u></a>.</p><h2 id="why-this-happens-and-how-it-impacts-trust">Why This Happens and How It Impacts Trust</h2><p>It’s worth separating technical reasons from trust issues. There are technical reasons to use virtual or hubbed infrastructure:</p><ul><li><strong>Risk &amp; regulation.</strong> Hosting in certain countries can expose both the provider and users to local surveillance or seizure.</li><li><strong>Infrastructure quality.</strong> Some regions simply don’t have the same density of reliable data centers or high-capacity internet links, so running servers there is harder and riskier.</li><li><strong>Performance &amp; cost.</strong> Serving “Bahamas” from Miami or “Cambodia” from Singapore can be cheaper, faster, and easier to maintain.</li></ul><p>From this perspective, a virtual location can be a reasonable compromise: you get a regional IP and content unblocking without the downsides of hosting in a fragile environment.</p><h3 id="where-it-becomes-a-trust-problem">Where It Becomes a Trust Problem</h3><p>Three things change the picture:</p><ul><li><strong>Lack of disclosure. </strong>Marking something clearly as “Virtual Bahamas (US-based)” is transparent. Listing “Bahamas” alongside “Germany” without any hint that one is virtual and the other is physical blurs the line between marketing and reality.</li><li><strong>Scale of the mismatch. </strong>It’s one thing to have a few virtual locations in hard-to-host places. It’s another when dozens of countries exist only as labels across your entire footprint, or when more than half of your tested locations are actually somewhere else.</li><li><strong>Downstream reliance. </strong>Journalists, activists, and NGOs may pick locations based on safety assumptions. Fraud systems, compliance workflows, and geo-restricted services may treat “Somalia” vs “France” as a meaningful difference. If both the VPN UI and the IP data say “Somalia” while the traffic is physically in France, everyone is making decisions on a false premise.</li></ul><p>That last point leads directly into the IP data problem that we are focused on solving.</p><h2 id="so-how-much-should-you-trust-your-vpn">So How Much Should You Trust Your VPN?</h2><p>If you’re a VPN user, here are some practical takeaways from this work:</p><ul><li><strong>Treat “100+ countries” as a marketing number, not a guarantee. </strong>In our sample, 97 countries existed only as claims, not reality, across 17 providers.</li><li><strong>Check how your provider talks about locations. </strong>Do they clearly label “virtual” servers? Document where they’re actually hosted? Or do they quietly mix virtual and physical locations in one long list?</li><li><strong>If you rely on IP data professionally, ask where it comes from. </strong>A static “99.x% accurate worldwide” claim doesn’t tell you how an IP data provider handles fast-moving, high-stakes environments like VPN infrastructure.</li></ul><p>Ultimately, this isn’t an argument against VPNs, or even against virtual locations. It’s an argument for honesty and evidence. If a VPN provider wants you to trust that map of flags, they should be willing, and able, to show that it matches the real network underneath.</p><h2 id="how-ipinfo-approaches-ip-data-differently">How IPinfo Approaches IP Data Differently</h2><p>Most legacy IP data providers rely on regional internet registry (RIR) allocation data and heuristics around routing and address blocks. These providers will often accept self-declared data like customer feedback, corrections, and geofeeds, without a clear way to verify them.&nbsp;</p><p>IPinfo takes a measurement-first approach:</p><ol><li><strong>Proprietary ProbeNet with 1,200+ points of presence</strong><br>We maintain an internet measurement platform of PoPs in locations around the world.</li><li><strong>Active measurements</strong><br>For each visible IP on the internet, including both IPv4 and IPv6 addresses, we measure RTT from multiple probes.</li><li><strong>Evidence-based geolocation</strong><br>We combine these measurements with IPinfo’s other signals to assign a country (and more granular location) that’s grounded in how the internet actually behaves.</li></ol><p>This measurement-first approach is unique in the IP data space. Once we realized how much inaccuracy came from self-declared data, we started investing heavily in research and building ProbeNet to use active measurements at scale. Our goal is to make IP data as evidence-based as possible, verifying with observation on how the internet actually behaves.</p><h2 id="our-methodology-for-this-report">Our Methodology for This Report</h2><p>We approached this VPN investigation the way a skeptical but well-equipped user would: start from the VPNs’ own claims, then test them.</p><h3 id="step-1-collecting-what-providers-say">Step 1: Collecting What Providers Say</h3><p>For each of the <strong>20 VPN providers</strong>, we pulled together three kinds of data:</p><ul><li><strong>Marketing promises: </strong>The “servers in X countries” claims and country lists from their websites. When a country was clearly listed there, we treated it as the locations they actively promote.&nbsp;</li><li><strong>Configurations and locations lists: </strong>Configurations from different protocols like OpenVPN or WireGuard were collected along with location information available on provider command-line tools, mobile applications, or APIs.</li><li><strong>Unique provider–location entries: </strong>We ended up with over 6,000,000 data points and a list of provider + location combinations we could actually try to connect to with multiple IPs each.</li></ul><h3 id="step-2-observing-where-the-traffic-really-goes">Step 2: Observing Where the Traffic Really Goes</h3><p>Next, we used IPinfo infrastructure and ProbeNet to dial into those locations and watch what actually happens:</p><ul><li>We connected to each VPN “location” and captured the exit IP addresses.</li><li>For each exit IP address, we used IPinfo + ProbeNet’s active measurements to determine a measured country, plus:<ul><li>The nearest ProbeNet vantage point (e.g., US, Brazil, France)</li><li>The round-trip time (RTT) from that probe (often under 1 ms), which is a strong hint about physical proximity</li></ul></li></ul><p>Now we had two views for each location:</p><ul><li><strong>Expected/Claimed country</strong>: What the VPN claims in its UI/configs/website</li><li><strong>Measured country</strong>: Where IPinfo + ProbeNet actually see the exit IP</li></ul><h3 id="step-3-comparing-claims-vs-reality">Step 3: Comparing Claims vs Reality</h3><p>For each location where a country was clearly specified, we asked a very simple question: Does the expected country match the measured country?</p><p>If yes, we counted it as a match. If not, it became a mismatch: a location where the app says one country, but the traffic exits somewhere else.</p><h3 id="acknowledgements-limitations-and-constrains">Acknowledgements, Limitations, and Constrains</h3><p>We deliberately used a very narrow definition of “mismatch.” For a location to be counted, two things had to be true: the provider had to clearly claim a specific country (on their website, in their app, or in configs), and we had direct active measurements from ProbeNet for the exit IPs behind that location.</p><p>We ignored any locations where the marketing was ambiguous, where we hadn’t measured the exit directly, or where we only had weaker hints like hostname strings, registry data, or third-party IP databases. Those signals can be useful and true, but we wanted our numbers to be as hard-to-argue-with as possible.</p><p>The result is that the mismatch rates we show here are conservative. With a looser methodology that also leaned on those additional hints, the numbers would almost certainly be higher, not lower.&nbsp;</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Dick Van Dyke turns 100 (115 pts)]]></title>
+            <title><![CDATA[Dick Van Dyke turns 100 (116 pts)]]></title>
             <link>https://www.theguardian.com/film/2025/dec/13/dick-van-dyke-centenarian-100-mary-poppins-chitty-chitty-bang-bang</link>
             <guid>46256954</guid>
             <pubDate>Sat, 13 Dec 2025 18:58:09 GMT</pubDate>
@@ -509,7 +1580,7 @@ Couldn't get https://www.science.org/content/article/want-sway-election-here-s-h
 <div id="readability-page-1" class="page"><div id="maincontent"><p><span>A</span>ll Hollywood stars grow old and die except perhaps one - Dick Van Dyke - who turns 100 today. The real world Peter Pan who used to trip over the ottoman on The Dick Van Dyke Show is still standing. The man who impersonated a wind-up toy in Chitty Chitty Bang Bang hasn’t wound down just yet. He has outlived mentors, co-stars, romantic partners and several studios. He’s even outlived the jokes about his performance in Mary Poppins. These days his <a href="https://www.theguardian.com/film/2025/nov/20/do-you-expect-me-to-talk-dick-van-dyke-says-he-turned-down-playing-james-bond" data-link-name="in body link">mangled cockney accent</a> is regarded with more fondness than contempt. It’s seen as one of the great charms of the 1964 classic, along with the carousel chase or the cartoon dancing penguins.</p><figure id="9cfd5a00-ebe1-4e6a-a661-a75e1c524273" data-spacefinder-role="inline" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-2"><picture><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="Accent on the charm … Dick Van Dyke with Julie Andrews in Mary Poppins." src="https://i.guim.co.uk/img/media/8cbbf0f601da373c12c7d5e4502e749c643db8f8/0_0_4502_4200/master/4502.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="415.14882274544647" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Accent on the charm … Dick Van Dyke with Julie Andrews in Mary Poppins.</span> Photograph: Donaldson Collection/Getty Images</figcaption></figure><p>Charm is the magic ingredient of every popular entertainer and few have possessed it in such abundance as Van Dyke, the impoverished son of a travelling cookie salesman who dropped out of high school and educated himself at the movies. “His job in this life is to make a happier world,” his Broadway co-star Chita Rivera once said - and this may explain his stubborn refusal to quit, not while times are tough and he feels that audiences still need cheering up.</p><p>Naturally his workrate has now slowed, but in the past few years he has competed on the TV show <a href="https://www.youtube.com/watch?v=vz8qbw8dTkg" data-link-name="in body link">The Masked Singer,</a> starred in a<a href="https://www.youtube.com/watch?v=pSeaHfkd3M8" data-link-name="in body link"> Coldplay video</a> and enthusiastically <a href="https://www.dailymail.co.uk/news/article-8063625/Bernie-Sanders-rallies-LA-Dick-Van-Dyke-Sarah-Silverman.html" data-link-name="in body link">stumped for Bernie Sanders</a>. Van Dyke simply couldn’t understand why America’s older citizens were resistant to Sanders’ democratic socialist domestic policies. He said, “I want to urge my generation to get out and vote for him, please.”</p><figure id="1ff74deb-d9af-412a-a6ca-835fa0f747ea" data-spacefinder-role="supporting" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-3"><picture><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=380&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 1300px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 1300px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=380&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 1300px)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=300&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 980px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 980px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=300&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 980px)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="Too much energy … Dick Van Dyke in Chitty Chitty Bang Bang." src="https://i.guim.co.uk/img/media/6b060c20f62c6c1ff808948d52ea992c00d2ee98/130_995_3528_3423/master/3528.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="431.75595238095235" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Too much energy … Dick Van Dyke in Chitty Chitty Bang Bang.</span> Photograph: Moviestore/REX/Shutterstock</figcaption></figure><p>As he nudges into triple figures, he has become a piece of living history: a walking, talking chronicle of US showbusiness itself. Van Dyke began his career performing for the troops in the second world war and proceeded to rub shoulders with the likes of Phil Silvers and Walt Disney. He had one foot in music-hall slapstick and the other in screwball comedy, and possibly splayed fingers in his midwestern hometown of Danville, Illinois.</p><p>In bridging these worlds, he perfected an outward-facing public image that was one part Stan Laurel to two parts Jimmy Stewart: a pratfalling clown who was decent and honest and smarter than he first appeared. And while he was already nearing 40 when The Dick Van Dyke Show and Mary Poppins made him an international star, the actor remained irrepressibly boyish. In 1968’s <a href="https://www.theguardian.com/film/chitty-chitty-bang-bang" data-link-name="in body link" data-component="auto-linked-tag">Chitty Chitty Bang Bang</a>, he played Caractacus Potts, the madcap inventor who dreams up a flying car, while Lionel Jeffries - six months younger - played Potts’s addled and eccentric dad.</p><p>Van Dyke, by and large, has steered clear of dark films. He famously turned down the lead role in The Omen and insists that he mostly played a version of himself. “Wholesome,” he says. “An all-round good boy.” That’s true so far as it goes, although it’s probably only half the story, because Van Dyke’s interpretation conveniently sidesteps a 25-year struggle with alcoholism that spanned his professional heyday. Possibly it also glosses over the air of dancing mischief – even wildness – that animates his most feted, family-friendly performances.</p><figure id="cc826a94-2386-46e8-89cf-4c94a7d23457" data-spacefinder-role="showcase" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-4"><picture><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=880&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 1300px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 1300px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=880&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 1300px)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=800&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 1140px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 1140px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=800&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 1140px)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=640&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 980px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 980px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=640&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 980px)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="Sparring mutual respect … Mary Tyler Moore and Dick Van Dyke in The Dick Van Dyke Show (1961)." src="https://i.guim.co.uk/img/media/38f194ab146eb921724a564f5323e2535b15ab57/0_445_2436_2700/master/2436.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="493.2266009852217" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Sparring mutual respect … Mary Tyler Moore and Dick Van Dyke in The Dick Van Dyke Show (1961). </span> Photograph: CBS Photo Archive/CBS/Getty Images</figcaption></figure><p>Or to put it more bluntly, Van Dyke may have been mainstream but he never once felt conservative, nor even cosy, exactly. He brought too much energy to the room. It was as though he’d just blown in from outside and wasn’t entirely housetrained. The <a href="https://www.theguardian.com/film/dick-van-dyke" data-link-name="in body link" data-component="auto-linked-tag">Dick Van Dyke</a> Show – an otherwise standard 60s family sitcom – is notable for the crackling sexual chemistry and sparring mutual respect which Van Dyke cooked up with his co-star, Mary Tyler Moore.</p><p>Caractacus Potts, for his part, is the ultimate rackety dad: loving and exciting and liable to forget every birthday and dentist appointment. And then there is Bert, the sweep from <a href="https://www.theguardian.com/film/mary-poppins" data-link-name="in body link" data-component="auto-linked-tag">Mary Poppins</a> who trips across London’s rooftops like an urbanised Puck of Pook’s Hill. The evidence suggests that Bert isn’t cockney at all. He’s a spooky nature spirit, antic and mercurial, who is gamely attempting to pass himself off as a local.</p><figure id="d044bd79-0ffb-4f26-96c9-0ce0eaf31e72" data-spacefinder-role="showcase" data-spacefinder-type="model.dotcomrendering.pageElements.ImageBlockElement"><div id="img-5"><picture><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=880&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 1300px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 1300px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=880&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 1300px)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=800&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 1140px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 1140px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=800&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 1140px)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=640&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 980px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 980px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=640&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 980px)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=620&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 660px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 660px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=620&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 660px)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=605&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 480px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 480px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=605&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 480px)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=445&amp;dpr=2&amp;s=none&amp;crop=none" media="(min-width: 320px) and (-webkit-min-device-pixel-ratio: 1.25), (min-width: 320px) and (min-resolution: 120dpi)"><source srcset="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" media="(min-width: 320px)"><img alt="Campaigning for Bernie Sanders, 2020." src="https://i.guim.co.uk/img/media/439b4bf60dc8bff6915613b026900f4f9f8cd8a0/0_0_5000_3333/master/5000.jpg?width=445&amp;dpr=1&amp;s=none&amp;crop=none" width="445" height="296.637" loading="lazy"></picture></div><figcaption data-spacefinder-role="inline"><span><svg width="18" height="13" viewBox="0 0 18 13"><path d="M18 3.5v8l-1.5 1.5h-15l-1.5-1.5v-8l1.5-1.5h3.5l2-2h4l2 2h3.5l1.5 1.5zm-9 7.5c1.9 0 3.5-1.6 3.5-3.5s-1.6-3.5-3.5-3.5-3.5 1.6-3.5 3.5 1.6 3.5 3.5 3.5z"></path></svg></span><span>Campaigning for Bernie Sanders, 2020.</span> Photograph: Étienne Laurent/EPA</figcaption></figure><p>Van Dyke is 100 and therefore no longer looks like Peter Pan. He looks, if anything, the platonic ideal of old age, with laughter lines and a thick white beard, the weathered embodiment of a life well lived. In his later years, he has grown used to people asking him for health advice, to the point where he even sat down and listed it all in a book (<a href="https://www.nytimes.com/2025/11/28/well/dick-van-dyke-health-habits.html" data-link-name="in body link">100 Rules for Living to 100</a>).</p><figure id="f508b87a-40e0-4d8b-8418-a57b479d78cc" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:13,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Porpoises rescue Dick Van Dyke&quot;,&quot;elementId&quot;:&quot;f508b87a-40e0-4d8b-8418-a57b479d78cc&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/film/2010/nov/11/dick-van-dyke-porpoises-rescue&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:10,&quot;display&quot;:2,&quot;theme&quot;:3}}"></gu-island></figure><p>The man is too self-aware to present himself as a paragon of good living. Instead he credits his longevity to a sprinkle of everyday magic – a combination of good genes, solid friendships and a positive mental outlook. “My life has been a magnificent indulgence,” he says. “I’ve been able to do what I love and share it with the world.”</p><p>It’s an arrangement that has sustained him for a full century on the planet. It’s fuelled a career so rewarding and fun that it barely felt like work at all. Van Dyke started out as showbusiness’s gawky gatecrasher, a controlled explosion of elastic limbs and rubber-faced double-takes, before maturing by degrees into Hollywood’s twinkling Father Time. He is ancient but evergreen, feted and cherished. And he’s altogether as lucky as lucky can be.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Are we stuck with the same Desktop UX forever? [video] (105 pts)]]></title>
+            <title><![CDATA[Are we stuck with the same Desktop UX forever? [video] (120 pts)]]></title>
             <link>https://www.youtube.com/watch?v=1fZTOjd_bOQ</link>
             <guid>46256834</guid>
             <pubDate>Sat, 13 Dec 2025 18:39:53 GMT</pubDate>
@@ -559,7 +1630,7 @@ Couldn't get https://www.science.org/content/article/want-sway-election-here-s-h
                                     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I tried Gleam for Advent of Code (235 pts)]]></title>
+            <title><![CDATA[I tried Gleam for Advent of Code (241 pts)]]></title>
             <link>https://blog.tymscar.com/posts/gleamaoc2025/</link>
             <guid>46255991</guid>
             <pubDate>Sat, 13 Dec 2025 17:00:14 GMT</pubDate>
@@ -621,7 +1692,7 @@ Couldn't get https://www.science.org/content/article/want-sway-election-here-s-h
 </span></span></code></pre></div><p>Sometimes you build a beautiful mental model and then the right answer is a single inequality.</p><h2 id="closing-thoughts">Closing thoughts<a href="#closing-thoughts" arialabel="Anchor">#</a></h2><p>I am very happy I picked Gleam this year.</p><p>It has sharp edges, mostly around where the standard library draws the line and a few language constraints that show up in puzzle code. But it also has real strengths.</p><p>Pipelines feel good. Options and Results make unsafe problems feel safe. The list toolbox is better than I expected. <code>fold_until</code> is incredible. Once you stop trying to write loops and you let it be functional, the solutions start to feel clearer.</p><p>I cannot wait to try Gleam in a real project. I have been thinking about using it to write a webserver, and I am genuinely excited to give it a go.</p><p>And of course, I cannot wait for next year’s Advent of Code.</p><p>If you want to look at the source for all 12 days, it is here:</p><p><a href="https://github.com/tymscar/Advent-Of-Code/tree/master/2025/gleam/aoc/src">https://github.com/tymscar/Advent-Of-Code/tree/master/2025/gleam/aoc/src</a></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[LG TV's new software update installed MS Copilot, which cannot be deleted (168 pts)]]></title>
+            <title><![CDATA[LG TV's new software update installed MS Copilot, which cannot be deleted (169 pts)]]></title>
             <link>https://old.reddit.com/r/mildlyinfuriating/comments/1plldqo/my_lg_tvs_new_software_update_installed_microsoft/</link>
             <guid>46255335</guid>
             <pubDate>Sat, 13 Dec 2025 15:41:24 GMT</pubDate>
@@ -739,7 +1810,7 @@ This includes posts that could be, within reason, regarded as politically, sexua
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: How can I get better at using AI for programming? (206 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: How can I get better at using AI for programming? (226 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=46255285</link>
             <guid>46255285</guid>
             <pubDate>Sat, 13 Dec 2025 15:37:16 GMT</pubDate>
@@ -748,7 +1819,7 @@ This includes posts that could be, within reason, regarded as politically, sexua
 </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We built another object storage (125 pts)]]></title>
+            <title><![CDATA[We built another object storage (126 pts)]]></title>
             <link>https://fractalbits.com/blog/why-we-built-another-object-storage/</link>
             <guid>46254087</guid>
             <pubDate>Sat, 13 Dec 2025 12:29:19 GMT</pubDate>
@@ -858,7 +1929,7 @@ Why Zig?</p>
 <p>[4]. Google Cloud Storage hierarchical namespace, <a href="https://cloud.google.com/blog/products/storage-data-transfer/new-gcs-hierarchical-namespace-for-ai-and-data-lake-workloads">https://cloud.google.com/blog/products/storage-data-transfer/new-gcs-hierarchical-namespace-for-ai-and-data-lake-workloads</a></p>  </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[YouTube's CEO limits his kids' social media use – other tech bosses do the same (183 pts)]]></title>
+            <title><![CDATA[YouTube's CEO limits his kids' social media use – other tech bosses do the same (185 pts)]]></title>
             <link>https://www.cnbc.com/2025/12/13/youtubes-ceo-is-latest-tech-boss-limiting-his-kids-social-media-use.html</link>
             <guid>46253985</guid>
             <pubDate>Sat, 13 Dec 2025 12:03:51 GMT</pubDate>
@@ -884,7 +1955,7 @@ Why Zig?</p>
 <div><p>Such a legend! I bet he still has his Amiga somewhere in his Hollywood hills mansion.</p></div></td></tr></tbody></table></td></tr><tr id="46253117"><td></td></tr><tr id="46253384"><td></td></tr><tr id="46254129"><td></td></tr><tr id="46254676"><td></td></tr><tr id="46253891"><td></td></tr></tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Doxers posing as cops are tricking big tech firms into sharing people's data (125 pts)]]></title>
+            <title><![CDATA[Doxers posing as cops are tricking big tech firms into sharing people's data (127 pts)]]></title>
             <link>https://www.wired.com/story/doxers-posing-as-cops-are-tricking-big-tech-firms-into-sharing-peoples-private-data/</link>
             <guid>46252171</guid>
             <pubDate>Sat, 13 Dec 2025 05:06:59 GMT</pubDate>
@@ -892,7 +1963,7 @@ Why Zig?</p>
 <div id="readability-page-1" class="page"><div id="main-content" tabindex="-1"><article lang="en-US"><div><header data-testid="SplitScreenContentHeaderWrapper"><div data-journey-hook="grid-wrapper"><div><p>A spoofed email address and an easily faked document is all it takes for major tech companies to hand over your most personal information.</p></div><div><p><span><picture><source media="(max-width: 767px)" srcset="https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_120,c_limit/security_dataleak_GettyImages-471954773.jpg 120w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_240,c_limit/security_dataleak_GettyImages-471954773.jpg 240w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_320,c_limit/security_dataleak_GettyImages-471954773.jpg 320w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_640,c_limit/security_dataleak_GettyImages-471954773.jpg 640w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_960,c_limit/security_dataleak_GettyImages-471954773.jpg 960w" sizes="100vw"><source media="(min-width: 768px)" srcset="https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_120,c_limit/security_dataleak_GettyImages-471954773.jpg 120w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_240,c_limit/security_dataleak_GettyImages-471954773.jpg 240w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_320,c_limit/security_dataleak_GettyImages-471954773.jpg 320w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_640,c_limit/security_dataleak_GettyImages-471954773.jpg 640w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_960,c_limit/security_dataleak_GettyImages-471954773.jpg 960w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_1280,c_limit/security_dataleak_GettyImages-471954773.jpg 1280w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_1600,c_limit/security_dataleak_GettyImages-471954773.jpg 1600w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_1920,c_limit/security_dataleak_GettyImages-471954773.jpg 1920w, https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_2240,c_limit/security_dataleak_GettyImages-471954773.jpg 2240w" sizes="100vw"><img alt="Folder eye and circuit board" loading="eager" src="https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_2560%2Cc_limit/security_dataleak_GettyImages-471954773.jpg" data-src="https://media.wired.com/photos/693377a12cc5d911c8d9ae0f/master/w_2560%2Cc_limit/security_dataleak_GettyImages-471954773.jpg"></picture></span></p></div></div><div data-journey-hook="grid-wrapper"><p><span>Photograph: Maxkabakov/Getty Images</span></p></div></header></div><div data-testid="ArticlePageChunks" data-attribute-verso-pattern="article-body"><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><figure data-testid="cne-audio-embed-figure"></figure><div><p><span>When a privacy</span> specialist at the legal response operations center of Charter Communications received an emergency data request via email on September 4 from Officer Jason Corse of the Jacksonville Sheriff’s Office, it took her just minutes to respond, with the name, home address, phone numbers, and email address of the “target.”</p><p>But the email had not in fact come from Corse or anyone else at the Jacksonville Sheriff’s Office. It was sent by a member of a hacking group that provides doxing-as-a-service to customers willing to pay for highly sensitive personal data held by tech companies in the United States.</p><p>“This took all of 20 minutes,” Exempt, a member of the group that carried out the ploy, told WIRED. He claims that his group has been successful in extracting similar information from virtually every major US tech company, including Apple and Amazon, as well as more fringe platforms like video-sharing site Rumble, which is popular with far-right influencers.</p><p>Exempt shared the information Charter Communications sent to the group with WIRED, and explained that the victim was a “gamer” from New York. When asked if he worried about how the information he obtained was used against the target, Exempt said: “I usually do not care.”</p><p>The victim did not respond to WIRED’s requests for comment.</p><p>“It is definitely concerning to hear criminals impersonating officers in such a manner, more so when they are claiming to be one of our employees,” says Christian Hancock, the media relations manager at the Jacksonville Sheriff’s Office. Officer Corse declined to comment.</p><p>Charter Communications declined to comment.</p><p>This method of tricking companies into handing over information that can be used to harass, threaten, and intimidate victims has been <a data-offer-url="https://krebsonsecurity.com/2022/03/hackers-gaining-power-of-subpoena-via-fake-emergency-data-requests/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://krebsonsecurity.com/2022/03/hackers-gaining-power-of-subpoena-via-fake-emergency-data-requests/&quot;}" href="https://krebsonsecurity.com/2022/03/hackers-gaining-power-of-subpoena-via-fake-emergency-data-requests/" rel="nofollow noopener" target="_blank">known about for years</a>. But WIRED has gained unprecedented insight into how one of these doxing groups operates, and why, despite years of warnings, it is still happening so often.</p><p>The Charter Communications incident was one of up to 500 successful requests Exempt claims to have made in recent years. To back up his claims, the hacker shared multiple documents and recordings with WIRED, including what he claimed were screenshots of email requests, fake subpoenas, responses from tech companies, and even a video recording of a phone call with one company’s law enforcement response team, which was seeking to verify a request. Exempt also shared evidence suggesting that a current law enforcement officer (Exempt refused to provide the officer’s location or name) was in contact with the group about allegedly working with them to submit requests from his own account in return for a cut of the profits.</p></div></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>“All I need is an IP address, which I can gain pretty easily, [and] next thing you know I have names, addresses, emails, and cell numbers,” says Exempt, adding that he can then use that information to make emergency data requests. “And with a subpoena and search warrant, I can access DMs, texts, call logs. That’s someone’s full life in my hands in the space of hours, depending on the response times of the company or provider.”</p><p>This type of doxing appears to be a lucrative business. Exempt claims his group brought in over $18,000 in the month of August alone. In one case, Exempt says he was paid $1,200 for a single dox of a person who was supposedly “grooming minors on an online gaming platform he owns. The individual was then allegedly promptly swatted.”</p><p>WIRED reviewed the information posted online about a 23-year-old from the southwestern US, which includes their home address, phone number, email addresses, and social media accounts. The person did not respond to WIRED’s request for comment. WIRED was unable to independently confirm if the person was swatted.</p><p>In the US, federal, state, and local law enforcement agencies who need to identify the owner of a social media account, or details about a specific phone, send the relevant company a subpoena or warrant requesting the information.</p><p>All major companies operating in the US have departments and specific staff assigned to dealing with these requests, which are typically sent via email. The companies, once they review the subpoena and see it has come from what looks like a law enforcement agency, typically comply with the requests, sometimes taking additional verification steps such as phoning the officer involved to confirm that they did indeed send the request.</p><p>But officers can also make emergency data requests, or EDRs, in cases involving a threat of imminent harm or death. These requests <a data-offer-url="https://www.ic3.gov/CSA/2024/241104.pdf" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.ic3.gov/CSA/2024/241104.pdf&quot;}" href="https://www.ic3.gov/CSA/2024/241104.pdf" rel="nofollow noopener" target="_blank">typically bypass</a> any additional verification steps by the companies who are under pressure to fulfill the request as quickly as possible.</p></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>This is the loophole that hackers like Exempt, who says he is “a Gen Z male located within the Europe area,” can exploit.</p><p>The problem partly stems from the fact that there are around 18,000 individual law enforcement agencies in the US, all of which use their own email naming conventions and domain registrations, including .us, .net, .org, .gov, and .com.</p><p>The hackers typically use one of two ways to trick companies into making them believe the emails are coming from real law enforcement agencies. In some cases, they use authentic law enforcement email accounts that they have compromised via social engineering or using credentials stolen in previous hacks. Other times, they create convincing fake domains that closely mimic legitimate police departments.</p><p>“This was an email address that looked like the real thing,” says Exempt, explaining the mechanics of how he tricked Charter Communications. “The real domain of the Jacksonville Sheriff’s Office in Florida is jaxsheriff.org. We purchased jaxsheriff.us and then spoofed our number as the department’s, so that when we called them to verify receipt of the legal process, when they searched the number, it would come back to the sheriff’s office, giving them no reason to doubt it. We use real badge numbers and officer names as well.”</p><p>The hackers also craft highly convincing fake official documents by mimicking official records.</p><p>“We look at real subpoenas through public records where available and use the legally correct wording and sections of the law in the subpoena so that everything is legally correct and binding, so that we realistically have zero percent chance of them second-guessing it,” says Exempt. This has worked in multiple states and courts in the US, he claims.</p><p>“As an extra verification step, we sometimes check online to see if the named judge is actually in court that day, so that if a company was to phone up and verify, they would be in the building but most likely be too busy to be able to verify the singular document,” says Exempt.</p></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>In many cases, Exempt says, the email and attached subpoena is enough to extract the information. In one example shared with WIRED, Exempt claims that his group, which he says is made up of around nine people located across Europe and the US, was able to obtain the information used to register the official Rumble account belonging to British far-right activist Tommy Robinson.</p><p>Robinson and Rumble did not respond to requests for comment.</p><p>Even in cases where companies do take additional steps to verify the subpoenas are coming from real officers, the hackers are able to circumvent this.</p><p>In a recording of a phone call shared with WIRED, a representative from Amazon’s law enforcement response team called the number included in the faked email Exempt sent, and spoke with Exempt to verify that they had received the documents she had sent him via an online portal.</p><p>“Amazon identified and blocked someone that was requesting data from us while impersonating law enforcement,” says Adam Montgomery, an Amazon spokesperson. “The impersonator received basic account data for fewer than 10 customers. We quickly took steps to protect these customer accounts, and have put additional safeguards in place to prevent this from happening again.”</p><p>When asked for details of what those safeguards were, Amazon declined to comment.</p><p>While the hackers are clearly exploiting massive loopholes in the system, in some cases, the tech companies themselves have laid out step-by-step guides on how to craft these requests.</p><p>“In order to request that Apple voluntarily disclose information on an emergency basis, the requesting government or law enforcement ofﬁcer should complete the Emergency Government &amp; Law Enforcement Information Request form and transmit it directly from their ofﬁcial government or law enforcement email address to [a specific @apple.com email address] with the words “Emergency Request” in the subject line,” Apple <a data-offer-url="https://www.apple.com/legal/privacy/law-enforcement-guidelines-us.pdf" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.apple.com/legal/privacy/law-enforcement-guidelines-us.pdf&quot;}" href="https://www.apple.com/legal/privacy/law-enforcement-guidelines-us.pdf" rel="nofollow noopener" target="_blank">writes</a>.</p></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>Exempt shared with WIRED an example of a request he made to Apple using a fake subpoena as well as the information Apple sent back to him that included an iCloud account holder’s home address, cell phone number, and email addresses. Apple did not respond to a request for comment.</p><p>One <a data-offer-url="https://www.search.org/resources/isp-list/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.search.org/resources/isp-list/&quot;}" href="https://www.search.org/resources/isp-list/" rel="nofollow noopener" target="_blank">online database</a> maintained by SEARCH, a nonprofit criminal justice support organization, lists direct contact details for the law enforcement divisions of over 700 internet service providers and other online content providers.</p><p>“The core issue isn't companies being careless, it's that traditional communications channels, like email, weren't built for the level of identity verification, context evaluation, and real-time decisioning that modern investigations and legal compliance require,” says Matt Donahue, a former FBI agent who left the agency in 2020. Soon after, Donahue founded Kodex, a company that works with business clients to build secure online portals that law enforcement can use to make data requests.</p><p>While technologies like Kodex provide a much safer alternative to email, over 80 percent of the companies listed on the SEARCH database still accept emergency data requests via emails, according to one review <a data-offer-url="https://blog.kodexglobal.com/hubfs/2025Q2%20Quarterly%20Threat%20Intel%20Report.pdf" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://blog.kodexglobal.com/hubfs/2025Q2%20Quarterly%20Threat%20Intel%20Report.pdf&quot;}" href="https://blog.kodexglobal.com/hubfs/2025Q2%20Quarterly%20Threat%20Intel%20Report.pdf" rel="nofollow noopener" target="_blank">conducted by Kodex</a>,</p><p>But even those who only use Kodex are not in the clear. Exempt claims that he was able to make requests through Kodex for a period of time, using compromised law enforcement email accounts. However, because of Kodex’s enhanced safety features, including whitelisting specific devices from which requests can be made, Exempt and his group have now lost access to the system.</p><p>The hacker claims, however, that they are now working to regain access via another avenue.</p><p>“We are in talks with a deputy from a large sheriff’s office … who we got paid to dox [and] who is now interested in either renting his Kodex account to us or he may submit the requests for us on his side,” says Exempt. “This is in [the] very early stages of talks. He would want a percentage of the money we make and his dox removed on a well-known doxing site.”</p></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>To back up his claim, Exempt shared a screenshot of an alleged text exchange with the officer, including a blurred image that he refers to as his ID card. “Y’all have the SSN and the rest of the info you need about me and my fam,” the alleged officer wrote in a message. “I’m on the fence about it right now, but we will all get what we want out of this if we do a d[eal].”</p><p>When asked if he thought it was possible the officer was trying to entrap them, Exempt said probably not, “just for the fact he has been doxed, and within that dox, some pretty damning stuff about said officer came out, which he clearly wants removed. So I’m pretty certain he is being honest about the fact he is considering it.”</p><p>Donahue says Kodex’s system could flag such behavior because it is able to “pattern-match” the behavior of law enforcement agents and how they interact with companies that use the Kodek platform. “We can and do detect behavioral changes that allow us to protect our customers on a continuous basis as opposed to a one-time verification,” says Donahue.</p><p>While the hackers are taking advantage of the weakness in email security, they are also taking advantage of companies’ desire to help law enforcement save lives.</p><p>“Public/private-sector coordination is an incredibly complex and nuanced space that could very well be the difference between a kid being found in a trunk, or not,” says Donahue. “Lawful government data requests sit at the very unique intersection of data privacy, public safety, security, legal compliance, and civil rights, so anyone suggesting these requests are carelessly responded to in minutes has little to no understanding of the subject matter.”</p></div></div></article><div><div data-testid="RowWrapper" data-journey-hook="grid-wrapper"><ul><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"><p>Starlink devices are allegedly being used at <a href="https://www.wired.com/story/doj-issued-seizure-warrants-to-starlink-over-satellite-internet-systems-used-at-scam-compounds/">scam compounds</a></p></li><li data-testid="LinkStackBullet"></li></ul></div><div data-testid="RowWrapper" data-journey-hook="grid-wrapper"><p><a href="https://www.wired.com/author/david-gilbert/"><span><picture><source media="(max-width: 767px)" srcset="https://media.wired.com/photos/663a737bf79ecb6f05993e53/1:1/w_80,c_limit/David%20Gilbert-2.jpg 80w" sizes="100vw"><source media="(min-width: 768px)" srcset="https://media.wired.com/photos/663a737bf79ecb6f05993e53/1:1/w_90,c_limit/David%20Gilbert-2.jpg 90w" sizes="100vw"><img alt="" loading="lazy" src="https://media.wired.com/photos/663a737bf79ecb6f05993e53/1:1/w_90%2Cc_limit/David%2520Gilbert-2.jpg" data-src="https://media.wired.com/photos/663a737bf79ecb6f05993e53/1:1/w_90%2Cc_limit/David%2520Gilbert-2.jpg"></picture></span></a></p><div><p><a href="https://www.wired.com/author/david-gilbert/">David Gilbert</a> is a reporter at WIRED covering disinformation, online extremism, and how these two online trends impact people’s lives across the globe, with a special focus on the 2024 US presidential election. Prior to joining WIRED, he worked at VICE News. He lives in Ireland. ... <a href="https://www.wired.com/author/david-gilbert">Read More</a></p></div></div></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple has locked my Apple ID, and I have no recourse. A plea for help (1483 pts)]]></title>
+            <title><![CDATA[Apple has locked my Apple ID, and I have no recourse. A plea for help (1493 pts)]]></title>
             <link>https://hey.paris/posts/appleid/</link>
             <guid>46252114</guid>
             <pubDate>Sat, 13 Dec 2025 04:55:59 GMT</pubDate>
@@ -900,7 +1971,7 @@ Why Zig?</p>
 <div id="readability-page-1" class="page"><div><p><strong>Summary:</strong> A major brick-and-mortar store sold an Apple Gift Card that Apple seemingly took offence to, and locked out my entire Apple ID, effectively bricking my devices and my iCloud Account, Apple Developer ID, and everything associated with it, and I have no recourse. Can you help? Email paris AT paris.id.au (and read on for the details). ❤️</p><p>Here’s how Apple “Permanently” locked my Apple ID.</p><p>I am writing this as a desperate measure. After nearly 30 years as a loyal customer, <a href="https://hey.paris/books-and-events/books/#books">authoring technical books on Apple’s own programming languages (Objective-C and Swift)</a>, and spending tens upon tens upon tens of thousands of dollars on devices, apps, conferences, and services, I have been locked out of my personal and professional digital life with no explanation and no recourse.</p><h2 id="the-situation">The Situation</h2><p>My Apple ID, which I have held for around 25 years (it was originally a username, before they had to be email addresses; it’s from the iTools era), has been permanently disabled. This isn’t just an email address; it is my core digital identity. It holds terabytes of family photos, my entire message history, and is the key to syncing my work across the ecosystem.</p><p><a href="https://hey.paris/"><img loading="lazy" src="https://hey.paris/cardfail.png#center" alt=""></a></p><ul><li><strong>The Trigger:</strong> The only recent activity on my account was a recent attempt to redeem a $500 Apple Gift Card to pay for my 6TB iCloud+ storage plan. The code failed. The vendor suggested that the card number was likely compromised and agreed to reissue it. Shortly after, my account was locked.<ul><li>An Apple Support representative suggested that this was the cause of the issue: indicating that something was likely untoward about this card.</li><li>The card was purchased from a major brick-and-mortar retailer (Australians, think Woolworths scale; Americans, think Walmart scale), so if I cannot rely on the provenance of that, and have no recourse, what am I meant to do? We have even sent the receipt, indicating the card’s serial number and purchase location to Apple.</li></ul></li></ul><p><a href="https://hey.paris/"><img loading="lazy" src="https://hey.paris/apple-account-locked.png#center" alt=""></a></p><ul><li><strong>The Consequence:</strong> My account is flagged as “closed in accordance with the Apple Media Services Terms and Conditions”.</li><li><strong>The Damage:</strong> I effectively have over $30,000 worth of previously-active “bricked" hardware. My iPhone, iPad, Watch, and Macs cannot sync, update, or function properly. I have lost access to thousands of dollars in purchased software and media.<ul><li>Apple representatives claim that only the “Media and Services” side of my account is blocked, but now my devices have signed me out of iMessage (and I can’t sign back in), and I can’t even sign out of the blocked iCloud account because… it’s barred from the sign-out API, as far as I can tell.</li><li>I can’t even login to the “Secure File Transfer” system Apple uses to exchange information, because it relies on an Apple ID. Most of the ways Apple has suggested seeking help from them involve signing in to an Apple service to upload something, or communicate with them. This doesn’t work as the account is locked.</li></ul></li></ul><p><a href="https://hey.paris/"><img loading="lazy" src="https://hey.paris/accountfail.png#center" alt=""></a></p><ul><li>I can’t even download my iCloud Photos, as:<ol><li>There are repeated auth-errors on my account, so I can’t make Photos work;</li><li>I don’t have a 6TB device to sync them to, even if I could.</li></ol></li></ul><p><a href="https://hey.paris/"><img loading="lazy" src="https://hey.paris/imessage.png#center" alt=""></a></p><h2 id="the-support-nightmare">The Support Nightmare</h2><p>I contacted Apple Support immediately (Case ID: 102774292094). The experience was terrifyingly dismissive:</p><ol><li><strong>No Information:</strong> Support staff refused to tell me <em>why</em> the account was banned or provide specific details on the decision.</li><li><strong>No Escalation:</strong> When I begged for an escalation to Executive Customer Relations (ECR), noting that I would lose the ability to do my job and that my devices were useless, I was told that “an additional escalation won’t lead to a different outcome”.<ul><li>Many of the reps I’ve spoken to have suggested strange things, one of the strangest was telling me that I could physically go to Apple’s Australian HQ at Level 3, 20 Martin Place, Sydney, and plead my case. They even put me on hold for 5 minutes while they looked up the address.</li></ul></li></ol><p><a href="https://hey.paris/"><img loading="lazy" src="https://hey.paris/chat.png#center" alt=""></a></p><h2 id="the-new-account-trap">The “New Account” Trap</h2><p>Most insultingly, the official advice from the Senior Advisor was to “create a new Apple account… and update the payment information”.</p><p>This advice is technically disastrous:</p><ul><li><strong>The Legal Catch:</strong> Apple’s Terms and Conditions rely on “Termination of Access.” By closing my account, they have revoked my license to use their services.</li><li><strong>The Technical Trap:</strong> If I follow their advice and create a new account on my current devices (which are likely hardware-flagged due to the gift card error), the new account will likely be linked to the banned one and disabled for circumventing security measures.</li><li><strong>The Developer Risk:</strong> As a professional Apple Developer, attempting to “dodge” a ban by creating a new ID could lead to my Developer Program membership being permanently blacklisted, amongst other things.</li></ul><h2 id="who-i-am">Who I Am</h2><p>I am not a casual user. I have <a href="https://hey.paris/books-and-events/books/#books">literally written the book on Apple development (taking over the <em>Learning Cocoa with Objective-C</em> series, which Apple themselves used to write, for O’Reilly Media, and then 20+ books following that)</a>. I help run the longest-running Apple developer event not run by Apple themselves, <a href="https://devworld.au/index.php">/dev/world</a>. I have effectively been an evangelist for this company’s technology for my entire professional life. We had an app on the App Store on Day 1 in every sense of the world.</p><h2 id="my-plea">My Plea</h2><p>I am asking for a human at Apple to review this case. I suspect an automated fraud flag regarding the bad gift card triggered a nuclear response that frontline support cannot override. I have escalated this through my many friends in WWDR and SRE at Apple, with no success.</p><p>I am desperate to resolve this and restore my digital life. If you can help, please email paris AT paris.id.au</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google removes Sci-Hub domains from U.S. search results due to dated court order (258 pts)]]></title>
+            <title><![CDATA[Google removes Sci-Hub domains from U.S. search results due to dated court order (260 pts)]]></title>
             <link>https://torrentfreak.com/google-removes-sci-hub-domains-from-u-s-search-results-due-to-dated-court-order/</link>
             <guid>46251684</guid>
             <pubDate>Sat, 13 Dec 2025 03:21:32 GMT</pubDate>
@@ -956,7 +2027,7 @@ Why Zig?</p>
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[1300 Still Images from the Animated Films of Hayao Miyazaki's Studio Ghibli (2023) (209 pts)]]></title>
+            <title><![CDATA[1300 Still Images from the Animated Films of Hayao Miyazaki's Studio Ghibli (2023) (210 pts)]]></title>
             <link>https://www.ghibli.jp/info/013772/</link>
             <guid>46251582</guid>
             <pubDate>Sat, 13 Dec 2025 02:56:49 GMT</pubDate>
