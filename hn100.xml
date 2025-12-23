@@ -4,12 +4,250 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 23 Dec 2025 12:30:01 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 23 Dec 2025 13:30:02 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[iOS 26.3 Brings AirPods-Like Pairing to Third-Party Devices in EU Under DMA (119 pts)]]></title>
+            <title><![CDATA[Instant database clones with PostgreSQL 18 (115 pts)]]></title>
+            <link>https://boringsql.com/posts/instant-database-clones/</link>
+            <guid>46363360</guid>
+            <pubDate>Tue, 23 Dec 2025 07:58:25 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://boringsql.com/posts/instant-database-clones/">https://boringsql.com/posts/instant-database-clones/</a>, See on <a href="https://news.ycombinator.com/item?id=46363360">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+      <p>Have you ever watched long running migration script, wondering if it's about
+to wreck your data? Or wish you can "just" spin a fresh copy of database for
+each test run? Or wanted to have reproducible snapshots to reset between
+runs of your test suite, (and yes, because you are reading boringSQL) needed
+to reset the learning environment?</p>
+<p>When your database is a few megabytes, <code>pg_dump</code> and restore works fine. But
+what happens when you're dealing with hundreds of megabytes/gigabytes - or more?
+Suddenly "just make a copy" becomes a burden.</p>
+<p>You've probably noticed that PostgreSQL connects to <code>template1</code> by default. What
+you might have missed is that there's a whole templating system hiding in plain
+sight. Every time you run</p>
+<pre><code><span>CREATE DATABASE dbname;
+</span></code></pre>
+<p>PostgreSQL quietly clones standard system database <code>template1</code> behind the
+scenes. Making it same as if you would use</p>
+<pre><code><span>CREATE DATABASE dbname TEMPLATE template1;
+</span></code></pre>
+<p>The real power comes from the fact that you can replace <code>template1</code> with any
+database. You can find more at <a href="https://www.postgresql.org/docs/current/manage-ag-templatedbs.html">Template Database
+documentation</a>.</p>
+<p>In this article, we will cover a few tweaks that turn this templating system
+into an instant, zero-copy database cloning machine.</p>
+<h2 id="create-database-strategy">CREATE DATABASE ... STRATEGY<a href="#create-database-strategy" aria-label="Anchor link for: create-database-strategy"></a>
+</h2>
+<p>Before PostgreSQL 15, when you created a new database from a template, it
+operated strictly on the file level. This was effective, but to make it
+reliable, Postgres had to flush all pending operations to disk (using
+<code>CHECKPOINT</code>) before taking a consistent snapshot. This created a massive I/O
+spike - a "Checkpoint Storm" - that could stall your production traffic.</p>
+<p>Version 15 of PostgreSQL introduced new parameter <code>CREATE DATABASE ... STRATEGY = [strategy]</code> and at the same time changed the default behaviour how the new
+databases are created from templates. The new default become <code>WAL_LOG</code> which
+copies block-by-block via the Write-Ahead Log (WAL), making I/O sequential (and
+much smoother) and support for concurrency without facing latency spike. This
+prevented the need to CHECKPOINT but made the database cloning operation
+potentially significantly slower. For an empty <code>template1</code>, you won't notice the
+difference. But if you try to clone a 500GB database using WAL_LOG, you are
+going to be waiting a long time.</p>
+<p>The <code>STRATEGY</code> parameter allows us to switch back to the original method
+<code>FILE_COPY</code> to keep the behaviour, and speed. And since PostgreSQL 18, this
+opens the whole new set of options.</p>
+<h2 id="file-copy">FILE_COPY<a href="#file-copy" aria-label="Anchor link for: file-copy"></a>
+</h2>
+<p>Because the <code>FILE_COPY</code> strategy is a proxy to operating system file operations,
+we can change how the OS handles those files.</p>
+<p>When using standard file system (like <code>ext4</code>), PostgreSQL reads every byte of
+the source file and writes it to a new location. It's a physical copy. However
+starting with PostgreSQL 18 - <code>file_copy_method</code> gives you options to switch
+that logic; while default option remains <code>copy</code>.</p>
+<p>With modern filesystems (like ZFS, XFS with reflinks, APFS, etc.) you can switch
+it to <code>clone</code> and leverage <code>CLONE</code> (<code>FICLONE</code> on Linux) operation for almost
+instant operation. And it won't take any additional space.</p>
+<p>All you have to do is:</p>
+<ul>
+<li>Linux with XFS or ZFS support (we will use XFS for the demostration) or similar
+operating system. MacOS APFS is also fully supported. FreeBSD with ZFS also
+supported (which normally would be my choice, but haven't got time to test so
+far)</li>
+<li>PostgreSQL cluster on that file system</li>
+<li>update the configuration <code>file_copy_method = clone</code></li>
+<li>and reload the configuration</li>
+</ul>
+<h2 id="the-benchmark">The benchmark<a href="#the-benchmark" aria-label="Anchor link for: the-benchmark"></a>
+</h2>
+<p>We need some dummy data to copy. This is the only part of the tutorial where you
+have to wait. Let's generate a ~6GB database.</p>
+<pre data-lang="sql"><code data-lang="sql"><span>CREATE DATABASE </span><span>source_db</span><span>;
+</span><span>\c source_db
+</span><span>
+</span><span>CREATE TABLE </span><span>boring_data</span><span> (
+</span><span>    id </span><span>serial PRIMARY KEY</span><span>,
+</span><span>    payload </span><span>text
+</span><span>);
+</span><span>
+</span><span>-- generate 50m rows
+</span><span>INSERT INTO</span><span> boring_data (payload)
+</span><span>SELECT</span><span> md5(random()::</span><span>text</span><span>) || md5(random()::</span><span>text</span><span>)
+</span><span>FROM</span><span> generate_series(</span><span>1</span><span>, </span><span>50000000</span><span>);
+</span><span>
+</span><span>-- force a checkpoint
+</span><span>CHECKPOINT;
+</span></code></pre>
+<p>You can verify the database now has roughly 6GB of data.</p>
+<pre><code><span>Name              | source_db
+</span><span>Owner             | postgres
+</span><span>Encoding          | UTF8
+</span><span>Locale Provider   | libc
+</span><span>Collate           | en_US.UTF-8
+</span><span>Ctype             | en_US.UTF-8
+</span><span>Locale            |
+</span><span>ICU Rules         |
+</span><span>Access privileges |
+</span><span>Size              | 6289 MB
+</span><span>Tablespace        | pg_default
+</span><span>Description       |
+</span></code></pre>
+<p>While enabling <code>\timing</code> you can test the default (WAL_LOG) strategy. And on my
+test volume (relatively slow storage) I get</p>
+<pre><code><span>CREATE DATABASE slow_copy TEMPLATE source_db;
+</span><span>CREATE DATABASE
+</span><span>Time: 67000.615 ms (01:07.001)
+</span></code></pre>
+<p>Now, let's verify our configuration is set for speed:</p>
+<pre><code><span>show file_copy_method;
+</span><span> file_copy_method
+</span><span>------------------
+</span><span> clone
+</span><span>(1 row)
+</span></code></pre>
+<p>Let's request the semi-instant clone of the same database, without taking
+extra disk space at the same time.</p>
+<pre><code><span>CREATE DATABASE fast_clone TEMPLATE source_db STRATEGY=FILE_COPY;
+</span><span>CREATE DATABASE
+</span><span>Time: 212.053 ms
+</span></code></pre>
+<p>That's a quite an improvement, isn't it?</p>
+<h2 id="working-with-cloned-data">Working with cloned data<a href="#working-with-cloned-data" aria-label="Anchor link for: working-with-cloned-data"></a>
+</h2>
+<p>That was the simple part. But what is happening behind the scenes?</p>
+<p>When you clone a database with <code>file_copy_method = clone</code>, PostgreSQL doesn't
+duplicate any data. The filesystem creates new metadata entries that point to
+the same physical blocks. Both databases share identical storage.</p>
+<p>This can create some initial confusion. If you ask PostgreSQL for the size:</p>
+<pre data-lang="sql"><code data-lang="sql"><span>SELECT</span><span> pg_database_size('</span><span>source_db</span><span>') as source,
+</span><span>       pg_database_size('</span><span>fast_clone</span><span>') as clone;
+</span></code></pre>
+<p>PostgreSQL reports both as ~6GB because that's the logical size - how much data
+each database "contains" - i.e. logical size.</p>
+<pre><code><span>-[ RECORD 1 ]------
+</span><span>source | 6594041535
+</span><span>clone  | 6594041535
+</span></code></pre>
+<p>The interesting part happens when you start writing. PostgreSQL doesn't update
+tuples in place. When you UPDATE a row, it writes a new tuple version somewhere
+(often a different page entirely) and marks the old one as dead. The filesystem
+doesn't care about PostgreSQL internals - it just sees writes to 8KB pages. Any
+write to a shared page triggers a copy of that entire page.</p>
+<p>A single UPDATE will therefore trigger copy-on-write on multiple pages:</p>
+<ul>
+<li>the page holding the old tuple</li>
+<li>the page receiving the new tuple</li>
+<li>index pages if any indexed columns changed</li>
+<li>FSM and visibility map pages as PostgreSQL tracks free space</li>
+</ul>
+<p>And later, VACUUM touches even more pages while cleaning up dead tuples. In this
+case diverging quickly from the linked storage.</p>
+<h2 id="xfs-proof">XFS proof<a href="#xfs-proof" aria-label="Anchor link for: xfs-proof"></a>
+</h2>
+<p>Using the database OID and relfilenode we can verify the both databases are now
+sharing physical blocks.</p>
+<pre><code><span>root@clone-demo:/var/lib/postgresql# sudo filefrag -v /var/lib/postgresql/18/main/base/16402/16404
+</span><span>Filesystem type is: 58465342
+</span><span>File size of /var/lib/postgresql/18/main/base/16402/16404 is 1073741824 (262144 blocks of 4096 bytes)
+</span><span> ext:     logical_offset:        physical_offset: length:   expected: flags:
+</span><span>   0:        0..    2031:   10471550..  10473581:   2032:             shared
+</span><span>   1:     2032..   16367:   10474098..  10488433:  14336:   10473582: shared
+</span><span>   2:    16368..   32751:   10497006..  10513389:  16384:   10488434: shared
+</span><span>   3:    32752..   65519:   10522066..  10554833:  32768:   10513390: shared
+</span><span>   4:    65520..  129695:   10571218..  10635393:  64176:   10554834: shared
+</span><span>   5:   129696..  195231:   10635426..  10700961:  65536:   10635394: shared
+</span><span>   6:   195232..  262143:   10733730..  10800641:  66912:   10700962: last,shared,eof
+</span><span>/var/lib/postgresql/18/main/base/16402/16404: 7 extents found
+</span><span>root@clone-demo:/var/lib/postgresql#
+</span><span>root@clone-demo:/var/lib/postgresql#
+</span><span>root@clone-demo:/var/lib/postgresql# sudo filefrag -v /var/lib/postgresql/18/main/base/16418/16404
+</span><span>Filesystem type is: 58465342
+</span><span>File size of /var/lib/postgresql/18/main/base/16418/16404 is 1073741824 (262144 blocks of 4096 bytes)
+</span><span> ext:     logical_offset:        physical_offset: length:   expected: flags:
+</span><span>   0:        0..    2031:   10471550..  10473581:   2032:             shared
+</span><span>   1:     2032..   16367:   10474098..  10488433:  14336:   10473582: shared
+</span><span>   2:    16368..   32751:   10497006..  10513389:  16384:   10488434: shared
+</span><span>   3:    32752..   65519:   10522066..  10554833:  32768:   10513390: shared
+</span><span>   4:    65520..  129695:   10571218..  10635393:  64176:   10554834: shared
+</span><span>   5:   129696..  195231:   10635426..  10700961:  65536:   10635394: shared
+</span><span>   6:   195232..  262143:   10733730..  10800641:  66912:   10700962: last,shared,eof
+</span><span>/var/lib/postgresql/18/main/base/16418/16404: 7 extents found
+</span></code></pre>
+<p>All it takes is to update some rows using</p>
+<pre data-lang="sql"><code data-lang="sql"><span>update</span><span> boring_data </span><span>set</span><span> payload = '</span><span>new value</span><span>' || id </span><span>where</span><span> id IN (</span><span>select</span><span> id </span><span>from</span><span> boring_data </span><span>limit </span><span>20</span><span>);
+</span></code></pre>
+<p>and the situation will start to change.</p>
+<pre><code><span>root@clone-demo:/var/lib/postgresql# sudo filefrag -v /var/lib/postgresql/18/main/base/16402/16404
+</span><span>Filesystem type is: 58465342
+</span><span>File size of /var/lib/postgresql/18/main/base/16402/16404 is 1073741824 (262144 blocks of 4096 bytes)
+</span><span> ext:     logical_offset:        physical_offset: length:   expected: flags:
+</span><span>   0:        0..      39:   10471550..  10471589:     40:
+</span><span>   1:       40..    2031:   10471590..  10473581:   1992:             shared
+</span><span>   2:     2032..   16367:   10474098..  10488433:  14336:   10473582: shared
+</span><span>   3:    16368..   32751:   10497006..  10513389:  16384:   10488434: shared
+</span><span>   4:    32752..   65519:   10522066..  10554833:  32768:   10513390: shared
+</span><span>   5:    65520..  129695:   10571218..  10635393:  64176:   10554834: shared
+</span><span>   6:   129696..  195231:   10635426..  10700961:  65536:   10635394: shared
+</span><span>   7:   195232..  262143:   10733730..  10800641:  66912:   10700962: last,shared,eof
+</span><span>/var/lib/postgresql/18/main/base/16402/16404: 7 extents found
+</span><span>root@clone-demo:/var/lib/postgresql# sudo filefrag -v /var/lib/postgresql/18/main/base/16418/16404
+</span><span>Filesystem type is: 58465342
+</span><span>File size of /var/lib/postgresql/18/main/base/16418/16404 is 1073741824 (262144 blocks of 4096 bytes)
+</span><span> ext:     logical_offset:        physical_offset: length:   expected: flags:
+</span><span>   0:        0..      39:   10297326..  10297365:     40:
+</span><span>   1:       40..    2031:   10471590..  10473581:   1992:   10297366: shared
+</span><span>   2:     2032..   16367:   10474098..  10488433:  14336:   10473582: shared
+</span><span>   3:    16368..   32751:   10497006..  10513389:  16384:   10488434: shared
+</span><span>   4:    32752..   65519:   10522066..  10554833:  32768:   10513390: shared
+</span><span>   5:    65520..  129695:   10571218..  10635393:  64176:   10554834: shared
+</span><span>   6:   129696..  195231:   10635426..  10700961:  65536:   10635394: shared
+</span><span>   7:   195232..  262143:   10733730..  10800641:  66912:   10700962: last,shared,eof
+</span><span>/var/lib/postgresql/18/main/base/16418/16404: 8 extents found
+</span><span>root@clone-demo:/var/lib/postgresql#
+</span></code></pre>
+<p>In this case extent 0 no longer has shared flag, first 40 blocks size (with
+default size 4KB) now diverge, making it total of 160KB. Each database now has
+its own copy at different physical address. The remaining extents are still
+shared.</p>
+<h2 id="things-to-be-aware-of">Things to be aware of<a href="#things-to-be-aware-of" aria-label="Anchor link for: things-to-be-aware-of"></a>
+</h2>
+<p>Cloning is tempting but there's one serious limitation you need to be aware if
+you ever attempt to do it in production. The source database can't have any
+active connections during cloning. This is a PostgreSQL limitation, not a
+filesystem one. For production use, this usually means you create a dedicated
+template database rather than cloning your live database directly. Or given the
+relatively short time the operation takes you have to schedule the cloning in
+times where you can temporary block/terminate all connections.</p>
+<p>Other limitation is that the cloning only works within a single filesystem. If
+your databases spans multiple table spaces on different mount points, cloning
+will fall back to regular physical copy.</p>
+<p>Finally, in most managed cloud environments (AWS RDS, Google Cloud SQL), you
+will not have access to the underlying filesystem to configure this. You are
+stuck with their proprietary (and often billed) functionality. But for your own
+VMs or bare metal? Go ahead and try it.</p>
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[iOS 26.3 Brings AirPods-Like Pairing to Third-Party Devices in EU Under DMA (124 pts)]]></title>
             <link>https://www.macrumors.com/2025/12/22/ios-26-3-dma-airpods-pairing/</link>
             <guid>46362927</guid>
             <pubDate>Tue, 23 Dec 2025 06:22:21 GMT</pubDate>
@@ -37,7 +275,7 @@ We've organized the info by likely release date, though there are some products 
 The Digital Markets Act requires Apple to provide third-party accessories with the same capabilities and access to device features that Apple's own products get. In iOS...</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: CineCLI – Browse and torrent movies directly from your terminal (173 pts)]]></title>
+            <title><![CDATA[Show HN: CineCLI – Browse and torrent movies directly from your terminal (186 pts)]]></title>
             <link>https://github.com/eyeblech/cinecli</link>
             <guid>46362655</guid>
             <pubDate>Tue, 23 Dec 2025 05:17:50 GMT</pubDate>
@@ -193,7 +431,7 @@ Fast. Cross-platform. Minimal. Beautiful.</p>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Archivists Posted the 60 Minutes Cecot Segment Bari Weiss Killed (183 pts)]]></title>
+            <title><![CDATA[Archivists Posted the 60 Minutes Cecot Segment Bari Weiss Killed (194 pts)]]></title>
             <link>https://www.404media.co/archivists-posted-the-60-minutes-cecot-segment-bari-weiss-killed/</link>
             <guid>46362214</guid>
             <pubDate>Tue, 23 Dec 2025 03:44:22 GMT</pubDate>
@@ -219,7 +457,22 @@ Fast. Cross-platform. Minimal. Beautiful.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The 60 Minutes report that Bari Weiss censored is now internet contraband (136 pts)]]></title>
+            <title><![CDATA[HNInternal: 60 Minutes: Cecot (138 pts)]]></title>
+            <link>https://news.ycombinator.com/item?id=46362149</link>
+            <guid>46362149</guid>
+            <pubDate>Tue, 23 Dec 2025 03:33:24 GMT</pubDate>
+            <description><![CDATA[<p>See on <a href="https://news.ycombinator.com/item?id=46362149">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><table id="hnmain"><tbody><tr><td></td></tr><tr></tr><tr id="bigbox"><td><table><tbody><tr id="46362149"><td><span></span></td><td><center><a id="up_46362149" href="https://news.ycombinator.com/vote?id=46362149&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><span><a href="https://news.ycombinator.com/item?id=46362149">60 Minutes: Cecot</a></span></td></tr><tr><td colspan="2"></td><td><span><span id="score_46362149">138 points</span> by <a href="https://news.ycombinator.com/user?id=jtgeibel">jtgeibel</a> <span title="2025-12-23T03:33:24 1766460804"><a href="https://news.ycombinator.com/item?id=46362149">9 hours ago</a></span> <span id="unv_46362149"></span> | <a href="https://news.ycombinator.com/hide?id=46362149&amp;goto=item%3Fid%3D46362149">hide</a> | <a href="https://hn.algolia.com/?query=60%20Minutes%3A%20Cecot&amp;type=story&amp;dateRange=all&amp;sort=byDate&amp;storyText=false&amp;prefix&amp;page=0">past</a> | <a href="https://news.ycombinator.com/fave?id=46362149&amp;auth=0ecc9711f7cf58e42931a859073a641d6e653737">favorite</a> | <a href="https://news.ycombinator.com/item?id=46362149">8&nbsp;comments</a></span></td></tr><tr><td colspan="2"></td><td><div><p>Already flagged off the front page twice even though there are lots of upvotes:</p><p>https://archive.org/details/60minutes-cecotsegment</p></div></td></tr><tr></tr><tr><td colspan="2"></td><td><form action="comment" method="post"></form></td></tr></tbody></table><br>
+<table><tbody><tr id="46362180"><td></td></tr><tr id="46362424"><td><table><tbody><tr><td indent="1"><img src="https://news.ycombinator.com/s.gif" height="1" width="40"></td><td><center><a id="up_46362424" href="https://news.ycombinator.com/vote?id=46362424&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><br>
+<div><p>As far as I understand it, the recommended way to get an improperly flagged submission back onto the front page is to email the moderators and ask them to manually override the flagging, not trying to brute force it by re-submitting.  The HN moderators can be reached at the email on the contact page linked at the bottom.</p></div></td></tr></tbody></table></td></tr><tr id="46362192"><td><table><tbody><tr><td indent="1"><img src="https://news.ycombinator.com/s.gif" height="1" width="40"></td><td><center><a id="up_46362192" href="https://news.ycombinator.com/vote?id=46362192&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><br>
+<div><p>[dupe] This is a dupe. Discussion is there. No need to split it up. Flagged doesn't mean it hasn't been seen or isn't active, front page doesn't matter, stuff moves fast around here.</p></div></td></tr></tbody></table></td></tr><tr id="46362231"><td><table><tbody><tr><td indent="2"><img src="https://news.ycombinator.com/s.gif" height="1" width="80"></td><td><center><a id="up_46362231" href="https://news.ycombinator.com/vote?id=46362231&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><br>
+<div><p>I'm not trying to split the discussion, the original post should clearly not be flagged. Also, I've never seen a post organically fall off the front page in less then 3 hours with hundreds of votes, unless the number of comments exceeds the post upvotes.</p></div></td></tr></tbody></table></td></tr><tr id="46362464"><td></td></tr><tr id="46362505"><td><table><tbody><tr><td indent="4"><img src="https://news.ycombinator.com/s.gif" height="1" width="160"></td><td><center><a id="up_46362505" href="https://news.ycombinator.com/vote?id=46362505&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><br>
+<div><p>A tv segment that got canned, accidentally broadcast in Canada and is now being hosted via BitTorrent and the internet archive. Of course there’s a tech angle here.</p></div></td></tr></tbody></table></td></tr><tr id="46362500"><td><table><tbody><tr><td indent="2"><img src="https://news.ycombinator.com/s.gif" height="1" width="80"></td><td><center><a id="up_46362500" href="https://news.ycombinator.com/vote?id=46362500&amp;how=up&amp;goto=item%3Fid%3D46362149"></a></center></td><td><br>
+<div><p>&gt; Flagged doesn't mean it hasn't been seen</p><p>For anyone arriving at the site after the moment it’s flagged it certainly does.</p></div></td></tr></tbody></table></td></tr><tr id="46362335"><td></td></tr></tbody></table></td></tr><tr><td><img src="https://news.ycombinator.com/s.gif" height="10" width="0"><br>
+<center><span><a href="https://news.ycombinator.com/newsguidelines.html">Guidelines</a> | <a href="https://news.ycombinator.com/newsfaq.html">FAQ</a> | <a href="https://news.ycombinator.com/lists">Lists</a> | <a href="https://github.com/HackerNews/API">API</a> | <a href="https://news.ycombinator.com/security.html">Security</a> | <a href="https://www.ycombinator.com/legal/">Legal</a> | <a href="https://www.ycombinator.com/apply/">Apply to YC</a> | <a href="mailto:hn@ycombinator.com">Contact</a></span></center></td></tr></tbody></table></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The 60 Minutes report that Bari Weiss censored is now internet contraband (142 pts)]]></title>
             <link>https://www.theverge.com/policy/849432/60-minutes-cecot-censored-canada-leak</link>
             <guid>46362032</guid>
             <pubDate>Tue, 23 Dec 2025 03:14:46 GMT</pubDate>
@@ -227,7 +480,7 @@ Fast. Cross-platform. Minimal. Beautiful.</p>
 <div id="readability-page-1" class="page"><div id="zephr-anchor"><p>Yesterday, <a href="https://www.theverge.com/business/793525/bari-weiss-cbs-news-glass-cliff">Bari Weiss, the new editor-in-chief of CBS News</a>, censored a segment of its newsmagazine <em>60 Minutes</em> about men who had been deported to an El Salvador prison. Today, it’s popping up online.</p><p><em>60 Minutes</em> had already begun promoting the now-censored segment online. Because it was pulled so late, it seems that CBS missed at least one platform for distribution: Canada’s Global TV. Some people used a VPN to watch it; at least one person recorded it, distributing it through an iCloud account.</p><p>The segment, which has been reviewed by <em>The Verge</em>, is a little shy of 14 minutes long. It features video of men, chained and bent double, being “paraded in front of cameras, pushed onto buses, and delivered to CECOT,” according to the segment’s narration. One former detainee, who CBS met in Colombia, said he was told he was “the living dead” at CECOT. After trying to seek asylum in the US, he says he was detained by customs and held for 6 months before being deported. He described horrific conditions at the prison, saying he was beaten until he bled and that he was thrown into a wall so hard he broke one of his teeth. He also described sexual assault by the guards. Another interviewed former detainee described what can only be called torture: being forced to kneel for 24 hours, and being put in a dark room, where they were beaten if they moved from the stress position.</p><div><p>“In my view, pulling it now, after every rigorous internal check has been met, is not an editorial decision, it is a political one.”</p></div><p>The men were among those who had been <a href="https://www.nytimes.com/2025/05/09/world/americas/el-salvador-trump-deportees-lawsuit.html">deported to El Salvador</a>, a country they are not from. The Trump administration has sent at least 288 people, mostly Venezuelans and Salvadorans, to CECOT after the president of El Salvador, Nayib Bukele, offered to house prisoners for a fee. Many of the people who were deported <a href="https://www.nytimes.com/2025/05/09/world/americas/el-salvador-trump-deportees-lawsuit.html">were awaiting asylum cases</a>, according to <em>The New York Times. </em>It is perhaps the most horrific and breathtaking abuse of human rights from the Trump administration, and a vital area for continued reporting.</p><p>The Trump administration has more deals like the one with CECOT in the pipeline, worth “millions of dollars,” according to the segment. The US may begin deporting people to places they have no relationship with, such as South Sudan and Uganda, which also have “well-documented histories of torturing prisoners.”</p><p>The story, in addition to breaking news about the deals with other countries, appears to be thoroughly reported, and both the US Department of Homeland Security and El Salvador were given opportunities to comment.</p><p>“Our story was screened five times and cleared by both CBS attorneys and Standards and Practices,” wrote Sharyn Alfonsi, the reporter whose segment it was, in an email to colleagues yesterday, according to <em>The New York Times</em>. “It is factually correct. In my view, pulling it now, after every rigorous internal check has been met, is not an editorial decision, it is a political one.”</p><div><p>Because the order to kill the story came so late, CBS didn’t successfully replace the original program everywhere that had been set to deliver it</p></div><div><p><a href="https://www.washingtonpost.com/business/2025/12/21/cbs-news-bari-weiss-intervention/">The story had gotten through all the usual approvals</a>, including Weiss, who suddenly changed her mind. She demanded additional reporting, “including an on-camera interview with a member of the Trump administration,” according to <em>The Washington Post</em>. The story was killed on Saturday night, and the promotional material was removed on Sunday. Weiss sent an edit note saying, among other things, that <a href="https://x.com/thesimonetti/status/2003142908854313225/photo/3">the segment did not adequately explain the administration’s rationale for sending people to El Salvador</a>.</p></div><p>The notes do not seem unreasonable — except in their timing, which is belated and bizarre, practically calculated to cause an uproar. And, it seems, because the order to kill the story came so late, not every distributor replaced the program.</p><p>Weiss was placed in charge of CBS News by David Ellison as part of a fairly obvious attempt to placate the Trump administration and allow his company, Skydance, to acquire CBS parent company, Paramount. President Donald Trump has repeatedly whined about CBS — and <em>60 Minutes’</em> work in particular. Just before the takeover by Skydance, Paramount paid $16 million to settle a lawsuit Trump filed over the editing applied to an interview with Kamala Harris.</p><p>Ellison’s Skydance is now attempting to buy Warner Bros. in a hostile bid.</p><p>Weiss claimed on an editorial call on Monday that she “held that story because it wasn’t ready,” according to <em>The Washington Post</em>. The team had given the White House a chance to comment, and the Trump administration declined, according to the <em>Post.</em> “If the standard for airing a story becomes ‘the government must agree to be interviewed,’ then the government effectively gains control over the 60 Minutes broadcast. We go from an investigative powerhouse to a stenographer for the state,” Alfonsi wrote in her email.</p><p>Anyway, best of luck to Weiss in playing DMCA whack-a-mole with the video of the story. The segment lives as online samizdat now. Thanks to Weiss’ censorship, it may very well wind up being the most-talked-about CBS News story this year.</p><div><p><span><strong>Follow topics and authors</strong> from this story to see more like this in your personalized homepage feed and to receive email updates.</span></p><ul><li id="follow-author-article_footer-dmcyOmF1dGhvclByb2ZpbGU6ODA0"><span aria-expanded="false" aria-haspopup="true" role="button" tabindex="0"><span><span><svg width="9" height="9" viewBox="0 0 9 9" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Follow"><path d="M5 0H4V4H0V5H4V9H5V5H9V4H5V0Z"></path></svg></span><span>Elizabeth Lopatto</span></span></span></li><li></li><li></li><li></li><li></li></ul></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pulled 60 Minutes segment on CECOT (119 pts)]]></title>
+            <title><![CDATA[Pulled 60 Minutes segment on CECOT (130 pts)]]></title>
             <link>https://archive.org/details/60minutes-cecotsegment</link>
             <guid>46361571</guid>
             <pubDate>Tue, 23 Dec 2025 01:59:06 GMT</pubDate>
@@ -235,7 +488,7 @@ Fast. Cross-platform. Minimal. Beautiful.</p>
 <div id="readability-page-1" class="page"><div><p><b>Please Don't Scroll Past This</b></p><p>Can you chip in? As an independent nonprofit, the Internet Archive is fighting for universal access to quality information. We build and maintain all our own systems, but we don’t charge for access, sell user information, or run ads. We'd be deeply grateful if you'd join the one in a thousand users that support us financially. </p><p>We understand that not everyone can donate right now, but if you can afford to contribute this Tuesday, we promise it will be put to good use. Our resources are crucial for knowledge lovers everywhere—so if you find all these bits and bytes useful, <b>please pitch in.</b></p></div><p><b>Please Don't Scroll Past This </b>The Internet Archive is working to keep the record straight by recording government websites, news publications, historical documents, and more. If you find our library useful, <b>please pitch in.</b></p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Snitch – A friendlier ss/netstat (208 pts)]]></title>
+            <title><![CDATA[Snitch – A friendlier ss/netstat (217 pts)]]></title>
             <link>https://github.com/karol-broda/snitch</link>
             <guid>46361229</guid>
             <pubDate>Tue, 23 Dec 2025 01:03:57 GMT</pubDate>
@@ -448,7 +701,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Cecot – 60 Minutes (534 pts)]]></title>
+            <title><![CDATA[Cecot – 60 Minutes (648 pts)]]></title>
             <link>https://archive.org/details/insidececot</link>
             <guid>46361024</guid>
             <pubDate>Tue, 23 Dec 2025 00:36:27 GMT</pubDate>
@@ -456,7 +709,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 <div id="readability-page-1" class="page"><div><p><b>Please Don't Scroll Past This</b></p><p>Can you chip in? As an independent nonprofit, the Internet Archive is fighting for universal access to quality information. We build and maintain all our own systems, but we don’t charge for access, sell user information, or run ads. We'd be deeply grateful if you'd join the one in a thousand users that support us financially. </p><p>We understand that not everyone can donate right now, but if you can afford to contribute this Tuesday, we promise it will be put to good use. Our resources are crucial for knowledge lovers everywhere—so if you find all these bits and bytes useful, <b>please pitch in.</b></p></div><p><b>Please Don't Scroll Past This </b>The Internet Archive is working to keep the record straight by recording government websites, news publications, historical documents, and more. If you find our library useful, <b>please pitch in.</b></p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Satellites reveal heat leaking from largest US cryptocurrency mining center (134 pts)]]></title>
+            <title><![CDATA[Satellites reveal heat leaking from largest US cryptocurrency mining center (137 pts)]]></title>
             <link>https://www.space.com/space-exploration/satellites/satellites-reveal-heat-leaking-from-largest-us-cryptocurrency-mining-center</link>
             <guid>46360465</guid>
             <pubDate>Mon, 22 Dec 2025 23:23:12 GMT</pubDate>
@@ -497,7 +750,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[NPM Package with 56K Downloads Caught Stealing WhatsApp Messages (294 pts)]]></title>
+            <title><![CDATA[NPM Package with 56K Downloads Caught Stealing WhatsApp Messages (300 pts)]]></title>
             <link>https://www.koi.ai/blog/npm-package-with-56k-downloads-malware-stealing-whatsapp-messages</link>
             <guid>46359996</guid>
             <pubDate>Mon, 22 Dec 2025 22:35:45 GMT</pubDate>
@@ -505,7 +758,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 <div id="readability-page-1" class="page"><div id="blog-rich-text"><p>The <code>lotusbail</code> npm package presents itself as a WhatsApp Web API library - a fork of the legitimate <code>@whiskeysockets/baileys</code> package. With over 56,000 downloads and functional code that actually works as advertised, it's the kind of dependency developers install without a second thought. The package has been available on npm for 6 months and is still live at the time of writing.</p><p>Behind that working functionality: sophisticated malware that steals your WhatsApp credentials, intercepts every message, harvests your contacts, installs a persistent backdoor, and encrypts everything before sending it to the threat actor's server.</p><figure><p><img src="https://cdn.prod.website-files.com/689ad8c5d13f40cf59df0e0c/694807a93d3c8c57926db6ed_image%20(18)%20(1).png" loading="lazy" alt=""></p><figcaption>Koidex report for lotusbail package</figcaption></figure><p>What gets captured:</p><ul role="list"><li>Authentication tokens and session keys</li><li>Complete message history (past and present)</li><li>Full contact lists with phone numbers</li><li>Media files and documents</li><li>Persistent backdoor access to your WhatsApp account</li></ul><h2>How It Works</h2><h3><strong>The Cover Is Real</strong></h3><p>Most malicious npm packages reveal themselves quickly - they're typosquats, they don't work, or they're obviously sketchy. This one actually functions as a WhatsApp API. It's based on the legitimate Baileys library and provides real, working functionality for sending and receiving WhatsApp messages.</p><p>Obvious malware is easy to spot. Functional malware? That gets installed, tested, approved, and deployed to production.</p><p>The social engineering here is brilliant: developers don't look for malware in code that works. They look for code that breaks.</p><h3><strong>The Theft and Exfiltration</strong></h3><p>The package wraps the legitimate WebSocket client that communicates with WhatsApp. Every message that flows through your application passes through the malware's socket wrapper first.</p><p>When you authenticate, the wrapper captures your credentials. When messages arrive, it intercepts them. When you send messages, it records them. The legitimate functionality continues working normally - the malware just adds a second recipient for everything.</p><figure><p><img src="https://cdn.prod.website-files.com/689ad8c5d13f40cf59df0e0c/6948073a4954450257af43cd_a29cc381.png" loading="lazy" alt=""></p></figure><p>All your WhatsApp authentication tokens, every message sent or received, complete contact lists, media files - everything that passes through the API gets duplicated and prepared for exfiltration.</p><p>But the stolen data doesn't get sent in plain text. The malware includes a complete, custom RSA implementation for encrypting the data before transmission:</p><figure><p><img src="https://cdn.prod.website-files.com/689ad8c5d13f40cf59df0e0c/6948073a4954450257af43d0_d6657ad0.png" loading="lazy" alt=""></p></figure><p>Why implement custom RSA? Because legitimate WhatsApp libraries don't need custom encryption - WhatsApp already handles end-to-end encryption. The custom crypto exists for one reason: to encrypt stolen data before exfiltration so network monitoring won't catch it.</p><p>The exfiltration server URL is buried in encrypted configuration strings, hidden inside compressed payloads. The malware uses four layers of obfuscation: Unicode variable manipulation, LZString compression, Base-91 encoding, and AES encryption. The server location isn't hardcoded anywhere visible.</p><h3><strong>The Backdoor</strong></h3><p>Here's where it gets particularly nasty. WhatsApp uses pairing codes to link new devices to accounts. You request a code, WhatsApp generates a random 8-character string, you enter it on your new device, and the devices link together.</p><p>The malware hijacks this process with a hardcoded pairing code. The code is encrypted with AES and hidden in the package:</p><figure><p><img src="https://cdn.prod.website-files.com/689ad8c5d13f40cf59df0e0c/6948073a4954450257af43d6_7375538c.png" loading="lazy" alt=""></p></figure><p>This means the threat actor has a key to your WhatsApp account. When you use this library to authenticate, you're not just linking your application - you're also linking the threat actor's device. They have complete, persistent access to your WhatsApp account, and you have no idea they're there.</p><p>The threat actor can read all your messages, send messages as you, download your media, access your contacts - full account control. And here's the critical part, uninstalling the npm package removes the malicious code, but the threat actor's device stays linked to your WhatsApp account. The pairing persists in WhatsApp's systems until you manually unlink all devices from your WhatsApp settings. Even after the package is gone, they still have access.</p><h2>They Really Didn't Want You Looking</h2><p>The package includes 27 infinite loop traps that freeze execution if debugging tools are detected:</p><figure><p><img src="https://cdn.prod.website-files.com/689ad8c5d13f40cf59df0e0c/6948073a4954450257af43d3_354957b5.png" loading="lazy" alt=""></p></figure><p>These traps check for debuggers, inspect process arguments, detect sandbox environments, and generally make dynamic analysis painful. They also left helpful comments in their code marking the malicious sections - professional development practices applied to supply chain attacks. Someone probably has a Jira board for this.</p><h2>Final Thoughts</h2><p>Supply chain attacks aren't slowing down - they're getting better. We're seeing working code with sophisticated anti-debugging, custom encryption, and multi-layer obfuscation that survives marketplace reviews. The <code>lotusbail</code> case isn't an outlier. It's a preview.</p><p>Traditional security doesn't catch this. Static analysis sees working WhatsApp code and approves it. Reputation systems see 56,000 downloads and trust it. The malware hides in the gap between "this code works" and "this code only does what it claims."</p><p>Catching sophisticated supply chain attacks requires behavioral analysis - watching what packages actually do at runtime. When a WhatsApp library implements custom RSA encryption and includes 27 anti-debugging traps, those are signals. But you need systems watching for them.</p><p>This writeup was authored by the research team at Koi Security. We built Koi to detect threats that pass traditional checks but exhibit malicious behavior at runtime.</p><p><a href="https://www.koi.ai/get-a-demo"><strong>Book a demo</strong></a> to see how behavioral analysis catches what static review misses.</p><p>Stay safe out there.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[It's Always TCP_NODELAY (340 pts)]]></title>
+            <title><![CDATA[It's Always TCP_NODELAY (357 pts)]]></title>
             <link>https://brooker.co.za/blog/2024/05/09/nagle.html</link>
             <guid>46359120</guid>
             <pubDate>Mon, 22 Dec 2025 21:09:59 GMT</pubDate>
@@ -577,7 +830,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Vince Zampella, developer of Call of Duty and Battlefield has died (131 pts)]]></title>
+            <title><![CDATA[Vince Zampella, developer of Call of Duty and Battlefield has died (133 pts)]]></title>
             <link>https://comicbook.com/gaming/news/vince-zampella-developer-of-call-of-duty-and-battlefield-dead-at-55/</link>
             <guid>46358437</guid>
             <pubDate>Mon, 22 Dec 2025 20:12:20 GMT</pubDate>
@@ -632,7 +885,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Ultrasound Cancer Treatment: Sound Waves Fight Tumors (271 pts)]]></title>
+            <title><![CDATA[Ultrasound Cancer Treatment: Sound Waves Fight Tumors (283 pts)]]></title>
             <link>https://spectrum.ieee.org/ultrasound-cancer-treatment</link>
             <guid>46357945</guid>
             <pubDate>Mon, 22 Dec 2025 19:37:34 GMT</pubDate>
@@ -640,7 +893,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 <div id="readability-page-1" class="page"><p>HistoSonics’ Edison system uses a water-filled membrane to transmit focused ultrasound into the body. The resulting bubbles expand and collapse within the tumor, producing mechanical stress that destroys cancer cells and liquefies the tumor.</p><div data-headline="Ultrasound Treatment Takes on Cancer’s Toughest Tumors"><p><strong>For many years,</strong> doctors and technicians who performed medical <a href="https://spectrum.ieee.org/focused-ultrasound-stimulation-inflammation-diabetes" target="_blank">ultrasound</a> procedures viewed bubbles with wary concern. The phenomenon of cavitation—the formation and collapse of tiny gas bubbles due to changes in pressure—was considered an undesirable and largely uncontrollable side effect. But in 2001, researchers at the University of Michigan began exploring ways to harness the phenomenon for the destruction of cancerous tumors and other problematic tissue.</p><p>The trouble was, creating and controlling cavitation generated heat, which harmed healthy tissue beyond the target area. <a href="https://bme.umich.edu/people/xu-zhen/" target="_blank">Zhen Xu</a>, who was working on a Ph.D. in <a href="https://spectrum.ieee.org/tag/biomedical-engineering">biomedical engineering</a> at the time, was bombarding pig heart tissue in a tank of water with <a href="https://spectrum.ieee.org/tag/ultrasound">ultrasound</a> when she made a breakthrough.</p><p>The key was using extremely powerful ultrasound to produce negative pressure of more than 20 megapascals, delivered in short bursts measured in microseconds—but separated by relatively long gaps, between a millisecond and a full second long. These parameters created bubbles that quickly formed and collapsed, tearing apart nearby cells and turning the tissue into a kind of slurry, while avoiding heat buildup. The result was a form of incisionless <a href="https://spectrum.ieee.org/tag/surgery">surgery</a>, a way to wipe out tumors without scalpels, <a href="https://spectrum.ieee.org/tag/radiation">radiation</a>, or heat.</p><p>“The experiments worked,” says Xu, now a professor at Michigan, “but I also destroyed the ultrasound equipment that I used,” which was the most powerful available at the time. In 2009, she cofounded a company, <a href="https://histosonics.com/" target="_blank">HistoSonics</a>, to commercialize more powerful ultrasound machines, test treatment of a variety of diseases, and make the procedure, called histotripsy, widely available.</p><p>So far, the killer app is fighting <a href="https://spectrum.ieee.org/tag/cancer" target="_blank">cancer</a>. In 2023, HistoSonics’ Edison system received <a href="https://spectrum.ieee.org/tag/fda">FDA</a> approval for <a href="https://histosonics.com/news/fda-awards-histosonics-clearance-of-its-first-of-a-kind-edison-histotripsy-system-2/" target="_blank">treatment of liver tumors</a>. In 2026, clinicians will conclude a <a href="https://histosonics.com/news/worlds-first-kidney-tumor-treated-using-the-histosonics-edison-histotripsy-system/" target="_blank">pivotal kidney cancer study</a> and apply for regulatory approval. They’ll also launch a large-scale pivotal trial for pancreatic <a href="https://spectrum.ieee.org/tag/cancer">cancer</a>, considered one of the deadliest forms of the disease with a five-year survival rate of just <a href="https://pancan.org/press-releases/pancreatic-cancer-diagnoses-and-mortality-rates-climb-five-year-survival-rate-for-pancreatic-cancer-stalls-at-13/" target="_blank">13 percent</a>. An effective treatment for pancreatic cancer would represent a major advance against one of the most lethal malignancies.</p><h2>Histotripsy’s Benefits for Cancer Treatment</h2><p>HistoSonics is not the only developer of histotripsy devices or techniques, but it is first to market with a purpose-built device. “What HistoSonics has developed is a symphony of technologies, which combines physics, biology, and biomedical engineering,” says <a href="https://www.cc.nih.gov/meet-our-doctors/bwood" target="_blank">Bradford Wood</a>, an interventional radiologist at the National Institutes of Health, who is not affiliated with the company. Its engineering effort has spanned multiple disciplines to produce robotic, computer-guided systems that turn physical forces into therapeutic effects.</p><p>Over the past decade, research has confirmed or found other benefits of histotripsy. With precise calibration, fibrous tissue—such as blood vessels—can be spared from damage even in the target zone. And while other noninvasive techniques may leave scar tissue, the liquefied debris created by histotripsy is cleared away by the body’s natural processes.</p><p>In HistoSonics’ early trials for pancreatic cancer, doctors used <a href="https://spectrum.ieee.org/tag/focused-ultrasound">focused ultrasound</a> pulses to ablate, or destroy, tumors deep within the pancreas. “It’s a great achievement for the entire field to show that it is possible to ablate pancreatic tumors and that it’s well tolerated,” says <a href="https://gastro.uw.edu/people/faculty/khokhlova-t" target="_blank">Tatiana Khokhlova</a>, a medical ultrasound researcher at the University of Washington, in Seattle, who has worked on alternative histotripsy techniques.</p><p>Khokhlova says the key to harnessing histotripsy’s benefits “will be combining ablation of the primary tumor in the pancreas with some other therapy.” Combination treatment could fight recurrent cancer and tiny tumors that ultrasound might miss, while also tapping into a surprising benefit.</p><p>Histotripsy generally seems to <a href="https://pubmed.ncbi.nlm.nih.gov/31940590/" target="_blank">stimulate an immune response</a>, helping the body attack cancer cells that weren’t targeted directly by ultrasound. The mechanical destruction of tumors likely leaves behind recognizable traces of cancer proteins that help the immune system learn to identify and destroy similar cells elsewhere in the body, explains Wood. Researchers are now exploring ways to pair histotripsy with immunotherapy to amplify that effect.</p><p>The company’s capacity to explore the treatment‘s potential for different conditions will only improve with time, says HistoSonics CEO <a href="https://www.linkedin.com/in/mike-blue-860b9522/" target="_blank">Mike Blue</a>. The company has fresh resources to accelerate R&amp;D: A new ownership group, which includes billionaire <a href="https://spectrum.ieee.org/tag/jeff-bezos">Jeff Bezos</a>, <a href="https://www.businesswire.com/news/home/20250807749442/en/HistoSonics-Announces-%242.25B-Acquisition-by-Consortium-of-Top-Tier-Investors" target="_blank">acquired</a> HistoSonics in August 2025 at a valuation of US $2.25 billion. </p><p>Engineers are already testing a new guidance system that uses a form of <a href="https://spectrum.ieee.org/tag/x-rays">X-rays</a> rather than <a href="https://spectrum.ieee.org/tag/ultrasound-imaging">ultrasound imaging</a>, which should expand use cases. The R&amp;D team is also developing a feedback system that analyzes echoes from the therapeutic ultrasound to detect tissue destruction and integrates that information into the live display, says Blue.</p><p>If those advances pan out, histotripsy could move well beyond the liver, kidney, and pancreas in the fight against cancer. What started as a curiosity about bubbles might soon become a new pillar of noninvasive medicine—a future in which surgeons wield not scalpels, but sound waves.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[US destroying its reputation as a scientific leader – European science diplomat (167 pts)]]></title>
+            <title><![CDATA[US destroying its reputation as a scientific leader – European science diplomat (168 pts)]]></title>
             <link>https://sciencebusiness.net/news/horizon-europe/us-demolishing-its-scientific-leadership-wrecking-ball-says-chief-eu-research</link>
             <guid>46357887</guid>
             <pubDate>Mon, 22 Dec 2025 19:31:50 GMT</pubDate>
@@ -648,7 +901,7 @@ theme = &quot;auto&quot;"><pre>[<span>defaults</span>]
 Couldn't get https://sciencebusiness.net/news/horizon-europe/us-demolishing-its-scientific-leadership-wrecking-ball-says-chief-eu-research: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[US blocks all offshore wind construction, says reason is classified (560 pts)]]></title>
+            <title><![CDATA[US blocks all offshore wind construction, says reason is classified (564 pts)]]></title>
             <link>https://arstechnica.com/science/2025/12/us-government-finds-new-excuse-to-stop-construction-of-offshore-wind/</link>
             <guid>46357881</guid>
             <pubDate>Mon, 22 Dec 2025 19:31:11 GMT</pubDate>
@@ -807,7 +1060,7 @@ Couldn't get https://sciencebusiness.net/news/horizon-europe/us-demolishing-its-
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Garbage Collection Handbook (221 pts)]]></title>
+            <title><![CDATA[The Garbage Collection Handbook (227 pts)]]></title>
             <link>https://gchandbook.org/index.html</link>
             <guid>46357870</guid>
             <pubDate>Mon, 22 Dec 2025 19:30:18 GMT</pubDate>
@@ -880,7 +1133,7 @@ Closing date 31 August 2012.
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Illustrated Transformer (402 pts)]]></title>
+            <title><![CDATA[The Illustrated Transformer (410 pts)]]></title>
             <link>https://jalammar.github.io/illustrated-transformer/</link>
             <guid>46357675</guid>
             <pubDate>Mon, 22 Dec 2025 19:15:56 GMT</pubDate>
@@ -1341,7 +1594,7 @@ The positional encoding shown above is from the Tensor2Tensor implementation of 
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[State regulators vote to keep utility profits high angering customers across CA (120 pts)]]></title>
+            <title><![CDATA[State regulators vote to keep utility profits high angering customers across CA (121 pts)]]></title>
             <link>https://www.latimes.com/environment/story/2025-12-18/state-regulators-vote-to-keep-utility-profits-high-angering-customers</link>
             <guid>46357535</guid>
             <pubDate>Mon, 22 Dec 2025 19:06:16 GMT</pubDate>
@@ -1349,7 +1602,7 @@ The positional encoding shown above is from the Tensor2Tensor implementation of 
 <div id="readability-page-1" class="page"><div data-element="story-body" data-subscriber-content=""> <p>Despite complaints from customers about <a href="https://www.latimes.com/environment/story/2025-09-15/la-fi-edison-rate-hikes">rising electric bills</a>, the California Public Utilities Commission voted 4 to 1 on Thursday to keep profits at Southern California Edison and the state’s other big investor-owned utilities at a level that consumer groups say has long been inflated. </p><p>The commission vote will slightly decrease the profit margins of <a href="https://www.latimes.com/environment/story/2025-09-15/la-fi-edison-rate-hikes">Edison </a>and three other big utilities beginning next year. Edison’s rate will fall to 10.03% from 10.3%.</p><p>Customers will see little impact in their bills from the decision. Because the utilities are continuing to spend more on wires and other infrastructure — capital costs that they earn profit on — that portion of customer bills is expected to continue to rise.</p><p>The vote angered consumer groups that had detailed in filings and hearings at the commission how the utilities’ return on equity — which sets the profit rate that the companies’ shareholders receive — had long been too high.</p><p>Among those testifying on behalf of consumers was Mark Ellis, the former chief economist for Sempra, the parent company of San Diego Gas &amp; Electric and Southern California Gas. Ellis estimated that the companies’ profit margin should be closer to 6%.</p><p>He argued in a filing that the California commission had for years authorized the utilities to earn an excessive return on equity, resulting in an “unnecessary and unearned wealth transfer” from customers to the companies.</p><p>Cutting the return on equity to a little more than 6% would give Edison, Pacific Gas &amp; Electric, SDG&amp;E and SoCalGas a fair return, Ellis said, while saving their customers $6.1 billion a year.</p><p>The four commissioners who voted to keep the return on equity at about 10% — the percentage varies slightly for each company — said they believed they had found a balance between the 11% or higher rate that the four utilities had requested and the affordability concerns of utility customers.</p><p>Alice Reynolds, the commission’s president, said before the vote that she believed the decision “accurately reflects the evidence.”</p><p>Commissioner Darcie Houck disagreed and voted against the proposal. In her remarks, she detailed how California ratepayers were struggling to pay their bills.</p><p>“We have a duty to consider the consumer interest in determining what is a just and reasonable rate,” she said.</p><p>Consumer groups criticized the commission’s vote.</p><p>“For too long, utility companies have been extracting unreasonable profits from Californians just trying to heat or cool their homes or keep the lights on,” said Jenn Engstrom at CALPIRG. “As long as CPUC allows such lofty rates of return, it incentivizes power companies to overspend, increasing energy bills for everyone.”</p><p>California now has the nation’s second-highest electric rates after Hawaii.</p><p>Edison’s electric rates have risen by more than 40% in the last three years, according to a November analysis by the commission’s Public Advocates Office. More than 830,000 Edison customers are behind in paying their electric bills, the office said, each owing a balance of $835 on average.</p><p>The commission’s vote Thursday was in response to a March request from Edison and the three other big for-profit utilities. The companies pointed to the January wildfires in Los Angeles County, saying they needed to provide their shareholders with more profit to get them to continue to invest in their stock because of the threat of utility-caused fires in California.</p><p>In its filing, Edison asked for a return on equity of 11.75%, saying that it faced “elevated business risks,” including “the risk of extreme wildfires.”</p><p>The company told the commission that its stock had declined after the Jan. 7 Eaton fire and it needed the higher return on equity to attract investors to provide it with money for “wildfire mitigation and supporting California’s clean energy transition.”</p><p>Edison is facing hundreds of lawsuits filed by victims of the fire, which killed 19 people and destroyed thousands of homes in Altadena. The company has said the fire may have been sparked by its 100-year-old transmission line in Eaton Canyon, which it kept in place even though it hadn’t served customers since 1971.</p><p>Return on equity is crucial for utilities because it determines how much they and their shareholders earn each year on the electric lines, substations, pipelines and the rest of the system they build to serve customers.</p><p>Under the state’s system for setting electric rates, investors provide part of the money needed to build the infrastructure and then earn an annual return on that investment over the assets’ life, which can be 30 or 40 years.</p><p>In a January report, state legislative analyst Gabriel Petek detailed how electric rates at Edison and the state’s two other biggest investor-owned electric utilities were 50% higher than those charged by public utilities such as the Los Angeles Department of Water and Power. The public utilities don’t have investors or charge customers extra for profit.</p><p>Before the vote, dozens of utility customers from across the state wrote to the commission’s five members, who were appointed by Gov. Gavin Newsom, asking them to lower the utilities’ return on equity.</p><p>“A profit margin of 10% on infrastructure improvements is far too high and will only continue to increase the cost of living in California,” wrote James Ward, a Rancho Santa Margarita resident. “I just wish I could get a guaranteed profit margin of 10% on my investments.”</p><div data-list-id="00000192-be43-dc88-abfe-fefbb2770003" data-module-id="00000192-be43-dc88-abfe-fefbb2770003" data-excluded-ids="00000199-307d-d070-a5dd-bfff99a10000" data-click="enhancement" data-align-center="">  <p data-element="element-header" data-click="liZZListTitleCTA">  <h3 data-element="element-header-title" data-counter="3">More to Read </h3>  </p>      </div> </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Universal Reasoning Model (53.8% pass 1 ARC1 and 16.0% ARC 2) (103 pts)]]></title>
+            <title><![CDATA[Universal Reasoning Model (53.8% pass 1 ARC1 and 16.0% ARC 2) (111 pts)]]></title>
             <link>https://arxiv.org/abs/2512.14693</link>
             <guid>46357458</guid>
             <pubDate>Mon, 22 Dec 2025 18:59:22 GMT</pubDate>
@@ -2145,14 +2398,6 @@ Couldn't get https://www.jeffgeerling.com/blog/2025/nist-was-5-μs-utc-after-las
 
 
     </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[The biggest CRT ever made: Sony's PVM-4300 (233 pts)]]></title>
-            <link>https://dfarq.homeip.net/the-biggest-crt-ever-made-sonys-pvm-4300/</link>
-            <guid>46353777</guid>
-            <pubDate>Mon, 22 Dec 2025 12:54:29 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://dfarq.homeip.net/the-biggest-crt-ever-made-sonys-pvm-4300/">https://dfarq.homeip.net/the-biggest-crt-ever-made-sonys-pvm-4300/</a>, See on <a href="https://news.ycombinator.com/item?id=46353777">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>Move over, GE Widescreen 1000. In 1989 in Japan, Sony introduced to the largest Trinitron CRT ever built, the KV-45ED1, also known as the PVM-4300. And in 1990, they imported 20 of them to the United States, just in time for the recession. About 34 years later, one of these enigmatic TVs surfaced.</p><h2>Sony’s PVM-4300/KV-45ED1</h2><figure id="attachment_35264" aria-describedby="caption-attachment-35264"><a href="https://dfarq.homeip.net/the-biggest-crt-ever-made-sonys-pvm-4300/sony_pvm_4300/" rel="attachment wp-att-35264"><img data-recalc-dims="1" fetchpriority="high" decoding="async" src="https://i0.wp.com/dfarq.homeip.net/wp-content/uploads/2024/06/Sony_PVM_4300.jpg?resize=300%2C209&amp;ssl=1" alt="The Sony PVM-4300, next to a 29-inch TV" width="300" height="209" srcset="https://i0.wp.com/dfarq.homeip.net/wp-content/uploads/2024/06/Sony_PVM_4300.jpg?resize=300%2C209&amp;ssl=1 300w, https://i0.wp.com/dfarq.homeip.net/wp-content/uploads/2024/06/Sony_PVM_4300.jpg?w=607&amp;ssl=1 607w" sizes="(max-width: 300px) 100vw, 300px"></a><figcaption id="caption-attachment-35264">The Sony PVM-4300 was the largest CRT TV ever made. Its 45-inch tube provided 43 inches of visible improved definition TV. It stood about 27 inches tall.</figcaption></figure><p>Sony’s part number suggests it has a 45 inch tube inside. But in a rare case of truth in advertising, Sony advertised it as a 43-inch model. It weighed about 450 pounds, stood about 27 inches tall, and it wouldn’t fit through a standard door frame. That’s probably okay, it’s not like someone was going to use this as a bedroom TV. This thing was going in your living room.</p><p>In Japan, it sold for 2.6 million yen, but in the United States, it retailed for $40,000, a significant markup. To be fair, shipping them across the Atlantic and then throughout the United States must have been expensive. And news articles in 1990 said Sony dealers would not allow any bickering. They would throw in a couple of options like the separate tuner or speakers. But no discounts.</p><p>Sony said at the time they hoped to sell 80 of them that year, but the recession may have kept that from happening.</p><h2>The biggest conventional CRT ever</h2><p>The Sony PVM-4300 was a conventional CRT, unlike the <a href="https://dfarq.homeip.net/ge-widescreen-1000/">GE Widescreen 1000</a>, which was a projection set. Projection TVs could be bigger and cheaper. But if you wanted the clearest picture, a big CRT was where it was at.</p><p>It was a conventional CRT that worked with over the air signals, but like many larger TVs of the era, it used a technology called IDTV to enhance the picture quality. The “ID” stood for “improved definition.” IDTV sets had a buffer so they would store successive frames and interpolate them rather than interlacing them the way a conventional CRT TV worked. They also had circuitry to detect motion and perform image stabilization to further enhance the image. The result wasn’t as good as HDTV. But it gave high rollers a better picture until HDTV. HDTV arrived in 1998, but articles at the time estimated 2005. The Chicago Tribune warned in 1990 that these $40,000 TVs would be obsolete in 15 years, but the salesperson countered that every TV would be obsolete in 15 years.</p><p>It’s also likely that someone in the market for a $40,000 TV didn’t worry about obsolescence. In 1990, the GE Widescreen 1000 looked dated and it wasn’t 15 years old yet.</p><h2>Why so expensive?</h2><p>The KV-45ED1 or PVM-4300 cost about 8 times as much as Sony’s second most expensive model at the time, which had a 29-inch screen. That’s largely because the KV-45ED1 had to be built by hand. Sony could mass produce its smaller TVs. This was a product for buyers who weren’t worried about the price.</p><p><a href="https://dfarq.homeip.net/the-last-sony-crt-ever-made/">Sony continued making CRTs into the 21st century</a>, bowing out with its high-def KD-34XBR970, 36-inch KD-36FS170, 32-inch KV-32FS170 and 27-inch KV27FS170 in February 2006.</p><p>It is unclear how many of these enormous 43-inch units Sony sold, and some people even questioned if it was ever built. A Chicago area dealer told the <em>Chicago Tribune</em> in 1990 that someone had purchased one, but that the buyer wanted to remain anonymous. That was good enough for me; a TV dealer wasn’t going to tell a newspaper that they have a $40,000 item and then not have it. That’s just bad business. Good business is taking the free advertising, having an example on display to show knowing most won’t buy it, but they may buy one of the smaller units. But luring someone into the store with a lie makes it much more difficult to sell anything.</p><p>And the Tribune wasn’t going to make something like this up. It would anger the TV dealers and risk losing their advertising. And someone who could afford a $40,000 TV was likely a business owner or high-ranking executive who could pull their advertising. In the days of print newspapers, advertisers and potential advertisers held a lot of sway. This could be both good and bad. I’m not going to say capitalism solves every problem but this was a case where it helped keep people honest.</p><h2>Shank Mods’ surviving Sony PVM-4300</h2><p>On December 22, 2024, Youtuber Shank Mods released a video telling the story of a Sony PVM-4300 and how he acquired it. One of the photos of a purported surviving unit turned out to be very real. It was taken in a restaurant in Japan, and the owner was actually aware of the photo. Unfortunately the restaurant was having to move, and needed to get rid of the set.&nbsp;Shank Mods was able to contact some people in Japan who could help race against time and remove the TV from the restaurant and then ship it to the United States.</p><p><a href="https://www.youtube.com/watch?v=JfZxOuc9Qwk&amp;pp=ygUOc2hhbmsgbW9kcyBjcnQ%3D">The 35-minute video</a> is well worth watching if you have interest in vintage CRTs, or even if you just like stories of strangers coming together and helping each other just for the sake of being helpful. Actually, I take that back. At the end of the video, Shank Mods played a prank on his fellow CRT fans that is absolutely hilarious and makes the video worth watching for that reason alone. I won’t ruin it for you.</p><p>We can only guess how many other examples may survive. But we now know that at least one survives and is in the hands of a retro hobbyist.</p><div itemtype="http://schema.org/Person" itemscope="" itemprop="author"><p><img data-recalc-dims="1" decoding="async" src="https://i0.wp.com/dfarq.homeip.net/wp-content/uploads/2017/06/dave_farquhar_181px.jpg?resize=100%2C100&amp;ssl=1" data-src="https://i0.wp.com/dfarq.homeip.net/wp-content/uploads/2017/06/dave_farquhar_181px.jpg?resize=100%2C100&amp;ssl=1" width="100" height="100" alt="" itemprop="image"></p><div><p>David Farquhar is a computer security professional, entrepreneur, and author. He has written professionally about computers since 1991, so he was writing about retro computers when they were still new. He has been working in IT professionally since 1994 and has specialized in vulnerability management since 2013. He holds Security+ and CISSP certifications. Today he blogs five times a week, mostly about retro computers and retro gaming covering the time period from 1975 to 2000.</p></div></div></div></div>]]></description>
         </item>
     </channel>
 </rss>
