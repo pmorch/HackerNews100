@@ -4,12 +4,132 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 21 Mar 2026 01:30:12 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 21 Mar 2026 02:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[OpenCode – The open source AI coding agent (406 pts)]]></title>
+            <title><![CDATA[We rewrote our Rust WASM Parser in TypeScript – and it got 3x Faster (111 pts)]]></title>
+            <link>https://www.openui.com/blog/rust-wasm-parser</link>
+            <guid>47461094</guid>
+            <pubDate>Fri, 20 Mar 2026 21:48:06 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.openui.com/blog/rust-wasm-parser">https://www.openui.com/blog/rust-wasm-parser</a>, See on <a href="https://news.ycombinator.com/item?id=47461094">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article><p>We built the openui-lang parser in Rust and compiled it to WASM.
+The logic was sound: Rust is fast, WASM gives you near-native speed in the browser,
+and our parser is a reasonably complex multi-stage pipeline.
+Why wouldn't you want that in Rust?</p>
+<p>Turns out we were optimising the wrong thing.</p>
+
+<p>The openui-lang parser converts a custom DSL emitted by an LLM into a React component tree. It runs on every streaming chunk — so latency matters a lot. The pipeline has six stages:</p>
+<figure dir="ltr" tabindex="-1"><div role="region" tabindex="0"><pre><code><span><span>autocloser → lexer → splitter → parser → resolver → mapper → ParseResult</span></span></code></pre></div></figure>
+<ul>
+<li><strong>Autocloser</strong>: makes partial (mid-stream) text syntactically valid by appending minimal closing brackets/quotes</li>
+<li><strong>Lexer</strong>: single-pass character scanner, emits typed tokens</li>
+<li><strong>Splitter</strong>: cuts the token stream into <code>id = expression</code> statements</li>
+<li><strong>Parser</strong>: recursive-descent expression parser, builds an AST</li>
+<li><strong>Resolver</strong>: inline all variable references (hoisting support, circular ref detection)</li>
+<li><strong>Mapper</strong>: converts internal AST into the public <code>OutputNode</code> format consumed by the React renderer</li>
+</ul>
+
+<p>Every call to the WASM parser pays a mandatory overhead regardless of how fast the Rust code itself runs:</p>
+<figure dir="ltr" tabindex="-1"><div role="region" tabindex="0"><pre><code><span><span>JS world                              WASM world</span></span>
+<span><span>────────────────────────────────────────────────────────</span></span>
+<span><span>wasmParse(input)</span></span>
+<span><span>  │</span></span>
+<span><span>  ├─ copy string: JS heap → WASM linear memory   (allocation + memcpy)</span></span>
+<span><span>  │</span></span>
+<span><span>  │                                 Rust parses   ✓ fast</span></span>
+<span><span>  │                                 serde_json::to_string()  ← serialize result</span></span>
+<span><span>  │</span></span>
+<span><span>  ├─ copy JSON string: WASM → JS heap             (allocation + memcpy)</span></span>
+<span><span>  │</span></span>
+<span><span>  JSON.parse(jsonString)                          ← deserialize result</span></span>
+<span><span>  │</span></span>
+<span><span>  return ParseResult</span></span></code></pre></div></figure>
+<p>The Rust parsing itself was never the slow part. The overhead was entirely in the boundary: copy string in, serialize result to JSON string, copy JSON string out, then V8 deserializes it back into a JS object.</p>
+
+<p>The natural question was: what if WASM returned a JS object directly, skipping the JSON serialization step? We integrated <code>serde-wasm-bindgen</code> which does exactly this — it converts the Rust struct into a <code>JsValue</code> and returns it directly.</p>
+<p>It was <strong>30% slower</strong>.</p>
+<p>Here's why. JS cannot read a Rust struct's bytes from WASM linear memory as a native JS object — the two runtimes use completely different memory layouts. To construct a JS object from Rust data, <code>serde-wasm-bindgen</code> must recursively materialise Rust data into real JS arrays and objects, which involves many fine-grained conversions across the runtime boundary per <code>parse()</code> invocation.</p>
+<p>Compare that to the JSON approach: <code>serde_json::to_string()</code> runs in pure Rust with zero boundary crossings, produces one string, one <code>memcpy</code> copies it to the JS heap, then V8's native C++ <code>JSON.parse</code> processes it in a single optimised pass. Fewer, larger, and more optimised operations win over many small ones.</p>
+<h3 id="benchmark-json-string-vs-direct-jsvalue-1000-runs-µs-per-call"><a data-card="" href="#benchmark-json-string-vs-direct-jsvalue-1000-runs-µs-per-call">Benchmark: JSON string vs direct JsValue (1000 runs, µs per call)</a></h3>
+<div><table><thead><tr><th>Fixture</th><th>JSON round-trip</th><th>serde-wasm-bindgen</th><th>Change</th></tr></thead><tbody><tr><td>simple-table</td><td>20.5</td><td>22.5</td><td>-9% slower</td></tr><tr><td>contact-form</td><td>61.4</td><td>79.4</td><td>-29% slower</td></tr><tr><td>dashboard</td><td>57.9</td><td>74.0</td><td>-28% slower</td></tr></tbody></table></div>
+<p>We reverted this change immediately.</p>
+
+<p>We ported the full parser pipeline to TypeScript. Same six-stage architecture, same <code>ParseResult</code> output shape — no WASM, no boundary, runs entirely in the V8 heap.</p>
+<h3 id="benchmark-method-one-shot-parse"><a data-card="" href="#benchmark-method-one-shot-parse">Benchmark Method: One-Shot Parse</a></h3>
+<p><strong>What is measured:</strong> A single <code>parse(completeString)</code> call on the finished output string. This isolates per-call parser cost.</p>
+<p><strong>How it was run:</strong> 30 warm-up iterations to stabilise JIT, then 1000 timed iterations using <code>performance.now()</code> (µs precision). The median is reported. Fixtures are real LLM-generated component trees serialised in each format's real streaming syntax.</p>
+<p><strong>Fixtures:</strong></p>
+<ul>
+<li><code>simple-table</code> — root + one Table with 3 columns and 5 rows (~180 chars)</li>
+<li><code>contact-form</code> — root + form layout with 6 input fields + submit button (~400 chars)</li>
+<li><code>dashboard</code> — root + sidebar nav + 3 metric cards + chart + data table (~950 chars)</li>
+</ul>
+<h3 id="results-one-shot-parse-median-µs-1000-runs"><a data-card="" href="#results-one-shot-parse-median-µs-1000-runs">Results: One-Shot Parse (median µs, 1000 runs)</a></h3>
+<div><table><thead><tr><th>Fixture</th><th>TypeScript</th><th>WASM</th><th>Speedup</th></tr></thead><tbody><tr><td>simple-table</td><td>9.3</td><td>20.5</td><td><strong>2.2x</strong></td></tr><tr><td>contact-form</td><td>13.4</td><td>61.4</td><td><strong>4.6x</strong></td></tr><tr><td>dashboard</td><td>19.4</td><td>57.9</td><td><strong>3.0x</strong></td></tr></tbody></table></div>
+
+<p>Eliminating WASM fixed the per-call cost, but the streaming architecture still had a deeper inefficiency.</p>
+<p>The parser is called on every LLM chunk. The naïve approach accumulates chunks and re-parses the entire string from scratch each time:</p>
+<figure dir="ltr" tabindex="-1"><div role="region" tabindex="0"><pre><code><span><span>Chunk 1:  parse("root = Root([t")              → 14 chars</span></span>
+<span><span>Chunk 2:  parse("root = Root([tbl])\ntbl = T") → 27 chars</span></span>
+<span><span>Chunk 3:  parse(full_accumulated_string)        → ...</span></span></code></pre></div></figure>
+<p>For a 1000-char output delivered in 20-char chunks: 50 parse calls processing a cumulative total of ~25,000 characters. O(N²) in the number of chunks.</p>
+<h3 id="the-fix-statement-level-incremental-caching"><a data-card="" href="#the-fix-statement-level-incremental-caching">The Fix: Statement-Level Incremental Caching</a></h3>
+<p>Statements terminated by a depth-0 newline are <strong>immutable</strong> — the LLM will never come back and modify them. We added a streaming parser that caches completed statement ASTs:</p>
+<figure dir="ltr" tabindex="-1"><div role="region" tabindex="0"><pre><code><span><span>State: { buf, completedEnd, completedSyms, firstId }</span></span>
+<span><span></span></span>
+<span><span>On each push(chunk):</span></span>
+<span><span>  1. Scan buf from completedEnd for depth-0 newlines</span></span>
+<span><span>  2. For each complete statement found: parse + cache AST → advance completedEnd</span></span>
+<span><span>  3. Pending (last, incomplete) statement: autoclose + parse fresh</span></span>
+<span><span>  4. Merge cached + pending → resolve + map → return ParseResult</span></span></code></pre></div></figure>
+<p>Completed statements are never re-parsed. Only the trailing in-progress statement is re-parsed per chunk. O(total_length) instead of O(N²).</p>
+<h3 id="benchmark-method-full-stream-total-parse-cost"><a data-card="" href="#benchmark-method-full-stream-total-parse-cost">Benchmark Method: Full-Stream Total Parse Cost</a></h3>
+<p><strong>What is measured:</strong> The <strong>total parse overhead accumulated across every chunk call for one complete document</strong>. This is different from the one-shot benchmark — it measures the sum of all parse calls during a real stream, not a single call. This is the number that affects actual user-perceived responsiveness.</p>
+<p><strong>How it was run:</strong> Documents are replayed in 20-char chunks. Each chunk triggers a <code>parse()</code> (naïve) or <code>push()</code> (incremental) call. Total time across all calls is recorded. 100 full-stream replays, median taken.</p>
+<h3 id="results-full-stream-total-parse-cost-median-µs-across-all-chunks"><a data-card="" href="#results-full-stream-total-parse-cost-median-µs-across-all-chunks">Results: Full-Stream Total Parse Cost (median µs across all chunks)</a></h3>
+<div><table><thead><tr><th>Fixture</th><th>Naïve TS (re-parse every chunk)</th><th>Incremental TS (cache completed)</th><th>Speedup</th></tr></thead><tbody><tr><td>simple-table</td><td>69</td><td>77</td><td>none (single statement, no cache benefit)</td></tr><tr><td>contact-form</td><td>316</td><td>122</td><td><strong>2.6x</strong></td></tr><tr><td>dashboard</td><td>840</td><td>255</td><td><strong>3.3x</strong></td></tr></tbody></table></div>
+<p>The <code>simple-table</code> fixture is a single statement — there's nothing to cache, so both approaches are equivalent. The benefit scales with the number of statements because more of the document gets cached and skipped on each chunk.</p>
+<h3 id="why-the-two-ts-numbers-look-different"><a data-card="" href="#why-the-two-ts-numbers-look-different">Why the two TS numbers look different</a></h3>
+<p>The one-shot table shows 13.4µs for <code>contact-form</code>; the streaming table shows 316µs (naïve). These are not contradictory — they measure different things:</p>
+<ul>
+<li><strong>13.4µs</strong> = cost of one <code>parse()</code> call on the complete 400-char string</li>
+<li><strong>316µs</strong> = total cost of ~20 <code>parse()</code> calls during the stream (chunk 1 parses 20 chars, chunk 2 parses 40 chars, ..., chunk 20 parses 400 chars — cumulative sum of all those growing calls)</li>
+</ul>
+
+<div><table><thead><tr><th>Approach</th><th>Per-call cost</th><th>Full-stream total</th><th>Notes</th></tr></thead><tbody><tr><td>WASM + JSON round-trip</td><td>20-61µs</td><td>baseline</td><td>Copy overhead each call</td></tr><tr><td>WASM + serde-wasm-bindgen</td><td>22-79µs</td><td>+9-29% slower</td><td>Hundreds of internal boundary crossings</td></tr><tr><td>TypeScript (naïve re-parse)</td><td>9-19µs</td><td>69-840µs</td><td>No boundary, but O(N²) streaming</td></tr><tr><td>TypeScript (incremental)</td><td>9-19µs</td><td>69-255µs</td><td>No boundary + O(N) streaming</td></tr></tbody></table></div>
+<p><strong>End result: 2.2-4.6x faster per call and 2.6-3.3x lower total streaming cost.</strong></p>
+
+<p>This experience sharpened our thinking on the right use cases for WASM:</p>
+<p>✅ <strong>Compute-bound with minimal interop</strong>: image/video processing, cryptography, physics simulations, audio codecs. Large input → scalar output or in-place mutation. The boundary is crossed rarely.</p>
+<p>✅ <strong>Portable native libraries</strong>: shipping C/C++ libraries (SQLite, OpenCV, libpng) to the browser without a full JS rewrite.</p>
+<p>❌ <strong>Parsing structured text into JS objects</strong>: you pay the serialization cost either way. The parsing computation is fast enough that V8's JIT eliminates any Rust advantage. The boundary overhead dominates.</p>
+<p>❌ <strong>Frequently-called functions on small inputs</strong>: if the function is called 50 times per stream and the computation takes 5µs, you cannot amortise the boundary cost.</p>
+
+<ol>
+<li>
+<p><strong>Profile where time is actually spent before choosing the implementation language.</strong>
+For us, the cost was never in the computation - it was always in data transfer across the WASM-JS boundary.</p>
+</li>
+<li>
+<p><strong>"Direct object passing" through <code>serde-wasm-bindgen</code> is not cheaper.</strong>
+Constructing a JS object field-by-field from Rust involves more boundary crossings than a single JSON string transfer, not fewer.
+The boundary crossings happen inside the single FFI call, invisibly.</p>
+</li>
+<li>
+<p><strong>Algorithmic complexity improvements dominate language-level optimisations.</strong>
+Going from O(N²) to O(N) in the streaming case had a larger practical impact than switching from WASM to TypeScript.</p>
+</li>
+<li>
+<p><strong>WASM and JS do not share a heap.</strong>
+WASM has a flat linear memory (<code>WebAssembly.Memory</code>) that JS can read as raw bytes, but those bytes are Rust's internal layout - pointers, enum discriminants, alignment padding - completely opaque to the JS runtime.
+Conversion is always required and always costs something.</p>
+</li>
+</ol></article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[OpenCode – The open source AI coding agent (460 pts)]]></title>
             <link>https://opencode.ai/</link>
             <guid>47460525</guid>
             <pubDate>Fri, 20 Mar 2026 21:03:52 GMT</pubDate>
@@ -17,7 +137,7 @@
 <div id="readability-page-1" class="page"><div data-component="content"><div data-slot="hero-copy" data-component="hero"><p><!--$-->Free models included or connect any model from any provider,<!--/--> <span data-slot="br"></span><!--$-->including Claude, GPT, Gemini and more.<!--/--></p></div><section data-component="video"><video src="https://opencode.ai/_build/assets/opencode-min-CiEsORKQ.mp4" autoplay="" playsinline="" loop="" muted="" preload="auto" poster="https://opencode.ai/_build/assets/opencode-poster-CbUiDHgA.png">Your browser does not support the video tag.</video></section><section data-component="what"><div data-slot="section-title"><h3>What is OpenCode?</h3><p>OpenCode is an open source agent that helps you write code in your terminal, IDE, or desktop.</p></div><ul><li><span>[*]</span><div><p><strong>LSP enabled</strong></p><!--$--><p>Automatically loads the right LSPs for the LLM</p><!--/--></div></li><li><span>[*]</span><div><p><strong>Multi-session</strong></p><!--$--><p>Start multiple agents in parallel on the same project</p><!--/--></div></li><li><span>[*]</span><div><p><strong>Share links</strong></p><!--$--><p>Share a link to any session for reference or to debug</p><!--/--></div></li><li><span>[*]</span><div><p><strong>GitHub Copilot</strong></p><!--$--><p>Log in with GitHub to use your Copilot account</p><!--/--></div></li><li><span>[*]</span><div><p><strong>ChatGPT Plus/Pro</strong></p><!--$--><p>Log in with OpenAI to use your ChatGPT Plus or Pro account</p><!--/--></div></li><li><span>[*]</span><div><p><strong>Any model</strong></p><!--$--><p>75+ LLM providers through Models.dev, including local models</p><!--/--></div></li><li><span>[*]</span><div><p><strong>Any editor</strong></p><!--$--><p>Available as a terminal interface, desktop app, and IDE extension</p><!--/--></div></li></ul><a href="https://opencode.ai/docs"><span><!--$-->Read docs<!--/--> </span><svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.5 12L17 12M13 16.5L17.5 12L13 7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"></path></svg></a></section><div data-slot="section-title" data-component="growth"><h3>The open source AI coding agent</h3><div><p><span>[*]</span></p><p>With over <strong>120,000</strong> GitHub stars, <strong>800</strong> contributors, and over <strong>10,000</strong> commits, OpenCode is used and trusted by over <strong>5M</strong> developers every month.</p></div></div><div data-slot="privacy-title" data-component="privacy"><h3>Built for privacy first</h3><div><p><span>[*]</span></p><p><!--$-->OpenCode does not store any of your code or context data, so that it can operate in privacy sensitive environments.<!--/--> <!--$-->Learn more about<!--/--> <a href="https://opencode.ai/docs/enterprise/">privacy</a>.</p></div></div><section data-component="faq"><p data-slot="section-title"><h3>FAQ</h3></p><ul><li></li><li></li><li></li><li></li><li></li><li></li><li></li><li></li></ul></section><div data-slot="zen-cta-copy" data-component="zen-cta"><p><strong>Access reliable optimized models for coding agents</strong></p><p>Zen gives you access to a handpicked set of AI models that OpenCode has tested and benchmarked specifically for coding agents. No need to worry about inconsistent performance and quality across providers, use validated models that work.</p><!--$--><a data-hk="0000000100000000000100000a160" href="https://opencode.ai/zen" link="true"><span data-hk="0000000100000000000100000a161"><!--$-->Learn about Zen<!--/--> </span><svg data-hk="0000000100000000000100000a162" width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6.5 12L17 12M13 16.5L17.5 12L13 7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="square"></path></svg></a><!--/--></div><!--$--><div data-slot="section-title" data-hk="0000000100000000000100000a170" data-component="email"><h3>Be the first to know when we release new products</h3><p>Join the waitlist for early access.</p></div><!--/--><!--$--><!--/--></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A Japanese Glossary of Chopsticks Faux Pas (105 pts)]]></title>
+            <title><![CDATA[A Japanese Glossary of Chopsticks Faux Pas (122 pts)]]></title>
             <link>https://www.nippon.com/en/japan-data/h01362/</link>
             <guid>47460452</guid>
             <pubDate>Fri, 20 Mar 2026 20:54:57 GMT</pubDate>
@@ -118,7 +238,7 @@
   				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Our commitment to Windows quality (394 pts)]]></title>
+            <title><![CDATA[Our commitment to Windows quality (418 pts)]]></title>
             <link>https://blogs.windows.com/windows-insider/2026/03/20/our-commitment-to-windows-quality/</link>
             <guid>47459296</guid>
             <pubDate>Fri, 20 Mar 2026 19:16:13 GMT</pubDate>
@@ -246,7 +366,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Attention Residuals (118 pts)]]></title>
+            <title><![CDATA[Attention Residuals (128 pts)]]></title>
             <link>https://github.com/MoonshotAI/Attention-Residuals</link>
             <guid>47458595</guid>
             <pubDate>Fri, 20 Mar 2026 18:23:41 GMT</pubDate>
@@ -453,7 +573,7 @@ def forward(self, blocks: list[Tensor], hidden_states: Tensor) -> tuple[list[Ten
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[BYD's bet on EVs is paying off as drivers ditch gas amid rising oil prices (155 pts)]]></title>
+            <title><![CDATA[BYD's bet on EVs is paying off as drivers ditch gas amid rising oil prices (158 pts)]]></title>
             <link>https://electrek.co/2026/03/20/byd-ev-demand-surges-drivers-ditch-gas-amid-rising-oil-prices/</link>
             <guid>47458549</guid>
             <pubDate>Fri, 20 Mar 2026 18:19:58 GMT</pubDate>
@@ -589,7 +709,7 @@ Benchmark on GitHub
 </a> </p> </div> <!-- Footer info --> <div data-astro-cid-rey7jovx=""> <p data-astro-cid-rey7jovx=""><strong data-astro-cid-rey7jovx="">System:</strong> Aegis-AI — Local-first AI home security on consumer hardware.</p> <p data-astro-cid-rey7jovx=""><strong data-astro-cid-rey7jovx="">Benchmark:</strong> HomeSec-Bench — 96 LLM + 35 VLM tests across 16 suites.</p> <p data-astro-cid-rey7jovx=""><strong data-astro-cid-rey7jovx="">Skill Platform:</strong> DeepCamera — Decentralized AI skill ecosystem.</p> </div> </div>    </main> <!-- Section indicators (Apple-style dots) — fixed to right edge, xl+ only --> <nav id="section-nav" data-astro-cid-sckkx6r4=""> <a href="#ai-scene-demo" data-section="ai-scene-demo" title="Home" data-astro-cid-sckkx6r4=""> <span data-astro-cid-sckkx6r4=""></span> </a> <a href="#features" data-section="features" title="Features" data-astro-cid-sckkx6r4=""> <span data-astro-cid-sckkx6r4=""></span> </a> <a href="#ai-showcase" data-section="ai-showcase" title="AI Engine" data-astro-cid-sckkx6r4=""> <span data-astro-cid-sckkx6r4=""></span> </a> <a href="#download" data-section="download" title="Download" data-astro-cid-sckkx6r4=""> <span data-astro-cid-sckkx6r4=""></span> </a> </nav>  <!-- Scripts -->   </div>]]></description>
         </item>
         <item>
-            <title><![CDATA[90% of crypto's Illinois primary spending failed to achieve its objective (123 pts)]]></title>
+            <title><![CDATA[90% of crypto's Illinois primary spending failed to achieve its objective (124 pts)]]></title>
             <link>https://www.mollywhite.net/micro/entry/202603172318</link>
             <guid>47456987</guid>
             <pubDate>Fri, 20 Mar 2026 16:34:04 GMT</pubDate>
@@ -641,7 +761,7 @@ Benchmark on GitHub
             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Having Kids (2019) (137 pts)]]></title>
+            <title><![CDATA[Having Kids (2019) (138 pts)]]></title>
             <link>https://paulgraham.com/kids.html</link>
             <guid>47455489</guid>
             <pubDate>Fri, 20 Mar 2026 14:56:03 GMT</pubDate>
@@ -771,7 +891,7 @@ for reading drafts of this.</p></span></td></tr></tbody></div></div>]]></descrip
 Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shares-plunge-25-after-co-founder-charged-in-25-billion-ai-chip-smuggling-plot/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Chuck Norris has died (691 pts)]]></title>
+            <title><![CDATA[Chuck Norris has died (694 pts)]]></title>
             <link>https://variety.com/2026/film/news/chuck-norris-dead-walker-texas-ranger-dies-1236694953/</link>
             <guid>47454782</guid>
             <pubDate>Fri, 20 Mar 2026 14:09:58 GMT</pubDate>
@@ -913,7 +1033,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Germany Mandates ODF for Public Administration (156 pts)]]></title>
+            <title><![CDATA[Germany Mandates ODF for Public Administration (159 pts)]]></title>
             <link>https://linuxiac.com/germany-mandates-odf-for-public-administration/</link>
             <guid>47454694</guid>
             <pubDate>Fri, 20 Mar 2026 14:04:39 GMT</pubDate>
@@ -971,7 +1091,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Java is fast, code might not be (183 pts)]]></title>
+            <title><![CDATA[Java is fast, code might not be (184 pts)]]></title>
             <link>https://jvogel.me/posts/2026/java-is-fast-your-code-might-not-be/</link>
             <guid>47454384</guid>
             <pubDate>Fri, 20 Mar 2026 13:43:23 GMT</pubDate>
@@ -1161,7 +1281,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
  </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I'm OK being left behind, thanks (802 pts)]]></title>
+            <title><![CDATA[I'm OK being left behind, thanks (807 pts)]]></title>
             <link>https://shkspr.mobi/blog/2026/03/im-ok-being-left-behind-thanks/</link>
             <guid>47454341</guid>
             <pubDate>Fri, 20 Mar 2026 13:38:56 GMT</pubDate>
@@ -1192,7 +1312,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Schizophrenia study finds new biomarker, drug candidate in mice (106 pts)]]></title>
+            <title><![CDATA[Schizophrenia study finds new biomarker, drug candidate in mice (107 pts)]]></title>
             <link>https://news.northwestern.edu/stories/2026/03/schizophrenia-study-finds-new-biomarker-drug-candidate-to-treat-cognitive-symptoms</link>
             <guid>47454091</guid>
             <pubDate>Fri, 20 Mar 2026 13:18:36 GMT</pubDate>
@@ -1256,7 +1376,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Social Smolnet (107 pts)]]></title>
+            <title><![CDATA[The Social Smolnet (111 pts)]]></title>
             <link>https://ploum.net/2026-03-20-social-smolnet.html</link>
             <guid>47453947</guid>
             <pubDate>Fri, 20 Mar 2026 13:02:19 GMT</pubDate>
@@ -1321,7 +1441,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[France's aircraft carrier located in real time by Le Monde through fitness app (464 pts)]]></title>
+            <title><![CDATA[France's aircraft carrier located in real time by Le Monde through fitness app (475 pts)]]></title>
             <link>https://www.lemonde.fr/en/international/article/2026/03/20/stravaleaks-france-s-aircraft-carrier-located-in-real-time-by-le-monde-through-fitness-app_6751640_4.html</link>
             <guid>47453942</guid>
             <pubDate>Fri, 20 Mar 2026 13:01:56 GMT</pubDate>
@@ -1329,7 +1449,7 @@ Couldn't get https://www.forbes.com/sites/tylerroush/2026/03/20/super-micro-shar
 Couldn't get https://www.lemonde.fr/en/international/article/2026/03/20/stravaleaks-france-s-aircraft-carrier-located-in-real-time-by-le-monde-through-fitness-app_6751640_4.html: Error: Request failed with status code 402]]></description>
         </item>
         <item>
-            <title><![CDATA[Entso-E final report on Iberian 2025 blackout (172 pts)]]></title>
+            <title><![CDATA[Entso-E final report on Iberian 2025 blackout (176 pts)]]></title>
             <link>https://www.entsoe.eu/publications/blackout/28-april-2025-iberian-blackout/</link>
             <guid>47452955</guid>
             <pubDate>Fri, 20 Mar 2026 11:03:27 GMT</pubDate>
