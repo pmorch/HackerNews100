@@ -4,12 +4,247 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 05 May 2026 08:30:17 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 05 May 2026 09:30:11 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[About 10% of AMC movie showings sell zero tickets. This site finds them (132 pts)]]></title>
+            <title><![CDATA[Google Chrome silently installs a 4 GB AI model on your device without consent (154 pts)]]></title>
+            <link>https://www.thatprivacyguy.com/blog/chrome-silent-nano-install/</link>
+            <guid>48019219</guid>
+            <pubDate>Tue, 05 May 2026 07:34:55 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.thatprivacyguy.com/blog/chrome-silent-nano-install/">https://www.thatprivacyguy.com/blog/chrome-silent-nano-install/</a>, See on <a href="https://news.ycombinator.com/item?id=48019219">Hacker News</a></p>
+Couldn't get https://www.thatprivacyguy.com/blog/chrome-silent-nano-install/: Error: Request failed with status code 503]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Async Rust never left the MVP state (106 pts)]]></title>
+            <link>https://tweedegolf.nl/en/blog/237/async-rust-never-left-the-mvp-state</link>
+            <guid>48019163</guid>
+            <pubDate>Tue, 05 May 2026 07:26:03 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://tweedegolf.nl/en/blog/237/async-rust-never-left-the-mvp-state">https://tweedegolf.nl/en/blog/237/async-rust-never-left-the-mvp-state</a>, See on <a href="https://news.ycombinator.com/item?id=48019163">Hacker News</a></p>
+<div id="readability-page-1" class="page"><p><strong>I've previously explained async bloat and some work-arounds for it, but would much prefer to solve the issue at the root, in the compiler. I've submitted a Project Goal, and am looking for help to fund the effort.</strong></p><div><p>I love me some async Rust! It's amazing how we can write executor agnostic code that can run concurrently on huge servers and tiny microcontrollers.</p><p>But especially on those tiny microcontrollers we notice that async Rust is far from the <a href="https://blog.rust-lang.org/2019/11/07/Async-await-stable/#zero-cost-futures">zero cost abstractions</a> we were promised. That's because every byte of binary size counts and async introduces a lot of bloat. This bloat exists on desktops and servers as well, but it's much less noticable when you have substantially more memory and compute available.</p><p>I've previously <a href="https://tweedegolf.nl/en/blog/235/debloat-your-async-rust">explained some work-arounds</a> for this issue, but would much prefer to get to the root of the problem, and work on improving async bloat in the compiler. As such I have submitted a <a href="https://rust-lang.github.io/rust-project-goals/2026/async-statemachine-optimisation.html">Project Goal</a>.</p><p>This is part 2 of my blog series on this topic. See <a href="https://tweedegolf.nl/en/blog/235/debloat-your-async-rust">part 1</a> for the initial exploration of the topic and what you can do when writing async code to avoid some of the bloat. In this second part we'll dive into the internals and translate the methods of blog 1 into optimizations for the compiler.</p><p>What I won't be talking about is the often discussed problem of futures becoming bigger than necessary and them doing a lot of copying. People are aware of that already. In fact, there is an open PR that tackles part of it: <a href="https://github.com/rust-lang/rust/pull/135527">https://github.com/rust-lang/rust/pull/135527</a></p>
+<h2 id="anatomy-of-a-generated-future">Anatomy of a generated future</h2><p>We're going to be looking at this code:</p><pre><code>fn foo() -&gt; impl Future&lt;Output = i32&gt; {
+    async { 5 }
+}
+
+fn bar() -&gt; impl Future&lt;Output = i32&gt; {
+    async {
+        foo().await + foo().await
+    }
+}
+</code></pre>
+<p><a href="https://godbolt.org/z/h6761nrEG">godbolt</a></p><p>We're using the desugared syntax for futures because it's easier to see what's happening.</p><p>So what does the <code>bar</code> future look like?</p><p>There are two await points, so the state machine must have at least two states, right?</p><p>Well, yes. But there's more.</p><p>Luckily we can ask the compiler to dump MIR for us at various passes. An interesting pass is the <code>coroutine_resume</code> pass. This is the last async-specific MIR pass. Why is this important? Well, async is a language feature that still exists in MIR, but not in LLVM IR. So the transformation of async to state machine happens as a MIR pass.</p><p>The <code>bar</code> function generates 360 lines of MIR. Pretty crazy, right? Although this gets optimized somewhat later on, the non-async version uses only 23 lines for this.</p><p>The compiler also outputs the <code>CoroutineLayout</code>. It's basically an enum with these states (comments my own):</p><pre><code>variant_fields: {
+    Unresumed(0): [], // Starting state
+    Returned (1): [],
+    Panicked (2): [],
+    Suspend0 (3): [_s1], // At await point 1, _s1 = the foo future
+    Suspend1 (4): [_s0, _s2], // At await point 2, _s0 = result of _s1, s2 = the second foo future
+},
+</code></pre>
+<p>So what are <code>Returned</code> and <code>Panicked</code>?</p><p>Well, <code>Future::poll</code> is a safe function. Calling it must not induce any UB, even when the future is done. So after <code>Suspend1</code> the future returns <code>Ready</code> and the future is changed to the <code>Returned</code> state.  Once polled again in that state, the poll function will panic.</p><p>The <code>Panicked</code> state exists so that after an async fn has panicked, but the catch-unwind mechanism was used to catch it, the future can't be polled anymore. Polling a future in the <code>Panicked</code> state will panic. If this mechanism wasn't there, we could poll the future again after a panic. But the future may be in an incomplete state and so that could cause UB. This mechanism is very similar to mutex poisoning.</p><p>(I'm 90% sure I'm correct about the <code>Panicked</code> state, but I can't really find any docs that actually describe this.)</p><p>Cool, this seems reasonable.</p><h2 id="why-panic">Why panic?</h2><p>But is it reasonable? Futures in the <code>Returned</code> state will panic. But they don't have to. The only thing we can't do is cause UB to happen.</p><p>Panics are relatively expensive. They introduce a path with a side-effect that's not easily optimized out. What if instead, we just return <code>Pending</code> again? Nothing unsafe going on, so we fulfill the contract of the <code>Future</code> type.</p><p>I've hacked this in the compiler to try it out and saw a 2%-5% reduction in binary size for async embedded firmware.</p><p>So I propose this should be a switch, just like <code>overflow-checks = false</code> is for integer overflow. In debug builds it would still panic so that wrong behavior is immediately visible, but in release builds we get smaller futures.</p><p>Similarly, when <code>panic=abort</code> is used, we might be able to get rid of the <code>Panicked</code> state altogether. I want to look into the repercussions of that.</p><h2 id="always-a-state-machine">Always a state machine</h2><p>We've looked at <code>bar</code>, but not yet at <code>foo</code>.</p><pre><code>fn foo() -&gt; impl Future&lt;Output = i32&gt; {
+    async { 5 }
+}
+</code></pre>
+<p>Let's implement it manually, to see what the optimal solution would be.</p><pre><code>struct FooFut;
+impl Future for FooFut {
+    type Output = i32;
+    
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, _cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt; {
+        Poll::Ready(5)
+    }
+}
+</code></pre>
+<p>Easy right? We don't need any state. We just return the number.</p><p>Let's see what the generated MIR is for the version the compiler gives us:</p><pre><code>// MIR for `foo::{closure#0}` 0 coroutine_resume
+/* coroutine_layout = CoroutineLayout {
+    field_tys: {},
+    variant_fields: {
+        Unresumed(0): [],
+        Returned (1): [],
+        Panicked (2): [],
+    },
+    storage_conflicts: BitMatrix(0x0) {},
+} */
+
+fn foo::{closure#0}(_1: Pin&lt;&amp;mut {async block@src\main.rs:5:5: 5:10}&gt;, _2: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;i32&gt; {
+    debug _task_context =&gt; _2;
+    let mut _0: core::task::Poll&lt;i32&gt;;
+    let mut _3: i32;
+    let mut _4: u32;
+    let mut _5: &amp;mut {async block@src\main.rs:5:5: 5:10};
+
+    bb0: {
+        _5 = copy (_1.0: &amp;mut {async block@src\main.rs:5:5: 5:10});
+        _4 = discriminant((*_5));
+        switchInt(move _4) -&gt; [0: bb1, 1: bb4, otherwise: bb5];
+    }
+
+    bb1: {
+        _3 = const 5_i32;
+        goto -&gt; bb3;
+    }
+
+    bb2: {
+        _0 = Poll::&lt;i32&gt;::Ready(move _3);
+        discriminant((*_5)) = 1;
+        return;
+    }
+
+    bb3: {
+        goto -&gt; bb2;
+    }
+
+    bb4: {
+        assert(const false, "`async fn` resumed after completion") -&gt; [success: bb4, unwind unreachable];
+    }
+
+    bb5: {
+        unreachable;
+    }
+}
+</code></pre>
+<p>Yikes! That's a lot of code!</p><p>Notice at line 4 that we still have the 3 default states and at line 22 that we're still switching on it. There's a big optimization opportunity here that we're not using, i.e. to have no states and always return <code>Poll::Ready(5)</code> on every poll.</p><p>I've also hacked this in the compiler and it saved 0.2% of binary size. Not a lot, but it's quite a simple optimization, so likely still worthwhile.</p><p>It does change the behavior a bit, but only for executors that aren't compliant. It means that the future always returns <code>Ready</code>. The behavior in the compiler right now is that any subsequent polls will panic.</p><h2 id="llvm-to-the-rescue">LLVM to the rescue?</h2><p>Ok, so the MIR output isn't great. But LLVM will pick up the pieces right?</p><p>Well, sometimes, yeah. But only when the futures are simple enough and you're running <code>opt-level=3</code>. If the future grows too complex (which happens fast because futures nest very deeply in idiomatic async Rust code) or you're optimizing for size (which we often do with embedded or wasm), LLVM doesn't optimize this all away.</p><p>Here's an example in godbolt: <a href="https://godbolt.org/z/58ahb3nne">https://godbolt.org/z/58ahb3nne</a></p><p>If you look through the generated assembly, you'll notice that it does know that <code>foo</code> returns 5, but that it doesn't optimize the answer of <code>bar</code> to be 10. The poll function of <code>foo</code> is also still called. This is done because of the potential panic the compiler can't fully account for. It doesn't realize <code>foo</code> is only called once and won't ever panic in practice.</p><p>If we comment out the panicking branch in the IR, we see it gets optimized better: <a href="https://godbolt.org/z/38KqjsY8E">https://godbolt.org/z/38KqjsY8E</a></p><p>LLVM is not our savior here sadly. We really do need to give it good inputs.</p><p>It does better with <code>opt-level=3</code>, but eventually can't keep up either when the code gets less trivial. And that's because we're relying on LLVM to spot that it should optimize out the things we're asking it to do.</p><h2 id="futures-arent-trivially-inlined">Futures aren't (trivially) inlined</h2><p>Inlining is great since it enables further optimization passes. Sadly, generated Rust futures are never inlined. After each future gets its implementation, then LLVM and the linker get an opportunity to do inlining. But as we've seen above, that's too late.</p><p>The prime opportunity for inlining is this:</p><pre><code>async fn foo(blah: SomeType) -&gt; OtherType {
+    // ...
+}
+
+async fn bar(blah: SomeType) -&gt; OtherType {
+    foo(blah).await
+}
+</code></pre>
+<p>This is a pattern that happens a lot when creating abstractions using traits. With the current compiler, <code>bar</code> gets its own state machine that calls the <code>foo</code> state machine, which is very wasteful. Instead,<code>bar</code> could also <em>become</em> <code>foo</code> by just returning the <code>foo</code> future.</p><p>Things get a little more difficult when we add a preamble and a postamble to the example.</p><pre><code>async fn foo(blah: bool) -&gt; i32 {
+    // ...
+}
+
+async fn bar(input: u32) -&gt; i32 {
+    let blah = input &gt; 10; // Preamble
+    let result = foo(blah).await;
+    result * 2 // Postamble
+}
+</code></pre>
+<p>This pattern is common when translating an async function from one signature to another, which happens for trait impls.</p><p>Note that <code>bar</code> doesn't need any async state of its own here either. No data is kept over the single await point that isn't captured by <code>foo</code>. <code>bar</code> can't simply <em>become</em> <code>foo</code>, but we can mostly rely on the state of <code>foo</code>. The manual implementation would be something like:</p><pre><code>enum BarFut {
+    Unresumed { input: u32 },
+    Inlined { foo: FooFut }
+}
+impl Future for BarFut {
+    type Output = i32;
+    
+    fn poll(self: Pin&lt;&amp;mut Self&gt;, cx: &amp;mut Context&lt;'_&gt;) -&gt; Poll&lt;Self::Output&gt; {
+        // Ignoring pin projection here
+        loop {
+            match self {
+                Unresumed { input } =&gt; {
+                    let blah = input &gt; 10; // Preamble
+                    *self = BarFut::Inlined { foo: foo(blah) };
+                },
+                Inlined { foo } =&gt; {
+                    break foo
+                        .poll(cx)
+                        .map(|result| result * 2) // Postamble
+                },
+            }
+        }
+    }
+}
+</code></pre>
+<p>That's a lot better than what's currently generated. If only we were allowed to execute the code up to the first await point, then we could get rid of the <code>Unresumed</code> state. But "futures don't do anything unless polled" is <a href="https://doc.rust-lang.org/reference/items/functions.html?highlight=function#r-items.fn.async.future">guaranteed</a>, so we can't change that.</p><p>There are more optimizations you could do with inlining if you were able to query properties of the futures you're polling. I don't think this is possible, at least not with the current architecture in rustc. Every async block is transformed individually and no data is kept about it afterwards.</p><p>For example, if you could query if a future always returns ready at the first poll, you wouldn't have to create a state for the await point in the future of the caller. If that were possible and you could apply these optimizations recursively, you could collapse a lot of futures into much simpler state machines.</p><p>I haven't tested out inlining yet, but I think this would significantly help binary size and performance.</p><h2 id="collapsing-states">Collapsing states</h2><p>The state machine gets an extra state for each await point in the async block. But there's code where multiple states could be collapsed into 1.</p><p>Take this example:</p><pre><code>pub async fn process_command() {
+    match get_command() {
+        CommandId::A =&gt; send_response(123).await,
+        CommandId::B =&gt; send_response(456).await,
+    }
+}
+</code></pre>
+<p>It's very natural to write it that way. But what happens is that we're getting two identical states:</p><pre><code>/* coroutine_layout = CoroutineLayout {
+    field_tys: {
+        _s0: CoroutineSavedTy { // Identical to _s1
+            ty: Coroutine(
+                DefId(0:11 ~ mir_test[b831]::send_response::{closure#0}),
+                [
+                    (),
+                    std::future::ResumeTy,
+                    (),
+                    (),
+                    (u32,),
+                ],
+            ),
+            source_info: SourceInfo {
+                span: src/main.rs:13:25: 13:49 (#14),
+                scope: scope[0],
+            },
+            ignore_for_traits: false,
+        },
+        _s1: CoroutineSavedTy { // Identical to _s0
+            ty: Coroutine(
+                DefId(0:11 ~ mir_test[b831]::send_response::{closure#0}),
+                [
+                    (),
+                    std::future::ResumeTy,
+                    (),
+                    (),
+                    (u32,),
+                ],
+            ),
+            source_info: SourceInfo {
+                span: src/main.rs:14:25: 14:49 (#16),
+                scope: scope[0],
+            },
+            ignore_for_traits: false,
+        },
+    },
+    variant_fields: {
+        Unresumed(0): [],
+        Returned (1): [],
+        Panicked (2): [],
+        Suspend0 (3): [_s0], // 2 states
+        Suspend1 (4): [_s1],
+    },
+    storage_conflicts: BitMatrix(2x2) {
+        (_s0, _s0),
+        (_s1, _s1),
+    },
+} */
+</code></pre>
+<p>The MIR for this function is 456 lines long and many basic blocks are essentially duplicates.</p><p>We can refactor the code manually to:</p><pre><code>pub async fn process_command() {
+    let response = match get_command() {
+        CommandId::A =&gt; 123,
+        CommandId::B =&gt; 456,
+    };
+    send_response(response).await;
+}
+</code></pre>
+<p>Here we don't get the duplicate states:</p><pre><code>/* coroutine_layout = CoroutineLayout {
+    field_tys: {
+        _s0: CoroutineSavedTy {
+            ty: Coroutine(
+                DefId(0:11 ~ mir_test[b831]::send_response::{closure#0}),
+                [
+                    (),
+                    std::future::ResumeTy,
+                    (),
+                    (),
+                    (u32,),
+                ],
+            ),
+            source_info: SourceInfo {
+                span: src/main.rs:16:5: 16:34 (#14),
+                scope: scope[1],
+            },
+            ignore_for_traits: false,
+        },
+    },
+    variant_fields: {
+        Unresumed(0): [],
+        Returned (1): [],
+        Panicked (2): [],
+        Suspend0 (3): [_s0],
+    },
+    storage_conflicts: BitMatrix(1x1) {
+        (_s0, _s0),
+    },
+} */
+</code></pre>
+<p>The total MIR length is now 302 lines and nothing is duplicated.</p><p>So it seems like a good optimization pass to search for identical code paths and states and collapse them into one. This optimization probably stacks well with the inlining pass.</p><h2 id="some-testing-results">Some testing results</h2><ul><li>Replace <code>Returned</code>' panic with <code>Poll::Pending</code>: 2-5% binary size savings on embedded.</li><li>When no await, no statemachine: 0.2% binary size savings on embedded.</li><li>Together: ~3% perf increase on x86 in synthetic benchmark with <code>smol</code> executor.</li></ul><p>Future inlining should have a greater effect again.</p><p>Ultimately it's hard to know the improvements until after it can be benched in real systems.</p><h2 id="summary">Summary</h2><p>Hopefully this article shed some light on some of the async Rust issues!</p><p>I would love to work on these items in the compiler:</p><ul><li><code>Returned</code> state no longer panics in release mode</li><li>Async blocks without awaits should not get state machines, but just return ready every time</li><li>Future inlining for futures with a single await</li><li>Collapse identical states</li></ul><p>Links to my hacks:</p><ul><li>No panics in poll after ready: <a href="https://github.com/rust-lang/rust/compare/main...diondokter:rust:resume-pending">https://github.com/rust-lang/rust/compare/main...diondokter:rust:resume-pending</a></li><li>No await, no statemachine: <a href="https://github.com/rust-lang/rust/compare/main...diondokter:rust:no-statemachine-when-no-await">https://github.com/rust-lang/rust/compare/main...diondokter:rust:no-statemachine-when-no-await</a></li></ul><h2 id="supporting-this-project-goal">Supporting this Project Goal</h2><p>I want to work on this in the compiler and as such have submitted it as a Project Goal: <a href="https://rust-lang.github.io/rust-project-goals/2026/async-statemachine-optimisation.html">https://rust-lang.github.io/rust-project-goals/2026/async-statemachine-optimisation.html</a></p><p>But I need your help because I can't do much without funding.</p><p>If you're with a company or organization that would benefit from this work and would be willing to (partially) fund it, please contact me at <a href="mailto:dion@tweedegolf.com"><code>dion@tweedegolf.com</code></a>. The scope is flexible and so is the amount of funding required. However, I have estimated that €30k could get all or at least a lot of this work done.</p></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[About 10% of AMC movie showings sell zero tickets. This site finds them (143 pts)]]></title>
             <link>https://walzr.com/empty-screenings</link>
             <guid>48018066</guid>
             <pubDate>Tue, 05 May 2026 04:33:22 GMT</pubDate>
@@ -17,7 +252,7 @@
 <div id="readability-page-1" class="page"><div id="resultsPanel" data-selected-id=""><h2>No empty rooms nearby right now.</h2><p>Try another ZIP code or use "Show all screenings" to see everything in the current window.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Train Your Own LLM from Scratch (193 pts)]]></title>
+            <title><![CDATA[Train Your Own LLM from Scratch (233 pts)]]></title>
             <link>https://github.com/angelos-p/llm-from-scratch</link>
             <guid>48017948</guid>
             <pubDate>Tue, 05 May 2026 04:09:17 GMT</pubDate>
@@ -243,7 +478,7 @@ mkdir scratchpad <span>&amp;&amp;</span> <span>cd</span> scratchpad</pre></div>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What I'm Hearing About Cognitive Debt (So Far) (189 pts)]]></title>
+            <title><![CDATA[What I'm Hearing About Cognitive Debt (So Far) (192 pts)]]></title>
             <link>https://margaretstorey.com/blog/2026/02/18/cognitive-debt-revisited/</link>
             <guid>48017298</guid>
             <pubDate>Tue, 05 May 2026 02:08:21 GMT</pubDate>
@@ -341,7 +576,7 @@ Cognitive debt lives in people.</p>
         </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bun is being ported from Zig to Rust (461 pts)]]></title>
+            <title><![CDATA[Bun is being ported from Zig to Rust (492 pts)]]></title>
             <link>https://github.com/oven-sh/bun/commit/46d3bc29f270fa881dd5730ef1549e88407701a5</link>
             <guid>48016880</guid>
             <pubDate>Tue, 05 May 2026 01:08:17 GMT</pubDate>
@@ -609,7 +844,7 @@ Cognitive debt lives in people.</p>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Y Combinator's Stake in OpenAI (0.6%) (306 pts)]]></title>
+            <title><![CDATA[Y Combinator's Stake in OpenAI (0.6%) (325 pts)]]></title>
             <link>https://daringfireball.net/2026/05/y_combinators_stake_in_openai</link>
             <guid>48016534</guid>
             <pubDate>Tue, 05 May 2026 00:09:01 GMT</pubDate>
@@ -664,7 +899,7 @@ aware of this.</p>
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Agent Skills (239 pts)]]></title>
+            <title><![CDATA[Agent Skills (249 pts)]]></title>
             <link>https://addyosmani.com/blog/agent-skills/</link>
             <guid>48015397</guid>
             <pubDate>Mon, 04 May 2026 21:40:42 GMT</pubDate>
@@ -846,7 +1081,7 @@ aware of this.</p>
     </section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA['Point of no return': New Orleans relocation must start now due to sea level (134 pts)]]></title>
+            <title><![CDATA['Point of no return': New Orleans relocation must start now due to sea level (135 pts)]]></title>
             <link>https://www.theguardian.com/us-news/2026/may/04/new-orleans-sea-levels-relocation-climate-crisis</link>
             <guid>48015218</guid>
             <pubDate>Mon, 04 May 2026 21:25:55 GMT</pubDate>
@@ -854,7 +1089,7 @@ aware of this.</p>
 <div id="readability-page-1" class="page"><div id="maincontent"><p><span>T</span>he process of relocating people from <a href="https://www.theguardian.com/us-news/new-orleans" data-link-name="in body link">New Orleans</a> should start immediately, as the city has reached a “point of no return” that will see it surrounded by the ocean within decades due to the <a href="https://www.theguardian.com/environment/climate-crisis" data-link-name="in body link">climate crisis</a>, a stark new study has concluded.</p><p>Ongoing sea-level rise and the rampant erosion of wetlands in southern <a href="https://www.theguardian.com/us-news/louisiana" data-link-name="in body link">Louisiana</a> will swallow up the New Orleans area within a few generations, with the new paper estimating the city “may well be surrounded by the Gulf of Mexico before the end of this century”.</p><p>Low-lying southern Louisiana faces multiple threats, with rising sea levels driven by global heating, compounded by strengthening hurricanes, also a <a href="https://www.theguardian.com/world/2024/feb/05/hurricanes-becoming-so-strong-that-new-category-needed-study-says" data-link-name="in body link">feature</a> of the climate crisis, and the gradual <a href="https://mpdap.coastal.la.gov/dataset/deep-subsidence#geography=extraction_point&amp;time=annual&amp;year=2&amp;scenario=A&amp;chart=2-52&amp;map=8.71/29.3914/-91.3051" data-link-name="in body link">subsidence</a> of a coastline that has been carved apart by the oil and gas industry.</p><figure id="588e58ff-3a93-456e-b99a-b01249a02513" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:3,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Ancient Roman gravestone found in New Orleans back yard returned to Italy&quot;,&quot;elementId&quot;:&quot;588e58ff-3a93-456e-b99a-b01249a02513&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/science/2026/may/01/roman-gravestone-new-orleans-returned-italy&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:1,&quot;theme&quot;:0}}"></gu-island></figure><p>Southern Louisiana is facing 3-7 metres of sea-level rise and the loss of three-quarters of its remaining coastal wetlands, which will cause the shoreline “to migrate as much as 100km (62 miles) inland”, thereby stranding <a href="https://www.theguardian.com/us-news/new-orleans" data-link-name="in body link" data-component="auto-linked-tag">New Orleans</a> and Baton Rouge, according to the study, which compared today’s rising global temperatures with a period of similar heat 125,000 years ago that caused a rise in sea level.</p><p>This scenario makes the region the “most physically vulnerable coastal zone in the world”, the researchers state, and requires immediate action to prepare a smooth transition for people away from New Orleans, which has a <a href="https://www.census.gov/quickfacts/fact/table/neworleanscitylouisiana/PST045224" data-link-name="in body link">population</a> of about 360,000 people, to safer ground.</p><p>Louisiana has already experienced <a href="https://www.ksla.com/2026/02/12/louisiana-leads-nation-population-loss-second-consecutive-year/" data-link-name="in body link">population</a> <a href="https://www.nola.com/news/politics/new-orleans-population-fell-census/article_35e7bee4-2365-4f13-9129-ba6926746519.html" data-link-name="in body link">loss</a> in recent years, and this trend will accelerate in a disordered way, the paper warns, should no action be taken to confront the perils faced by its largest city and surrounding communities.</p><p>“While climate mitigation should remain the first step to prevent the worst outcomes, coastal Louisiana has evidently already crossed the point of no return,” added the perspectives paper, <a href="https://www.nature.com/articles/s41893-026-01820-z" data-link-name="in body link">published</a> in the <a href="https://www.nature.com/natsustain/" data-link-name="in body link">Nature Sustainability journal</a>. A perspectives paper is a scholarly article that provides an assessment, rather than new data.</p><p>Billions of dollars have been spent to fortify New Orleans with a vast network of levees, floodgates and pumps erected after 2005’s catastrophic Hurricane Katrina. But the growing threats to the city mean the levees, which already require hefty <a href="https://www.politico.com/news/2025/08/30/shrinking-post-katrina-levees-need-1b-in-upgrades-00534348" data-link-name="in body link">upgrades</a> to remain sufficient, will not be able to save the city in the long run, the new paper warns.</p><gu-island name="InteractiveBlockComponent" priority="critical" deferuntil="idle" props="{&quot;url&quot;:&quot;https://interactive.guim.co.uk/uploader/embed/2026/05/archive-zip/giv-32554KxIfj2iZI6P6/&quot;,&quot;scriptUrl&quot;:&quot;https://interactive.guim.co.uk/embed/iframe-wrapper/0.1/boot.js&quot;,&quot;alt&quot;:&quot;Animated map showing the land below water along the southern coast of Louisiana at both three and seven metres&quot;,&quot;format&quot;:{&quot;design&quot;:0,&quot;display&quot;:1,&quot;theme&quot;:0},&quot;elementId&quot;:&quot;b3b1abfc-0e61-4639-9b1d-bf3c65d4168c&quot;,&quot;isMainMedia&quot;:false}" data-spacefinder-role="inline"><figure id="b3b1abfc-0e61-4639-9b1d-bf3c65d4168c" data-alt="Animated map showing the land below water along the southern coast of Louisiana at both three and seven metres" data-testid="interactive-element-Animated%20map%20showing%20the%20land%20below%20water%20along%20the%20southern%20coast%20of%20Louisiana%20at%20both%20three%20and%20seven%20metres" data-spacefinder-role="inline"><a data-name="placeholder" href="https://interactive.guim.co.uk/uploader/embed/2026/05/archive-zip/giv-32554KxIfj2iZI6P6/">Animated map showing the land below water along the southern coast of Louisiana at both three and seven metres</a></figure></gu-island><p>“In paleo-climate terms, New Orleans is gone; the question is how long it has,” said Jesse Keenan, an expert in climate adaptation at Tulane University and one of the paper’s five co-authors.</p><p>Keenan said the timeframe available to plan a retreat isn’t certain but “it’s most likely decades rather than centuries”.</p><p>“Even if you stopped climate change today, New Orleans’s days are still numbered,” he added. “It will be surrounded by open water, and you can’t keep an island situated below sea level afloat. There’s no amount of money that can do that.”</p><p>City, state and federal leaders should begin work to help support people moving away from the New Orleans region in a coordinated way, starting with the most vulnerable communities, such as those in <a href="https://firststreet.org/county/plaquemines-parish-la/22075_fsid/flood" data-link-name="in body link">Plaquemines parish</a> who live outside the levee system, Keenan said.</p><p>“New Orleans is in a terminal condition, and we need to be clear with the patient that it is terminal,” he said. “There is an opportunity for palliative care, we can transition people and the economy. We can get ahead of this.”</p><p>But, he added, “no politician wants to first give this terminal diagnosis. They will speak about it behind closed doors, but never in public.”</p><p>New Orleans faces obvious challenges – situated in a bowl-shaped basin below sea level, the city already has 99% of its population at major risk of severe flooding, the worst exposure of any US city according to <a href="https://www.science.org/doi/10.1126/sciadv.aec2079" data-link-name="in body link">a separate study released</a> last week.</p><p>“Even compared to all other US cities, New Orleans really stands out, which is alarming,” said Wanyun Shao, a co-author of this study and a geographer at the University of Alabama.</p><p>“There is no specific timeline to how long New Orleans has left but we know it’s in big trouble. They are facing one of the highest sea level rises in the world and I don’t know how long human effort can fight against that tide. It’s like a timebomb.”</p><p>Shao said she concurred that relocation of people would have to take place. “I know it’s a politically and emotionally charged issue, there are people with a deep attachment to New Orleans,” she said. “But managed retreat, no matter how unappealing it may be, is the ultimate solution at some point.”</p><p>A major pressure upon this southern cultural hotspot is that its surrounding land is briskly receding. Since the 1930s, Louisiana <a href="https://coastal.la.gov/whats-at-stake/a-changing-landscape/" data-link-name="in body link">has lost</a> 2,000 sq miles of land to coastal erosion, equivalent to the size of Delaware, with a further 3,000 sq miles set to vanish over the next 50 years. The rate of land loss is so rapid that a football pitch-sized area is wiped out <a href="https://mississippiriverdelta.org/our-coastal-crisis/land-loss/" data-link-name="in body link">every 100 minutes</a>.</p><p>To help counter this, <a href="https://www.theguardian.com/us-news/louisiana" data-link-name="in body link" data-component="auto-linked-tag">Louisiana</a> last decade settled upon a new sort of plan that eschewed building yet more flood defenses and instead sought to harness the Mississippi River’s natural ability to rebuild land. Levees and other infrastructure have, until now, straitjacketed the naturally meandering Mississippi and pushed the sediment it carries straight into the Gulf of Mexico, rather than replenish the coastal wetlands.</p><p>The so-called <a href="https://mississippiriverdelta.org/project/mid-barataria-sediment-diversion/" data-link-name="in body link">Mid-Barataria Sediment Diversion</a> project, which broke ground in 2023, would help restore a more natural flow in the Mississippi Delta and allow sediment to build up in coastal areas where it has been lost. More than 20 sq miles of new land would be created over the next 50 years under the plan, the project estimated.</p><p>However, Jeff Landry, Louisiana’s Republican governor, <a href="https://lailluminator.com/2025/07/18/environmentalists-lament-while-oystermen-celebrate-demise-of-mid-barataria-diversion/" data-link-name="in body link">scrapped</a> the project last year, arguing its $3bn cost was too high and that it threatened the state’s fishing industry. “This level of spending is unsustainable,” Landry said at the time, adding that the project imperiled the livelihoods of “people who have sustained our state for generations”.</p><p>Proponents of the project, which was funded via a settlement from BP over the Deepwater Horizon disaster in 2010, decried the decision as disastrous for the state, pointing out fishing communities will need to move anyway because of worsening erosion.</p><p>Garret Graves, a Republican former congressman who once led the state’s coastal restoration agency, <a href="https://apnews.com/article/louisiana-coastal-restoration-gulf-oil-spill-affaae2877bf250f636a633a14fbd0c7" data-link-name="in body link">said</a> Landry was guilty of a “boneheaded decision” that would “result in one of the largest setbacks for our coast and the protection of our communities in decades”.</p><p>According to the new research paper, the loss of the sediment diversion plan “effectively means giving up on extensive portions of coastal Louisiana, including the New Orleans area”.</p><p>A legal effort to force oil and gas companies to pay for damage to Louisiana’s coastline, meanwhile, is also in doubt. This month, the US supreme court <a href="https://www.theguardian.com/us-news/2026/apr/17/supreme-court-oil-and-gas-louisiana" data-link-name="in body link">allowed the fossil fuel industry</a> to federally contest a state jury decision that Chevron pay $740m to remedy harm caused to wetlands by dredging canals, drilling wells and dumping wastewater.</p><p>“The combination of these decisions is driving a scenario where the state has stopped trying to build land,” Keenan said. “That just accelerates the timeline. They could be buying time, but that option is foreclosed now, meaning it’s a certainty the New Orleans levees will fail again multiple times. The flood water will have nowhere else to go.”</p><p>While the US has never wholesale moved a major city before, numerous communities have relocated for economic reasons in the past, with some now being shifted due to <a href="https://locd.la.gov/programs/isle-de-jean-charles-resettlement-project" data-link-name="in body link">the climate crisis</a>, <a href="https://apnews.com/article/climate-change-permafrost-melting-alaska-newtok-relocation-moving-292694f057b75f75a9438c794853ee25" data-link-name="in body link">too</a>. In Louisiana, the government could start planning and building appropriate infrastructure in safer areas on the other side of Lake Pontchartrain, the large estuary that sits to the north of New Orleans, Keenan said.</p><p>“This could be an opportunity for New Orleans to help migrate people further north, invest in long-term infrastructure and make that sustainable,” Keenan said.</p><p>“That exodus has already begun, so if nothing is done, people will just trickle out over time and it will be an uncoordinated mess. The market will speak as people won’t be able to get insurance. Louisiana has to stop the bleeding and acknowledge this is happening. But at the moment there is no plan.”</p><p>Timothy Dixon, an expert in coastal environments at the University of South Florida who was not involved in the new paper, said the study “does a nice job” of highlighting the challenge Louisiana faces with subsiding land combined with rising sea levels.</p><p>“New Orleans is not going to disappear in 10 years or anything like that, but policymakers really should’ve thought about a relocation plan a century ago,” said Dixon, <a href="https://www.tandfonline.com/doi/full/10.1080/00206814.2026.2621969" data-link-name="in body link">whose own research has recommended</a> a measured retreat from coastal Louisiana.</p><p>“Governments may not have the ability to just command people to leave, but people will volunteer to move and we are seeing that already. I’m not optimistic our political system is capable of dealing with this stuff, it will take leadership and unpopular decisions. Also, many people don’t want to move. They love where they are born.”</p><p>Landry’s office was contacted for comment but did not respond.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Formatting a 25M-line codebase overnight (163 pts)]]></title>
+            <title><![CDATA[Formatting a 25M-line codebase overnight (165 pts)]]></title>
             <link>https://stripe.dev/blog/formatting-an-entire-25-million-line-codebase-overnight-the-rubyfmt-story</link>
             <guid>48014325</guid>
             <pubDate>Mon, 04 May 2026 20:11:53 GMT</pubDate>
@@ -862,7 +1097,7 @@ aware of this.</p>
 <div id="readability-page-1" class="page"><div id="__next"><main><div><nav></nav><section><div><p><span>Date:</span><span>2026.4.28</span></p><p><span>Reading time:</span><span>8 min read</span></p><div><p><span>Categories:</span></p><div><p>Engineering</p><p>Developer Productivity</p></div></div></div><div><h2>About the author<!-- -->s</h2><div><h3>Fable Tales</h3><p>Fable works on Developer Productivity at Stripe.</p><ul></ul></div><div><h3>Anna Mason</h3><p>Anna Mason is a technical writer at Stripe working across the engineering organization.</p><ul></ul></div></div></section></div></main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[How OpenAI delivers low-latency voice AI at scale (391 pts)]]></title>
+            <title><![CDATA[How OpenAI delivers low-latency voice AI at scale (404 pts)]]></title>
             <link>https://openai.com/index/delivering-low-latency-voice-ai-at-scale/</link>
             <guid>48013919</guid>
             <pubDate>Mon, 04 May 2026 19:42:47 GMT</pubDate>
@@ -870,7 +1105,7 @@ aware of this.</p>
 Couldn't get https://openai.com/index/delivering-low-latency-voice-ai-at-scale/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[DHS demanded Google surrender data on a Canadian man over anti-ICE posts (108 pts)]]></title>
+            <title><![CDATA[DHS demanded Google surrender data on a Canadian man over anti-ICE posts (109 pts)]]></title>
             <link>https://www.wired.com/story/dhs-demanded-google-surrender-data-on-canadians-activity-location-over-anti-ice-posts/</link>
             <guid>48013423</guid>
             <pubDate>Mon, 04 May 2026 19:06:53 GMT</pubDate>
@@ -878,7 +1113,7 @@ Couldn't get https://openai.com/index/delivering-low-latency-voice-ai-at-scale/:
 <div id="readability-page-1" class="page"><div data-testid="ArticlePageChunks"><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p><span>The Department of</span> Homeland Security tried to obtain a Canadian man’s location information, activity logs, and other identifying information from <a href="https://www.wired.com/tag/google/">Google</a> after he criticized the Trump administration online following the killings of <a href="https://www.wired.com/story/ice-agent-jonathan-ross-renee-good-shooting-firearms-trainer-testimony/">Renee Good</a> and <a href="https://www.wired.com/story/the-instant-smear-campaign-against-border-patrol-shooting-victim-alex-pretti/">Alex Pretti</a> by federal immigration agents in Minneapolis early this year.</p><p>Lawyers for the man, who has not been named, are alarmed in part because they say that the man has not entered the United States in more than a decade. “I don’t know what the government knows about our client’s residence, but it’s clear that the government isn’t stopping to find out,” says Michael Perloff, a senior staff attorney at the American Civil Liberties Union of the District of Columbia who is representing the man in a lawsuit against Markwayne Mullin, the secretary of DHS, over the summons. The lawsuit alleges that DHS violated the customs law that gives the agency the power to request records from businesses and other parties.</p><p>Perloff argues that the government is using the fact that big tech companies are based in the US to request information it would not otherwise be able to get. “It’s using that geographic fact to get information that otherwise would be totally outside of its jurisdiction,” he says. “I mean, we’re talking about the physical movements of a person who lives in Canada.”</p><p>DHS and Google did not immediately respond to a request for comment.</p><p>The demand for the man’s location data was included in a request DHS issued to Google called a customs summons, which is supposed to be used to investigate issues related to importing goods and collecting customs duties.</p><p>“It says right in the statute, it’s for records and testimony about the correctness of an entry, the liability of a person for duties, taxes, and fees, you know, compliance with basic customs laws,” says Chris Duncan, a former assistant chief counsel for US Customs and Border Protection who now works as a private-practice attorney representing importers and exporters. “And that's all it was ever envisioned to be used for.”</p><p>A customs summons is a type of administrative subpoena and is not reviewed by a judge or grand jury before being sent out. According to the complaint, Google alerted the man about the request on February 9, despite an ask included in the summons “not to disclose the existence of this summons for an indefinite period of time.”</p><p>Through his attorneys, the man told WIRED he initially mistook the notification for a joke or scam before realizing it was real.</p><p>The summons, which is included in the complaint, does not give a specific reason for why the man was under investigation beyond citing the Tariff Act of 1930. The man’s lawyers contend that he did not export or import anything from the United States between September 1, 2025, to February 4, 2026, the time frame the government requested information about.</p><p>Instead, the man’s lawyers allege, the summons was filed in response to the man’s online activities, including posts that he made condemning immigration enforcement agents after the killings of Good and Pretti in January.</p><p>The man tells WIRED that watching members of the Trump administration “smear these two souls as terrorists was absolutely disgusting and enraging. People were being asked to disbelieve our own eyes so that the men responsible for killing two good Americans would go free.”</p><p>The man says of his online activity, “I felt I needed to do something that would stand out and be seen by despairing Americans to show them they had support and that they were not alone.”</p></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>The summons specifically asks for any records and other information related to “History of Account Suspensions or Violations of Terms due to Threatening or Harassing Language.” The complaint describes the man’s posts as “passionate and even sometimes off-color but never contain threats or incite violence.”</p><p>As the Trump administration’s immigration enforcement efforts have ramped up, DHS has used both <a data-offer-url="https://www.courtlistener.com/docket/72457933/1/2/v-homeland-security/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.courtlistener.com/docket/72457933/1/2/v-homeland-security/&quot;}" href="https://www.courtlistener.com/docket/72457933/1/2/v-homeland-security/" rel="nofollow noopener" target="_blank">customs</a> <a data-offer-url="https://www.courtlistener.com/docket/73171398/1/2/doepodslurp-v-department-of-homeland-security/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.courtlistener.com/docket/73171398/1/2/doepodslurp-v-department-of-homeland-security/&quot;}" href="https://www.courtlistener.com/docket/73171398/1/2/doepodslurp-v-department-of-homeland-security/" rel="nofollow noopener" target="_blank">summons</a> and <a data-offer-url="https://www.courtlistener.com/docket/71386144/1/3/j-doe-v-united-states-department-of-homeland-security/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.courtlistener.com/docket/71386144/1/3/j-doe-v-united-states-department-of-homeland-security/&quot;}" href="https://www.courtlistener.com/docket/71386144/1/3/j-doe-v-united-states-department-of-homeland-security/" rel="nofollow noopener" target="_blank">other</a> <a data-offer-url="https://www.courtlistener.com/docket/72222842/1/12/doe-v-united-states-department-of-homeland-security/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.courtlistener.com/docket/72222842/1/12/doe-v-united-states-department-of-homeland-security/&quot;}" href="https://www.courtlistener.com/docket/72222842/1/12/doe-v-united-states-department-of-homeland-security/" rel="nofollow noopener" target="_blank">types</a> of administrative subpoenas to try to unmask users who are publicly critical of the agency or who attempt to <a href="https://www.wired.com/story/opposing-ice-might-save-the-country-could-also-ruin-your-life/">track its agents’ activities</a>. In March, after an anonymous Reddit user sued to stop DHS from obtaining their personal information through a customs summons, federal officials withdrew the administrative subpoena and issued a <a data-offer-url="https://theintercept.com/2026/04/10/reddit-ice-protest-grand-jury/" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://theintercept.com/2026/04/10/reddit-ice-protest-grand-jury/&quot;}" href="https://theintercept.com/2026/04/10/reddit-ice-protest-grand-jury/" rel="nofollow noopener" target="_blank">grand jury subpoena</a> instead.</p><p>It’s unclear how many people have been targeted as part of these efforts. In February, The New York Times <a data-offer-url="https://www.nytimes.com/2026/02/13/technology/dhs-anti-ice-social-media.html?unlocked_article_code=1.e1A.OqE7.5d7hh3vD6TUi&amp;smid=url-share" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.nytimes.com/2026/02/13/technology/dhs-anti-ice-social-media.html?unlocked_article_code=1.e1A.OqE7.5d7hh3vD6TUi&amp;smid=url-share&quot;}" href="https://www.nytimes.com/2026/02/13/technology/dhs-anti-ice-social-media.html?unlocked_article_code=1.e1A.OqE7.5d7hh3vD6TUi&amp;smid=url-share" rel="nofollow noopener" target="_blank">reported</a> that Google, Reddit, Discord, and Meta had received hundreds of administrative subpoenas during the previous six months. In March, a group of US congressmembers <a href="https://robinkelly.house.gov/sites/evo-subsites/robinkelly.house.gov/files/evo-media-document/rep-kelly-leads-letter-to-tech-companies-on-dhs-admin-subpoenas.pdf">asked</a> tech leaders for data on how many requests their companies have received and how they’ve handled them, but it’s unclear whether they received a response. In April, the Electronic Frontier Foundation, a digital-rights nonprofit, <a data-offer-url="https://www.eff.org/press/releases/eff-sues-dhs-and-ice-records-subpoenas-seeking-unmask-online-critics-0" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://www.eff.org/press/releases/eff-sues-dhs-and-ice-records-subpoenas-seeking-unmask-online-critics-0&quot;}" href="https://www.eff.org/press/releases/eff-sues-dhs-and-ice-records-subpoenas-seeking-unmask-online-critics-0" rel="nofollow noopener" target="_blank">sued</a> DHS and Immigration and Customs Enforcement in an effort to obtain records about how many subpoenas the agencies have sent.</p><p>Both tech companies and civil liberties advocates have been concerned about DHS’s use of administrative subpoenas for years. WIRED <a href="https://www.wired.com/story/ice-1509-custom-summons/">previously found</a> that agents issued customs summons, including ones for legitimate investigations into customs issues, more than 170,000 times between 2016 and mid-August 2022. The most common recipients of those requests included big tech firms and telecommunications companies.</p><p>In 2017, Twitter, which is now X, filed a <a href="https://www.wired.com/2017/04/trump-co-just-picked-wrong-fight-twitter/">lawsuit</a> against DHS over what it alleged was an illegal customs summons that demanded information about who was behind an anonymous account that was critical of the first Trump administration’s immigration policies. DHS later withdrew its request, and the social media platform dropped its lawsuit in response, meaning a judge was never able to rule on whether the practice was actually illegal.</p><p>That incident triggered an <a href="https://www.oig.dhs.gov/sites/default/files/assets/Mga/2017/oig-18-18-nov17.pdf">investigation</a> by the DHS Office of the Inspector General, which found that the group within DHS that had issued the request, the US Customs and Border Protection’s Office of Professional Responsibility, violated its own policies in about one out of every five summonses that the OIG reviewed.</p><p>“The saddest thing for me about all of this, as a career national security law enforcement attorney, is that if you abuse your authority like this, it undermines all the legitimate stuff you do,” says Duncan.</p><p>“There was a long time where the United States government advised other countries on how to protect people within their territory from foreign oppression,” Perloff says. “And it is appalling to realize that now other countries may have to do that about us.”</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Microsoft Edge stores all passwords in memory in clear text, even when unused (525 pts)]]></title>
+            <title><![CDATA[Microsoft Edge stores all passwords in memory in clear text, even when unused (541 pts)]]></title>
             <link>https://twitter.com/L1v1ng0ffTh3L4N/status/2051308329880719730</link>
             <guid>48012735</guid>
             <pubDate>Mon, 04 May 2026 18:22:42 GMT</pubDate>
@@ -928,7 +1163,7 @@ Couldn't get https://openai.com/index/delivering-low-latency-voice-ai-at-scale/:
                             </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Securing a DoD Contractor: Finding a Multi-Tenant Authorization Vulnerability (194 pts)]]></title>
+            <title><![CDATA[Securing a DoD Contractor: Finding a Multi-Tenant Authorization Vulnerability (197 pts)]]></title>
             <link>https://www.strix.ai/blog/how-strix-found-zero-auth-vulnerability-dod-backed-startup</link>
             <guid>48012162</guid>
             <pubDate>Mon, 04 May 2026 17:46:32 GMT</pubDate>
@@ -936,7 +1171,7 @@ Couldn't get https://openai.com/index/delivering-low-latency-voice-ai-at-scale/:
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Days Without GitHub Incidents (372 pts)]]></title>
+            <title><![CDATA[Days Without GitHub Incidents (374 pts)]]></title>
             <link>https://www.dayswithoutgithubincident.com/</link>
             <guid>48012022</guid>
             <pubDate>Mon, 04 May 2026 17:36:32 GMT</pubDate>
@@ -960,7 +1195,7 @@ Couldn't get https://openai.com/index/delivering-low-latency-voice-ai-at-scale/:
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Heat pump sales rise across Europe (245 pts)]]></title>
+            <title><![CDATA[Heat pump sales rise across Europe (250 pts)]]></title>
             <link>https://www.pv-magazine.com/2026/05/04/heat-pump-sales-rise-17-across-europe-in-q1-as-energy-prices-surge/</link>
             <guid>48012003</guid>
             <pubDate>Mon, 04 May 2026 17:35:15 GMT</pubDate>
@@ -2413,14 +2648,6 @@ Anyone claiming otherwise is simply riding on the Notepad++ name.</p>
             <pubDate>Mon, 04 May 2026 09:31:12 GMT</pubDate>
             <description><![CDATA[<p>URL: <a href="https://www.bbc.co.uk/news/articles/cn0p8yled1do">https://www.bbc.co.uk/news/articles/cn0p8yled1do</a>, See on <a href="https://news.ycombinator.com/item?id=48006402">Hacker News</a></p>
 <div id="readability-page-1" class="page"><div data-testid="rich-text" data-block="text"><p>Under the proposed deal to buy eBay, Cohen would become the chief executive of the new firm and receive no salary or bonuses, being "compensated solely based on the performance of the combined company".</p><p>GameStop, which currently has a stock market valuation of around $11.9bn, said it has a commitment letter from TD Securities to provide around $20bn in debt to help finance the deal.</p><p>The majority of the proposed cost cuts would be in eBay's sales and marketing division, which GameStop said had failed to attract more users to a "marketplace with near-universal brand recognition".</p><p>The proposal does not sound like a "terribly good offer" as it would saddle eBay with GameStop's debt, said retail industry analyst Sucharita Kodali from market research firm Forrester.</p><p>It makes sense for GameStop because it could lift its valuation by being linked with a larger company like eBay, she told the BBC.</p><p>"The truth is, we are not necessarily putting two strong companies together," Kodali added.</p><p>Shares in eBay jumped by more than 13% in after-hours trading when news of the potential offer emerged on Friday, while GameStop jumped by around 4%.</p><p>GameStop's shops would give eBay a national network for its "live commerce" and other business operations, Cohen said.</p><p>Cohen, who became the GameStop boss in 2023, has criticised its slow shift into e-commerce.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Over 8M Thermos jars and bottles recalled after 3 people lost vision (108 pts)]]></title>
-            <link>https://www.goodmorningamerica.com/living/story/8-million-thermos-jars-bottles-recalled-after-3-132568152</link>
-            <guid>48006123</guid>
-            <pubDate>Mon, 04 May 2026 08:40:41 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.goodmorningamerica.com/living/story/8-million-thermos-jars-bottles-recalled-after-3-132568152">https://www.goodmorningamerica.com/living/story/8-million-thermos-jars-bottles-recalled-after-3-132568152</a>, See on <a href="https://news.ycombinator.com/item?id=48006123">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div data-testid="prism-GridColumn"><p>Thermos, the popular food and beverage insulated container company, is voluntarily <a data-testid="prism-linkbase" href="https://abcnews.com/video/132546735/" dir="ltr">recalling</a> more than 8 million jars and bottles for injury risk after several people "suffered permanent vision loss."</p><p>According to an <a data-testid="prism-linkbase" href="https://www.cpsc.gov/Recalls/2026/Thermos-Recalls-8-2-Million-Stainless-King-Food-Jars-and-Bottles-Due-to-Serious-Impact-Injury-and-Laceration-Hazards" dir="ltr">April 30 recall notice</a> from the company and posted on the United States Consumer Product Safety Commission website, "If perishable food or beverages are stored in the container for an extended period of time, the stopper can forcefully eject when opened, which can result in serious impact injury and laceration hazards to the consumer."</p><p>Thermos also shared the recall information in an <a data-testid="prism-linkbase" href="https://www.instagram.com/stories/thermosbrand/3886774495998793406/" dir="ltr">Instagram story</a>.</p><div data-testid="prism-inline-image"><figure data-testid="prism-figure"><img data-testid="prism-image" draggable="false" src="https://i.abcnewsfe.com/a/7a1baee9-74f1-4316-b6eb-b481df7bbd21/thermos-recall-1-ht-jef-260501_1777643414985_hpMain.jpg?w=992"><figcaption><div data-testid="prism-caption"><p><span data-testid="prism-truncate"><span><span>Thermos Recalls 8.2 Million Stainless King Food Jars and Bottles Due to Serious Impact Injury and Laceration Hazards</span></span></span></p><p><span>Thermos via Consumer Product Safety Commission</span></p></div></figcaption></figure></div><p>The malfunction is due to multiple models of containers missing a pressure relief function in the center of the stopper.</p><p>The recall includes roughly 5.8 million Stainless King Food Jars and 2.3 million Sportsman Food <!-- -->&amp;<!-- --> Beverage Bottles.</p><p>Thermos received 27 total reports of users who "were struck by a stopper that forcefully ejected from these containers upon opening, including complaints of impact and laceration injuries requiring medical attention," according to the notice.</p><div data-testid="prism-inline-image"><figure data-testid="prism-figure"><img data-testid="prism-image" draggable="false" src="https://i.abcnewsfe.com/a/6ff6d684-0f1d-4ec2-b40d-6cc7b32572b6/thermos-recall-2-ht-jef-260501_1777643322990_hpEmbed_3x2.jpg?w=992"><figcaption><div data-testid="prism-caption"><p><span data-testid="prism-truncate"><span><span>Thermos Recalls 8.2 Million Stainless King Food Jars and Bottles Due to Serious Impact Injury and Laceration Hazards</span></span></span></p><p><span>Thermos via Consumer Product Safety Commission</span></p></div></figcaption></figure></div><p>The recall says "Three consumers suffered permanent vision loss after being struck in the eye."</p><p>The Thermos Stainless King Food Jars, model numbers SK3000 and SK3020 made before July 2023, and all Thermos Sportsman Food <!-- -->&amp;<!-- --> Beverage Bottles with model number SK3010 are affected by the recall. SK3000 was sold in 16 ounces, SK3020 in 24 ounces and SK3010 in 40 ounces.</p><section data-testid="article-conditional-render"><header><p><h2>Editor’s Picks</h2></p></header></section><p>According to the <a data-testid="prism-linkbase" href="https://www.goodmorningamerica.com/food/story/cottage-cheese-sold-walmart-recalled-pasteurization-concerns-company-130562782" dir="ltr">recall</a> notice, consumers who are in possession of a recalled product should stop use and contact Thermos to remedy the defect.</p><p>For SK3000 and SK3020 jars, Thermos is asking customers to send a photo of their disposed stopper to the company. For the SK3010 bottles, the company is asking consumers to send in their bottle with a prepaid shipping label.</p><p>"If you believe your product is impacted, please go to<!-- -->&nbsp;<a data-testid="prism-linkbase" href="https://support.thermos.com/" dir="ltr"><strong>https://support.thermos.com</strong></a>&nbsp;<!-- -->and follow the instructions to submit a claim for a replacement stopper or product, depending on the model. You will be able to fill out a form for a pre-paid label to return your SK3010 product," reads a message on Thermos' website.</p><p>The message continued, "You can also call 662-563-6822 between hours: 7 a.m. to 3:30 p.m CST if you need further guidance. Please allow between 7-9 weeks after all information is received and verified by Thermos before we can process a shipment of your replacement stopper or product."</p><p>The jars and bottles were sold at retailers like Target and Walmart, in stores and online, and Amazon and Thermos online between roughly March 2008 and July 2024 for around $30.</p><p>ABC News has reached out to Thermos via their website, as well as Target, Walmart and Amazon.</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
