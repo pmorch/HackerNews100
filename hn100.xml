@@ -4,12 +4,179 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 06 Jun 2026 16:30:02 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 06 Jun 2026 17:30:03 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Google will pay SpaceX $920M per month for compute (181 pts)]]></title>
+            <title><![CDATA[Moving beyond fork() + exec() (133 pts)]]></title>
+            <link>https://lwn.net/SubscriberLink/1076018/16f01bbbb8e0d1f0/</link>
+            <guid>48425528</guid>
+            <pubDate>Sat, 06 Jun 2026 14:34:20 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://lwn.net/SubscriberLink/1076018/16f01bbbb8e0d1f0/">https://lwn.net/SubscriberLink/1076018/16f01bbbb8e0d1f0/</a>, See on <a href="https://news.ycombinator.com/item?id=48425528">Hacker News</a></p>
+<div id="readability-page-1" class="page"><p>
+
+<h2>[LWN subscriber-only content]</h2>
+</p><div><main>
+
+Since the earliest days of Unix, two of the core process-oriented system
+calls have been <tt>fork()</tt>, which creates a child process as a copy of
+the parent, and <tt>exec()</tt>, which runs a new program in the place of
+the current one.  In Linux kernels, those system calls are better known as
+<a href="https://man7.org/linux/man-pages/man2/clone.2.html"><tt>clone()</tt></a>
+and <a href="https://man7.org/linux/man-pages/man2/execve.2.html"><tt>execve()</tt></a>,
+but the core functionality remains the same.  While there is elegance to
+this process-creation model, there are shortcomings as well.  A recent <a href="https://lwn.net/ml/all/20260528095235.2491226-1-me@linux.beauty">proposal</a> from
+Li Chen to add "spawn templates" to the kernel will not be accepted in its
+current form, but it may point the way toward a new process-creation
+primitive in the future.
+<p>
+<tt>fork()</tt> is a relatively expensive system call; it must copy the
+entire process state (including memory) for the child process.  Many
+optimizations have been made over the years, but a fork is still a
+fundamentally costly operation.  To make things worse, a <tt>fork()</tt>
+call is often immediately followed by an <tt>exec()</tt>, which will
+discard all of that memory that was so carefully copied for the child.
+Attempts (such as <a href="https://man7.org/linux/man-pages/man2/vfork.2.html"><tt>vfork()</tt></a>)
+have been made over the years to optimize for this case, but the pattern
+still is more expensive than it could be.
+</p><blockquote>
+The <a href="https://lwn.net/ksdb/">LWN kernel-source database</a> is the definitive source of information about kernel releases.  <a href="https://lwn.net/Promo/KSDB/claim">Try a one-month free trial subscription</a> for immediate access to LWN's kernel content and KSDB as well.
+</blockquote>
+<h4>Spawn templates</h4>
+<p>
+Chen's patch set takes an interesting approach to optimize the
+<tt>fork()</tt> and <tt>exec()</tt> pattern.  It is focused on applications
+that repeatedly launch processes running the same executable; imagine, for
+example, a program that must run Git repeatedly to obtain information about
+the contents of a repository.  In such cases, the program could establish a
+template to accelerate those invocations, spreading the setup cost across
+multiple operations.  This template would be created with the
+<tt>spawn_template_create()</tt> system call:
+</p><pre>    struct spawn_template_create_args {
+	__aligned_u64 flags;
+	__s32 execfd;
+	__u32 exec_flags;
+	__aligned_u64 filename;
+	/* Some fields elided */
+    };
+
+    int spawn_template_create(struct spawn_template_create_args *args, size_t args_size);
+</pre>
+<p>
+This call will return a file descriptor representing a template for the
+executable file, which can be specified as either a file descriptor
+(<tt>execfd</tt>) or an absolute path (<tt>filename</tt>), but not both.
+To create the template, the kernel will open the indicated file and cache a
+bunch of information that will allow a process to run that file more
+quickly in the future.
+</p><p>
+The application in question may run a given executable many times, but each
+invocation is different in a number of ways.  The details of a specific
+invocation must be placed into an instance of this structure:
+</p><pre>    struct spawn_template_spawn_args {
+	__aligned_u64 flags;
+	__aligned_u64 pidfd;
+	__aligned_u64 argv;
+	__aligned_u64 envp;
+	__aligned_u64 actions;
+	__aligned_u64 actions_len;
+	__aligned_u64 reserved[4];
+    };
+</pre>
+<p>
+The <tt>argv</tt> field is a pointer to the argument list to be passed to
+the program, while <tt>envp</tt> points to its environment.  Changes to
+file descriptors and signal handling, instead, are passed through
+<tt>actions</tt>, which is a pointer to an array of:
+</p><pre>    struct spawn_template_action {
+	__u32 type;
+	__u32 flags;
+	__s32 fd;
+	__s32 newfd;
+	__aligned_u64 arg;
+    };
+</pre>
+<p>
+If, for example, file descriptor four should be closed in the child, the
+associated <tt>spawn_template_action</tt> structure would have
+<tt>type</tt> set to <tt>SPAWN_TEMPLATE_ACTION_CLOSE</tt> and <tt>fd</tt>
+set to four.  Other actions exist for duplicating file descriptors, opening
+files, changing the working directory, and changing signal handling.
+</p><p>
+Once the <tt>spawn_template_spawn_args</tt> structure has been filled in,
+the new process can be run with:
+</p><pre>    int spawn_template_spawn(int template_fd,
+    			     struct spawn_template_spawn_args *args, int args_size);
+</pre>
+<p>
+Internally, this system call follows something close to the normal
+<tt>fork()</tt>/<tt>exec()</tt> path.  Chen is careful to point out that
+all of the normal checks applied when executing a new file remain in place.
+But the cached information in the template makes the whole process faster
+than it was before.
+
+How much faster?  Benchmark results provided in the cover letter show an
+improvement of about&nbsp;2%, which may not seem like a lot, but it may
+make a difference for applications that fit the expected pattern.
+</p><h4>Toward <tt>posix_spawn()</tt></h4>
+<p>
+The most detailed review of this work was <a href="https://lwn.net/ml/all/vealb52tv5suireenkke4lul2l3wbnaul2rp3ea545ly5wa5ty@yk3aksvp7skt">posted
+by Mateusz Guzik</a>, who said: "<q>This problem is dear to my heart and I
+have been pondering it on and off for some time now. The entire fork + exec
+idiom is terrible and needs to be retired</q>".  He pointed out that the
+focus of the patch set was a bit strange in that it left the
+<tt>fork()</tt> part of the problem untouched.  That is where most of the
+cost lies, he said, so optimization efforts should seek to remove it from
+the picture.  Rather than copying the current process, "<q>creating a
+pristine process is the way to go</q>".
+</p><p>
+Christian Brauner <a href="https://lwn.net/ml/all/20260528-madig-fachrichtung-fehlinformation-61117ba640da@brauner">was
+favorable</a> toward the goal, saying: "<q>The idea of having a builder api
+for exec isn't all that crazy</q>".  His suggestion, though, was that a new
+API should be built on top of the existing <a href="https://lwn.net/Articles/794707/">pidfd</a> abstraction.  Without getting into any
+degree of detail, he said that the right approach would be to create an
+option to <a href="https://man7.org/linux/man-pages/man2/pidfd_open.2.html"><tt>pidfd_open()</tt></a>
+to create an empty process.  A series of calls to a new
+<tt>pidfd_config()</tt> system call would then configure this new process
+as desired, setting up its environment, image to execute, and more.
+<tt>pidfd_config()</tt> would thus be analogous to <a href="https://man7.org/linux/man-pages/man2/fsconfig.2.html"><tt>fsconfig()</tt></a>.
+</p><p>
+An important objective for a new interface, Brauner said, would be the
+ability to support an implementation of <a href="https://man7.org/linux/man-pages/man3/posix_spawn.3.html"><tt>posix_spawn()</tt></a>
+in user space.  <tt>posix_spawn()</tt> is well suited as a replacement for
+the <tt>fork()</tt>/<tt>exec()</tt> pattern; developers would likely
+welcome a native implementation that isn't (unlike the current
+implementation) hiding <tt>fork()</tt> and <tt>exec()</tt> under the covers.
+
+Chen <a href="https://lwn.net/ml/all/19e883b2f84.6134d346323880.1325813164715871999@linux.beauty">agreed</a>
+that the API as broadly sketched out by Brauner seemed better, and said
+that future work would be in that direction.  So there will be no spawn
+templates in the Linux kernel but, if Chen's future work comes to fruition,
+Linux may finally gain a proper <tt>posix_spawn()</tt> implementation instead.<br clear="all"></p><table>
+           <tbody><tr><th colspan="2">Index entries for this article</th></tr>
+           <tr><td><a href="https://lwn.net/Kernel/Index">Kernel</a></td><td><a href="https://lwn.net/Kernel/Index#System_calls-clone">System calls/clone()</a></td></tr>
+            <tr><td><a href="https://lwn.net/Kernel/Index">Kernel</a></td><td><a href="https://lwn.net/Kernel/Index#System_calls-execve">System calls/execve()</a></td></tr>
+            </tbody></table><br clear="all">
+
+               <br clear="all">
+               <hr>
+            
+<a name="CommAnchor1076662"></a>
+    
+<a name="CommAnchor1076680"></a>
+    
+<a name="CommAnchor1076688"></a>
+    
+<a name="CommAnchor1076691"></a>
+    
+<a name="CommAnchor1076730"></a>
+    
+
+</main></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Google will pay SpaceX $920M per month for compute (220 pts)]]></title>
             <link>https://techcrunch.com/2026/06/05/google-will-pay-spacex-920m-per-month-for-compute/</link>
             <guid>48423990</guid>
             <pubDate>Sat, 06 Jun 2026 11:46:15 GMT</pubDate>
@@ -69,7 +236,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pokemon Emerald Ported to WebAssembly (100k FPS) (106 pts)]]></title>
+            <title><![CDATA[Pokemon Emerald Ported to WebAssembly (100k FPS) (134 pts)]]></title>
             <link>https://pokeemerald.com/</link>
             <guid>48423762</guid>
             <pubDate>Sat, 06 Jun 2026 11:12:58 GMT</pubDate>
@@ -103,7 +270,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Smart TV in Your LivingRoom Is a Node in the AIScraping Economy (155 pts)]]></title>
+            <title><![CDATA[The Smart TV in Your LivingRoom Is a Node in the AIScraping Economy (165 pts)]]></title>
             <link>https://blog.includesecurity.com/2026/06/the-smart-tv-in-your-livingroom-is-a-node-in-the-aiscraping-economy/</link>
             <guid>48422993</guid>
             <pubDate>Sat, 06 Jun 2026 09:17:49 GMT</pubDate>
@@ -454,7 +621,7 @@
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[GrapheneOS user reported to authorities for using GrapheneOS (422 pts)]]></title>
+            <title><![CDATA[GrapheneOS user reported to authorities for using GrapheneOS (428 pts)]]></title>
             <link>https://discuss.grapheneos.org/d/36134-grapheneos-user-reported-to-authorities-for-using-grapheneos</link>
             <guid>48422798</guid>
             <pubDate>Sat, 06 Jun 2026 08:43:59 GMT</pubDate>
@@ -473,7 +640,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Zig Zen Update (116 pts)]]></title>
+            <title><![CDATA[Zig Zen Update (118 pts)]]></title>
             <link>https://codeberg.org/ziglang/zig/commit/621844bde551ee1a9b8142d7d146d1fa804247a2</link>
             <guid>48422769</guid>
             <pubDate>Sat, 06 Jun 2026 08:38:44 GMT</pubDate>
@@ -481,7 +648,7 @@
 <div id="readability-page-1" class="page"><p>This is an automated check to get rid of most bots. If you have JavaScript enabled, it should redirect to the real page soon. If you don't, it still should redirect soon, but you can <a href="https://codeberg.org/ziglang/zig/commit/621844bde551ee1a9b8142d7d146d1fa804247a2?trans-rights=human-rights">click here</a> if you're fast.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[S&P 500 rejects SpaceX, also blocking entry for OpenAI and Anthropic (1027 pts)]]></title>
+            <title><![CDATA[S&P 500 rejects SpaceX, also blocking entry for OpenAI and Anthropic (1078 pts)]]></title>
             <link>https://arstechnica.com/tech-policy/2026/06/sp-500-blocks-fast-spacex-entry-wont-waive-rule-for-unprofitable-ai-firms/</link>
             <guid>48421442</guid>
             <pubDate>Sat, 06 Jun 2026 04:38:36 GMT</pubDate>
@@ -502,7 +669,7 @@
                   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pre-Modern Armies for Worldbuilders, Part I: Why They Fight (133 pts)]]></title>
+            <title><![CDATA[Pre-Modern Armies for Worldbuilders, Part I: Why They Fight (138 pts)]]></title>
             <link>https://acoup.blog/2026/06/05/collections-pre-modern-armies-for-worldbuilders-part-i-why-they-fight/</link>
             <guid>48421171</guid>
             <pubDate>Sat, 06 Jun 2026 03:41:32 GMT</pubDate>
@@ -801,7 +968,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Why is the HN crowd so anti-AI? (234 pts)]]></title>
+            <title><![CDATA[HNInternal: Ask HN: Why is the HN crowd so anti-AI? (240 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=48420827</link>
             <guid>48420827</guid>
             <pubDate>Sat, 06 Jun 2026 02:31:51 GMT</pubDate>
@@ -810,7 +977,7 @@
 </td></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The intracies of modern camera lens repair (2024) (214 pts)]]></title>
+            <title><![CDATA[The intracies of modern camera lens repair (2024) (216 pts)]]></title>
             <link>https://salvagedcircuitry.com/sigma-45mm.html</link>
             <guid>48420148</guid>
             <pubDate>Sat, 06 Jun 2026 00:33:26 GMT</pubDate>
@@ -1006,7 +1173,7 @@
 			</section></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The perils of UUID primary keys in SQLite (120 pts)]]></title>
+            <title><![CDATA[The perils of UUID primary keys in SQLite (129 pts)]]></title>
             <link>https://andersmurphy.com/2026/06/05/the-perils-of-uuid-primary-keys-in-sqlite.html</link>
             <guid>48419571</guid>
             <pubDate>Fri, 05 Jun 2026 23:13:12 GMT</pubDate>
@@ -1040,7 +1207,7 @@
 </code></pre><p>Results:</p><table><thead><tr><th>total rows</th><th>time in ms</th></tr></thead><tbody><tr><td>10000000</td><td>1372</td></tr><tr><td>20000000</td><td>1280</td></tr><tr><td>30000000</td><td>1365</td></tr><tr><td>40000000</td><td>1250</td></tr><tr><td>50000000</td><td>1256</td></tr><tr><td>60000000</td><td>1270</td></tr><tr><td>70000000</td><td>1246</td></tr><tr><td>80000000</td><td>1257</td></tr><tr><td>90000000</td><td>1245</td></tr><tr><td>100000000</td><td>1258</td></tr></tbody></table><p>Back to a more reasonable number. Slightly slower than our baseline. UUID blob primary keys are 16 bytes vs int primary keys which are 8 bytes.</p><h2 id="conclusion">Conclusion</h2><p>Hopefully, this post helps illustrate some of the pitfalls with UUID primary keys in SQLite and how to navigate them.</p><p>The full benchmark code <a href="https://github.com/andersmurphy/clj-cookbook/tree/master/sqlite-perils-of-uuid">can be found here</a>.</p><p>If you enjoyed this post you might like this one <a href="https://andersmurphy.com/2025/12/02/100000-tps-over-a-billion-rows-the-unreasonable-effectiveness-of-sqlite.html">100000 TPS with SQLite</a></p><h2 id="further_reading">Further reading</h2><ul><li><a href="https://en.wikipedia.org/wiki/Database_index#Clustered">Clustered Indexes</a></li><li><a href="https://sqlite.org/withoutrowid.html">Clustered Indexes and the WITHOUT ROWID Optimization</a></li><li><a href="https://github.com/clojure-goes-fast/clj-async-profiler">clj-async-profiler</a></li><li><a href="https://clojure-goes-fast.com/kb/profiling/clj-async-profiler/exploring-flamegraphs/">Exploring flamegraphs</a></li><li><a href="https://clojure-goes-fast.com/kb/profiling/clj-async-profiler/diffgraphs/">Diffgraphs</a></li></ul><p><strong>Thanks to</strong> Everyone on the <a href="https://discord.gg/bnRNgZjgPh">Datastar discord</a> who read drafts of this and gave me feedback.</p><h3 id="discussion">Discussion</h3><ul><li><a href="https://news.ycombinator.com/item?id=48419571">hackernews</a></li><li><a href="https://www.reddit.com/r/programming/comments/1tyalr6/the_perils_of_uuid_primary_keys_in_sqlite/">reddit</a></li><li><a href="https://lobste.rs/s/76plqm/perils_uuid_primary_keys_sqlite">lobsters</a></li></ul></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Hacker News, Sans AI (175 pts)]]></title>
+            <title><![CDATA[Hacker News, Sans AI (176 pts)]]></title>
             <link>https://elijahpotter.dev/articles/hacker-news-sans-AI</link>
             <guid>48417916</guid>
             <pubDate>Fri, 05 Jun 2026 20:38:40 GMT</pubDate>
@@ -1048,7 +1215,7 @@
 Couldn't get https://elijahpotter.dev/articles/hacker-news-sans-AI: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Accidentally deleted subscriptions for chat integrations (Slack and MS Teams) (123 pts)]]></title>
+            <title><![CDATA[Accidentally deleted subscriptions for chat integrations (Slack and MS Teams) (125 pts)]]></title>
             <link>https://www.githubstatus.com/incidents/2nmfnbknhlnv</link>
             <guid>48416936</guid>
             <pubDate>Fri, 05 Jun 2026 19:15:36 GMT</pubDate>
@@ -1166,7 +1333,7 @@ Couldn't get https://elijahpotter.dev/articles/hacker-news-sans-AI: Error: Reque
 <div id="readability-page-1" class="page"><div id="ScriptLoadFailure"><form action="" method="GET"><div><p><span>Something went wrong, but don’t fret — let’s give it another shot.</span></p><p><img alt="⚠️" draggable="false" src="https://abs.twimg.com/emoji/v2/svg/26a0.svg"><span> Some privacy related extensions may cause issues on x.com. Please disable them and try again.</span></p></div></form></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Transformers are inherently succinct (133 pts)]]></title>
+            <title><![CDATA[Transformers are inherently succinct (134 pts)]]></title>
             <link>https://openreview.net/pdf?id=Yxz92UuPLQ</link>
             <guid>48416635</guid>
             <pubDate>Fri, 05 Jun 2026 18:50:26 GMT</pubDate>
@@ -1250,82 +1417,6 @@ Couldn't get https://elijahpotter.dev/articles/hacker-news-sans-AI: Error: Reque
 	</div><!-- #secondary -->
 
 		</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Gov.uk has replaced Stripe with Dutch provider Adyen (538 pts)]]></title>
-            <link>https://www.theregister.com/public-sector/2026/06/04/govuk-goes-dutch-on-payments-as-it-dumps-stripe/5250763</link>
-            <guid>48415217</guid>
-            <pubDate>Fri, 05 Jun 2026 16:55:30 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.theregister.com/public-sector/2026/06/04/govuk-goes-dutch-on-payments-as-it-dumps-stripe/5250763">https://www.theregister.com/public-sector/2026/06/04/govuk-goes-dutch-on-payments-as-it-dumps-stripe/5250763</a>, See on <a href="https://news.ycombinator.com/item?id=48415217">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-                <article>
-
-                    <section id="main">
-
-                            
-
-
-
-                        <div data-element-guid="d11159dd-82a3-4c53-901c-d41dec75505c">
-
-    
-
-
-
-        <p><a href="https://www.theregister.com/tag/public%20sector">public sector</a></p>
-
-
-    
-
-
-
-
-
-        
-        <p>Means residents can skip the credit card and use 'pay by bank' for local authorities and services</p>
-
-
-        
-
-</div>
-
-
-                        
-
-                        
-                        
-
-
-                        
-
-                        <div data-element-guid="4c9dc5d9-c886-4348-bf4a-01d0dc71377d">
-    
-    
-
-    <p>The UK’s Government Digital Service (GDS) has replaced Stripe with Dutch provider Adyen as its processor for many payments made through its GOV.UK Pay service.</p><p>Adyen will take over GOV.UK Pay card payments for local authorities, police forces and armed forces units from Stripe, as well as pay by bank services, under a three-year <a href="https://www.contractsfinder.service.gov.uk/Notice/b725c8c9-e265-4f01-905c-6108313f8fef">contract</a> worth up to £25.3 million. </p><p>According to the tender notice published in February 2025, the contract covers around 17 percent of payments made through GOV.UK Pay but more than 70&nbsp;percent of its organizations and includes the only <a href="https://www.contractsfinder.service.gov.uk/Notice/182de6c9-d246-421a-8204-5d50922b30de">option</a> allowing users to start taking payments within one working day. At that point the contract had an estimated maximum value of £49 million, although with no guarantees over volume.&nbsp;</p>
-<p>In a <a href="https://gds.blog.gov.uk/2026/06/02/building-for-the-future-making-change-simple-on-gov-uk-pay/">blogpost</a> about the contract award on 2 June, GDS said it will migrate around 1,000 services to the new supplier. “We will make migration as straightforward as possible while complying with Know Your Customer legislation that protects everyone from fraud,” wrote Alan Maddrell, senior content designer for the service. “Most importantly, there will be no discernible difference for paying users and no loss in functionality.”</p>
-<p>He added that the change of supplier will help introduce new options including pay by bank, which transfers money directly between bank accounts using open banking services and avoids the need to type in card details. GDS will continue to use WorldPay to process payments for central government, linked organizations and NHS bodies.</p>
-<p>GDS established GOV.UK Pay to save public services the effort and cost of setting up online payments themselves. It doesn’t charge organizations for the service beyond passing on transaction fees.</p><p>According to its <a href="https://www.payments.service.gov.uk/performance/">performance data page</a>, GOV.UK Pay has processed 137.5 million transactions since it was set up in 2016, worth around £9.2 billion. It currently provides 1,718 services, including 662 for local government and 256 for police forces, to 608 organisations ranging from 1079 (Tiverton) Squadron RAF Air Cadets to Yeovil Town Council. ®</p>
-
-    
-
-    
-</div>
-
-
-                        
-
-
-                        
-
-
-                        
-
-                    </section>
-                    
-                </article>
-                
-            </div></div>]]></description>
         </item>
     </channel>
 </rss>
