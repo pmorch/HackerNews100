@@ -4,12 +4,555 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sat, 15 Aug 2026 13:30:07 GMT</lastBuildDate>
+        <lastBuildDate>Sat, 15 Aug 2026 14:30:26 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[The other Sean Byrne doesn't exist (257 pts)]]></title>
+            <title><![CDATA[Auto-research with codex: How I achieved a 232x Faster Kernel (138 pts)]]></title>
+            <link>https://sankalp.bearblog.dev/autoresearch/</link>
+            <guid>49309549</guid>
+            <pubDate>Sat, 15 Aug 2026 11:00:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://sankalp.bearblog.dev/autoresearch/">https://sankalp.bearblog.dev/autoresearch/</a>, See on <a href="https://news.ycombinator.com/item?id=49309549">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+    
+
+    
+
+    
+        
+
+        <p>
+            <i>
+                <time datetime="2026-07-08T14:35Z">
+    08 Jul, 2026
+</time>
+            </i>
+        </p>
+    
+
+    <h2 id="table-of-contents">Table of Contents</h2><ul>
+<li><a href="#intro">Intro</a><ul>
+<li><a href="#contest-in-short">Contest in short</a></li>
+<li><a href="#problem-intro">Problem intro</a></li>
+</ul>
+</li>
+<li><a href="#why-this-problem-is-auto-research-able">Why this problem is auto-research-able</a></li>
+<li><a href="#learning-enough-to-ask-better-questions">Learning Enough to Ask Better Questions</a></li>
+<li><a href="#optional-math-for-qr-decomposition-householder-reflections">(Optional) Math for QR decomposition: Householder reflections</a></li>
+<li><a href="#make-serial-work-small-with-the-help-of-the-blocked-householder-algorithm">Make serial work small with the help of the blocked Householder algorithm</a></li>
+<li><a href="#other-challenges">Other challenges</a></li>
+<li><a href="#codex-maxxing">Codex-maxxing</a><ul>
+<li><a href="#kernel-progress-breakthroughs">Kernel progress breakthroughs</a></li>
+<li><a href="#breakthrough-ideas">Breakthrough ideas</a></li>
+</ul>
+</li>
+<li><a href="#introducing-idea-diversity-to-escape-the-local-maxima">Introducing idea diversity to escape the local maxima</a></li>
+<li><a href="#implementation-hints">Implementation Hints</a></li>
+<li><a href="#what-i-could-have-done-better">What I could have done better</a></li>
+<li><a href="#conclusion">Conclusion</a></li>
+<li><a href="#references">References</a></li>
+<li><a href="#acknowledgements">Acknowledgements</a></li>
+</ul>
+<h3 id="intro">Intro</h3><h4 id="contest-in-short">Contest in short</h4><p>GPU Mode, in collab with Core Automation, recently hosted an auto-research themed contest. The problem statement was to <code>implement batched square compact-Householder QR factorization aka QR decomposition</code>.  I placed 12th out of 183 participants, ending up with a 232x speedup over the baseline solution. This post is about how I got there. I will go through my approach, learnings, and bottlenecks I ran into during the contest. It was my first serious attempt at auto-research. Some people will call this "loop engineering", and honestly that is fine too.</p>
+<p>Note that you don't need to go through the mathematics or the problem itself in detail to follow most of this blog post. I have focused on my approach while keeping the math and the problem itself secondary as most people who will read this won't have participated in the contest.</p>
+<p>You can check out the full contest page here: <a href="https://www.gpumode.com/leaderboard/774?tab=rankings">Problem Link and Leaderboard</a></p>
+<p>This contest was part of GPU Mode's <a href="https://www.gpumode.com/news/linear-algebra-kernels-age-of-research">Linear Algebra Kernels in the Age of Research</a> series.</p>
+
+<h4 id="problem-intro">Problem intro</h4><p>We were given a batch of square FP32 CUDA matrices <code>A</code> with shape <code>batch x n x n</code>, and had to return the same compact Householder QR representation as <code>torch.geqrf(A)</code>: an <code>H</code> matrix whose upper triangle is <code>R</code> and whose lower triangle stores Householder vectors, plus a <code>tau</code> vector of reflector coefficients. The checker rebuilt <code>Q</code> with <code>torch.linalg.householder_product(H, tau)</code>, took <code>R = triu(H)</code>, and verified:</p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>A</mi><mo>≈</mo><mi>Q</mi><mi>R</mi><mo>,</mo><mspace width="2em"></mspace><msup><mi>Q</mi><mo>⊤</mo></msup><mi>Q</mi><mo>≈</mo><mi>I</mi><mo>,</mo><mspace width="2em"></mspace><msup><mi>Q</mi><mo>⊤</mo></msup><mi>A</mi><mo>≈</mo><mi>R</mi></mrow></math></p>
+<p>Among correct submissions, the leaderboard ranked runtime by geometric mean across shapes and conditioning cases. The important sizes were batched square matrices like <code>512 x 512</code>, with larger <code>1024</code>, <code>2048</code>, and <code>4096</code> cases too. Low-bit FP16, FP8, or NVFP4 was allowed internally, but returned factors still had to satisfy FP32-style QR checks.</p>
+<p>A tiny <code>3 x 3</code> example is:</p>
+<p>
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>A</mi><mo>=</mo><mo>[</mo><mtable><mtr><mtd><mn>12</mn></mtd><mtd><mo>−</mo><mn>51</mn></mtd><mtd><mn>4</mn></mtd></mtr><mtr><mtd><mn>6</mn></mtd><mtd><mn>167</mn></mtd><mtd><mo>−</mo><mn>68</mn></mtd></mtr><mtr><mtd><mo>−</mo><mn>4</mn></mtd><mtd><mn>24</mn></mtd><mtd><mo>−</mo><mn>41</mn></mtd></mtr></mtable><mo>]</mo><mo>=</mo><munder><munder><mrow><mo>[</mo><mtable><mtr><mtd><mn>6</mn><mo>/</mo><mn>7</mn></mtd><mtd><mo>−</mo><mn>69</mn><mo>/</mo><mn>175</mn></mtd><mtd><mo>−</mo><mn>58</mn><mo>/</mo><mn>175</mn></mtd></mtr><mtr><mtd><mn>3</mn><mo>/</mo><mn>7</mn></mtd><mtd><mn>158</mn><mo>/</mo><mn>175</mn></mtd><mtd><mn>6</mn><mo>/</mo><mn>175</mn></mtd></mtr><mtr><mtd><mo>−</mo><mn>2</mn><mo>/</mo><mn>7</mn></mtd><mtd><mn>6</mn><mo>/</mo><mn>35</mn></mtd><mtd><mo>−</mo><mn>33</mn><mo>/</mo><mn>35</mn></mtd></mtr></mtable><mo>]</mo></mrow><mo>⏟</mo></munder><mrow><mi>Q</mi></mrow></munder><munder><munder><mrow><mo>[</mo><mtable><mtr><mtd><mn>14</mn></mtd><mtd><mn>21</mn></mtd><mtd><mo>−</mo><mn>14</mn></mtd></mtr><mtr><mtd><mn>0</mn></mtd><mtd><mn>175</mn></mtd><mtd><mo>−</mo><mn>70</mn></mtd></mtr><mtr><mtd><mn>0</mn></mtd><mtd><mn>0</mn></mtd><mtd><mn>35</mn></mtd></mtr></mtable><mo>]</mo></mrow><mo>⏟</mo></munder><mrow><mi>R</mi></mrow></munder></mrow></math></p>
+<p>Here <code>Q</code> is orthogonal, which means its columns are unit-length and perpendicular to each other, and <code>R</code> is upper triangular, which means everything below the diagonal is zero. The contest was not asking us to print dense <code>Q</code> and <code>R</code> directly; it asked for the compact Householder version that lets the checker reconstruct <code>Q</code> and read <code>R</code> from the upper triangle.</p>
+<p>For the 3×3 example above, the very first reflector maps the first column (12, 6, −4) straight onto (−14, 0, 0) in one shot. The −14 becomes <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>R</mi><mrow><mn>11</mn></mrow></msub></mrow></math>. How that works is in the math section.</p>
+<h3 id="why-this-problem-is-auto-research-able">Why this problem is auto-research-able</h3><p>GPU Mode provides participants with the popcorn CLI making it agent-friendly. Agents can use this to test, benchmark, and submit to the leaderboard directly. The checker also provided shape-wise feedback along with the overall geometric mean timing.</p>
+<p>Astute observers will notice this is an apt setup for writing a loop. Agents yearn for tight feedback loops. They allow them to hill-climb to their heart's content.</p>
+<p>GPU Mode contests usually give you some way to iterate on kernels. Either you submit directly, or a sponsor like Modal chips in credits. Here the organizers basically allowed unlimited submissions as long as you spaced them out. If you didn't, the queues got long and everybody's runs timed out. At one point the workspace even ran out of Modal credits because everyone had been hammering submissions. It's a nice way to make learning accessible.</p>
+<p>Over the course of 14 days, I made over 1500 submissions.</p>
+<h3 id="learning-enough-to-ask-better-questions">Learning Enough to Ask Better Questions</h3><p><img src="https://bear-images.sfo2.cdn.digitaloceanspaces.com/sankalp/codex-image-1.webp" alt="codex-image (1)"></p>
+<p>I have known the basics of GPU kernel optimization (mainly in Triton with some understanding of CUDA) for a year, but haven't worked in this domain professionally. What I am trying to tell you is that I was an underdog among the people around me on the leaderboard. The person just above me on the leaderboard (CUDA Colonel) is a principal engineer at NVIDIA.</p>
+<p>Anyway aura farming aside, since I know the basics and had recently read about GatedDeltaNet, I was fresh on the general GPU kernel lingo.</p>
+<p>The better you know something, the better you can prompt the LLMs, because you convert unknown unknowns into known unknowns.</p>
+<p>At the same time, it's worth noting that this contest was doable without domain knowledge - like you probably won't make it to the top 10, but you can get a respectable speedup over baseline by just relying on your harness/agent loop or whatever.</p>
+<p>My first steps in the contest were to learn what QR decomposition is and how it can be done. There are a bunch of ways to do it - like Gram-Schmidt and Householder reflections. The contest mandated Householder reflections. I went back and forth with Claude and watched a few YouTube videos to build intuition. After my discussions with Claude, it was clear that we needed to use the blocked Householder algorithm as the main architecture with the trailing WY-update. As it turns out, GPT-5.5 also had a good idea about this. QR decomposition is a fairly well known problem.</p>
+<p>I found the concept interesting as matrix decompositions show up in several modern optimizer variants for LLM training, especially in methods that use matrix preconditioning, such as Shampoo-style optimizers and related approaches. Muon (used by Kimi) is another good example: instead of treating a weight update as one giant flattened vector, it keeps the matrix structure around and orthogonalizes the momentum update, usually through a few Newton-Schulz iterations that approximate the polar factor.</p>
+<h3 id="optional-math-for-qr-decomposition-householder-reflections">(Optional) Math for QR decomposition: Householder reflections</h3><p><strong>I recommend skimming through this section if you are curious about the math otherwise feel free to skip.</strong> The only thing to note is that
+there is a sequential dependency in Householder QR which makes it problematic to do GEMM. We use blocked Householder to make it more matrix-multiplication shaped.</p>
+<figure>
+  <img src="https://bear-images.sfo2.cdn.digitaloceanspaces.com/sankalp/andrew.webp" alt="andrew" width="75%">
+</figure>
+<h4 id="the-contract">The contract</h4><p>Quickly reviewing the contract: input is a batch of square FP32 matrices <code>A</code>; output is the compact <code>(H, tau)</code> format that <code>torch.geqrf</code> returns. The upper triangle of <code>H</code> is <code>R</code>. Below the diagonal, <code>H</code> stores the Householder vectors, and <code>tau</code> stores one scalar per column. The checker rebuilds <code>Q</code> from <code>(H, tau)</code> and verifies <code>A ≈ QR</code>.</p>
+<h4 id="mirrors">Mirrors</h4><p>Forget matrices for a second. In a bathroom mirror, your reflection is exactly as far <em>behind</em> the glass as you are in front of it, straight through.</p>
+<p>If <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mrow><mi>⟂</mi></mrow></msub></mrow></math> is the part of <code>x</code> sticking out perpendicular to the glass, reflection just subtracts that part twice:</p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>x</mi><mrow><mtext>reflected</mtext></mrow></msub><mo>=</mo><mi>x</mi><mo>−</mo><mn>2</mn><msub><mi>x</mi><mrow><mi>⟂</mi></mrow></msub></mrow></math></p>
+<p>So a Householder reflection is about finding the perpendicular part and subtracting it twice.</p>
+<h4 id="storing-the-mirror">Storing the mirror</h4><p>A Householder vector is the mirror, stored compactly. In code, we don't carry around the whole mirror plane. We store one vector <code>v</code> sticking straight out of it. The mirror is everything perpendicular to <code>v</code>, and the reflection moves along <code>v</code>.</p>
+<p>The perpendicular part is just the shadow of <code>x</code> along <code>v</code>, which is <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><msup><mi>v</mi><mo>⊤</mo></msup><mi>x</mi></mrow><mrow><msup><mi>v</mi><mo>⊤</mo></msup><mi>v</mi></mrow></mfrac></mrow></math> copies of <code>v</code>. Plug that into the subtraction above:</p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><mspace width="0.167em"></mspace><mi>x</mi><mo>=</mo><mi>x</mi><mo>−</mo><mi>τ</mi><mspace width="0.167em"></mspace><mi>v</mi><mspace width="0.167em"></mspace><mo stretchy="false">(</mo><msup><mi>v</mi><mo>⊤</mo></msup><mi>x</mi><mo stretchy="false">)</mo><mo>,</mo><mspace width="2em"></mspace><mi>τ</mi><mo>=</mo><mfrac><mrow><mn>2</mn></mrow><mrow><msup><mi>v</mi><mo>⊤</mo></msup><mi>v</mi></mrow></mfrac></mrow></math></p>
+<p>So <code>tau</code> is just <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mfrac><mrow><mn>2</mn></mrow><mrow><msup><mi>v</mi><mo>⊤</mo></msup><mi>v</mi></mrow></mfrac></mrow></math>: the factor of 2 and the length of <code>v</code> bundled into one precomputed number. <code>v</code> picks the mirror, <code>tau</code> scales the update. (I'll write the mathematical reflector as <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>ℋ</mi><mi>j</mi></msub></mrow></math> and reserve <code>H</code> for the compact output matrix.)</p>
+<figure id="hhref">
+
+<div>
+  <p><strong>Householder reflection in 2D</strong>
+    <span id="hhref-readout">tau = 0.00</span>
+  </p>
+  <svg id="hhref-svg" viewBox="0 0 720 420" role="img" aria-label="Interactive two dimensional Householder reflection">
+    <defs>
+      <marker id="hhref-arrow-input" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#c9571a"></path>
+      </marker>
+      <marker id="hhref-arrow-reflected" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#16845f"></path>
+      </marker>
+      <marker id="hhref-arrow-normal" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#255c99"></path>
+      </marker>
+    </defs>
+    <g id="hhref-grid"></g>
+    <line id="hhref-xaxis"></line>
+    <line id="hhref-yaxis"></line>
+    <line id="hhref-bridge"></line>
+    <line id="hhref-plane"></line>
+    <line id="hhref-parallel"></line>
+    <line id="hhref-perp-pos"></line>
+    <line id="hhref-perp-neg"></line>
+    <line id="hhref-normal" marker-end="url(#hhref-arrow-normal)"></line>
+    <line id="hhref-input" marker-end="url(#hhref-arrow-input)"></line>
+    <line id="hhref-reflected" marker-end="url(#hhref-arrow-reflected)"></line>
+    <circle id="hhref-handle" r="8"></circle>
+    <text id="hhref-label-x">x</text>
+    <text id="hhref-label-hx">reflected x</text>
+    <text id="hhref-label-v">v</text>
+    <text id="hhref-label-parallel">x_parallel</text>
+    <text id="hhref-label-perp">x_perp</text>
+    <text x="18" y="392">Mirror rule: keep x_parallel, flip x_perp. So reflected x = x - 2x_perp.</text>
+  </svg>
+</div>
+<figcaption>
+  A simplified 2D Householder step. Drag the orange vector: the purple mirror changes so the green reflected vector lands on the horizontal axis. In higher dimensions, landing on the axis is exactly what makes the below-diagonal entries become zero.
+</figcaption>
+
+</figure>
+<h4 id="why-qr-cares-about-mirrors">Why QR cares about mirrors</h4><p>QR wants to turn <code>A</code> into an upper-triangular matrix <code>R</code>. Column 1 should become something like <code>(*, 0, 0)</code>, column 2 should have zeros below row 2, and so on.</p>
+<p>A Householder mirror is useful because it can do that to a column in one shot. Take the first column of the 3×3 example above: <code>(12, 6, -4)</code>. We want to send it to the x-axis so the lower entries become zero. A reflection can only change direction, not length, so the target must also have length 14. One valid target is <code>(-14, 0, 0)</code>. After that reflection, the <code>6</code> and <code>-4</code> entries are gone, which is exactly what we wanted.</p>
+<p>How do we find the mirror? It sits halfway between the column and its target, so <code>v</code>, the vector poking through the mirror, is just the column minus its target:</p>
+<p><code>v = (12, 6, -4) - (-14, 0, 0) = (26, 6, -4)</code></p>
+<h4 id="the-householder-update">The Householder update</h4><p>Then compute <code>tau = 2 / (vᵀv)</code>. The reflector itself is:</p>
+<div>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><mo>=</mo><mi>I</mi><mo>−</mo><mi>τ</mi><mi>v</mi><msup><mi>v</mi><mo>⊤</mo></msup><mo>,</mo><mspace width="2em"></mspace><mi>τ</mi><mo>=</mo><mfrac><mrow><mn>2</mn></mrow><mrow><msup><mi>v</mi><mo>⊤</mo></msup><mi>v</mi></mrow></mfrac></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><mi>x</mi><mo>=</mo><mo stretchy="false">(</mo><mi>I</mi><mo>−</mo><mi>τ</mi><mi>v</mi><msup><mi>v</mi><mo>⊤</mo></msup><mo stretchy="false">)</mo><mi>x</mi></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><mi>x</mi><mo>=</mo><mi>x</mi><mo>−</mo><mi>τ</mi><mi>v</mi><mo stretchy="false">(</mo><msup><mi>v</mi><mo>⊤</mo></msup><mi>x</mi><mo stretchy="false">)</mo></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><msub><mi>A</mi><mrow><mtext>active</mtext></mrow></msub><mo>=</mo><mo stretchy="false">(</mo><mi>I</mi><mo>−</mo><mi>τ</mi><mi>v</mi><msup><mi>v</mi><mo>⊤</mo></msup><mo stretchy="false">)</mo><msub><mi>A</mi><mrow><mtext>active</mtext></mrow></msub></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>ℋ</mi><msub><mi>A</mi><mrow><mtext>active</mtext></mrow></msub><mo>=</mo><msub><mi>A</mi><mrow><mtext>active</mtext></mrow></msub><mo>−</mo><mi>τ</mi><mi>v</mi><mo stretchy="false">(</mo><msup><mi>v</mi><mo>⊤</mo></msup><msub><mi>A</mi><mrow><mtext>active</mtext></mrow></msub><mo stretchy="false">)</mo></mrow></math></p>
+</div>
+<p>This turns the current column into <code>(-14, 0, 0)</code> and rewrites the other columns consistently, so the next reflector is built from the updated matrix.</p>
+<p>We keep doing this once per column. In rough notation, the repeated updates look like:</p>
+<div>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>1</mn><mo stretchy="false">)</mo></mrow></msup><mo>=</mo><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>0</mn><mo stretchy="false">)</mo></mrow></msup><mo>−</mo><msub><mi>τ</mi><mn>1</mn></msub><msub><mi>v</mi><mn>1</mn></msub><mo stretchy="false">(</mo><msubsup><mi>v</mi><mn>1</mn><mo>⊤</mo></msubsup><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>0</mn><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>2</mn><mo stretchy="false">)</mo></mrow></msup><mo>=</mo><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>1</mn><mo stretchy="false">)</mo></mrow></msup><mo>−</mo><msub><mi>τ</mi><mn>2</mn></msub><msub><mi>v</mi><mn>2</mn></msub><mo stretchy="false">(</mo><msubsup><mi>v</mi><mn>2</mn><mo>⊤</mo></msubsup><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>1</mn><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>3</mn><mo stretchy="false">)</mo></mrow></msup><mo>=</mo><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>2</mn><mo stretchy="false">)</mo></mrow></msup><mo>−</mo><msub><mi>τ</mi><mn>3</mn></msub><msub><mi>v</mi><mn>3</mn></msub><mo stretchy="false">(</mo><msubsup><mi>v</mi><mn>3</mn><mo>⊤</mo></msubsup><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mn>2</mn><mo stretchy="false">)</mo></mrow></msup><mo stretchy="false">)</mo></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>⋯</mo></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo>=</mo><msup><mi>A</mi><mrow><mo stretchy="false">(</mo><mi>n</mi><mo stretchy="false">)</mo></mrow></msup></mrow></math></p>
+</div>
+<p>Each line uses the matrix produced by the previous line. Each reflector zeroes out everything below the diagonal of its column without disturbing the columns already finished. After the last one, <code>A</code> has walked down to an upper-triangular <code>R</code>:</p>
+<p>
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>A</mi><mo>=</mo><munder><munder><mrow><msub><mi>ℋ</mi><mn>1</mn></msub><msub><mi>ℋ</mi><mn>2</mn></msub><mo>⋯</mo><msub><mi>ℋ</mi><mi>n</mi></msub></mrow><mo>⏟</mo></munder><mrow><mi>Q</mi></mrow></munder><mspace width="0.167em"></mspace><mi>R</mi></mrow></math></p>
+<p>Mirrors don't change lengths or angles, so each <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>ℋ</mi><mi>j</mi></msub></mrow></math> is orthogonal, and so is their product <code>Q</code>. That's where the orthogonality the checker verifies comes from for free.</p>
+<h4 id="whats-the-compact-format">What's the compact format</h4><p>Once column <code>j</code> is processed, everything below its diagonal is dead space. <code>geqrf</code> reuses those slots to stash the tail of <code>v_j</code> (the leading 1 is implicit). On and above the diagonal you're looking at <code>R</code>; below it, the reflectors; and <code>tau</code> rides along as a separate vector. That's why the checker needs both <code>H</code> and <code>tau</code> to rebuild <code>Q</code>.</p>
+<figure id="hhpack">
+
+<div>
+  <p><strong>Compact geqrf storage (n = 6)</strong>
+    <span id="hhpack-readout">hover a column</span>
+  </p>
+  <div>
+    <p>H&nbsp; (upper triangle = R, below diagonal = reflector tails)</p>
+    
+    <p>tau&nbsp; (one scalar per reflector)</p>
+    
+    <p><span><i></i><b>r</b> entries of R</span>
+      <span><i></i>tail of <b>v<sub>j</sub></b></span>
+      <span><i></i><b>τ<sub>j</sub></b></span>
+    </p>
+  </div>
+</div>
+<figcaption>
+  One matrix, two payloads. Hover (or tap) any column j: the below-diagonal slots of that column are zero after reflector j fires, so <code>geqrf</code> reuses them to store the tail of v<sub>j</sub>. The leading 1 (shown on the diagonal when highlighted) is implicit. Pair each column with its τ<sub>j</sub> and the checker can rebuild Q.
+</figcaption>
+
+</figure>
+<h3 id="make-serial-work-small-with-the-help-of-the-blocked-householder-algorithm">Make serial work small with the help of the blocked Householder algorithm</h3><p>Householder QR zeroes out <code>A</code> below the diagonal one column at a time. Each step builds a reflector from the current column and applies it to everything on the right. The problem is reflector j+1 is built from the matrix <em>after</em> reflector j has already hit it. So you can't reorder the steps and you can't fuse them. It's serial, and the serial matrix-vector work runs in the slow vector lanes of the SM while the tensor cores just sit there idle.</p>
+<figure id="hhsteps">
+
+<div>
+  <p><strong>Householder QR, one reflector at a time (n = 5)</strong>
+    <span>math view: zeros appear, trailing block gets rewritten</span>
+  </p>
+  
+  <p><span><i></i>original a</span>
+    <span><i></i>final entry of <b>R</b></span>
+    <span><i></i>rewritten by this reflector</span>
+    <span><b>0</b>&nbsp;zeroed (v<sub>j</sub> gets stashed here)</span>
+  </p>
+</div>
+<figcaption>
+  Reflector j zeroes column j below the diagonal and finalizes row j of R. But it also rewrites the entire orange trailing block, and reflector j+1 can only be built from that rewritten block. That data dependency is the serial chain the blocked algorithm attacks.
+</figcaption>
+
+</figure>
+<p>The classic fix is the <strong>blocked</strong> algorithm. You pick a narrow panel of b columns (say 32 or 64) and do all the serial work inside it. That's fine, because the panel is only b columns wide, so it stays cheap. Then, instead of applying the panel's b reflectors to the rest of the matrix one at a time, you compress them into a single rank-b update (the "WY representation") and hit the entire trailing block in one shot with three back-to-back matrix multiplies. The serial work stays confined to the panel, and everything else turns into GEMMs, which is exactly the shape the tensor cores want.</p>
+<p>Concretely, the WY representation collapses a panel's <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi></mrow></math> reflectors into a single rank-<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi></mrow></math> update. Stack the panel's Householder vectors as columns of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi><mo>=</mo><mo stretchy="false">[</mo><mspace width="0.167em"></mspace><msub><mi>v</mi><mn>1</mn></msub><mo>,</mo><msub><mi>v</mi><mn>2</mn></msub><mo>,</mo><mo>…</mo><mo>,</mo><msub><mi>v</mi><mi>b</mi></msub><mspace width="0.167em"></mspace><mo stretchy="false">]</mo></mrow></math>, build a small <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi><mi>×</mi><mi>b</mi></mrow></math> upper-triangular <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math>, then:</p>
+<p>
+<math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>ℋ</mi><mn>1</mn></msub><msub><mi>ℋ</mi><mn>2</mn></msub><mo>⋯</mo><msub><mi>ℋ</mi><mi>b</mi></msub><mo>=</mo><mi>I</mi><mo>−</mo><mi>V</mi><mi>T</mi><msup><mi>V</mi><mo>⊤</mo></msup></mrow></math></p>
+<p>and the trailing-block update becomes three GEMM-shaped steps:</p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi><mo>=</mo><msup><mi>V</mi><mo>⊤</mo></msup><msub><mi>A</mi><mrow><mtext>trail</mtext></mrow></msub></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi><mo>=</mo><msup><mi>T</mi><mo>⊤</mo></msup><mi>W</mi></mrow></math></p>
+<p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>A</mi><mrow><mtext>trail</mtext></mrow></msub><mo>←</mo><msub><mi>A</mi><mrow><mtext>trail</mtext></mrow></msub><mo>−</mo><mi>V</mi><mi>Z</mi></mrow></math></p>
+<figure id="hhblk">
+
+<div>
+  <p><strong>Blocked Householder (n = 6, panel width b = 2)</strong>
+    <span>confine the serial work, GEMM the rest</span>
+  </p>
+  
+  <p><span><i></i>final entry of <b>R</b></span>
+    <span><i></i>stored <b>v</b> (panel, serial)</span>
+    <span><i></i>rewritten by the rank-b update</span>
+    <span><i></i>untouched</span>
+  </p>
+</div>
+<figcaption>
+  The serial column-by-column work from the previous figure still happens. But only inside the narrow blue panel, where it's cheap. The b reflectors are then compressed into I − V T V<sup>⊤</sup> and slam the whole trailing block at once: three GEMMs instead of b separate rank-1 updates. The panel then slides onto the orange block and the story repeats.
+</figcaption>
+
+</figure>
+<p>The panel is where the serial matrix-vector work is stuck, but it is only <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi></mrow></math> columns wide. Everything to its right is the big trailing block, and that is pure GEMM. As the panel walks down the diagonal, the trailing block shrinks.</p>
+<p><strong>If you want to understand the math, I recommend brainstorming with Claude. Also check out <a href="https://ml-mike.com/writing/qr_v2/">Mike's writeup</a> where he has covered math in a more descriptive and visual way than me. He placed 5th in the contest and shared his learnings focusing on the problem.</strong></p>
+<h3 id="other-challenges">Other challenges</h3><p>Two more things proved to be challenging: reliably using low precision internally (especially for ill-conditioned inputs), and coping with the wide spread of shapes (n = 32, 176, 352, 512, 1024, 2048, 4096) and batch sizes, where the largest matrices had too few batches to fill the tensor cores while n = 32 was so small we had to pack many matrices into one kernel launch.</p>
+<h3 id="codex-maxxing">Codex-maxxing</h3><h4 id="why-i-picked-codex">Why I picked Codex</h4><p>I participated with ChatGPT Pro (200 USD subscription) and Claude Pro (20 USD subscription). I also used Modal for profiling (they provide 30 USD worth of credits free every month btw).</p>
+<p>I chose Codex mainly because:</p>
+<ol>
+<li>I had the bigger subscription.</li>
+<li>From prior experience, my intuition was that OpenAI models are better at Triton.</li>
+<li><code>/compaction</code> works very well in Codex.</li>
+</ol>
+<h4 id="setting-up-the-harness">Setting up the harness</h4><p>After I got a basic understanding, I asked Codex to do the basic setup: add problem_statement.md, mention basic details in AGENTS.md on how to submit and use popcorn CLI, and maintain a log.md where we did bookkeeping of the submissions and their status (accept/reject along with shape-wise timings). If we have to contrast with Karpathy's auto-research, my AGENTS.md and problem_statement.md were initially my <a href="https://github.com/karpathy/autoresearch/blob/master/program.md">program.md</a>.</p>
+<p>Logs serve as the evidence of the ideas that worked and didn't work. Future agent sessions could read the logs and quickly check if an idea had been tried or not. I put more investment into logging after the 3000 µs mark as things started to get harder.</p>
+<h4 id="just-tell-it-what-to-do">Just tell it what to do</h4><p>The cool thing about Codex is you can just tell it to do stuff and it will actually do the stuff. You can make it work for hours if you give it a detailed enough prompt with targets. It knows all the math and code, and it has all the feedback it needs. I had this intuition, but I was still surprised by how much GPT-5.5 could push the performance beyond the baseline solution (which was the torch.geqrf/cuSolver function).</p>
+<p>My initial few sessions were manual prompts to implement a solution in Triton and optimize for the n = 512 and n = 1024 shapes, as they had the most weight in the final geometric mean.</p>
+<h4 id="steering-with-goal">Steering with /goal</h4><p>However, if you want to make the model loop until a certain objective is achieved, use <code>/goal</code>. You can give specific, achievable, quantitative goals. I found that giving a good numeric goal followed by specific criteria worked well.</p>
+<p>Example: "Use only Triton or CUDA and beat our active best's n = 512 timings. Try several ideas either by submitting directly to the leaderboard or using Modal profiling. Remove cuSolver altogether in the new set of experiments. We will only use it as a fallback."
+At one point, this goal ran for over a day.</p>
+<figure>
+  <img src="https://bear-images.sfo2.cdn.digitaloceanspaces.com/sankalp/17pm.webp" alt="Codex goal running for a long time" width="75%">
+</figure>
+<p>I gave inputs every 2-3 hours to move the model in the direction I wanted. I also let it run without supervision overnight on some days. In the initial few days, my instructions were mostly around steering the model to try out different ideas (more on this later) for different shapes, shouting at it to use more Triton, less PyTorch, and fewer fallbacks! A lesson I learned here: I often had the itch to check on my agents frequently, but you gotta trust it and let it do its work. Get out of the agent's way you must; steer it back only when it gets stuck.</p>
+<h4 id="checking-in-without-pausing-the-loop">Checking in without pausing the loop</h4><p>When using <code>/goal</code>, you can ask the model questions without pausing the loop by using <code>/btw</code> or <code>/side</code>. This creates a temporary thread with context from your main conversation. I liked this way of checking on the agent and providing oversight.</p>
+<p>I would ask questions like: Are you winning son? What algorithm/changes are there in the current active submission? Explain this concept to me. What are the ideas you are currently working on? What's the progress? What are some recent breakthroughs? Can we transfer it to another shape? What are your next best ideas? Based on the responses, I would consult Claude to improve
+my understanding of the concepts and bottlenecks involved and then provide my thoughts to Codex. After questioning, I would just go back to the main thread and dump thoughts to steer the model.</p>
+<blockquote><p lang="en" dir="ltr">if a /goal or some loop type thing is running, then either you can queue up the instruction in codex to ask stuff or you can do /btw. (img me checking on codex to ask what's it doing, what next ideas are etc.). if you do esc to interrupt the loop, then the /goal pauses <a href="https://t.co/Yx6EpH5PKo">https://t.co/Yx6EpH5PKo</a> <a href="https://t.co/imqZc6RPkz">pic.twitter.com/imqZc6RPkz</a></p><br>sankalp (@dejavucoder) <a href="https://x.com/dejavucoder/status/2070965828829564946?ref_src=twsrc%5Etfw">June 27, 2026</a></blockquote> 
+<p>The baseline <code>torch.geqrf</code> path was around 419 ms (419,000 µs) overall. I was able to reach 5000 µs within a day on the n = 512 shape after implementing the blocked Householder route for that shape. This was the shape weighted most heavily in the geomean.</p>
+<p>The 232x number above comes from comparing the rough 419,000 µs baseline to the final 1,805 µs tracked result. The lineage chart below starts from the first recovered point in my tracked submission history, so it shows the later 108,803 to 1,805 µs arc rather than the full baseline-to-final ratio.</p>
+<p>When optimizing kernels, making the work more matrix-shaped so the tensor cores stop being idle is your life's purpose.</p>
+<p>Optimizations were much harder after the 3000 µs point. I had to get more involved in the loop in terms of learning the concepts and steering the model. I gave Modal profiling access to Codex and let it run torch profiling / nsys profiling to test out different ideas, compare implementations, and sweep parameters faster. (Later on, the organizers also provided a way to do NCU profiling.)</p>
+<h4 id="kernel-progress-breakthroughs">Kernel progress breakthroughs</h4><!-- QR v2 B200 geomean lineage chart (zoomable). Self-contained, paste into Bear blog -->
+<div id="qrlin">
+
+<div>
+  <h3>QR v2 · B200 full-table geomean</h3>
+  <p><span>103 best submissions · Jun 15 – Jun 30, 2026 · 108,803 → 1,805 µs (−98.34%)</span>
+</p></div>
+<p><span><span></span> new best</span>
+  <span><span></span> big jump (≥2.5%)</span>
+  <span>hover / tap a dot · scroll or pinch to zoom, drag to pan, double-click to zoom in</span>
+</p>
+
+
+</div>
+<hr>
+<h4 id="breakthrough-ideas">Breakthrough ideas</h4><p>The rough structural evolution of the QR kernel, from baseline/library-heavy paths toward custom panel work, fused assembly, and GEMM-shaped trailing updates:</p>
+<table>
+<thead>
+<tr>
+  <th>#</th>
+  <th>Structural change</th>
+  <th>What it did</th>
+  <th>Type</th>
+  <th>Geomean</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><code>torch.geqrf</code> everywhere</td>
+  <td>Generic QR for every shape</td>
+  <td>starting point</td>
+  <td>&gt;108.8k µs</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td>Blocked WY QR on n512</td>
+  <td>Panel factor + trailing update</td>
+  <td>algorithm / routing</td>
+  <td>108.8k µs</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td>Blocked route on all shapes</td>
+  <td>n32 full-QR, LARFB16 updates</td>
+  <td>algorithm / routing</td>
+  <td>10.2k µs</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td>Triton panels + grouped WY</td>
+  <td>panel16/32 kernels, grouped updates</td>
+  <td>kernel / runtime</td>
+  <td>4.3k µs</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td>Cholesky-ORHR for n4096</td>
+  <td>Gram, Cholesky, rebuilt reflectors</td>
+  <td>algorithm / routing</td>
+  <td>4.0k µs</td>
+</tr>
+<tr>
+  <td>6</td>
+  <td>CUDA graph replay</td>
+  <td>Capture routes, kill launch overhead</td>
+  <td>kernel / runtime</td>
+  <td>3.4k µs</td>
+</tr>
+<tr>
+  <td>7</td>
+  <td>Fused V/T layout assembly</td>
+  <td>No slice copies, cats, temporaries</td>
+  <td>kernel / runtime</td>
+  <td>2.75k µs</td>
+</tr>
+<tr>
+  <td>8</td>
+  <td>split16 panels + tail-Gram</td>
+  <td>Skip full WY near tails</td>
+  <td>algorithm / routing</td>
+  <td>2.5k µs</td>
+</tr>
+<tr>
+  <td>9</td>
+  <td>Fixed-shape kernel specialization</td>
+  <td>Hardcoded rows, fused reductions</td>
+  <td>kernel / runtime</td>
+  <td>2.0k µs</td>
+</tr>
+<tr>
+  <td>10</td>
+  <td>Composed superpanels, custom Cholesky</td>
+  <td>V256/T256 packs, direct-H returns</td>
+  <td>kernel / runtime</td>
+  <td>1.80k µs</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<p>There was a lot of back and forth on profiling the entire shape and then identifying the bottlenecks. For this problem, launch overhead and panel overhead dominated. We were rarely memory or compute bound. Most of the effort was spent finding ways to reduce panel overhead and make the WY-update more GEMM-able.</p>
+<p>Questions I found myself repeatedly asking:</p>
+<ul>
+<li><p>What is panel overhead/launch overhead? How do we solve it?</p>
+</li>
+<li><p><em>What info are we missing and how can we get it?</em></p>
+</li>
+<li><p>What's the latest profile that you have done? What's your take on it?</p>
+</li>
+<li><p>Look for fusion candidates. Are there Triton fusion-level candidates?</p>
+</li>
+<li><p>Look for possible compiler-based optimizations. What can we convert from a runtime signal to a static signal? The idea was to give compiler hints. I once had a 200 µs jump because of this</p>
+</li>
+<li><p>Asked it a few times to look at Triton-generated compiled artifacts</p>
+</li>
+<li><p>What are some numerical tricks to exploit the precision slack?</p>
+</li>
+<li><p>Can you deploy sub-agents to do some math and find possible optimizations?</p>
+</li>
+<li><p>Deploy agents to search for bugs that may be bogging us down</p>
+</li>
+<li><p>Are there <a href="https://pytorch.org/blog/why-is-pytorch-compile-so-fast-kernel-fusion/#:~:text=Reduction%20Fusion%3A%20Combines%20reducing%20operations%20like%20max%2C%20mean%2C%20or%20sum%2C%20with%20the%20operations%20that%20happen%20before%20and%20after%20them.%20This%20is%20critical%20for%20operations%20like%20batch%20normalization.">reduction fusions</a> possible? I saw Codex discover one and then I started hammering it often. Reductions are operations like doing a sum or finding max. Since work needs to be done to iterate through the entire sequence, we can perform multiple of these in a single go.</p>
+</li>
+</ul>
+<figure>
+  <img src="https://bear-images.sfo2.cdn.digitaloceanspaces.com/sankalp/maja.webp" alt="maja" width="75%">
+  <figcaption>Asking good questions is all you need</figcaption>
+</figure>
+<h3 id="introducing-idea-diversity-to-escape-the-local-maxima">Introducing idea diversity to escape the local maxima</h3><p>A major challenge I started facing in the 3000 -&gt; 1800 µs range was the model getting stuck in local maxima.
+This looked like endless hand-tuning of parameters and small variants of the same idea.</p>
+<p>A couple of years ago, agents got stuck in (doom) loops because they were not smart enough or just didn't have the knowledge (or the verification loop was not robust enough). People used to experiment with sampling, temperature variation and different decoding strategies for this.</p>
+<p>Then over time, models got smart enough, pretrained on newer knowledge, and we got tons of RL scaling and inference-time compute (training the model to think for a larger number of tokens).</p>
+<p>Now the models struggle with finding new ideas and "research taste" - what next best idea/experiment should we do given the verifier feedback, prior evidence, and our evals (profiler feedback in our case). Good idea generation is the next great adventure. I recently wrote an <a href="https://sankalp.bearblog.dev/on-idea-generation/">article</a> too on this theme.</p>
+<p>I used the following strategies to help the model get out of local maxima:</p>
+<figure>
+  <img src="https://bear-images.sfo2.cdn.digitaloceanspaces.com/sankalp/10pm.webp" alt="beam of candidates" width="100%">
+  <figcaption>The beam-of-candidates idea: keep multiple promising idea families alive instead of forcing every experiment to beat the current best immediately.</figcaption>
+</figure>
+<ul>
+<li><p>Beam of candidates: For a long time, I did a dumb thing. I kept a single best candidate against which new candidates were tested. If the agent tries a new structural idea or a significantly big change, then it's highly likely that it would score less than our current best submission. However, after a few iterations, that change may outperform our best candidate. With this observation, I introduced some instructions to maintain a beam of 3-5 candidates.</p>
+</li>
+<li><p>Human in the loop: I would act as the secret sauce to steer the model when it was stuck for long times without improvement</p>
+</li>
+<li><p>Encourage the model to take more risks and try ambitious ideas. You will not believe it but this worked. Also, Claude would often give up after a few rounds, with excuses like "we have exhausted all optimizations to reach x geomean"; Codex, on the other hand, is more persistent.</p>
+</li>
+<li><p>Use a stronger advisor model that produces more varied ideas. In my harness, this would look like an instruction
+in AGENTS.md to encourage the model to use headless calls <code>claude -p</code> to get ideas, provide profiling data, etc.</p>
+</li>
+<li><p>Instruct the model to frequently use sub-agents to try out ambitious ideas, search the web for blogs and papers, go through the list I mentioned above, and find micro-optimizations</p>
+</li>
+<li><p>Profile using NCU and Modal, compare the results, and work on bottlenecks that both Modal and NCU profiling pointed out</p>
+</li>
+<li><p>Cleanup</p>
+<ul>
+<li>Clear context, start fresh</li>
+<li>Clean up the environment, move older submission files to archives</li>
+<li>Occasional iterations to simplify code, remove dead code, renaming/refactoring</li>
+</ul>
+</li>
+<li><p>A multi-agent swarm approach is something I thought of but didn't try.</p>
+</li>
+</ul>
+<p>I think the strong advisor strategy (like GPT-5.6 Sol or Fable) is going to be a standard strategy in auto-research flows. Think very big models with state-of-the-art training. Claude Code provides an <code>/advisor</code> command for this too.</p>
+<blockquote><div lang="en" dir="ltr"><p>We're bringing the advisor strategy to the Claude Platform.</p><p>Pair Opus as an advisor with Sonnet or Haiku as an executor, and get near Opus-level intelligence in your agents at a fraction of the cost. <a href="https://t.co/fRkegyMs5t">pic.twitter.com/fRkegyMs5t</a></p></div><br>Claude (@claudeai) <a href="https://x.com/claudeai/status/2042308622181339453?ref_src=twsrc%5Etfw">April 9, 2026</a></blockquote> 
+<h3 id="implementation-hints">Implementation Hints</h3><p>My directory structure looked like this by the end:</p>
+<div><pre><span></span>qr/
+├── submission.py                    # the live entry
+├── submission_*.py            (560) # named submission variants (crystal_rain, blue_reply, …)
+├── modal_b200_*.py            (119) # Modal B200 probe / compare scripts
+│
+├── AGENTS.md                        # top-level notes / logs
+├── attempts_log.md
+├── claude_ideas.md
+├── leaps.md
+├── problem_statement.md
+│
+├── docs/                      ( 68) # per-experiment writeups &amp; status docs
+├── code/                            # the actual QR kernel source tree
+├── scripts/                         # summarizers, timing, submit helpers
+├── archive/                         # cleaned-out old submissions &amp; probes
+│   ├── submissions_20260616_17/
+│   ├── submissions_20260618_20/
+│   ├── probe_scripts_cleanup_20260627/
+│   └── …
+├── submit_logs/                     # logs provided by the evaluator for each submission
+└── profile.*/                       # captured NCU profile runs
+</pre></div>
+<p>Here's what my AGENTS.md looked like by the end:</p>
+<blockquote>
+<h2 id="leaderboard-agent-notes">Leaderboard Agent Notes</h2><p>This workspace is for leaderboard-style optimization work. Follow these standing instructions unless the user explicitly overrides them.</p>
+<h2 id="submission-discipline">Submission Discipline</h2><ul>
+<li>Don't hesitate to use sub-agents. Give them relevant instructions so they can do their task.</li>
+<li>Profile after major changes or major score gains.</li>
+<li>Use an advisor model when you are stuck or need fresh ideas. It can help break tunnel vision.</li>
+<li>Don't be afraid to implement hard tasks.</li>
+<li>Don't hesitate to take risks.</li>
+<li>Be open to new ideas and search the internet at times for new idea exposure.</li>
+<li>Before submitting, run the cheapest available sanity check for the candidate file.</li>
+<li>Keep submission logs under <code>submit_logs/</code>.</li>
+<li>Always save submit output into a timestamped log.</li>
+<li>Space leaderboard submissions out. Do not stack rapid back-to-back submissions unless explicitly asked.</li>
+<li>Treat a timeout as inconclusive, not as a correctness/performance rejection.</li>
+<li>Treat a completed residual failure or timing regression as real evidence.</li>
+<li>Only completed pass/fail/timing output is evidence.</li>
+</ul>
+<h2 id="beam-search-discipline">Beam Search Discipline</h2><p>Do not optimize as a single-incumbent hill climb. Maintain a small beam of active idea families so that local negative results do not prematurely kill useful ingredients.</p>
+<ul>
+<li>Keep a live beam note in <code>docs/</code>.</li>
+<li>Each beam entry should record the parent candidate, hypothesis, exact changed functions or gates, current best candidate/log, and next singleton, combination, or kill decision.</li>
+<li>Keep at least 3 active beams when there is enough work:<ul>
+<li>one exploit beam near the current best,</li>
+<li>one near-miss beam,</li>
+<li>one structural/high-risk beam from profiling or external ideas,</li>
+<li>one cleanup/compile-time beam only if it has not consumed the whole search.</li>
+</ul>
+</li>
+<li>Use sub-agents to work different beams, not many variants of the same tiny parameter unless explicitly asked for a parallel sweep.</li>
+<li>Do not declare a family dead after isolated singletons fail.</li>
+<li>If two ideas are individually neutral or slightly slower but touch independent costs, try combining them before retiring the family unless correctness risk is high.</li>
+<li>Preserve near-misses as beam material when they show a repeatable isolated win, improve one important case, remove overhead, or change an algorithmic surface that can combine with another beam.</li>
+<li>Kill a beam only with a clear reason: inherent correctness failure, repeated meaningful regression after a reasonable retune, singleton and plausible combinations both lose, profile evidence shows the targeted cost is no longer material, or implementation cost is blocking higher-value beams.</li>
+<li>After every 3-5 submissions, update the beam note with the current beam ranking and next combination candidates.</li>
+</ul>
+<ul>
+<li>When a new candidate is promoted into the active file, stage the promoted candidate, active file, evidence docs/logs, and any archive moves.</li>
+<li>Commit after promotion unless the user says not to.</li>
+<li>Use a lower-case commit subject and describe both what changed and what made the improvement in the commit body.</li>
+</ul>
+<h2 id="profiling-evidence-habits">Profiling / Evidence Habits</h2><ul>
+<li>Prefer current active evidence over older sidecar timings.</li>
+<li>Keep raw profile logs and JSON under <code>submit_logs/</code>.</li>
+<li>When a candidate is rejected or promoted, update the relevant doc in <code>docs/</code>.</li>
+<li>Use <code>rg</code> for searching when possible.</li>
+<li>Archive older candidates, profile logs, and probe scripts so the root stays navigable.</li>
+</ul>
+<h2 id="known-tried-ideas">Known Tried Ideas</h2><ul>
+<li>Do not mirror every attempt summary here. Check <code>docs/</code> before repeating an idea, and update the relevant doc when an idea is rejected or promoted.</li>
+<li>Do not repeat rejected ideas as-is. If revisiting one, make the algorithmic difference explicit in the doc/log.</li>
+<li>If a platform or evaluator rule rejects a class of ideas, record it clearly so future agents do not rediscover the same invalid path.</li>
+</ul>
+</blockquote>
+<h3 id="what-i-could-have-done-better">What I could have done better</h3><p>While there is scope for improvement in my simple harness, most of my shortcomings were problem-specific. I had these realizations after scanning the top 10 submissions and reading <a href="https://ml-mike.com/writing/qr_v2/">Mike's</a> writeup.</p>
+<ul>
+<li><p>The n = 512 and n = 1024 cases had multiple input distributions such as dense, clustered, rank-deficient, mixed, and near-rank families. The faster kernels had written data detectors and exploited distributions, e.g. low-rank cases have lots of zeros, so how do we exploit this? I could have pushed Codex more here or at least inquired more in this regard.</p>
+</li>
+<li><p>Top 10 solutions more aggressively removed library functions. For example, the 2nd and 5th solutions used custom triangular inverse instead of using PyTorch triangular solve. My solution had lots of back and forth between PyTorch and Triton.</p>
+</li>
+<li><p>Could have kept the trailing matrix resident in <code>fp16</code> instead of repeatedly moving between representations. This was an unknown unknown for me and was purely a domain expertise miss.</p>
+</li>
+<li><p>I should have had the beam of candidates from the start</p>
+</li>
+<li><p>Write a more robust profiler to test the mixed precision cases</p>
+</li>
+<li><p>Wasn't able to use <code>tcgen05</code> instructions, NVIDIA's fifth-generation tensor-core instructions on Blackwell, to exploit B200 tensor cores more</p>
+</li>
+</ul>
+<h3 id="conclusion">Conclusion</h3><p>I placed 12th out of 183, with a 232x speedup over baseline. More importantly, I learned a lot about GPU kernel optimization, auto-research (or loop engineering?) basics, and some B200-specific details.</p>
+<p>I also concluded that domain expertise accelerates both harness design and human-in-the-loop steering. I also had a couple of observations. There is a spectrum for how domain-specific engineers want to make things. On the left, people want to make a general harness that can self-improve. On the other end, people are interested in making very problem/environment-specific harnesses. I personally lean toward problem-specific harnesses.</p>
+<p>I hope you enjoyed reading this and learned something new. <strong>If you liked this blog, please like/upvote/share!</strong></p>
+<p>By the way, the second contest in the series, <a href="https://www.gpumode.com/leaderboard/775?tab=rankings">eigen decomposition</a>, is currently going on. See you on the leaderboard.</p>
+<h3 id="references">References</h3><p>I used the following to revise or learn new concepts.</p>
+<p><a href="https://modal.com/gpu-glossary">Modal GPU glossary</a></p>
+<p><a href="https://siboehm.com/articles/22/CUDA-MMM">How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog</a></p>
+<p><a href="https://www.paulwillchan.com/articles/outperforming-cublas-b200">Outperforming cuBLAS on NVIDIA B200</a></p>
+<p><a href="https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog">Outperforming cuBLAS on H100: a Worklog</a></p>
+<p><a href="https://ml-mike.com/writing/qr_v2/">Fast QR decomposition on NVIDIA B200 GPUs</a> - Mike's writeup helped me revise the problem itself lol.</p>
+<p>Additional references that I wish to go through:</p>
+<p><a href="https://veitner.bearblog.dev/blog/">Simon's blog</a> - CuteDSL and B200-specific things.</p>
+<p><a href="https://gau-nernst.github.io/">gau-nernst blog</a> - gau-nernst placed 2nd.</p>
+<h3 id="acknowledgements">Acknowledgements</h3><p><a href="https://x.com/marksaroufim">Mark Saroufim</a>, <a href="https://x.com/_arohan_">Rohan Anil</a>, for hosting the contest. <a href="https://x.com/myainotez">Sinatras</a> for detecting reward hacks and encouraging me initially.</p>
+<p><a href="https://x.com/Michael_J_Lutz">Mike</a> placed 5th and wrote an amazing <a href="https://ml-mike.com/writing/qr_v2/">writeup</a> that decodes the problem and has great visuals.</p>
+<p><a href="https://x.com/levidiamode">Levidiamode</a> for valuable posts around GPU kernels, <a href="https://tokenbender.com/">Tokenbender</a> for nudging me to write this, and <a href="https://x.com/blelbach">CUDA colonel</a> for providing tips on the GPU Mode server.</p>
+<p>Claude Opus 4.8 and GPT-5.5 (Codex) helped with editing and math-related writing.</p>
+
+
+    
+
+    
+        
+
+        
+            
+
+
+        
+
+        
+            
+        
+    
+
+
+  </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The other Sean Byrne doesn't exist (273 pts)]]></title>
             <link>https://conic.al/writing/the-other-sean-byrne-doesnt-exist/</link>
             <guid>49307592</guid>
             <pubDate>Sat, 15 Aug 2026 04:18:44 GMT</pubDate>
@@ -167,7 +710,7 @@ Ireland</p>
         </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Ploopy A+ Trackball Is Here (113 pts)]]></title>
+            <title><![CDATA[The Ploopy A+ Trackball Is Here (116 pts)]]></title>
             <link>https://blog.ploopy.co/the-aplus-is-finally-here-499</link>
             <guid>49306443</guid>
             <pubDate>Sat, 15 Aug 2026 00:55:31 GMT</pubDate>
@@ -175,7 +718,7 @@ Ireland</p>
 Couldn't get https://blog.ploopy.co/the-aplus-is-finally-here-499: Error: Request failed with status code 500]]></description>
         </item>
         <item>
-            <title><![CDATA[Simplifying and Refactoring Introductory Calculus (2018) (110 pts)]]></title>
+            <title><![CDATA[Simplifying and Refactoring Introductory Calculus (2018) (114 pts)]]></title>
             <link>https://arxiv.org/abs/1811.03459</link>
             <guid>49306196</guid>
             <pubDate>Sat, 15 Aug 2026 00:15:23 GMT</pubDate>
@@ -244,7 +787,7 @@ Couldn't get https://blog.ploopy.co/the-aplus-is-finally-here-499: Error: Reques
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Jane Street suffers $15B hit after meltdown at Situational Awareness (127 pts)]]></title>
+            <title><![CDATA[Jane Street suffers $15B hit after meltdown at Situational Awareness (128 pts)]]></title>
             <link>https://www.ft.com/content/47dd5308-dd17-404a-a615-61046defd697</link>
             <guid>49305927</guid>
             <pubDate>Fri, 14 Aug 2026 23:40:37 GMT</pubDate>
@@ -252,7 +795,7 @@ Couldn't get https://blog.ploopy.co/the-aplus-is-finally-here-499: Error: Reques
 Couldn't get https://www.ft.com/content/47dd5308-dd17-404a-a615-61046defd697: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Stop sending me huge PRs; a rant (127 pts)]]></title>
+            <title><![CDATA[Stop sending me huge PRs; a rant (130 pts)]]></title>
             <link>https://getsmall.xyz/post/cmstjfl9l000if70ljmpzr4va</link>
             <guid>49305558</guid>
             <pubDate>Fri, 14 Aug 2026 22:48:15 GMT</pubDate>
@@ -421,7 +964,7 @@ Couldn't get https://www.ft.com/content/47dd5308-dd17-404a-a615-61046defd697: Er
 					</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[eigendrum (195 pts)]]></title>
+            <title><![CDATA[eigendrum (200 pts)]]></title>
             <link>https://eigendrum.com/#p=circle</link>
             <guid>49305250</guid>
             <pubDate>Fri, 14 Aug 2026 22:15:12 GMT</pubDate>
@@ -552,7 +1095,7 @@ Couldn't get https://www.ft.com/content/47dd5308-dd17-404a-a615-61046defd697: Er
       </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Going Dark, and the era of law enforcement hacking (385 pts)]]></title>
+            <title><![CDATA[Going Dark, and the era of law enforcement hacking (392 pts)]]></title>
             <link>https://blog.cryptographyengineering.com/2026/08/14/everything-is-about-to-go-dark/</link>
             <guid>49304447</guid>
             <pubDate>Fri, 14 Aug 2026 20:52:44 GMT</pubDate>
@@ -672,7 +1215,7 @@ Couldn't get https://www.ft.com/content/47dd5308-dd17-404a-a615-61046defd697: Er
 Couldn't get https://www.cnn.com/2026/08/14/business/vishal-garg-better-ceo: Error: Request failed with status code 451]]></description>
         </item>
         <item>
-            <title><![CDATA[Firefox is now the last major browser that still supports uBlock Origin (1287 pts)]]></title>
+            <title><![CDATA[Firefox is now the last major browser that still supports uBlock Origin (1346 pts)]]></title>
             <link>https://www.pcworld.com/article/3212428/firefox-is-now-the-last-major-browser-that-still-supports-ublock-origin.html</link>
             <guid>49303202</guid>
             <pubDate>Fri, 14 Aug 2026 19:03:20 GMT</pubDate>
@@ -726,7 +1269,7 @@ Couldn't get https://www.cnn.com/2026/08/14/business/vishal-garg-better-ceo: Err
 </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Racket v9.3 (116 pts)]]></title>
+            <title><![CDATA[Racket v9.3 (117 pts)]]></title>
             <link>https://blog.racket-lang.org/2026/08/racket-v9-3.html</link>
             <guid>49302562</guid>
             <pubDate>Fri, 14 Aug 2026 18:14:48 GMT</pubDate>
@@ -781,7 +1324,7 @@ See https://blog.racket-lang.org/2026/08/racket-v9-3.html for the release announ
 </col-2></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Count Binface receives over a quarter of votes in Clacton by-election (446 pts)]]></title>
+            <title><![CDATA[Count Binface receives over a quarter of votes in Clacton by-election (449 pts)]]></title>
             <link>https://www.bbc.com/news/articles/ce97mm3vvemo</link>
             <guid>49301260</guid>
             <pubDate>Fri, 14 Aug 2026 16:45:49 GMT</pubDate>
@@ -789,7 +1332,7 @@ See https://blog.racket-lang.org/2026/08/racket-v9-3.html for the release announ
 <div id="readability-page-1" class="page"><div id="bbc-main"><article><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/ea9d/live/9d458100-963f-11f1-8414-97750c5a4202.jpg.webp" loading="eager" alt="Getty Images A man with a bin on his head poses triumphantly outside a giant glass window. The bin is silver with a slit cut out for his eyes and a square hold for his mouth. He also wears black gloves, a black breastplate, knee and elbow guards, and a long silver cape. "><span>Getty Images</span></p></div><p><figcaption>Count Binface is standing against Nigel Farage in the Clacton by-election </figcaption></p></figure></div><div data-component="text-block"><p>Count Binface, the self-styled intergalactic space warrior, has received nearly 10,000 votes in the Clacton by-election, his best performance yet.</p></div><div data-component="text-block"><p>Farage has re-won his seat, receiving more than 22,000 votes in Clacton, on the Essex coast.</p></div><div data-component="text-block"><p>Binface received 26.9% of the vote while Farage won 63.3%. Binface had<b id=""> </b>his highest share yet with 9,455 votes, having lost to no fewer than three prime ministers, and one who later became prime minister, in previous attempts.</p></div><div data-component="text-block"><p>But how many votes has he previously received? And where does he fit into the British tradition of spoofing politicians?</p></div><div data-component="subheadline-block"><p><h2>2017: May the force be with you</h2></p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/7ac4/live/44867fc0-963e-11f1-8414-97750c5a4202.jpg.webp" loading="lazy" alt="Getty Images A row of candidates can be seen on stage at the election count. Theresa May is on the far left of at least nine candidates on stage. She wears a bright red skirt suit and matching high heels, with her grey hair in a neat bob. She has her hands clasped on front of her and is smiling wryly. Lord Buckethead is on the far left of the row of candidates and is doing a dab. He wears a large black bucket on his head, with black armour and a black cape with a sliver lining."><span>Getty Images</span></p></div><p><figcaption>Theresa May (far left) keeps her distance from Lord Buckethead at her election count</figcaption></p></figure></div><div data-component="text-block"><p>The man inside the bin is the comedian Jon Harvey, an Oxford graduate who has specialised in satire, writing scripts for BBC comedy shows The Thick of It and Have I Got News For You.</p></div><div data-component="text-block"><p>He first donned a bin on his head to stand for election in 2017, when he challenged the then Prime Minister Theresa May in her Maidenhead constituency, although back then he was known as Lord Buckethead, a character inspired by a Star Wars parody film.</p></div><div data-component="text-block"><p>He won 249 votes and viral fame, leading to an appearance on John Oliver's HBO show Last Week Tonight - as well as a legal dispute with another Lord Buckethead he described at the time as "an unpleasant battle on the planet Copyright".</p></div><div data-component="subheadline-block"><p><h2>2019: The bin takes on Boris Johnson</h2></p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/de67/live/ace19640-963e-11f1-8414-97750c5a4202.jpg.webp" loading="lazy" alt="Getty Images Boris Johnson is in the centre of the photo, wearing a black suit with a pale blue shirt and a red spotted tie. Behind him to the right is Count Binface, wearing a large silver bin on his head and a silver cape. On his right is a man dressed as the fuzzy red Sesame Street character Elmo."><span>Getty Images</span></p></div><p><figcaption>Binface gets in the picture as Boris Johnson is re-elected as MP for Uxbridge</figcaption></p></figure></div><div data-component="text-block"><p>Harvey found himself a different bin to cover his head and switched characters to Count Binface to take on the next Conservative leader, Boris Johnson, announcing himself as the leader of the Recyclons from planet Sigma IX.</p></div><div data-component="text-block"><p>He only won 69 votes, but was again able to take his place on stage as the election result was declared alongside a sitting prime minister, who was also flanked by a candidate dressed as the Sesame Street character Elmo, at his Uxbridge election count.</p></div><div data-component="subheadline-block"><p><h2>2024: Sunak takes out the trash</h2></p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/9ed4/live/f847f480-963e-11f1-870d-5d08c49babb2.jpg.webp" loading="lazy" alt="Getty Images Rishi Sunak is standing on stage in front of a bright purple backdrop with the slogan visit North Yorkshire. He is on the left of the photograph, giving a speech at a podium, with other candidates lined up to his right. Count Binface is standing on the right of the stage in his costume."><span>Getty Images</span></p></div><p><figcaption>Binface had competition from a Monster Raving Loony ventriloquist at Rishi Sunak's count</figcaption></p></figure></div><div data-component="text-block"><p>A third Conservative leader, Rishi Sunak, was in Count Binface's sights in the 2024 general election campaign.</p></div><div data-component="text-block"><p>He got 308 votes, which at the time was his best result.</p></div><div data-component="text-block"><p>The Monster Raving Loony Party's candidate, Sir Archibald Stanton, received 99 votes - 0.2% of the vote share.</p></div><div data-component="subheadline-block"><p><h2>2026: Burnham courts the Count</h2></p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/8954/live/51298e60-963f-11f1-8414-97750c5a4202.jpg.webp" loading="lazy" alt="Getty Images Burnham is in the centre of the photograph, wearing a black suit over a black t-shirt, and shaking hands with Count Binface on his left. To his right is a man dressed as a fox, holding a placard reading Protect British Wildlife."><span>Getty Images</span></p></div><p><figcaption>Newly-elected MP for Makerfield Andy Burnham shakes hands with the Count</figcaption></p></figure></div><div data-component="text-block"><p>In June this year, it was Andy Burnham's turn to face Binface in the by-election that paved the way for the then Greater Manchester Mayor to become prime minister.</p></div><div data-component="text-block"><p>Rather than studiously ignoring the intergalactic warlord, as some may have been tempted to do, Burnham shook him warmly by the hand as he was elected Labour MP for Makerfield.</p></div><div data-component="text-block"><p>Binface bagged just 95 votes to Burnham's 24,927.</p></div><div data-component="subheadline-block"><p><h2>2026: The Bin's best result yet</h2></p></div><div data-component="text-block"><p>While Nigel Farage won the Clacton by-election on Friday morning, Count Binface came second.</p></div><div data-component="text-block"><p>The Reform UK leader got 22,239 while Count Binface received 9,455. The intergalactic space warrior celebrated the number with his usual two peace sign fingers.</p></div><div data-component="text-block"><p>Speaking to BBC Breakfast after, Binface said: "I promised to be a local champion for Clacton and I thought to hear the verdict of the Clactonites was the least I could do."</p></div><div data-component="subheadline-block"><p><h2>A great British tradition?</h2></p></div><div data-component="text-block"><p>The UK has a rich history of novelty candidates standing in elections, with Monster Raving Loony Party founder Screaming Lord Sutch - a rock musician who fought more than 40 elections in his trademark top hat and gold lame suit - first standing in a by-election in the 1960s. A different Lord Buckethead stood in 1987 and 1992, while comedian Al Murray's pub landlord stood against Farage in 2015.</p></div><div data-component="text-block"><p>Objections to such "frivolous" candidates date back even further - to 1918, when a £150 deposit was introduced for candidates. That was later upped to £500, in 1985, in large part due to the popularity of the Monster Raving Loony Party.</p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/af02/live/17477b70-9640-11f1-8414-97750c5a4202.jpg.webp" loading="lazy" alt="BBC/ Willie Smith Screaming Lord Sutch of the Monster Raving Loony Party, at their 1990 party conference. He wears a leapoard skin suit with a matching leopardskin top hat and is sitting astride an orange spacehopper. He is wearing several giant yellow and black rosettes and carries a golden loudhailer, all with the slogan Vote Lord Sutch. He is surrounded by a group of supporters also riding spacehoppers in a car park."><span>BBC/ Willie Smith</span></p></div><p><figcaption>Screaming Lord Sutch was co-founder of the Monster Raving Loony Party in 1982</figcaption></p></figure></div><div data-component="text-block"><p>But the bar for entry remains fairly low: anyone over the age of 18 who can scrape together a £500 deposit and get support from 10 people in the form of signatures is allowed to stand as a candidate in UK elections.</p></div><div data-component="text-block"><p>That's why Count Binface has been able to stand in so many high-profile elections. He has, however, lost his £500 every time, after failing to meet the minimum 5% of votes cast in order for his deposit to be returned.</p></div><div data-component="text-block"><p>Yet Binface has had his moment in the spotlight each time.</p></div><div data-component="text-block"><p>That is because another British tradition means all election candidates must stand side-by-side on a stage at the election count to hear how many votes they have each received - it's a literal leveller, where everyone from prime minsters to a bloke dressed as a bin has the right to be seen and heard as an official candidate.</p></div><div data-component="text-block"><p>But all of these no-hope novelty candidates share a few serious aims: to poke fun at power, prick the pomposity of political elites, and allow people a protest vote.</p></div><div data-component="image-block"><figure><div><p><img src="https://static.files.bbci.co.uk/bbcdotcom/web/20260729-174851-148577b706-web-3.17.0-2/grey-placeholder.png" aria-label="image unavailable"><img sizes="(min-width: 1280px) 50vw, (min-width: 1008px) 66vw, 96vw" srcset="https://ichef.bbci.co.uk/news/240/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 240w,https://ichef.bbci.co.uk/news/320/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 320w,https://ichef.bbci.co.uk/news/480/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 480w,https://ichef.bbci.co.uk/news/640/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 640w,https://ichef.bbci.co.uk/news/800/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 800w,https://ichef.bbci.co.uk/news/1024/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 1024w,https://ichef.bbci.co.uk/news/1536/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp 1536w" src="https://ichef.bbci.co.uk/news/480/cpsprodpb/6fad/live/133a6af0-dc98-11ef-bc01-8f2c83dad217.png.webp" loading="lazy" alt="Thin, red banner promoting the Politics Essential newsletter with text saying, “Get the latest political analysis and big moments, delivered straight to your inbox every weekday”. There is also an image of the Houses of Parliament."></p></div></figure></div></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Maximizing the value of your Claude Code sessions (266 pts)]]></title>
+            <title><![CDATA[Maximizing the value of your Claude Code sessions (278 pts)]]></title>
             <link>https://claude.com/blog/maximizing-the-value-of-your-claude-code-sessions</link>
             <guid>49300800</guid>
             <pubDate>Fri, 14 Aug 2026 16:15:21 GMT</pubDate>
@@ -797,7 +1340,7 @@ See https://blog.racket-lang.org/2026/08/racket-v9-3.html for the release announ
 <div id="readability-page-1" class="page"><div><h3>Input and output tokens</h3><p>A request goes through the GPU in two phases, and they cost different amounts.&nbsp;</p><p>First, during prefill, the model reads your request and context: the system prompt, your <code>CLAUDE.md</code>, your message, and everything that's been added to the conversation since (the files Claude has read and the output of the commands it ran). Those are your input tokens.</p><p>Then, during decode, it writes output tokens: its thinking, the tool calls it makes, and the text you see. This happens one token at a time; a 200-token response is 200 runs of the model, one after the other. Per token, decode keeps the GPU busy for a lot longer, which is why output is priced at roughly 5x input.</p><figure><p><img alt="" src="https://cdn.prod.website-files.com/68a44d4040f98a4adf2207b6/6a7f1947bc7cd69c4c891a0f_c69dbb11.png" loading="lazy"></p></figure><p>A lot of the output tokens in a session are thinking tokens, and how much thinking the model does per turn is what the effort level controls. Like the model, the level you pick with <code>/effort</code> sticks around as your default for the next session too.</p><blockquote><strong>Tip: </strong>run <code>/model </code>and <code>/effort</code> once in a fresh session to see what you're actually on. Both remember whatever you picked last time, and you want that decision to be deliberate.</blockquote><blockquote><strong>Tip: </strong>if you already know a session is going to be grunt work, <code>MAX_THINKING_TOKENS=0</code> claude turns thinking off for that one session (except on Fable 5), which is the step below <code>/effort</code> low.</blockquote><h3>Prompt caching</h3><p>If a request starts with exactly the same tokens as a request the server just saw, the state for that shared beginning comes out the same, so the server can keep it around from last time and only prefill whatever comes after it. This is called prompt caching.</p><p>Reading from the cache costs 0.1x the input price, because the server loads the state instead of computing it. Writing tokens into the cache costs a bit more than normal input, up to 2x, since the server also has to hold on to the state afterwards. But the write happens once per token, and the 0.1x reads happen on every turn after it.</p><p>Claude Code manages the prompt cache on every request, there's nothing to turn on. However you can break it, so it's important to know how to avoid these cost spikes.</p><p>Say we type "fix the failing test in <code>utils.test.ts</code>". Here's what Claude Code sends for it:</p><ol role="list"><li>Claude Code assembles the first request out of the system prompt (tool definitions included), your <code>CLAUDE.md</code>, and your message, and sends it off (input tokens). Nothing is in the cache yet, so all of it gets prefilled and written into the cache.</li></ol><ol start="2" role="list"><li>The model can't fix a test it hasn't seen, so it thinks for a moment and responds with a Read call for <code>utils.test.ts</code> (output tokens). Claude Code reads the file, appends it to the conversation, and sends the whole thing again (input tokens). This time everything from request 1 is read back out of the cache at a tenth of the price, and the only thing prefilled at full price is what's new: the Read call and the file.</li></ol><ol start="3" role="list"><li>Now the model wants the file under test (output). Another Read, another append, and everything goes out again: requests 1 and 2 from the cache, the second file at full price (input).</li></ol><ol start="4" role="list"><li>The model responds with an Edit (output). Claude Code applies it, appends the result, and sends everything again. Same story: the Edit and its result are new, everything in front of them is a cache read (input).</li></ol><ol start="5" role="list"><li>The model runs <code>npm test </code>(output). Claude Code appends the test output and sends everything again, with the test output as the only new part (input).</li></ol><ol start="6" role="list"><li>The tests pass, and the model responds with a short summary (output). No tool call means nothing to append and no request 6, so we're done.</li></ol><p>That's five requests for one small fix, and every one of them contained the entire conversation up to that point. A typical turn is lopsided: tens of thousands of tokens going in, a few hundred coming out. But only what's new in that turn gets prefilled at full price.&nbsp;</p><p>That's the whole per-turn bill: cache reads on the history, full input price on whatever's new, and the output price on the response.</p><blockquote>This applies on a subscription too. You don't see these prices directly, but the same requests are what draw down your limits.</blockquote><p>The cache has to match from the very start of the request forward, and requests always go out in the same order: tool definitions, then the system prompt, then the conversation (with <code>CLAUDE.md</code> at the front of it).&nbsp;</p><p>If anything in that prefix changes, everything behind it gets prefilled again. A tool result appended to the end of the conversation is the ideal case, since nothing is behind it. What throws the cache away is anything that changes the request further towards the front, or changes what the cache is keyed on:</p><ul role="list"><li><strong><code>/model</code></strong>: every model has its own cache, so on the next turn the entire conversation gets prefilled again at full price. (This includes opusplan, which switches models every time you go in or out of plan mode.)</li><li><strong><code>/effort:</code></strong> the effort level is part of what the cache is keyed on too, so it's the same story. It's why both <code>/model </code>and <code>/effort </code>ask you to confirm when you switch in the middle of a conversation.</li><li><strong>Fast mode</strong>: also part of the key, and the re-prefill happens at fast mode prices, so if you're going to turn it on, turn it on at the start. (Turning it off again is free, cache-wise.)</li><li><strong><code>/compact</code></strong>: the conversation gets replaced with a shorter one, so nothing in it matches anymore (the system prompt in front of it survives). Writing the summary itself is cheap as long as the old conversation is still in the cache, so it's a lot cheaper before a long break than after one.</li><li><strong>Time:</strong> every turn resets the clock, but the cache expires after an hour on a subscription or five minutes on an API key (<code>ENABLE_PROMPT_CACHING_1H=1 </code>makes it an hour). Come back later than that, and the next turn prefills the whole conversation again. Resuming an old session almost always does too: the cache is usually gone by then, and the system prompt gets rebuilt at launch anyway.</li></ul><p>None of this means you should never switch models or effort. It means there are cheap moments to do it, the start of a session or right after a <code>/clear</code>, and expensive ones, the middle of a long conversation.</p><blockquote><strong>Tip: </strong>if the last few turns went somewhere you don't want to keep,<code> /rewind</code> to just before them instead of running <code>/compact</code>. Rewinding only cuts those turns off the end, so everything before them is still cached and it costs nothing. Compacting rewrites the whole conversation, so it always costs something.</blockquote><h2><strong>What decides how many tokens a session sends</strong></h2><p>The main thing to know here is that nothing gets sent just once. Everything that ends up in the conversation, a file Claude read or the output of a command it ran, gets sent again on every turn after it, for the rest of the session.&nbsp;</p><p>It's cached, so each of those re-sends is cheap, but cheap isn't nothing, and it's taking up room in the context the model has to think around on every turn too.</p><p>That's really the whole cost model of a session: how many tokens end up in the context, how many turns they stay there, and how many contexts you're running at the same time.</p><h3><strong>What ends up in the context</strong></h3><p>Part of what's in the context is there before you type anything: the tool definitions, the system prompt, <code>CLAUDE.md</code>, and whatever else gets loaded at startup.</p><blockquote><strong>Tip</strong>: run <code>/context</code> in a fresh session to see what's in there before you've typed anything. Keep <code>CLAUDE.md</code> to specific instructions and move workflow-specific ones into skills, which only get loaded when they're used. If there's an MCP server you don't need in this session, turn it off with <code>/mcp</code>.</blockquote><p>Nearly everything else that gets added during the session is tool results: the files Claude reads, and the output of the commands it runs.</p><p>How much Claude reads mostly comes down to how much it has to figure out on its own. If you say "the tests are failing", it first has to find out which tests: a grep or two, a few files opened to see which one is relevant, and all of those results stay in the context long after they've stopped being useful.&nbsp;</p><p>"Fix the failing test in <code>utils.test.ts</code>" skips the searching and costs one Read call for the file, and "Fix the failing test in <code>@utils.test.ts</code>" doesn't cost the Read call either.</p><figure><p><img alt="" src="https://cdn.prod.website-files.com/68a44d4040f98a4adf2207b6/6a7f1b213f60488b546224d4_cab63270.png" loading="lazy"></p></figure><blockquote><strong>Tip:</strong> when you're referring to a file, @-mention it instead of typing the path. Claude Code attaches the file to your message before anything gets sent, so it's in the very first request and there's no Read call for it. The file itself takes up the same room in the context either way, so you only need to mention it once per conversation: it stays there, and @-mentioning it again on a later turn generally attaches a second copy.</blockquote><p>The other thing that fills up the context is the output of the commands Claude runs. Every time it runs your tests, a build, or a git log, whatever that prints gets appended to the conversation just like a file it read, and stays there for the same number of turns.</p><p>Really big outputs are actually fine: after 30,000 characters Claude Code writes the output to a file and only puts a short preview and the path in the conversation (<code>BASH_MAX_OUTPUT_LENGTH</code> if you want to change it).&nbsp;</p><p>The problem is everything under that. A test runner that prints 400 passing tests one line at a time comes in under the limit, and those 400 lines are now part of every remaining turn.&nbsp;</p><p>Claude will often take care of this for you with flags and tail, and if you'd rather not leave it up to Claude, there's a small hook in the docs that rewrites noisy commands before they run so only the lines that matter come back.</p><blockquote><strong>Tip</strong>: put the two or three commands you run all day in <code>CLAUDE.md</code>, quiet flags included, the way you'd type them yourself ("run a single test file with <code>npx vitest run &lt;file&gt; --reporter=dot"</code>). It's a small addition, but it saves a turn and a few hundred lines of output in every session after it.</blockquote><h3>How many turns it stays there</h3><p>One long session costs more than the same work spread over a few short ones, and by more than you'd think, because turn 40 is also re-reading the 39 turns before it. You want the context in your session to be short and relevant, so don't carry one task's context into the next: <code>/clear </code>when you start something new, and <code>/compact</code> when the earlier part of the same task is done.</p><figure><p><img alt="" src="https://cdn.prod.website-files.com/68a44d4040f98a4adf2207b6/6a7f1cdb7fb1ad2229b0afa5_92ab0ee2.png" loading="lazy"></p></figure><blockquote><strong>Tip</strong>: <code>/rename</code> before you <code>/clear </code>if you'll want the session back later. When you <code>/compact</code>, tell it what to keep, or put a "Compact instructions" section in <code>CLAUDE.md</code> if it's always the same thing. And if you're on a 1M model and would rather have the auto-compact safety net where it used to be, <code>/autocompact 200k</code> puts it back (needs Claude Code v2.1.221+).</blockquote><p>Keep an eye on turns that happen when you're not typing, too. A <code>/loop</code> fires as a full turn in the session you set it up in, carrying that whole conversation with it every time, and if it's been more than an hour since the last turn, it's a cache miss on top. Start a fresh session in another terminal and run the loop from there.</p><h3>Subagents</h3><p>The other way to keep something out of your context is to have it happen in a different one, which is what subagents are for. A subagent gets its own context window, with its own system prompt, the tools, and your <code>CLAUDE.md</code>, but not your conversation. It runs its own turns, and the only thing that comes back to the main session is its answer. Everything else is thrown away once it's done.</p><p>The downside of not having your conversation is that a subagent sometimes has to re-read things the main session already had, and it's paying for its own turns while it does. For a small job it's just overhead.&nbsp;</p><p>It pays off when a job produces a lot of output you don't need to keep, like going through a log. Claude will often reach for one on its own for that kind of thing, and you can ask for one directly when it doesn't ("go through this log in a subagent"). Just keep in mind that the main session only gets back what the subagent chose to report.</p><figure><p><img alt="" src="https://cdn.prod.website-files.com/68a44d4040f98a4adf2207b6/6a7f1cdb7fb1ad2229b0afaa_a653b369.png" loading="lazy"></p></figure><blockquote><strong>Tip</strong>: if there's a noisy job you hand off over and over, give it a subagent definition of its own with model: haiku (or sonnet). Otherwise it runs on whatever your main session is running on.</blockquote><h2>Where to look first</h2><p>Of everything above, four things are worth keeping an eye on, roughly in order of how much they cost:</p><figure><p><img alt="" src="https://cdn.prod.website-files.com/68a44d4040f98a4adf2207b6/6a7f1dd4531c50c7022d5171_df696a6b.png" loading="lazy"></p></figure></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[RustDesk now supports true unattended remote access on Wayland (320 pts)]]></title>
+            <title><![CDATA[RustDesk now supports true unattended remote access on Wayland (322 pts)]]></title>
             <link>https://rustdesk.com/blog/unattended-remote-access-wayland/</link>
             <guid>49300759</guid>
             <pubDate>Fri, 14 Aug 2026 16:12:52 GMT</pubDate>
@@ -805,7 +1348,7 @@ See https://blog.racket-lang.org/2026/08/racket-v9-3.html for the release announ
 <div id="readability-page-1" class="page"><div><p>Wayland support has been one of the harder parts of Linux remote desktop.</p><p>RustDesk can now provide <strong>true unattended access on Wayland</strong>, without requiring someone at the remote machine to approve every session. <strong>Multi-monitor setups are supported as well.</strong></p><p>After the initial setup, you can connect even when no one is at the remote machine — including from the <strong>login screen</strong> after a reboot.</p><p>For now, we are releasing this as a separate preview build for <strong>x86_64 Debian/Ubuntu-based systems</strong>:</p><p><strong><a href="https://github.com/rustdesk/rustdesk/releases/download/nightly/rustdesk-unattended-wayland-1.4.9-x86_64.deb">Download the Wayland unattended access build</a></strong></p><p>Wayland support is still limited in several major remote desktop products. AnyDesk currently requires Xorg for incoming Linux sessions, while TeamViewer still describes Wayland support as experimental for common desktop environments.</p><p>We would like to get more real-world testing before making this the default.</p><p>Once the implementation is stable, we plan to bring unattended Wayland access to more Linux distributions, including <strong>Fedora and Arch Linux</strong>, and eventually include it in the standard RustDesk releases.</p><p>If you use Wayland, especially with multiple monitors, please give the preview build a try and let us know what works—and what doesn’t.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[France's top court blocks social media ban for under-15s (222 pts)]]></title>
+            <title><![CDATA[France's top court blocks social media ban for under-15s (224 pts)]]></title>
             <link>https://www.reuters.com/world/frances-top-court-rules-social-media-ban-curtails-freedom-expression-2026-08-14/</link>
             <guid>49300671</guid>
             <pubDate>Fri, 14 Aug 2026 16:06:49 GMT</pubDate>
@@ -813,7 +1356,7 @@ See https://blog.racket-lang.org/2026/08/racket-v9-3.html for the release announ
 Couldn't get https://www.reuters.com/world/frances-top-court-rules-social-media-ban-curtails-freedom-expression-2026-08-14/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[AI by Hand (335 pts)]]></title>
+            <title><![CDATA[AI by Hand (338 pts)]]></title>
             <link>https://www.byhand.ai/</link>
             <guid>49300568</guid>
             <pubDate>Fri, 14 Aug 2026 15:58:59 GMT</pubDate>
@@ -821,7 +1364,7 @@ Couldn't get https://www.reuters.com/world/frances-top-court-rules-social-media-
 <div id="readability-page-1" class="page"><div id="block-3f6bc765-bff3-4c4c-8997-1dbe359e39e2" data-editor-isolation-target="content-block-3f6bc765-bff3-4c4c-8997-1dbe359e39e2"><p>Subscribe to receive new AI by Hand ✍️ content in your inbox!</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google is making private AI practical with homomorphic encryption (435 pts)]]></title>
+            <title><![CDATA[Google is making private AI practical with homomorphic encryption (443 pts)]]></title>
             <link>https://blog.google/security/how-google-is-making-private-ai-practical-with-homomorphic-encryption/</link>
             <guid>49300314</guid>
             <pubDate>Fri, 14 Aug 2026 15:43:10 GMT</pubDate>
@@ -2147,84 +2690,6 @@ It is also recommended to modify the <code>factor</code> as needed. For example,
   
   <p>You obviously know what cookies are. If we don't put this here, delighted lawyers from EU and CA will sue us. Not only this is very expensive, there are no browser settings to remove this, since every site does this differently. You voted for this! Also you have to click "I agree"</p>
 </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[I turned my RSS feeds into an e-ink newspaper to stop reading on my phone (170 pts)]]></title>
-            <link>https://heyjonny.dev/posts/rss-to-eink-newspaper/</link>
-            <guid>49299081</guid>
-            <pubDate>Fri, 14 Aug 2026 14:21:18 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://heyjonny.dev/posts/rss-to-eink-newspaper/">https://heyjonny.dev/posts/rss-to-eink-newspaper/</a>, See on <a href="https://news.ycombinator.com/item?id=49299081">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>  <article>   <p>I really like personal blogs. I read them for entertainment, learning, and to keep myself updated on the latest trends in software engineering. I prefer to read them in a horizontal position, like on a couch or a deckchair outside in the sun. That explains why I almost never read them on my computer and always on my phone. I don’t necessarily enjoy that, though, since it makes my eyes tired.</p>
-<p>This never bothered me enough to actively do something about it. But when I came across a pocket-sized e-reader called the X4 by Xteink, I got an idea. At only 4.3 inches, the X4 fits nicely in the palm of your hand. It also has no touchscreen and no backlight, and doesn’t ship with a preinstalled bookstore. While most people probably think of this as inconvenient or old-fashioned, a small community has gathered around this device. They even created an open source firmware for it called Crosspoint.<sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="" aria-describedby="footnote-label">1</a></sup></p>
-<p>At this point I already fell in love with the whole idea and ordered myself one. It took some time to ship it from China to Germany, and I worried the package might get stuck in customs. Luckily it didn’t. Once I got it, I wanted to try the stock firmware first, but it left so little impression that I can barely remember what it looked like. Within a few seconds I disliked it and wanted to install Crosspoint. To my greatest surprise, I had it installed after just three clicks. I then bought a DRM-free e-book, copied it to the X4, and started reading. I expected a lot more fiddling, but it just worked. Big shout out to all the contributors, you really nailed this.</p>
-<p>But the real reason I wanted the X4 was to read my blog posts on it instead of my phone. I would just need to create an e-pub from them and load them onto the X4. My own little newspaper. With the help of AI, I could build it in a couple of minutes.</p>
-<p>I use Feedbin as my RSS reader, which comes with a handy API. I just had to fetch all my unread posts, mark them as read, and create an e-pub from them. I also needed to filter out some feeds, since I subscribe to YouTube channels, JS-heavy blogs, and link-only newsletters that don’t make sense to read on e-ink. I won’t annoy you with the details, but if you want to take a look, you can find the project on GitHub. I called it <a href="https://github.com/jonashonecker/feedpaper">feedpaper</a> and you can install it via Homebrew.<sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="" aria-describedby="footnote-label">2</a></sup></p>
-<p>With a freshly printed feedpaper on my X4 (and my phone at home), I drove to one of my favorite outdoor cafés and enjoyed a good read with a latte. If you make your own feedpaper someday, I’d love to see a picture of it.</p>
-<p><img src="https://heyjonny.dev/rss-to-eink-newspaper.jpeg" alt="A hand holding the small X4 e-reader outdoors, its e-ink screen showing a blog post. A latte and a metal café chair sit in the sunlit background."></p>
-<section data-footnotes="">
-<ol>
-<li id="user-content-fn-1">
-<p><a href="https://crosspointreader.com/">Crosspoint</a> runs not only on the <a href="https://www.xteink.com/products/xteink-x4">X4</a>, but also other ESP32C3 based devices. <a href="#user-content-fnref-1" data-footnote-backref="" aria-label="Back to reference 1">↩</a></p>
-</li>
-<li id="user-content-fn-2">
-<p>it didn’t make sense to me to support any OS other than macOS, but if you want to check it out and can’t get it running manually, let me know. <a href="#user-content-fnref-2" data-footnote-backref="" aria-label="Back to reference 2">↩</a></p>
-</li>
-</ol>
-</section>  </article>  </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[In Australia, a Home Battery Boom Has Helped Cut Wholesale Power Prices in Half (329 pts)]]></title>
-            <link>https://e360.yale.edu/digest/australia-home-batteries</link>
-            <guid>49298910</guid>
-            <pubDate>Fri, 14 Aug 2026 14:07:52 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://e360.yale.edu/digest/australia-home-batteries">https://e360.yale.edu/digest/australia-home-batteries</a>, See on <a href="https://news.ycombinator.com/item?id=49298910">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section>
-                  
-<div>
-
-  <figure>
-
-    <div>
-      
-                  
-      <p><a href="https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=1200&amp;h=800&amp;auto=compress%2Cformat&amp;fit=crop&amp;dm=1786711355&amp;s=347aa00c6dac7cec6f67c29318bb8602" data-caption="" data-credit="NSW Climate and Energy Action">
-  
-  
-  
-    
-  
-  
-  
-      
-    
-                
-    
-                
-    
-                
-    
-                
-    
-                        
-  <img sizes="(min-width: 1450px) 832px, (min-width: 620px) 620px, 100vw" srcset="https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=1200&amp;h=800&amp;auto=compress%2Cformat&amp;fit=crop&amp;dm=1786711355&amp;s=347aa00c6dac7cec6f67c29318bb8602 1200w, https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=200&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=c7c9ade74260b30f5c7274a261ca534a 200w, https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=400&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=83ba0620e761ba5efd3aa6af08036bd5 400w, https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=600&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=ec09ca13ba32c15d330ba29743f0f57b 600w, https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=800&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=ec3e47cfc667b98874bbc9f1b4b22125 800w, https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=1000&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=8d69122eacb8566de1578da34e186961 1000w" src="https://yale-threesixty.transforms.svdcdn.com/production/Home-Battery_NSWECA.jpg?w=400&amp;auto=compress%2Cformat&amp;fit=clip&amp;dm=1786711355&amp;s=83ba0620e761ba5efd3aa6af08036bd5" alt="">
-</a>
-      </p>
-          </div>
-
-        <figcaption>
-              <p><span></span>
-          <span>NSW Climate and Energy Action</span></p>
-    </figcaption>
-    
-  </figure>
-
-</div> <!-- imageBlock -->
-            
-
-<div>
-  <p>A little more than one year ago, Australia rolled out a program to heavily subsidize home batteries, part of a larger effort to make use of the huge volumes of solar energy that were going to waste. On Friday, officials announced that more than 500,000 batteries had been installed under the plan, helping to slash wholesale power prices roughly in half.</p><p>Energy Minister Chris Bowen said that Australia now has more home batteries than the United States, which has a population 12 times larger. “This is a story of global significance that Australian households have achieved,” Bowen said in a <a href="https://www.pm.gov.au/media/press-conference-castle-hill-sydney">press conference</a>.</p><p>Australia is the <a href="https://www.green.com.au/solar/solar-statistics">world leader</a> in rooftop solar, with panels installed on more than one in three households, the highest rate of adoption globally. But abundant solar power has created a new dilemma as the grid faces a surge of electricity from connected rooftop arrays. Power prices <a href="https://theconversation.com/why-some-countries-give-away-free-electricity-and-even-pay-consumers-to-use-it-280852">plunge</a>. Centralized power plants are forced offline, threatening grid <a href="https://www.afr.com/companies/energy/the-hidden-crisis-behind-australia-s-solar-boom-20251119-p5ngpe">stability</a>. And much of that solar power <a href="https://www.abc.net.au/news/2025-11-10/renewable-energy-spilled-as-generation-outgrows-demand-/105929716">goes to waste</a>.</p><p>The government has moved to make use of this surplus solar energy, including by offering <a href="https://www.theguardian.com/environment/2026/jun/30/solar-sharer-offer-sso-three-free-hours-electricity-power-energy-australia">free power</a> in the early afternoon to homeowners in Queensland, New South Wales, and South Australia, regardless of whether they have solar panels on their roof or not. The goal is to spur more consumers to run appliances or charge electric vehicles during this window.</p><p>With its home battery <a href="https://www.energy.gov.au/rebates/cheaper-home-batteries-program">subsidy program</a>, launched in July 2025, the government is aiming to help households use more solar energy by providing a 30 percent discount on residential battery systems connected to solar arrays.</p><p>The subsidy program has spurred a boom in installations. Australia is on track to more than double its home battery capacity this year, <i>Bloomberg </i><a href="https://www.bloomberg.com/news/articles/2026-08-13/one-in-25-australian-homes-installed-a-battery-in-grid-shakeup">reports</a>. The program has also been a boon to the grid. By relying on batteries in the early evening, when demand peaks, homeowners are reducing the need for utilities to fire up additional power plants during those hours, which is helping to lower costs for other ratepayers, officials say.</p><p>The subsidy program has been “the major factor in the wholesale price of energy falling in Australia by 47 percent in the last 12 months,” Bowen said. “Australia is one of the very, very few countries in the world which is reducing wholesale prices in the midst of a global energy crisis.”</p><h2><strong>ALSO ON YALE E360</strong></h2><p><a href="https://e360.yale.edu/features/home-battery-vpps"><i><strong>A Home Battery Revolution Is Reshaping the Power Grid</strong></i></a></p>
-</div>
-                </section></div>]]></description>
         </item>
     </channel>
 </rss>
