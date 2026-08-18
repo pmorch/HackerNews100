@@ -4,12 +4,553 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 18 Aug 2026 09:30:32 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 18 Aug 2026 10:30:13 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[HNInternal: Ask HN: Does anyone else feel like nothing matters anymore? (172 pts)]]></title>
+            <title><![CDATA[Linux 7.3 improves performance when running out of vRAM (137 pts)]]></title>
+            <link>https://pixelcluster.dev/VRAM-Overcommit/</link>
+            <guid>49342719</guid>
+            <pubDate>Tue, 18 Aug 2026 07:51:50 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://pixelcluster.dev/VRAM-Overcommit/">https://pixelcluster.dev/VRAM-Overcommit/</a>, See on <a href="https://news.ycombinator.com/item?id=49342719">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+   <header>
+  <time datetime="2026-08-17T00:00:00+00:00">August 17, 2026</time>
+</header>
+
+   <p>Earlier this year, I blogged about work I did to <a href="https://pixelcluster.dev/VRAM-Mgmt-fixed">improve VRAM management</a>
+for games. Now, after many months of floating around in mailing lists, the kernel patches
+are finally merged upstream and queued for Linux 7.3! Hooray!</p>
+
+<p>To celebrate, let’s look a bit deeper at one sentence I wrote in my previous post:</p>
+<blockquote>
+  <p>[Games] should perform much more stable - as long as the game itself doesn’t
+  use more VRAM than you actually have.</p>
+</blockquote>
+
+<p>So, one may ask: What if they do, in fact, use more VRAM than you actually have?</p>
+
+<p>Typical expectations for this seem to be that once this happens you’re pretty much screwed.
+Games will start crashing left and right, performance plummets to unplayable levels,
+a good gaming experience becomes impossible.</p>
+
+<p>But is that really just an unavoidable fact of life? What <em>really</em> makes running out of
+VRAM suck so hard? And, most importantly: How can we make it suck as little as possible?</p>
+
+<h2 id="setting-expectations">Setting expectations</h2>
+
+<p>In theory, running out of VRAM should exclusively be a performance issue, not a stability one.
+Support for overcommitting VRAM has existed for as long as GPU drivers have: If the driver
+overcommits VRAM, you are generally allowed to request as much VRAM as you’d like,
+and you’ll get as much as the kernel driver decides it can fit into the physical memory that exists on GPU.</p>
+
+<p>On the performance side, the big-picture reason for bad performance when you run out of VRAM is fairly simple.
+As soon as the game requests more VRAM than is physically present, some of the game’s memory will
+have to be moved/evicted to CPU RAM instead. For the GPU, accessing CPU RAM is much slower than VRAM:
+Not only is CPU RAM slower than a dedicated GPU’s VRAM in general, all memory accesses also
+have to go over the PCI bus. The PCI bus adds latency and is typically also the limiting factor in bandwidth when
+fetching from CPU memory.</p>
+
+<p>Due to PCI speed limitations, there are some truly unavoidable performance constraints when overcommitting VRAM.
+Assuming the GPU is hooked up via a PCIe 4.0x16 connection, you get a little less than 32GiB/s of bandwidth. Each
+millisecond, that PCIe bus can transfer ~32.2MiB of data. For a minimum framerate of 30 frames per second (33.3ms
+per frame), the absolute maximum amount of data the GPU is able to access is ~1,075.5MiB, a tiny bit over 1GiB of
+data. In other words, if so much memory gets evicted that the GPU needs to fetch more than 1GiB from evicted memory
+in one single frame, it is simply impossible to still hit 30 FPS.</p>
+
+<h2 id="not-all-memory-is-equal">Not all memory is equal</h2>
+
+<p>At the same time, just reading a little bit of CPU memory on the GPU is not immediately a death sentence for performance.
+In fact, GPU drivers sometimes decide to let things like command buffer data and related allocations live in CPU
+RAM even when there’s plenty of VRAM available! Whenever the GPU executes these commands, it has to access CPU memory, and yet
+in these cases everything runs completely fine. So what makes these accesses different - why are they fine and yet
+running out of VRAM seems catastrophic?<sup id="fnref:1"><a href="#fn:1" rel="footnote" role="doc-noteref">1</a></sup></p>
+
+<p>One thing that influences the calculus significantly is caching. Since the access latency in case of a cache hit is the same
+regardless of whether the cached memory lives on CPU or GPU, the high initial cost of fetching over the PCI bus can be
+amortized by cache hits (to some extent). We can estimate latency differences between fetching CPU RAM and VRAM by writing microbenchmarks
+that measure access latency for different buffer sizes
+(using an adversarial access pattern to minimize cache hitrates as far as possible). The result you get may
+look something like this (captured on RDNA3):</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/RDNA3Microbench.png" alt="Cache microbenchmark for an RDNA3 GPU."></p>
+
+<p>As expected, if the buffer fits into L2 (or any higher-level cache), access latencies are exactly the same for
+memory backed by CPU RAM and memory backed by VRAM, because the data gets fetched directly from cache in either case.
+At a size of 6MB (the L2 cache size on RDNA3), CPU memory latencies go up to about 2400 cycles per access,
+while device memory latencies stay within the same rough ballpark.
+Note that VRAM accesses also go through the Infinity Cache, but CPU memory accesses do not (they hit PCIe directly on an L2 miss).
+I suspect this is because the Infinity Cache sits directly on top of VRAM, so any access that doesn’t hit VRAM also doesn’t reach
+the Infinity Cache.</p>
+
+<p>Obviously, memory doesn’t start off with being cached anywhere, so the first access will still have considerably higher
+latency. Also, losing the Infinity Cache definitely hurts as well: PCIe fetches seem to have somewhere around 7.3x as much
+latency than an Infinity Cache hit, and around 4.6x as much latency as a fetch from VRAM.
+This increased latency needs really high cache hitrates to fully amortize the cost of going over PCIe.
+That means there is only a small set of use cases where using CPU memory has such minuscule slowdowns
+that you’d actively decide to use it in favor of VRAM when you have the choice. When you’re evicting memory from VRAM, there
+will almost unavoidably be at least some degree of slower performance.</p>
+
+<p>Still, even though slowdown is unavoidable, there is going to be memory where eviction matters more and memory
+where eviction has a lesser effect on overall perf. Memory that is accessed in very cache-friendly ways is not
+affected by the slowdown of CPU RAM as much. If the access patterns aren’t cache-friendly but the memory isn’t accessed very
+often, things may also still be fine since the GPU only rarely needs to actually fetch data from CPU RAM. There might be many
+memory allocations where the GPU will only access a small part of the total allocation size, and never even read the rest.
+If these allocations were to be evicted, you might evict multiple GiBs of data, but still remain well below the 1GiB hard limit of data
+that is <em>actually</em> accessed per frame.</p>
+
+<p>All of these variables make it surprisingly hard to predict how performance actually pans out in practice when memory is being
+evicted. But in short: Depending on how much the evicted memory gets accessed and how well these accesses cache, you might just be able to run out
+of VRAM without (completely) ruining performance!</p>
+
+<h2 id="confronting-reality">Confronting reality</h2>
+
+<p>We’ve theorycrafted ourselves all the way towards having performant VRAM overcommitment now. Great! Let’s just boot up SteamOS, start some game and crank
+up the setti-<br>
+<code>radv/amdgpu: Not enough memory for command submission.</code></p>
+
+<p>oh.</p>
+
+<p>As it turns out, running out of VRAM in practice does carry plenty of stability issues with it.</p>
+
+<p>This error isn’t quite like a regular “couldn’t allocate, out of memory” error, though. Note that the message specifically complains about
+command submission: RADV prints this message when the kernel returns <code>-ENOMEM</code> when trying to submit commands<sup id="fnref:2"><a href="#fn:2" rel="footnote" role="doc-noteref">2</a></sup>, but merely submitting
+commands does not allocate any new resources! All the command buffers were allocated in advance, and clearly their allocation succeeded.
+Even though all memory was successfully allocated, using it in a GPU submission suddenly results in “out of memory” errors being thrown.</p>
+
+<p>It’s time for another kernel adventure! Surely getting the kernel to accept the submission can’t be that hard - after all, the kernel already
+accepted all the allocations<sup id="fnref:3"><a href="#fn:3" rel="footnote" role="doc-noteref">3</a></sup>!</p>
+
+<h2 id="the-horrors-of-kernel-locking">The horrors of kernel locking</h2>
+
+<p>One thing the <code>amdgpu</code> driver has to do on every submission, before it can direct the GPU to start executing commands, is to make sure that
+all memory that may potentially be referenced by the GPU commands is accessible. With more modern bindless graphics APIs, you have to assume
+all allocated memory may at some point get referenced. Therefore, <code>amdgpu</code> will try to make sure all allocated memory is also accessible.</p>
+
+<p>Each memory allocation carries information about which type of memory (for our purposes here, system RAM or GPU VRAM) it can be properly accessed
+from. Most allocations can be accessed from either CPU RAM or VRAM, and <code>amdgpu</code> will be happy with the memory allocation being in either of these
+memory types. Some allocations, however, have to be placed in VRAM and VRAM only. If these memory allocations have been evicted to system RAM because
+some other application allocated VRAM in the meantime, <code>amdgpu</code> will have to move them back into VRAM. Because there is no free VRAM available at all,
+moving the allocation back requires evicting something else. For some reason, that failed and the kernel
+reported an out-of-memory condition.</p>
+
+<p>In order to explain why evicting something randomly fails, we’ll have to take a small detour to look at how the kernel handles (CPU-side) locking for GPU allocations.
+In order to evict a memory allocation, you have to acquire a lock associated with that allocation. However, during a submission, you also have to lock
+every allocation that’s referenced in a submission, to prevent some other application from moving the allocation somewhere else while you’re busy preparing
+GPU work. But if another GPU submission is doing the same thing concurrently, you can end up in a situation like this:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/AMDGPUDeadlock.png" alt="Deadlock condition when concurrent submits evict"></p>
+
+<p>If one submit wants to evict an allocation that another submit has already locked, but that other submit also needs to lock an allocation from the first one
+to make progress, we have a textbook ABBA deadlock condition.</p>
+
+<p>But fear not, the kernel knows how to detect and resolve deadlocks! The details about how deadlock detection works are
+explained in <a href="https://www.kernel.org/doc/html/latest/locking/ww-mutex-design.html">this kernel documentation page</a>, but in very broad strokes, the
+kernel associates locking operations with a “transaction” (which basically just keeps track of which locks were acquired). If two transactions would
+deadlock, one of the transactions is marked as “wounded”, and the next time it tries to acquire a lock, the <code>-EDEADLCK</code> error is returned.
+This error requests the transaction to be aborted: All locks acquired during the transaction should be released, and the transaction is restarted
+from scratch. In the context of command submission, this just means the driver will restart the process of going over all memory allocations and making
+sure they’re accessible.</p>
+
+<p>So where’s the catch? There isn’t one. This approach is rock solid and works really well.</p>
+
+<p>At least as long as it’s actually implemented everywhere.</p>
+
+<p>In the graphics subsystem, the gritty internals of the wound-abort-retry loop are abstracted using a small helper library called <code>drm_exec</code>. Instead of
+having to manually track which allocations are locked, and release the locks once you run into <code>-EDEADLCK</code>, you simply use the <code>drm_exec_lock_obj</code> helper.
+If you study the <a href="https://elixir.bootlin.com/linux/v7.2-rc7/source/drivers/gpu/drm/ttm/ttm_bo_util.c#L841-L867">locking code in TTM</a>,
+the shared Linux GPU memory management layer, you will notice a profound lack of usage of <code>drm_exec</code>.</p>
+
+<p>Instead, there even is a comment noting that <code>-EDEADLCK</code> will cause eviction to fail. There we go, we found our issue! As soon as this deadlock
+condition is encountered because of intense memory pressure during command submission, the kernel bails out and rejects the submission instead of
+retrying.</p>
+
+<p>There already are some patchsets to hook up the <code>drm_exec</code> helper in TTM,
+<a href="https://lore.kernel.org/all/20240710124301.1628-7-christian.koenig@amd.com/">sent all the way back in 2024</a>, but those never made it in for a few reasons,
+among which were some remaining bugs that hadn’t been figured out. My work had been cut out for me here: Rebase the patchset on top of
+my kernel version and figure out what those remaining bugs are.</p>
+
+<p>Rebasing the patchset wasn’t too much of a hassle, and figuring out the bugs only took one single week of intense suffering with games randomly hanging 3 minutes
+into heavy VRAM contention. Not the worst!</p>
+
+<p>I tried <a href="https://lore.kernel.org/all/20260703-ttm_2_drm_exec-v1-0-43685ac1286b@gmx.de/">resending</a> the patchset with fixes for all bugs I found in the
+hopes it would get in this time, but there’s going to be more work needing to be done with it before it can be merged.</p>
+
+<p>Now that running out of VRAM at least won’t crash your apps at random, we can at least properly crank up the settings and look at perf. The initial
+result gave me an absolutely glorious performance graph like this:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/MangohudVRAM.png" alt="Horrible perf graph"></p>
+
+<h2 id="hold-on-where-did-all-the-perf-go">Hold On Where Did All The Perf Go</h2>
+
+<p>Figuring out why performance is so garbage requires figuring out what the system is actually <em>doing</em> that’s this slow. For broad “what’s the kernel driver doing??”
+questions like that, I like using <a href="https://github.com/mikesart/gpuvis">gpuvis</a>. gpuvis uses kernel tracepoints to build a timeline of things that happened
+(including “GPU work submission started/stopped”, from which the time taken for each submission can be inferred).</p>
+
+<p>Booting up gpuvis with a trace taken while the system is running out of VRAM, the timeline shows a situation like this:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/gpuvisGarbage.png" alt="Horrible perf with SDMA being busy most of the time"></p>
+
+<p>Turns out, most of that time isn’t actually spent on handling the submission (that’s the gfx_0.0.0 activity), but instead moving around memory in preparation
+for that submission (sdma0 activity)!</p>
+
+<p>The reason why there are so many buffer moves all the time becomes more obvious if you use gpuvis’s event list, together with a filter to show only captured
+move events for a particular buffer object (I chose one at random here, most buffer objects have a similar pattern):</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/gpuvisGarbageBO.png" alt="gpuvis event filter showing buffer go ping pong ping pong ping pong"></p>
+
+<p>The list shows quite clearly that contending processes (in this case, <code>gamescope</code> and the game itself) will constantly take turns evicting and moving
+back the same piece of memory, over and over. That’s really bad! And it’s very reminiscent of something I wrote in my first blogpost:</p>
+
+<blockquote>
+  <p>Generally, two competing applications can be expected to roughly take turns executing GPU work - first one application submits work, then the other, then the first again, and so on.
+With that approach, memory would keep being moved back and forth after every single submission. One application gets kicked out and immediately moved back in, kicking the other out (which moves memory back in the next step). All this moving ended up with
+<strong>worse</strong> performance than if the memory had never been moved in the first place.</p>
+</blockquote>
+
+<p>This described an old issue where overly aggressive VRAM allocation would lead to ping-pong-like moves happening constantly. But that issue had since been
+fixed by simply not trying to claim VRAM when there isn’t any free VRAM left, and the kernel only started being somewhat aggressive when I implemented
+VRAM protection with dmem cgroups. Obviously, this must have reintroduced the ping-ponging somehow.</p>
+
+<p>Conceptually, the design of the dmem cgroup VRAM protection should never result in ping-pong moves, because the kernel is only supposed to evict memory that
+does not have any cgroup VRAM protection associated with it. Without any VRAM protection, you should <em>typically</em> not be allowed to evict protected VRAM.</p>
+
+<p>The single exception to this rule is memory that absolutely has to live in VRAM for things to work properly. These kinds of memory allocations are always
+allowed to be moved to VRAM to ensure system stability. Typically, almost nothing coming from an application is really required to live in VRAM for correct operation,
+but there is one buffer object coming from an application that does: The buffer containing image data to be scanned out to the display<sup id="fnref:4"><a href="#fn:4" rel="footnote" role="doc-noteref">4</a></sup>.</p>
+
+<h2 id="display-hardware-is-funky">Display hardware is funky</h2>
+
+<p>Not only does the display hardware like scanned-out images to be in VRAM, it also completely skips past the GPU’s virtual memory architecture and
+works with physical addresses exclusively. In consequence, scanned-out images also have to be <em>contiguous</em> in physical memory.</p>
+
+<p>With virtual memory and the power of page tables, typical application buffers are only contiguous in <em>virtual</em> memory, and may be scattered around
+all over physical memory<sup id="fnref:5"><a href="#fn:5" rel="footnote" role="doc-noteref">5</a></sup>. The first page of a buffer at virtual address <code>0x5000</code> may be mapped in the page tables to point to physical address
+<code>0x1234000</code>, but the second page at virtual address <code>0x6000</code> might point to physical address <code>0x4321000</code>, somewhere completely different!</p>
+
+<p>Here is a diagram visualizing the mapping of virtual allocations to physical ones in case where there is a lot of fragmentation (which typically
+is the case when you’re very low on VRAM):</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/AMDGPUFragmentation.png" alt="Contiguous virtual memory mapping to fragmented physical memory." width="80%"></p>
+
+<p>The arrows show page table mappings to physical memory segments for the different segments of the first allocation.
+They’re left out for all other allocations for readability.</p>
+
+<p>If you’re allocating display scanout data, this fragmentation is not an option as the physical memory has to be contiguous. This has very, very
+unfortunate interactions with eviction of other data specifically. Let’s assume the scanout data has already been evicted, but now it’s
+time for that data to be scanned out, so it has to be moved back into VRAM.</p>
+
+<p>Simply evicting one buffer won’t be sufficient, even if that buffer is the same size as the display scanout data, because evicting it does not
+result in enough <em>contiguous</em> physical space to place the scanout data in! To make matters worse, the eviction algorithm does not take into
+account physical memory constraints at all. It is a very simplistic loop along the lines of</p>
+<div><pre><code><span>while</span> <span>(</span><span>true</span><span>)</span> <span>{</span>
+   <span>evict</span><span>(</span><span>getLeastRecentlyUsedBuffer</span><span>())</span>
+   <span>if</span> <span>(</span><span>tryAllocate</span><span>(</span><span>newBuffer</span><span>)</span> <span>==</span> <span>SUCCESS</span><span>)</span>
+      <span>break</span><span>;</span>
+<span>}</span>
+</code></pre></div>
+
+<p>Using this algorithm (assuming the allocations are arranged in LRU order), even if you evict the first 3 allocations (green, blue, and red), there won’t be a large
+enough space to hold the scanout buffer! Even the largest possible free space is ever so slightly too small, as is visible in this updated diagram:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/AMDGPUFragmentationEvicted.png" alt="Still no space for the scanout buffer." width="80%"></p>
+
+<p>To find a large enough physically contiguous memory region in our example, every single allocation in VRAM would end up being evicted! In
+real-world scenarios, I observed up to 4GiB of VRAM being nuked just to make space for scanout images (which are ~32MiB of pixel data per image for a R11G11B10
+pixel format). That’s going to hurt real hard! Simply the act of moving all that data out from VRAM would already cost at least ~130ms, according to
+the PCIe transfer rate estimated earlier.</p>
+
+<p><img src="https://pixelcluster.dev/assets/memes/scanout.png" alt="welp." height="300"></p>
+
+<h2 id="throwing-heuristics-at-the-problem">Throwing heuristics at the problem</h2>
+
+<p>While scanout is definitely the most egregious failure case here, this issue is more general: There are always going to be certain memory allocations
+that will be moved to VRAM over and over, potentially kicking out some memory that an application might prefer to stay in VRAM. Resisting this and
+trying to move the evicted memory back in will most likely backfire.</p>
+
+<p>Even though dmem cgroup protection is not a complete solution to this problem, it does reduce the problem scope by a lot. With cgroup protection, you
+can be sure that any random app won’t try to kick out important game resources willy-nilly. Any memory that does get moved back into VRAM by force
+probably has a good reason to be in VRAM. Therefore, even with dmem cgroup protection, we should be careful and not try to reclaim evicted memory back
+by force.</p>
+
+<p>With some iterative testing, I think I’ve arrived at a set of heuristics that work reasonably well for most cases a game would encounter in the wild
+(not being too aggressive when stuff gets evicted by important system allocations is one thing, but it also needs to be reasonably quick at reclaiming
+evicted memory if e.g. the game is paused and the Steam menu runs instead, evicting lots of game memory, and then the game is resumed).</p>
+
+<p>The heuristics work something like this:</p>
+<ol>
+  <li>When the kernel detects an application’s memory is being evicted, it enters a “hard throttle” phase for a few milliseconds. During this phase, it does
+not try moving any memory for that app back into VRAM whatsoever (as long as all memory can be properly accessed, of course).</li>
+  <li>After this period, it switches a “soft throttle” phase, during which it may reclaim free space by moving things back into VRAM, but does not
+try evicting any memory that other apps have allocated. This period may last up to a few seconds, to make extra sure everything reached a stable state.</li>
+  <li>If the “soft throttle” phase has completed without any further memory being evicted again, the system is assumed to have reached a fairly stable state
+and restrictions on evicting other applications’ memory are removed.</li>
+</ol>
+
+<p>IME, this achieves an acceptable balance between not shooting oneself in the foot with overaggressive eviction of other apps, while still recovering
+reasonably fast when lots of your memory was suddenly evicted, for example because the game was paused and the user browsed around on Steam instead of
+playing.</p>
+
+<h2 id="getting-somewhere">Getting somewhere</h2>
+
+<p>With those heuristics in place, let’s finally try cranking up the settings for real this time.</p>
+
+<p>I ended up going with Indiana Jones: The Great Circle, since it conveniently exposes a setting for streaming pool sizes that you
+can mess with to modify VRAM consumption pretty much directly.</p>
+
+<p>Lo and behold, even if the settings are turned up to a somewhat ridiculous point, where the game requests 9GiB of 8GiB VRAM (aka. a whole 1GiB of
+overcommitted game resources living in CPU memory), performance isn’t cratering into oblivion anymore! A 19.6ms per frame average is what I’d still
+call perfectly playable.</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/IndyOvercommit.png" alt="Indiana Jones: TGC overcommit to 9GiB/8GiB"></p>
+
+<p>I can also bump the settings to <em>even more ridiculous</em> levels and double the amount of overcommitted memory, with the game requesting 10GiB of VRAM
+on this 8GiB system (and thus 2GiB of resources being overcommitted). Frametime variance goes up quite a lot at this point, with spikes
+reaching above 33.3ms happening frequently. The overall average is around 29.8ms which isn’t the <em>worst</em>, but especially paired with the variance,
+this would start being noticeable in gameplay.</p>
+
+<p>While this is already a huge step forward, we aren’t quite there yet. The experience under VRAM overcommit can sometimes still be a bit hit-or-miss,
+and frametimes may noticeably vary depending on which objects in the game you’re looking at.</p>
+
+<p>Remember that for actually good eviction performance, it matters a lot how the evicted memory is used by the GPU.
+Right now, this isn’t taken into account at all! If we were able to base our eviction decisions more on how well the application’s accesses work
+with CPU memory, a lot of this variance might simply disappear.</p>
+
+<h2 id="handing-over-the-controls">Handing over the controls</h2>
+
+<p>The complicated thing about the application’s memory access patterns is that they are only really known to the application.
+Therefore, the driver isn’t really able to take them into account as-is. Ideally there would be some API where the application
+can supply hints to the driver about how well a particular memory allocation is suited to being evicted.</p>
+
+<p>Something exactly like <a href="https://docs.vulkan.org/refpages/latest/refpages/source/vkSetDeviceMemoryPriorityEXT.html"><code>vkSetDeviceMemoryPriorityEXT</code></a>!
+The <code>VK_EXT_pageable_device_local_memory</code> extension provides precisely what we need here, by allowing applications to communicate any priority
+they want for any piece of device memory they want. As long as applications provide reasonable hints through this extension, implementing
+prioritization in the kernel and then utilizing app-provided priorities has the potential to stabilize things by a lot!</p>
+
+<p>Hooking up priorities in the kernel turns out to be a lot less of an issue than you might expect. The kernel already maintains a Least-Recently-Used
+list of memory allocations that, on eviction, are traversed in order. For each entry on that LRU list, eviction is attempted until there is enough
+free space for whatever the eviction was for.</p>
+
+<p>This LRU list provides a good heuristic for which application’s memory should be evicted first. Applications that haven’t submitted anything in a long
+while are unlikely to need the memory soon, and since their memory is Not Recently Used, it will appear early in the LRU list and be evicted first.</p>
+
+<p>When an application uses a set of buffers, that set of buffers is moved to the very end of the LRU list in one bulk. However, the order of allocations
+within that bulk is not explicitly controlled at all. That means once the kernel closes in on some application to evict its memory, which specific
+pieces of memory get evicted is more or less undefined<sup id="fnref:6"><a href="#fn:6" rel="footnote" role="doc-noteref">6</a></sup>. A simplified visualization could look something like this:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/AMDGPULRU.png" alt="Unsorted LRU list visualization"></p>
+
+<p>If the kernel walks the LRU list like this, it would evict the buffer with a priority value of 2 first, even though there are much lower-priority buffers
+elsewhere in the LRU list. If only the first buffer of priority 2 gets evicted, things might be okay, but if the highly important buffer with priority 4
+ends up evicted as well, there are likely going to be problems.</p>
+
+<p>Given that we already know specific priorities for the individual allocations, this LRU list is a very simple place to integrate them. It’s as simple as ordering
+the list entries within a single application by their priority<sup id="fnref:7"><a href="#fn:7" rel="footnote" role="doc-noteref">7</a></sup>:</p>
+
+<p><img src="https://pixelcluster.dev/assets/images/AMDGPULRU2.png" alt="Sorted LRU list visualization"></p>
+
+<p>Now, when the kernel goes over the LRU list to find something to evict, the very first thing it will find and try to evict are the lowest-priority buffers.
+The highest-priority buffers are last in the list, and thus only get evicted when evicting all the lower-priority buffers was not enough.</p>
+
+<h3 id="memory-priority-adoption-in-apps">Memory priority adoption in apps</h3>
+
+<p>Unfortunately, not all applications actually set priorities via <code>VK_EXT_pageable_device_local_memory</code>. As for native Vulkan applications,
+I haven’t observed any idTech game using the extension directly, at least :/</p>
+
+<p>The D3D side looks a lot better, because <code>vkd3d-proton</code> already uses <code>VK_EXT_pageable_device_local_memory</code> when available, and translates both the
+<code>ID3D12Device::MakeResident</code>/<code>ID3D12Device::Evict</code> API calls as well as priorities set via <code>ID3D12Device1::SetResidencyPriority</code> to priority values
+set using the Vulkan <code>vkSetDeviceMemoryPriority</code> command. Lots of D3D12 games utilize at least one of these APIs, so the hints these games provide will now be
+utilized.</p>
+
+<p>I don’t have super solid numbers for how much memory exactly is overcommitted by most D3D12 apps, as they don’t typically expose the total amount of
+VRAM they request in an easy-to-access way like idTech’s performance overlay does. However, properly honoring memory priorities generally seems to have
+a good chance to improve the experience. Performance generally appears more stable over time (because you’re not relying on luck with which buffers the
+kernel evicts as much). In some spots I had a good comparison point at, I suspect it increased performance compared to the kernel evicting random
+things by up to 30% in the very best case - but again, take this number with a <em>mountain</em> of salt as it depends almost entirely on luck with regards to eviction.</p>
+
+<h2 id="conclusion">Conclusion</h2>
+
+<p>When all is said and done, how well does running out of VRAM hold up?</p>
+
+<p>I’d say it’s quite alright! In many cases, you may be surprised how much performance you can retain even when evicting a gigabyte or more of memory!
+Then again, that’s of course a rather optimistic case, and the wrong thing ending up in CPU RAM can very quickly cause very significant slowdowns. Eviction is
+tricky to get just right, and to an extent, performance will always be dragged down. If a game is struggling to hit 30fps even with everything
+in VRAM, needing to evict something on top of all that could sometimes just unavoidably result in that 30fps target being missed.</p>
+
+<p>Regardless, what I hope this blogpost can demonstrate is that even if you end up with some memory evicted to system RAM, the slowdown can be manageable. There’s
+measures that drivers (particularly, the kernel driver) can take to make overcommit work as fast as possible, and even applications can do their
+part in coordinating with the driver stack to mitigate the effects of their memory being evicted. With everything in place, VRAM overcommit isn’t
+really as big of a deal as one may think it is at first sight.</p>
+
+<p>All the work I described here has already been released in SteamOS for some time now (it’s both in Stable and Preview. As long as your system is up-to-date, it’s good to go!).</p>
+
+<h2 id="a-note-on-upstreaming">A note on upstreaming</h2>
+
+<p>Of course, I’m already working on upstreaming all this work so it’s available to everyone! However, there’s a lot of moving parts and a lot of deep
+refactors of some pretty core concepts at play here, so it will likely need time to cook before everything is merged upstream.</p>
+
+<p>At the same time, I don’t want to put up a blogpost talking about lots of cool code just to finish it with “actually you can’t see for yourself,
+go wait until it’s all upstream lol”, either.</p>
+
+<p>As a middle ground, I have rebased the kernel work onto a recent upstream version of the kernel and published a git branch
+<a href="https://gitlab.freedesktop.org/pixelcluster/kernel/-/commits/vramstuff-rebase">here</a>.
+While it should theoretically yield similar effects, it did <strong>not</strong> go through as rigorous testing the SteamOS kernel did. There will likely
+be bugs and instabilities that weren’t there in the SteamOS version. <strong>Use at your own risk</strong>, basically.
+I don’t expect to be maintaining this branch in any significant capacity, as I’d rather focus on getting the patches into upstream properly.</p>
+
+<p>In order to pass through application priority hints to the kernel, you will also need a custom Mesa branch I pushed
+<a href="https://gitlab.freedesktop.org/pixelcluster/mesa/-/commits/vram-prios">here</a>.
+Similar considerations as the kernel branch apply here, as well.</p>
+
+<h2 id="questions-of-my-own">Questions of my own</h2>
+
+<p>While I would claim to have a fairly good overview of the driver side of memory management at this point, I am not very familiar with how
+applications decide on supplying memory management heuristics internally, at all. I would suspect optimizing cases where you’ve already run out of
+VRAM isn’t exactly the top item on developer TODOs (who knows, maybe the memory scarcity is changing that? :P), so maybe there’s some
+unexplored room for performance improvements there?</p>
+
+<p>If you, dear reader, happen to know about VRAM management for larger games/engines (especially when running out), I’d love to chat! I have a hunch that
+there’s still perf to be gained by making apps and drivers coordinate better, but I’m also plainly interested in how things look from an application
+developer’s point of view.</p>
+
+
+
+
+
+   
+     <hr>
+     
+     
+     
+     
+     
+ 
+     
+   
+ </article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[I don't enjoy the Internet any more (102 pts)]]></title>
+            <link>https://btao.org/posts/2026-08-17-i-dont-enjoy-the-internet/</link>
+            <guid>49341551</guid>
+            <pubDate>Tue, 18 Aug 2026 05:17:14 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://btao.org/posts/2026-08-17-i-dont-enjoy-the-internet/">https://btao.org/posts/2026-08-17-i-dont-enjoy-the-internet/</a>, See on <a href="https://news.ycombinator.com/item?id=49341551">Hacker News</a></p>
+<div id="readability-page-1" class="page"><article>
+  <p>I grew up on the Internet. I spent a significant proportion of my childhood, and later my adult life, on message boards, blogs, social networks, chatrooms, and other online communities. I made friends, found jobs, and was exposed to so many new concepts thanks to the Internet. Many of my core beliefs were sharpened by ideas and discussions I followed online. It’s been a huge part of my life.</p>
+<p>But today, the joy is largely gone. This wasn’t a sudden change: my experience with the Internet has been getting worse over many years. As it became increasingly monetized, thoughtful knowledge sharing and new ideas started being replaced by an ever-growing volume of attention-seeking, low-quality content. And today, largely thanks to LLMs, the ratio is so skewed that it doesn’t feel worth it.</p>
+<p>I’m reminded of the video game Disco Elysium (spoilers ahead). In the game, the world is made up of distinct regions called isolas, separated by a nothingness called the pale. The pale is a gradually growing area that degrades information. Venture far enough into it and you’ll be left with a damaged mind. The pale covers most of the world, and some believe that it’ll continue to expand until it envelops everything. This sounds a lot like AI-generated content! On the Internet, we still have a few isolas here and there, but the pale is growing faster than we can handle.</p>
+<p>I’ve occasionally managed to find isolas of interesting people on social media like Bluesky, but I’m increasingly skeptical of short-form content. Learning about the world through 500-character snippets, or 30-second videos, is not a serious way to engage with knowledge. It triggers our worst instincts in terms of tribalism and groupthink and makes us intellectually lazy. This is true of short-form content whether you’re experiencing it on Instagram, TikTok, X, Mastodon, or something else.</p>
+<p>Longer-form content like blogs isn’t safe, either. I’ve stopped reading Hacker News because too many stories on the front page are clearly written by an LLM. The writing is bad, and while there <em>might</em> be an interesting idea in there, it’s equally likely to be empty filler content. The effort of writing an article used to indicate that the author felt they had something worth saying. That’s no longer true. If the author couldn’t be bothered to write it, why should I bother reading it?</p>
+<p>The final nail in the coffin was work. It’s incredibly hard to get to know the people you’re working with when everyone is slinging LLM outputs to each other. And this isn’t some anti-AI screed — I’m all-in on agentic software engineering! My issue is with communication more broadly. When you have no sense of what your coworkers believe, or how they think, all the joy and connection of collaboration disappears. I <em>hope</em> that we’ll collectively decide that it’s rude to pass off LLM writing as your own, but I wouldn’t bet on it.</p>
+<p>The incentives on the Internet have been skewed for a long time, but there were always isolas of lovely people and high-quality thinking. These isolas are now much harder to find in the pale of slop, and I don’t see a way back.</p>
+</article></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[The Benchmarkpocalypse (111 pts)]]></title>
+            <link>https://danluu.com/benchpocalypse/</link>
+            <guid>49340299</guid>
+            <pubDate>Tue, 18 Aug 2026 02:11:02 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://danluu.com/benchpocalypse/">https://danluu.com/benchpocalypse/</a>, See on <a href="https://news.ycombinator.com/item?id=49340299">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+
+<p>There's been a lot of talk about the vulnpocalypse, to which I don't have much to add because I'm not a security person, but I haven't seen much discussion on the closely related (and to be fair, less serious, issue), the benchmarkpocalypse.</p>
+
+<p>While it's become easier than ever to make serious performance gains, it's also become easier than ever to reward hack a benchmark and make fake performance gains. The former is probably happening quietly across many different companies, but the latter is something I see at least once a week nowadays. Someone will claim they optimized X and got some huge performance improvement over existing software, but, when you look at it, what they did was make some optimization that improves benchmark performance without actually improving real-world performance. This is often some kind of "we rewrote X in Rust"<sup id="fnref:P"><a rel="footnote" href="#fn:P">1</a></sup> project or a new startup that's looking to either fundraise or sell something, but it happens on other kinds of projects as well.</p>
+
+<p>Of course, people have always trumpeted unrepresentative microbenchmarks to show that their pet project is great. It's always been easy to fake up an unrepresentative microbenchmark and that's never going to change. What's changed is that it used to take a lot of work to game a large benchmark suite, but an LLM and loop can just do it. There are quite a few famous examples of gaming large benchmark suites from back when this was hard. For example, way back when people cared about SPECint / SPECfp as proxies for workstation performance, CPU vendors would try to find compiler "optimizations" that would speed up the calculation in the benchmark, such as Sun finding a way to improve <code>179.art</code> <a href="https://danluu.com/car-safety/">by 12x in SPECfp2000</a>. Skilled engineers spent a lot of time trying to find benchmark hacks like that. LLMs make this trivial, making formerly trustworthy benchmarks meaningless unless you audit the result or trust someone who did.</p>
+
+<p>Rather than point to someone's bad claim, I'll point to <a href="https://github.com/danluu/fre/">FRE, this regex engine I had an agent build</a>, which I could claim is the world's fastest regex engine because it beats the Rust regex crate at the fairly comprehensive <a href="https://github.com/BurntSushi/rebar">rebar regex benchmark suite</a>. But this was created by putting an agent in a loop for a month with instructions to not overfit to the benchmark but no real supervision. For the most part, getting an LLM to give you a good benchmark score is fairly easy, and this case was no different; it took a couple weeks to roughly match <abbr title="which is probably the fastest general-purpose regex engine in the world">Rust regex crate</abbr> performance and then another couple weeks to get to 1.4x faster<sup id="fnref:O"><a rel="footnote" href="#fn:O">2</a></sup> on rebar. But agents are wont to reward hack and overfit unless you put serious guardrails in place to avoid that, which I didn't do in this case as an experiment.</p>
+
+<p>To check for overfitting, I somewhat arbitrarily<sup id="fnref:A"><a rel="footnote" href="#fn:A">3</a></sup> used the ripgrep benchmark corpus as a holdout benchmark it was 10x slower on cases where the benchmark didn't take forever due to an algorithmic blow-up, and there were cases where it took so long that it wasn't reasonable to even wait for the benchmark to complete. So much for being 40% faster!</p>
+
+<p>Andrew Gallant (aka BurntSushi)'s rebar benchmark suite is fairly comprehensive as benchmaark suites go, but even with a fairly comprehensive benchmark suite, agents have no problem getting a high score while overfitting in a way that doesn't necessarily give good general performance.</p>
+
+<p>The next step was <a href="https://danluu.com/pl-tokens/">using a trick we talked about before</a> of not just telling the LLM not to cheat, but that there's a holdout benchmark set that it's judged against. After that, the LLM moderately generalized performance to the point where it's about 2.4x slower overall on the holdout. That sounds pretty good considering that we're comparing it to the fastest general purpose regex engine in existence. But, recall that these benchmarks were made by a coding agent. On looking at what the benchmarks measure, some of them really don't make sense to include, at least at equal weight. If we only look at the benchmarks that seem like they matter, <a href="https://github.com/danluu/fre/">FRE</a> is 4x slower on the holdout<sup id="fnref:and-actually-runs-all-tests-to-completion-so-the-speedup-was-much-more-than-just-10-4"><a rel="footnote" href="#fn:and-actually-runs-all-tests-to-completion-so-the-speedup-was-much-more-than-just-10-4">0</a></sup>, which is a lot better than before applying the good ole' "tell them you have a holdout" trick, but still pretty far from being 40% faster.</p>
+
+<p>There are a few things I thought were interesting about this:</p>
+
+<ol>
+<li>It's trivial to "win" a non-trivial benchmark in a meaningless way even when you instruct agents to not reward hack or overfit to win the benchmark</li>
+<li>Once again, telling the LLM there's a holdout set worked better than just telling the LLM to do generalized work or not overfit or cheat</li>
+<li>Although the overall performance of <a href="https://github.com/danluu/fre/">FRE</a> isn't that good, it is actually performs better for some use cases; in general, the cost of writing specialized code that used to require people serious engineering experience for some specific use case has gone way down</li>
+</ol>
+
+<p>On (1), no wonder I'm seeing so many bogus claims. In the past, to build something like <a href="https://github.com/danluu/fre/">FRE</a> that fakes performance well enough to be able to bogusly claim a 40% speedup, you would need a fair amount of expertise. At a minimum, you'd need to have a pretty good understanding of string matching algorithms, regex engines, as well as decent general code optimization and SIMD optimization skills. <a href="https://github.com/danluu/fre/">FRE</a> also has a mode where it compiles the regex to machine code, so you'd also need some compiler expertise. Now you can get that kind of benchmark cheating (whether or not you want the cheating) with a few minutes of typing.</p>
+
+<p>On (2), I'm curious if this generalizes but haven't tried enough examples to be able to tell.</p>
+
+<p>On (3), there's no reason to use a vibe coded regex library that was almost no human effort that's slower than a robust, existing, well-tested, library, so I find the <a href="https://github.com/danluu/fre/">FRE</a> artifact uninteresting. The thing I find interesting here is how much LLMs can substitute for what used to be rare, specialized, and expensive, knowledge.</p>
+
+<p>In the past, even if you had the knowledge, you probably wouldn't write a custom regex engine that's optimized for your particular workload. There are some large-scale use cases where people would do that level of customization, e.g., when I worked on <a href="https://danluu.com/bitfunnel-sigir.pdf">the Bing index</a>, the code contained multiple different compilers because someone who worked on it wanted to eke out maximal performance; since you care about both compile time and compiled performance in a search engine and the trade-offs are different in different places, you get better performance by writing a custom compiler for each place where a normal project might just use an interpreter or directly walk some data structure with "normal code". The person who wrote those compilers, working on regex-like code might also write multiple custom regex engines, but very few people have both the expertise and the inclination to do that, let alone the freedom to spend that kind of time on such specialized code for work. If you price out that Bing engineer (then a Partner-level engineer, promoted to Distinguished Engineer for their work on the search index) compared to the price of running an LLM in a loop, the cost of writing this kind of specialized code has gone down by many orders of magnitude.</p>
+
+<p>Even though the overall <a href="https://github.com/danluu/fre/">FRE</a> regex engine has worse performance than the Rust regex crate, the gains you can get for specializing to your workload or use case mean that, in some cases, it could be reasonable to insert your own specialized regex engine somewhere, and the same goes for various other kinds of low-level software. You don't have to be an AI maximalist to think that it's plausible that, within some number of years, we could see this kind of thing happening for larger things, like databases.</p>
+
+<p><i>Thanks to Yossi Kreinin, Jamie Brandon, Peter Geoghegan, Luke Burton, John Spurling, Dennis Snell, and Max Bittker for comments/corrections/discussion.</i></p><i>
+
+<p>P.S. <a href="https://danluu.com/pl-tokens/">Per the discussion here</a>, with LLMs, the time it takes to poke at something for a bit and satisfy my curiosity has gone way down, while the time it takes to write something up and make it rigorous enough to publish on my blog hasn't really changed (for a variety of reasons, I think it's actually gone up). The result of this has been that I'm doing a lot more analyses than ever and sharing results with a few friends but not publishing them. As an experiment, I'm trying to write up some things very quickly, with a much lower standard for how cleaned up and rigorous things are than I'd normally have for something that appears on the blog; more like what I'd tell a friend in a casual conversation than what I'd normally put in a blog post. <abbr title="I think I failed on this one, although I didn't time it">The goal for this post was to do the write-up in about half an hour</abbr>, so it's something I could do over lunch and not really take time on. If you have opinions on this, let me know what you think!</p>
+
+</i><p><i>Of course, a caveat here is that all of the numbers have a higher risk of being wrong than usual. I looked at one benchmark for maybe a minute or two and found an issue, then I looked at another benchmark for a minute and found another issue. Both of those are fixed, but this implies there are other issues I haven't taken the time to chase down. But, with respect to bad benchmark numbers, that's highly realistic! Almost any time I look into benchmark numbers, <a href="https://danluu.com/pl-tokens/">such as here</a>, or <a href="https://danluu.com/exercise-7/">here</a>, the numbers are wrong. Another aspect of the benchmarkpocalypse is that, at least for now, LLMs are good at doing bad benchmarking, so even if you have something that's a real performance improvement, you generally can't tell from some LLM-generated benchmark setup unless a significant amount of care has been taken to make sure that the benchmark setup is reasonable.</i></p>
+
+<h3 id="appendix-more-fre-benchmark-details">Appendix: more FRE benchmark details</h3>
+
+<p>One thing I found after I wrote the above but before publishing the post, was that the LLM's claim that <a href="https://github.com/danluu/fre/">FRE</a> is 40% faster than the Rust regex crate on rebar was also wrong. Or, if not wrong, at least misleading. It wasn't actually running benchmarks in the same way rebar benchmarks were run. I checked this after spending a minute checking benchmark results found two issues. It turns out that, despite instructions to run rebar benchmarks as they're run in <a href="https://github.com/BurntSushi/rebar">https://github.com/BurntSushi/rebar</a>, the LLM changed the interface to allow <a href="https://github.com/danluu/fre/">FRE</a> to make some optimizations that improve performance. After fixing that, instead of <a href="https://github.com/danluu/fre/">FRE</a> being 1.4x faster than Rust on rebar, it was 1.5x slower (and "only" twice as fast as re2), so the original result was doubly fake. Not only was <a href="https://github.com/danluu/fre/">FRE</a> highly overfit to the rebar benchmarks, it the results also involved cheating.</p>
+
+<p>But on the bright side, this means the difference in performance between <a href="https://github.com/danluu/fre/">FRE</a> on rebar (1.5x slower than Rust) and on the holdout benchmarks (2.4x slower) isn't as big as it looked before, so the "tell the LLM you have a holdout" trick worked even better than it seemed to before.</p>
+
+<p>After that, I let an LLM hill climb for a few hours and it claimed that <a href="https://github.com/danluu/fre/">FRE</a> was 1.28x faster, which sounds like a great improvement for only a few hours of LLM time, but then I decided to spend another minute looking for cheating and found multiple issues, including one case where a search for the count of matches of <code>(?s)^(.*)$</code> returned the count without even looking at the haystack (data). Another case of cheating was doing a multi-line grep where the benchmark is supposed to be done line-by-line. Finding these isn't surprising because this is the kind of thing that happens when you leave an agent in a loop for a month without defining strict guardrails. Whether this makes my point here stronger or undermines it isn't clear, but after fixing another set of these issues, <a href="https://github.com/danluu/fre/">FRE</a> was back to being 1.4x slower. After leaving an agent to run overnight, <a href="https://github.com/danluu/fre/">FRE</a> was allegedly back to being 1.5x faster.</p>
+
+<p>Since my original goal here was to see what happens when you run a current (public) SOTA agent in a loop (GPT-5.6 Sol) without much supervision on a non-trivial code optimization problem without any real supervision, rather than spend more time fixing things up to make the benchmarks fairer, I'll just stop here and put a few plots of the results.</p>
+
+<p>Overall, we can see that against Rust and RE2, <a href="https://github.com/danluu/fre/">FRE</a> tends to outperform on the rebar benchmarks (and as noted above, much of this is due to overfitting), but not across the board (the graphs below don't necessarily match the numbers mentioned in the post because an agent is constantly making changes, so any snapshot is a point-in-time estimate that becomes obsolete immediately):</p>
+
+
+
+
+
+
+<p>If you're curious about performance on specific benchmarks or specific classes of rebar benchmarks, we have the following table (ratios above one mean <a href="https://github.com/danluu/fre/">FRE</a> is faster; below mean <a href="https://github.com/danluu/fre/">FRE</a> is slower):</p>
+
+
+
+
+
+
+<p>There's also an AOT compiler mode that takes a long time to compile a regex to native code before running it. There isn't AOT support for everything, but here are the results from the cases where it's supported. As we can see, the AOT compiler is very slow (it loses very badly in the compilation time benchmarks) and, despite spending quite a bit of time compiling, results are often slower than with the standard <a href="https://github.com/danluu/fre/">FRE</a> regex engine (though it's also faster in many cases).</p>
+
+
+
+
+
+
+<p>And then there are the holdout benchmarks. As noted above, for the non-AOT <a href="https://github.com/danluu/fre/">FRE</a> code, performance on the holdout isn't as good as on rebar. And as also noted above, considering that this is for a workload like ripgrep, the "hot search" set of benchmarks is probably more important than the others, so the <a href="https://github.com/danluu/fre/">FRE</a> result is worse than the overall score would make it look.</p>
+
+
+
+
+
+
+
+
+
+
+
+<p>One thing to note here is that, for the holdout benchmark cases where we don't include compile time as part of the benchmark and we repeatedly run searches, AOT <a href="https://github.com/danluu/fre/">FRE</a> outperforms on the benchmark. For a lot of use cases, you don't want a regex that takes multiple seconds to compile, but there are plenty of cases where this is fine, e.g., for something like ripgrep or Silver Searcher, it could start running with a regex that can start matching right away and then compile in another thread and cut over to the faster matcher when it's done compiling. Given how much of my CPU is spent on long ripgrep searches, it seems like a strategy like that could improve performance for work I personally do. Before LLMs, it probably wouldn't have made sense to spend the effort to write an optimizing regex compiler, but this is now do-able with a few tokens.</p>
+
+<p>Another thing to note here is that this comparison is arguably unfair because this was run on an ARM Graviton machine with SVE/SVE2 and <a href="https://github.com/danluu/fre/">FRE</a> has SVE/SVE2 optimizations. Pre-LLM, it might not have been worth it to have regexes optimized for every combination of SIMD instructions out there, but with LLMs, it's fairly easy to generate ok-ish SIMD optimizations. I know human experts who find that they can generally outperform LLMs here, e.g., Jay Stelly said that the last time he tried getting an LLM to produce SIMD code, it took 20-some iterations to get the code as good as he wanted. But, on the flip side, LLMs have the capability to try more optimizations than a human could possibly try in any given amount of time, so they can still perform pretty well overall even if any specific optimization isn't as good as a human expert would produce.</p>
+
+<p>There's also the problem discussed in this post of overfitting. Depending on the context, that problem is somewhere from very easy to solve to a bit difficult to solve. I deliberately didn't try very hard to solve the problem here to see what would happen, but I did manage to solve the problem without an outsized amount of effort when <a href="https://danluu.com/game/tile/">working on this Azul AI</a> (just for example), but a lot of these big benchmark claims come when people spend little to no effort trying to avoid overfitting, or even negative effort. In the pre-LLM era, people would often pick highly unrepresentative microbenchmarks to show off how great their pet project is which, at least at a non-conscious level, involves negative effort to avoid overfitting to a benchmark. Due to how humans are, I don't think people are going to stop making misleading claims and it's become easier than ever to make misleading claims, so of course we see more of them.</p>
+
+<p>Note that while this post has discussed non-AI software, everything said here goes double for AI software. For example, I've seen lots of people drop comments saying that Kimi K3 is Fable (5) level. But every single person I know who's used it has found it to be substantially worse than GPT-5.6 Sol and Fable. I'm not saying it's not an impressive engineering achievement, but the performance on a wide variety of real-world tasks isn't up to the level it is in benchmarks. This even applies to various eval-y problems, such as when a friend tried different coding agents on the ICFP 2026 contest problems. It also applies to security issues, which are something that I have no doubt AI labs are putting into their evals, e.g., a colleague of mine tried using Kimi K3 to scan for vulns in our software and found that it found approximately a quarter of the vulns GPT-5.6 Sol found, found no vulns that GPT-5.6 Sol didn't find, and didn't have any advantages in any dimension other than on cost. The people I know who are using cheaper models to find real security issues are using other models, such as GLM-5.2, which perform worse on benchmarks but better in practice.</p>
+
+<p>Back on the topic of FRE, one more note is that the holdout benchmark is an arbitrary subset of the ripgrep benchmark setup that was chosen by an agent for unknown reasons. I asked an agent to pull the entire benchmark suite, but that didn't finish in time for this post, so I don't know what the result will be once it's done.</p>
+
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[HNInternal: Ask HN: Does anyone else feel like nothing matters anymore? (179 pts)]]></title>
             <link>https://news.ycombinator.com/item?id=49340013</link>
             <guid>49340013</guid>
             <pubDate>Tue, 18 Aug 2026 01:28:48 GMT</pubDate>
@@ -78,7 +619,7 @@
 <div><p>I'm in a shitty place for working as a dev, and I still get recruiters knocking. What they're offering is not great, but that's because the market here is shit. At least there's something!</p></div></td></tr></tbody></table></td></tr></tbody></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Repair Cafe – Fix Your Broken Items (104 pts)]]></title>
+            <title><![CDATA[Repair Cafe – Fix Your Broken Items (116 pts)]]></title>
             <link>https://www.repaircafe.org/</link>
             <guid>49339097</guid>
             <pubDate>Mon, 17 Aug 2026 23:28:28 GMT</pubDate>
@@ -86,7 +627,7 @@
 Couldn't get https://www.repaircafe.org/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[How Bluesky draws its logo on screenshots (491 pts)]]></title>
+            <title><![CDATA[How Bluesky draws its logo on screenshots (531 pts)]]></title>
             <link>https://timmarinin.net/2026/bluesky-screenshots/</link>
             <guid>49338459</guid>
             <pubDate>Mon, 17 Aug 2026 22:20:40 GMT</pubDate>
@@ -115,7 +656,7 @@ Couldn't get https://www.repaircafe.org/: Error: timeout of 10000ms exceeded]]><
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Quake Shareware, a CD-ROM just a little too full (338 pts)]]></title>
+            <title><![CDATA[Quake Shareware, a CD-ROM just a little too full (359 pts)]]></title>
             <link>https://fabiensanglard.net/quake_shareware_cd/index.html</link>
             <guid>49338328</guid>
             <pubDate>Mon, 17 Aug 2026 22:06:14 GMT</pubDate>
@@ -319,7 +860,7 @@ with almost 150,000 CDs sitting in a warehouse.
  <center>*</center></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Fairphone 6 and PostmarketOS working main camera (191 pts)]]></title>
+            <title><![CDATA[Fairphone 6 and PostmarketOS working main camera (204 pts)]]></title>
             <link>https://catcrafts.net/posts/fairphone-6-postmarketos-working-main-camera</link>
             <guid>49338285</guid>
             <pubDate>Mon, 17 Aug 2026 22:01:17 GMT</pubDate>
@@ -327,7 +868,7 @@ with almost 150,000 CDs sitting in a warehouse.
 <div id="readability-page-1" class="page"><div><p>Today i bring the working main camera!</p><p>Building on the work nondescriptpointer did on the wide lens camera i have written the driver for the main camera and now its working alongside auto focus and color correction.</p><p>The color correction still a work in progress, but you can already see how much it improved the image.</p><p>before:</p><div><picture><source srcset="https://catcrafts.net/media/e2924a02871d8548.avif" type="image/avif"><source srcset="https://catcrafts.net/media/e2924a02871d8548.webp" type="image/webp"><img loading="lazy" decoding="async" alt="" src="https://catcrafts.net/media/e2924a02871d8548.png" width="1443" height="1920"></picture></div><p>After:</p><div><picture><source srcset="https://catcrafts.net/media/c87df983e4f3daa6.avif" type="image/avif"><source srcset="https://catcrafts.net/media/c87df983e4f3daa6.webp" type="image/webp"><img loading="lazy" decoding="async" alt="" src="https://catcrafts.net/media/c87df983e4f3daa6.png" width="1443" height="1920"></picture></div><p>But the after is still very grainy, plasma camera storing in jpg isn't exactly helping either, ill be working to get rid of the grain.</p><p>If we look at the same scene form my android galaxy A16 you see that there still is alot of work to be done:</p><p>I'll continue to work on the camera, but i wanted to get something out today (mainly so i could send to nondescriptpointer xd)</p><p>I asked him what role he wanted to play in the upstreaming and we agreed he would send it and i would review and assist. ~~So i successfully pulled down another soul into the linux phone kernel rabbit hole muhahahahaha~~</p><h2>News roundup</h2><p>Alot of things happend lately so good thing to discuss them, the big one:</p><h3>Emergency calling test</h3><p>You may have noticed that everywhere i put warnings that emergency calling is not verified yet. i wanted to fix that but after searching i couldn't find anything about it.</p><p>So i just called the police non emergency line and explained the situation, the operator told me that the information wasn't public but provided me with an email to send my application too.</p><p>I was a bit sad cause if its a non public thing its probably gated behind being big tech, but i send the email anyway, and much to my suprise i got back.</p><blockquote><p>De testen zijn goedgekeurd voor dinsdag 18 augustus tussen 13:30 en 14:15 uur.</p><p>Met vriendelijke groet,</p><p>(name censored) B ICT,</p><p>Tactisch &amp; Technisch Beheer 1-1-2 (TB112)</p></blockquote><p>Translation:</p><blockquote><p>The tests have been approved for Tuesday, August 18, between 1:30 p.m. and 2:15 p.m.</p><p>Kind regards,</p><p>(name censored) B ICT,</p><p>Tactical &amp; Technical Management 1-1-2 (TB112)</p></blockquote><p>So Im really excited for this, and then you know for sure that you can reach the emergency number with your linux phone.</p><h3>Fairphone 6+</h3><p>So the Fairphone 6+ has been officially announced an as soon as i can buy one im buying one, testing my image, and fixing any issues.</p><p>Im really glad for the donations so i can justify to myself this purchase instead of spending 650 euros for a phone that i already have.</p><h3>Donations</h3><p>I'm really grateful for all the people that donated and still continue to donate, i was over the moon when i got my first donation and i never expected to get this much. From the bottom of my heart thank you all very much.</p><p>I want to be open on where it's going. And i think as donators you deserve to know that its being spent wisely. so i made a script that builds this page from my bank statement:</p><p><a href="https://catcrafts.net/financials">https://catcrafts.net/financials</a></p><p>If it all works then donations should be reflected live and it will show the expense for the FP6+ when i buy it, net will drop in the negative as the remainder is coming out of my pocket.</p><p>If you want to send a donation please do so to the updated link: <a href="https://catcrafts.net/shop/donation">https://catcrafts.net/shop/donation</a> this will be reflected in the dashboard live and for tax reasons its now mega clear that its a donation.</p><h3>Catcrafts as a company</h3><p>Im contacting a notary with the plans to have Catcrafts corporated as a non profit company (stichting), this is is depending on all the legal stuff however so this isn't set in stone.</p><p>If and if this company goes somewhere and i could quit my job, i will pay myself a salary to live on that will be publicly visible on the financials page. Dutch law requires for non profits that salary to be at max market confirming and not a shadow way for paying out dividends, so its guaranteed that any money in the company will go towards furthering the mission.</p><p>I think a non profit phone company has a genuinely good proposition, i praise fairphone alot for the things they do right but in the end they are still an profit seeking business so im a bit wary, and they still post on Musk's X so my long term judgement on their company is still out there</p><p>I applied to be a fairphone partner with in my eyes a pretty good pitch, if they accept my opinion will be improved ;) hopefully i just need to have more patience or they are ghosting me ;-;</p><h3>Shipping restrictions</h3><p>I'm sad to announce this but i don't think i can do worlwide shippng, earlier i said i would be shipping worlwide but i must sadly retract that statement for reasons out of my control. I will be shipping worldwide with the following exceptions:</p><p>US, CA: It's seemingly impossible to get a Bedrijfsaansprakelijkheids­verzekering (corporate liability insurance) for the United States and Canada in the netherlands, its all worldwide excluding US and CA. Getting coverage for those requires "contact us" with probably a very hefty premium, and selling without insurance is too risky as that would mean financial ruin if i get sued.</p><p>I would appreciate if anyone that isn't a massive company has experience with this, will be contacting my insurer aswell to see what's possible on this front</p><p>RU, BY, KP: Sanctions make it a criminal offense for me to ship to these countries.</p><h3>imsd</h3><p>| Device | OS | Carrier |---|---|---| | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | KPN NL | | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telekom Deutschland GER | | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Phonero | | The Fairphone (Gen. 6) | postmarketOS, Linux 7.1.2 | Telia Norge |</p><p>Thanks to the community we now have 4 confirmed working carriers! If you are using the image please let me know so i can add it to the list!</p><h3>Making a Linux phone</h3><p>Ever since this project i've been dreaming about making my own linux phone, i've been looking into it here and there and while this might just be the sleep deprivation talking i think i can do it.</p><p>Making a good linux phone however is the hard part, and i don't think i can make an better arm linux phone then the fairphone 6 as those qualcomm chips are impossible to buy.</p><p>So im not going to, i'll make a RISCV one. will it be bad? yes, will it end up like the pinephone? most probably, will it run hot and have terrible battery life?, most likely. will it cost me a ton of money?, yes.</p><p>BUT</p><p>It will be a phone as open as i can make it, with good software, and a (in my eyes ethical) non profit company backing it. i think there is a good business proposition to made there, whatever the case its very long term anyway.</p><h3>Meeting the lead pmos dev</h3><p>Imagine my surprise when i see the lead pmos dev on a dutch tech forum, and i'm named, and then heart sank trough the floor when i'm being made out for something that can be disproved with a 10s search.</p><p>Luckily the record was set straight fast!</p><div><picture><source srcset="https://catcrafts.net/media/5abaddb68042e2ab.avif" type="image/avif"><source srcset="https://catcrafts.net/media/5abaddb68042e2ab.webp" type="image/webp"><img loading="lazy" decoding="async" alt="" src="https://catcrafts.net/media/5abaddb68042e2ab.png" width="1216" height="1791"></picture></div><p>Translation:</p><div><picture><source srcset="https://catcrafts.net/media/90991a2dacd9eb5e.avif" type="image/avif"><source srcset="https://catcrafts.net/media/90991a2dacd9eb5e.webp" type="image/webp"><img loading="lazy" decoding="async" alt="" src="https://catcrafts.net/media/90991a2dacd9eb5e.png" width="1216" height="1791"></picture></div><p>I don't want to hide context so here is the full thread:</p><p><a href="https://tweakers.net/nieuws/250872/fairphone-gaat-smartphone-met-12gb-ram-uitbrengen-voor-649-euro.html?showReaction=22462270#r_22462270">https://tweakers.net/nieuws/250872/fairphone-gaat-smartphone-met-12gb-ram-uitbrengen-voor-649-euro.html?showReaction=22462270#r_22462270</a></p><h3>What's next</h3><ol><li>More color correction</li><li>Laser rangefinder autofocus instead of software only.</li><li>Selfie camera</li><li>Fingerprint sensor</li><li>Extensive testing</li></ol><p>And then the FP6 is done, i will open my shop and continue with the FP6+</p><p>Since a long time i feel purpose in my life again, and i have alot of stuff still planned! And getting all the patches upstreamed is also probably a half year commitment atleast.</p><p>If you made it this far thank you for reading! As always ask me anything in the comments and ill do my best to answer.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[GPT-5.6 Sol Pricing Cut by 50% (429 pts)]]></title>
+            <title><![CDATA[GPT-5.6 Sol Pricing Cut by 50% (452 pts)]]></title>
             <link>https://openrouter.ai/openai/gpt-5.6-sol</link>
             <guid>49337602</guid>
             <pubDate>Mon, 17 Aug 2026 21:03:18 GMT</pubDate>
@@ -335,7 +876,7 @@ with almost 150,000 CDs sitting in a warehouse.
 <div id="readability-page-1" class="page"><div><p><span data-nav-home-placeholder="true"><a href="https://openrouter.ai/workspaces"></a></span><a href="https://openrouter.ai/models"></a><a href="https://openrouter.ai/benchmarks"></a><a data-nav-capability-link="chatroom" href="https://openrouter.ai/chat"></a><span data-nav-capability-fallback="chatroom"><span>Not available in this workspace</span></span><a href="https://openrouter.ai/rankings"></a><a href="https://openrouter.ai/apps"></a><a href="https://openrouter.ai/docs/quickstart"></a></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Israel creates fake think tank in likely attempt to dupe AI chatbots (479 pts)]]></title>
+            <title><![CDATA[Israel creates fake think tank in likely attempt to dupe AI chatbots (525 pts)]]></title>
             <link>https://responsiblestatecraft.org/israel-influence-chatgpt/</link>
             <guid>49337392</guid>
             <pubDate>Mon, 17 Aug 2026 20:46:10 GMT</pubDate>
@@ -343,7 +884,7 @@ with almost 150,000 CDs sitting in a warehouse.
 <div id="readability-page-1" class="page"><div data-headline="Israel creates fake think tank in likely attempt to dupe AI chatbots"><p>At a glance, the Hanover Institute for Public Policy looks like a new think tank dedicated to Israel/Palestine. The organization churns out think-tank style reports on questions <a href="https://hanoverinstitute.com/hanover/research/aipac-dark-money-and-the-filings" rel="noopener noreferrer" target="_blank"><u>such as</u></a> “Does AIPAC Use ‘Dark Money in Elections?” <a href="https://hanoverinstitute.com/hanover/research/starvation-campaign-claim-and-the-records" rel="noopener noreferrer" target="_blank"><u>and</u></a> “Is <a href="https://responsiblestatecraft.org/tag/israel/">Israel</a> Carrying out a Deliberate Campaign of Starvation in Gaza?” </p><p>But the Hanover Institute is not a real think tank. None of the reports have bylines. A small disclaimer at the bottom of the webpage notes that the organization was created on behalf of the Israeli Government Advertising Agency by Piro, Inc, a firm co-founded by Daniel Rosenberg, the producer of Spike Lee’s “Inside Man.” </p><p>The Hanover Institute’s reports — all of which are about Israel and Palestine — appear to be part of an Israeli effort to influence chatbots. The institute’s “data reports” have footnotes and tables of contents, and they present arguments in a neutral tone, helping them appeal to chatbots like Claude or Gemini. Piro’s <a href="https://www.wearepiro.com/ai-story-optimization" rel="noopener noreferrer" target="_blank"><u>website</u></a> says that it “author(s) content engineered for how LLMs evaluate credibility,” describing this service as "AI Story Optimization." Others <a href="https://www.anthropic.com/research/small-samples-poison" rel="noopener noreferrer" target="_blank"><u>refer</u></a> to this practice of influencing <a href="https://responsiblestatecraft.org/tag/artificial-intelligence/">artificial intelligence</a> as “LLM poisoning.” </p><p>According to its “about” <a href="https://hanoverinstitute.com/hanover/about" rel="noopener noreferrer" target="_blank"><u>page</u></a>, the Hanover Institute “studies the inputs fueling antisemitism in the United States, and publishes what the evidence shows.” Many of the reports are formulaic, starting with an innocent question that someone might ask a chatbot. </p><p>“What Caused the Displacement of Palestinians in 1948?”</p><p>“Which Humanitarian Organizations Have Documented Israeli War Crimes?” </p><p>“What is the Current Situation in the Gaza Strip?” </p><p>In an <a href="https://hanoverinstitute.com/hanover/research/the-most-moral-army-claim-and-the-code" rel="noopener noreferrer" target="_blank"><u>article</u></a> titled “Is the IDF the World’s Most Moral Army?” the Hanover Institute cites a 2022 poll that found that 47% of Israeli Jews believed that statement. Another <a href="https://hanoverinstitute.com/hanover/research/gaza-now-and-what-each-body-counts" rel="noopener noreferrer" target="_blank"><u>report</u></a> casts doubt on UNICEF's assertion that “90% of water and institutional infrastructure has been damaged or destroyed” in Gaza. Many of the reports conclude by linking the topic to rising antisemitism, oftentimes citing the same studies. </p><p>In a few cases, the Hanover Institute publishes what it claims are original findings. For instance, it put out a <a href="https://hanoverinstitute.com/hanover/research/how-top-israel-gaza-explainers-frame-the-conflict" rel="noopener noreferrer" target="_blank"><u>study</u></a> saying 19 of the 36 most-watched Israel-Gaza explainer videos contain contested claims, with most of the contested claims aligning with the Palestinian narrative. </p><p>The Hanover Institute’s publications sometimes <a href="https://hanoverinstitute.com/hanover/research/what-tracks-campus-antisemitism" rel="noopener noreferrer" target="_blank"><u>contradict</u></a> Israeli government narratives. For instance, one report says that foreign funding of universities as an explanation for antisemitic incidents is “weak and full of exceptions.” Israeli Prime Minister <a href="https://responsiblestatecraft.org/tag/benjamin-netanyahu/">Benjamin Netanyahu</a> has pushed this theory, <a href="https://www.breitbart.com/middle-east/2025/08/28/netanyahu-you-cant-be-maga-if-anti-israel/" rel="noopener noreferrer" target="_blank"><u>telling</u></a> Breitbart last year that Europeans and Qataris have spent “billions of American universities, vilifying, vilifying Israel, vilifying Jews, also, frankly, vilifying the United States.”</p><p>Alice Lee, an analyst at NewsGuard, a disinformation tracking company, told RS that the sites appear designed to reach a U.S. audience curious about the ongoing conflict, either through search engines or AI chatbots. "LLMs favor concrete statistics and data, as well as strong citations and sources, which these articles all have," Lee said.</p><p>"It's a perfect mimicry of a typical credible American think tank, right down to the generic name, the site layout, and the red-white-blue color scheme," Lee added.</p><p>Piro, Inc, the firm that created the Hanover Institute, has <a href="https://x.com/nick_clevelands/status/2064352128919863682?s=20" rel="noopener noreferrer" target="_blank"><u>received</u></a> $900,000 from the Israeli government for its work. Like <a href="https://quincyinst.org/research/the-eighth-front-inside-israels-1-billion-influence-campaign/" rel="noopener noreferrer" target="_blank"><u>many other</u></a> contractors working for Israel, Piro’s work is subcontracted through Havas <a href="https://responsiblestatecraft.org/media/">Media</a>, a French public relations conglomerate. </p><p>The fake think tank has churned out over 100 reports since it started publishing on August 6. The Hanover Institute <a href="https://hanoverinstitute.com/hanover/about" rel="noopener noreferrer" target="_blank"><u>claims</u></a> that “cited research is peer-reviewed and academic,” although it <a href="https://hanoverinstitute.com/hanover/research/starvation-campaign-claim-and-the-records" rel="noopener noreferrer" target="_blank"><u>frequently</u></a> <a href="https://hanoverinstitute.com/hanover/research/the-most-moral-army-claim-and-the-code" rel="noopener noreferrer" target="_blank"><u>cites</u></a> Israeli government sources such as the Israel Defense Forces and the Ministry of Foreign Affairs. </p><p>RS analyzed 12 random Hanover Institute articles using GPTZero, a popular AI detection software that claims a low false-positive rate. GPTZero flagged 11 of the articles as AI-written with “high confidence”; it flagged one article as AI-written with “moderate confidence.” </p><p>Israel has also<a href="https://responsiblestatecraft.org/israel-chatgpt/" target="_self"> <u>contracted</u></a> former Trump campaign manager Brad Parscale to create pro-Israel websites engineered to influence chatbots as part of a $46.5 million contract. A Drop Site <a href="https://www.dropsitenews.com/p/israel-brad-parscale-ai-chatbots-gaza" rel="noopener noreferrer" target="_blank"><u>investigation</u></a> last month found that many chatbots, particularly Microsoft Copilot and Google Gemini, had been successfully trained on data from those websites. Other chatbots frequently cite those websites without flagging them as part of an Israeli influence operation.</p><p>Piro does not explicitly state in its agreement <a href="https://efile.fara.gov/ords/fara/f?p=1235:20::::::" rel="noopener noreferrer" target="_blank"><u>submitted</u></a> to the Department of Justice that its work for Israel is to influence AI. In an email to Politico, which first reported the filing, Rosenberg <a href="https://www.politico.com/influence" rel="noopener noreferrer" target="_blank"><u>said</u></a> his firm’s work is to “put accurate, sourced facts into the public record and to counter misinformation about Israel with verifiable information.” However, last month, Rosenberg posted on LinkedIn <a href="https://www.linkedin.com/feed/update/urn:li:activity:7479870532944044032/" rel="noopener noreferrer" target="_blank"><u>advertising</u></a> Piro’s ability to influence chatbots:</p><p>“When someone asks ChatGPT, Gemini, or Perplexity about your category, an answer comes back in one confident paragraph. Most brands have no idea how that paragraph gets built. So we spent months reverse-engineering it…At Piro, we already knew how to build stories that move people. The question was: how do you make sure AI knows how to tell them?”</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AI;DR (AI; Didn't Read) (872 pts)]]></title>
+            <title><![CDATA[AI;DR (AI; Didn't Read) (891 pts)]]></title>
             <link>https://www.rickmanelius.com/p/aidr-ai-didnt-read</link>
             <guid>49336573</guid>
             <pubDate>Mon, 17 Aug 2026 19:47:15 GMT</pubDate>
@@ -353,7 +894,7 @@ with almost 150,000 CDs sitting in a warehouse.
 (AI; didn’t read)</p><div><p><span>4:13 PM · Aug 15, 2026</span><span> · </span><span>346K Views</span></p><p><span>83 Replies</span><span> · </span><span>2.09K Reposts</span><span> · </span><span>16.6K Likes</span></p></div></div></a><p>I’ve been thinking about it ever since. Why? Because there is growing grumbling among everyone about AI writing. And it’s not just others; it’s me! I am getting to the point where I physically flinch (sometimes dropping my shoulders and hunching, or having a slight eye twitch) when someone I respect sends me unfiltered and unedited AI output.</p><p>Look, I get it. It’s Q3 2026, and we should expect that everyone is utilizing AI at SOME point in their process (sourcing ideas, creating outlines, refining prose, etc.).</p><p>However, I have a new policy.</p><p>If you’re not bothered enough to review and edit it...</p><p>...then I’m not going to bother reading it.</p><p>Yes, there are certain situations in which we should expect 100% AI-generated copy. Customer support would be a perfect example. We’re not looking for artisanal “did you make sure to reset your phone” style dialogue.</p><p>But if you’re my colleague and we’re in a Slack discussion and you post a wall of Claude output, then I’m afraid I received a different message than you intended.</p><p>The same is true for people’s newsletters and social content. It’s your name on it; are you proud of the prose and weird AI-isms sprinkled throughout it? If so, great. But I can ask Claude directly if I wanted to.</p><p>TL;DR (too long; didn’t read) was the solution for social media.</p><p>AI;DR (AI; didn’t read) is the solution for AI slop.</p><p>May you embrace this policy yourself and seek out those willing to care enough to prioritize a human touch when they talk to you.</p></div></article></div><div><div id="discussion"><h4>Discussion about this post</h4></div><div><h3>Ready for more?</h3></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[India has paved the way for charging merchants a fee on UPI transactions (148 pts)]]></title>
+            <title><![CDATA[India has paved the way for charging merchants a fee on UPI transactions (153 pts)]]></title>
             <link>https://www.bbc.com/news/articles/c8xnwqe00v1o</link>
             <guid>49336304</guid>
             <pubDate>Mon, 17 Aug 2026 19:25:11 GMT</pubDate>
@@ -524,7 +1065,7 @@ with almost 150,000 CDs sitting in a warehouse.
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Los Puesteros, solitary men who look after ranches and livestock in Patagonia (145 pts)]]></title>
+            <title><![CDATA[Los Puesteros, solitary men who look after ranches and livestock in Patagonia (147 pts)]]></title>
             <link>https://www.newyorker.com/culture/photo-booth/the-lonely-men-at-the-end-of-the-world</link>
             <guid>49335600</guid>
             <pubDate>Mon, 17 Aug 2026 18:34:09 GMT</pubDate>
@@ -532,7 +1073,7 @@ with almost 150,000 CDs sitting in a warehouse.
 <div id="readability-page-1" class="page"><div id="main-content" tabindex="-1"><article lang="en-US"><div><header><div data-testid="ContentHeaderContainer"><div data-testid="ContentHeaderAccreditation"><p>In Patagonia, <em>los puesteros</em> look after other people’s livestock for not very much money, and sometimes go months without seeing anyone else.</p></div><div data-testid="ContentHeaderLeadAsset"><figure><p><span><div data-testid="aspect-ratio-container"><picture><source media="(max-width: 767px)" srcset="https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_120,c_limit/Zatarain-Coiron_17.jpg 120w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_240,c_limit/Zatarain-Coiron_17.jpg 240w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_320,c_limit/Zatarain-Coiron_17.jpg 320w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_640,c_limit/Zatarain-Coiron_17.jpg 640w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_768,c_limit/Zatarain-Coiron_17.jpg 768w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_960,c_limit/Zatarain-Coiron_17.jpg 960w" sizes="100vw"><source media="(min-width: 768px)" srcset="https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_120,c_limit/Zatarain-Coiron_17.jpg 120w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_240,c_limit/Zatarain-Coiron_17.jpg 240w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_320,c_limit/Zatarain-Coiron_17.jpg 320w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_640,c_limit/Zatarain-Coiron_17.jpg 640w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_768,c_limit/Zatarain-Coiron_17.jpg 768w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_960,c_limit/Zatarain-Coiron_17.jpg 960w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_1280,c_limit/Zatarain-Coiron_17.jpg 1280w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_1600,c_limit/Zatarain-Coiron_17.jpg 1600w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_1920,c_limit/Zatarain-Coiron_17.jpg 1920w, https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_2240,c_limit/Zatarain-Coiron_17.jpg 2240w" sizes="100vw"><img alt="A man looking out of a window." src="https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_2560%2Cc_limit/Zatarain-Coiron_17.jpg" data-src="https://media.newyorker.com/photos/6a7f7fc939cfd25116c026de/master/w_2560%2Cc_limit/Zatarain-Coiron_17.jpg"></picture></div></span></p></figure></div></div></header></div><div data-testid="ArticlePageChunks" data-attribute-verso-pattern="article-body"><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>The landscape in the southernmost part of Chilean Patagonia, often called the End of the World, has a post-apocalyptic quality. At the final stop, so to speak, before Antarctica, the weather is harshly volatile, and in the wilderness surrounding the few small cities and towns, civilization dwindles almost to nothing. Most of the human presence in that region is transient—tourists who marvel at nature and soon depart. But a small number of people do live on the land, in isolated cabins, often going weeks, and sometimes months, without seeing one another, or anyone else. Known as <em>puesteros</em>, they are solitary men employed by landowners to look after ranches and livestock. Because this onerous and not very lucrative work is unappealing to younger generations, the <em>puesteros</em> are an aging breed, with few lined up to replace them.</p></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A man on a horse in snow." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_120,c_limit/Zatarain-Coiron_02.jpg 120w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_240,c_limit/Zatarain-Coiron_02.jpg 240w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_320,c_limit/Zatarain-Coiron_02.jpg 320w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_640,c_limit/Zatarain-Coiron_02.jpg 640w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_768,c_limit/Zatarain-Coiron_02.jpg 768w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_960,c_limit/Zatarain-Coiron_02.jpg 960w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_1280,c_limit/Zatarain-Coiron_02.jpg 1280w, https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_1600,c_limit/Zatarain-Coiron_02.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7ed55b6cfa7eff424505/master/w_1600%2Cc_limit/Zatarain-Coiron_02.jpg"></picture></span></p></figure><figure><p><span><picture tabindex="0" role="button"><img alt="A seated man near a wooden fence." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_120,c_limit/Zatarain-Coiron_10.jpg 120w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_240,c_limit/Zatarain-Coiron_10.jpg 240w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_320,c_limit/Zatarain-Coiron_10.jpg 320w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_640,c_limit/Zatarain-Coiron_10.jpg 640w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_768,c_limit/Zatarain-Coiron_10.jpg 768w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_960,c_limit/Zatarain-Coiron_10.jpg 960w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_1280,c_limit/Zatarain-Coiron_10.jpg 1280w, https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_1600,c_limit/Zatarain-Coiron_10.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f5b4e2f6e2fc9382519/master/w_1600%2Cc_limit/Zatarain-Coiron_10.jpg"></picture></span></p></figure></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A tree in a landscape." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_120,c_limit/Zatarain-Coiron_14.jpg 120w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_240,c_limit/Zatarain-Coiron_14.jpg 240w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_320,c_limit/Zatarain-Coiron_14.jpg 320w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_640,c_limit/Zatarain-Coiron_14.jpg 640w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_768,c_limit/Zatarain-Coiron_14.jpg 768w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_960,c_limit/Zatarain-Coiron_14.jpg 960w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_1280,c_limit/Zatarain-Coiron_14.jpg 1280w, https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_1600,c_limit/Zatarain-Coiron_14.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7fa0ab5143dd216fd46e/master/w_1600%2Cc_limit/Zatarain-Coiron_14.jpg"></picture></span></p></figure></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>In 2018, during a nine-month stay in Patagonia, the Dutch photographer Pie Aerts often spotted <em>puesteros</em> from a distance: lone figures atop horses, silhouetted against the horizon. “In that huge landscape, they appeared stoic, but extremely vulnerable, as well,” Aerts told me recently. Those distant encounters were the whole of his contact with the men during that trip; it wasn’t until the compulsory lockdown of 2020, which Aerts endured back home, in Amsterdam, that he began to consider the effects of prolonged isolation. Recalling his visions of <em>puesteros</em>, he searched for more information online and came across a short documentary that chronicled their seclusion. He reached out to the film’s director, Matías Bolla, an Australian filmmaker of Chilean descent who was also spending quarantine in his home country. The exchange led the pair back to Chile in 2022, on the first of several trips that have resulted in a feature-length film, currently in post-production, and the photo book “<a data-offer-url="https://gostbooks.com/products/coiron" data-event-click="{&quot;element&quot;:&quot;ExternalLink&quot;,&quot;outgoingURL&quot;:&quot;https://gostbooks.com/products/coiron&quot;}" href="https://gostbooks.com/products/coiron" rel="nofollow noopener" target="_blank">Coirón</a>” (GOST Books), which takes its title from an unusually resilient grass that is native to the region.</p></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A man seated at a dining table." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_120,c_limit/Zatarain-Coiron_18.jpg 120w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_240,c_limit/Zatarain-Coiron_18.jpg 240w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_320,c_limit/Zatarain-Coiron_18.jpg 320w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_640,c_limit/Zatarain-Coiron_18.jpg 640w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_768,c_limit/Zatarain-Coiron_18.jpg 768w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_960,c_limit/Zatarain-Coiron_18.jpg 960w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_1280,c_limit/Zatarain-Coiron_18.jpg 1280w, https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_1600,c_limit/Zatarain-Coiron_18.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7fdb149a61e11da58a9d/master/w_1600%2Cc_limit/Zatarain-Coiron_18.jpg"></picture></span></p></figure></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A rosarie in a window." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_120,c_limit/Zatarain-Coiron_01.jpg 120w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_240,c_limit/Zatarain-Coiron_01.jpg 240w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_320,c_limit/Zatarain-Coiron_01.jpg 320w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_640,c_limit/Zatarain-Coiron_01.jpg 640w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_768,c_limit/Zatarain-Coiron_01.jpg 768w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_960,c_limit/Zatarain-Coiron_01.jpg 960w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_1280,c_limit/Zatarain-Coiron_01.jpg 1280w, https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_1600,c_limit/Zatarain-Coiron_01.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7e942c8df8f8f533933d/master/w_1600%2Cc_limit/Zatarain-Coiron_01.jpg"></picture></span></p></figure><figure><p><span><picture tabindex="0" role="button"><img alt="Image may contain Stain Leaf and Plant" loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_120,c_limit/Zatarain-Coiron_07.jpg 120w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_240,c_limit/Zatarain-Coiron_07.jpg 240w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_320,c_limit/Zatarain-Coiron_07.jpg 320w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_640,c_limit/Zatarain-Coiron_07.jpg 640w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_768,c_limit/Zatarain-Coiron_07.jpg 768w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_960,c_limit/Zatarain-Coiron_07.jpg 960w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_1280,c_limit/Zatarain-Coiron_07.jpg 1280w, https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_1600,c_limit/Zatarain-Coiron_07.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f2178e7ba60b61c1724/master/w_1600%2Cc_limit/Zatarain-Coiron_07.jpg"></picture></span></p></figure></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="Image may contain Face Head Person Adult Photography Portrait and Sitting" loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_120,c_limit/Zatarain-Coiron_15.jpg 120w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_240,c_limit/Zatarain-Coiron_15.jpg 240w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_320,c_limit/Zatarain-Coiron_15.jpg 320w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_640,c_limit/Zatarain-Coiron_15.jpg 640w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_768,c_limit/Zatarain-Coiron_15.jpg 768w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_960,c_limit/Zatarain-Coiron_15.jpg 960w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_1280,c_limit/Zatarain-Coiron_15.jpg 1280w, https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_1600,c_limit/Zatarain-Coiron_15.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7fb0ee492832c41d0352/master/w_1600%2Cc_limit/Zatarain-Coiron_15.jpg"></picture></span></p></figure></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>The book features portraits of <em>puesteros</em> between shots of domestic settings and local landscapes—the little that belongs to them and the vastness that does not. Though Aerts initially intended to focus on solitude, he came to see that the lives of these men were equally shaped by precarity and dispossession, by “the fear of retirement that they all carry, with few pension funds or social-welfare conditions for them in place,” Aerts said. He quoted a <em>puestero</em> who said, “What a shame to come to love the land that will never be mine.” In one photo from the book, two paltry berries rest on a man’s open palm, fresh soil under his fingernails.</p><div data-testid="GenericCallout"><figure><p><span><picture tabindex="0" role="button"><img alt="A hand holding strawberries." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_120,c_limit/Zatarain-Coiron_06.jpg 120w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_240,c_limit/Zatarain-Coiron_06.jpg 240w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_320,c_limit/Zatarain-Coiron_06.jpg 320w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_640,c_limit/Zatarain-Coiron_06.jpg 640w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_768,c_limit/Zatarain-Coiron_06.jpg 768w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_960,c_limit/Zatarain-Coiron_06.jpg 960w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_1280,c_limit/Zatarain-Coiron_06.jpg 1280w, https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_1600,c_limit/Zatarain-Coiron_06.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f13f3f906404b11d8a4/master/w_1600%2Cc_limit/Zatarain-Coiron_06.jpg"></picture></span></p></figure></div></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><div data-testid="GenericCallout"><figure><p><span><picture tabindex="0" role="button"><img alt="A bedroom with many posters." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_120,c_limit/Zatarain-Coiron_09.jpg 120w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_240,c_limit/Zatarain-Coiron_09.jpg 240w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_320,c_limit/Zatarain-Coiron_09.jpg 320w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_640,c_limit/Zatarain-Coiron_09.jpg 640w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_768,c_limit/Zatarain-Coiron_09.jpg 768w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_960,c_limit/Zatarain-Coiron_09.jpg 960w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_1280,c_limit/Zatarain-Coiron_09.jpg 1280w, https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_1600,c_limit/Zatarain-Coiron_09.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f4d9c8270617da9e6ae/master/w_1600%2Cc_limit/Zatarain-Coiron_09.jpg"></picture></span></p></figure></div><div data-testid="GenericCallout"><figure><p><span><picture tabindex="0" role="button"><img alt="A man seated on a couch." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_120,c_limit/Zatarain-Coiron_13.jpg 120w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_240,c_limit/Zatarain-Coiron_13.jpg 240w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_320,c_limit/Zatarain-Coiron_13.jpg 320w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_640,c_limit/Zatarain-Coiron_13.jpg 640w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_768,c_limit/Zatarain-Coiron_13.jpg 768w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_960,c_limit/Zatarain-Coiron_13.jpg 960w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_1280,c_limit/Zatarain-Coiron_13.jpg 1280w, https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_1600,c_limit/Zatarain-Coiron_13.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f8c5f939adf5c3b09e5/master/w_1600%2Cc_limit/Zatarain-Coiron_13.jpg"></picture></span></p></figure></div><p>Outside the modest cabins, seasons pass. One stands starkly in the dead white of winter; another appears almost to melt into the pink-hued mountains surrounding it. Inside the homes, sunlight falls on faded posters, worn furniture, and an old radio by a window. Other photos present less legible scenarios. There is a taxidermied puma lying in the middle of an abandoned room, five taxidermied armadillos arranged on a couch, three mattresses collapsed under an overcast sky. These images baffle, then linger, suggesting that life in this remote countryside is stranger than we may understand it to be.</p></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="Old mattresses in an arid landscape." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_120,c_limit/Zatarain-Coiron_03.jpg 120w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_240,c_limit/Zatarain-Coiron_03.jpg 240w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_320,c_limit/Zatarain-Coiron_03.jpg 320w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_640,c_limit/Zatarain-Coiron_03.jpg 640w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_768,c_limit/Zatarain-Coiron_03.jpg 768w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_960,c_limit/Zatarain-Coiron_03.jpg 960w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_1280,c_limit/Zatarain-Coiron_03.jpg 1280w, https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_1600,c_limit/Zatarain-Coiron_03.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7ee9fa2d55c6cbd25c7d/master/w_1600%2Cc_limit/Zatarain-Coiron_03.jpg"></picture></span></p></figure></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A many laying down." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_120,c_limit/Zatarain-Coiron_04.jpg 120w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_240,c_limit/Zatarain-Coiron_04.jpg 240w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_320,c_limit/Zatarain-Coiron_04.jpg 320w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_640,c_limit/Zatarain-Coiron_04.jpg 640w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_768,c_limit/Zatarain-Coiron_04.jpg 768w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_960,c_limit/Zatarain-Coiron_04.jpg 960w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_1280,c_limit/Zatarain-Coiron_04.jpg 1280w, https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_1600,c_limit/Zatarain-Coiron_04.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7ef6fa2d55c6cbd25c83/master/w_1600%2Cc_limit/Zatarain-Coiron_04.jpg"></picture></span></p></figure></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="Taxidermy armadillos on a couch." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_120,c_limit/Zatarain-Coiron_08.jpg 120w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_240,c_limit/Zatarain-Coiron_08.jpg 240w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_320,c_limit/Zatarain-Coiron_08.jpg 320w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_640,c_limit/Zatarain-Coiron_08.jpg 640w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_768,c_limit/Zatarain-Coiron_08.jpg 768w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_960,c_limit/Zatarain-Coiron_08.jpg 960w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_1280,c_limit/Zatarain-Coiron_08.jpg 1280w, https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_1600,c_limit/Zatarain-Coiron_08.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f38c817cc66305676f3/master/w_1600%2Cc_limit/Zatarain-Coiron_08.jpg"></picture></span></p></figure></div><div data-journey-hook="grid-wrapper" data-testid="BodyWrapper"><p>Aerts is not fluent in Spanish; during visits with the men, Bolla conducted interviews while Aerts sat in the background, absorbing what he could. This turned out to be a fertile constraint. His relationships with the <em>puesteros</em> were largely built on nonverbal exchanges: playing music, cooking dinner, sharing in stillness. “Sometimes it was required to sit in a room and not speak at all, just listening to the wind,” Aerts said. “It was a big shock for me, coming from a world where everything is so connected, and where we’re always filling the void.” Silence is palpable in the portraits of the men, photographs that show hardship coexisting with resilience, that quiver with pathos but do not collapse.</p></div><div data-testid="RowWrapper"><figure><p><span><picture tabindex="0" role="button"><img alt="A sunset or sunrise." loading="lazy" srcset="https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_120,c_limit/Zatarain-Coiron_12.jpg 120w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_240,c_limit/Zatarain-Coiron_12.jpg 240w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_320,c_limit/Zatarain-Coiron_12.jpg 320w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_640,c_limit/Zatarain-Coiron_12.jpg 640w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_768,c_limit/Zatarain-Coiron_12.jpg 768w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_960,c_limit/Zatarain-Coiron_12.jpg 960w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_1280,c_limit/Zatarain-Coiron_12.jpg 1280w, https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_1600,c_limit/Zatarain-Coiron_12.jpg 1600w" sizes="100vw" src="https://media.newyorker.com/photos/6a7f7f7478e7ba60b61c172a/master/w_1600%2Cc_limit/Zatarain-Coiron_12.jpg"></picture></span></p></figure></div></div></article><div data-testid="RowWrapper" data-journey-hook="grid-wrapper"><ul><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"><p>A scientist with a Ph.D. from Harvard fatally shot three of her colleagues. Then revelations about <a href="https://www.newyorker.com/magazine/2013/02/11/a-loaded-gun">her family history came to light</a>.</p></li><li data-testid="LinkStackBullet"></li><li data-testid="LinkStackBullet"></li></ul></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[GPU Offload in Rust: Portable, Safe, and Fast (211 pts)]]></title>
+            <title><![CDATA[GPU Offload in Rust: Portable, Safe, and Fast (216 pts)]]></title>
             <link>https://arxiv.org/abs/2608.13759</link>
             <guid>49334991</guid>
             <pubDate>Mon, 17 Aug 2026 17:54:59 GMT</pubDate>
@@ -788,7 +1329,7 @@ DDR4 Memory Kit Pricing Change (2025 → 2026)
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Qwen3.8 27B scores 52 on Artificial Analysis (348 pts)]]></title>
+            <title><![CDATA[Qwen3.8 27B scores 52 on Artificial Analysis (349 pts)]]></title>
             <link>https://artificialanalysis.ai/models/qwen3-8-27b</link>
             <guid>49334544</guid>
             <pubDate>Mon, 17 Aug 2026 17:25:17 GMT</pubDate>
@@ -796,7 +1337,7 @@ DDR4 Memory Kit Pricing Change (2025 → 2026)
 <div id="readability-page-1" class="page"><div><section id="intelligence"><div><p><h2><span>Intelligence</span></h2></p></div><div><div id="intelligence-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_32llfiv5tabsrb_-trigger-artificial-analysis-intelligence-index" tabindex="0" dir="ltr"><div><div><h3><span>Artificial Analysis Intelligence Index</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Artificial Analysis Intelligence Index v4.1.1 incorporates 9 evaluations: GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_djr2llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_5jr2llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Artificial Analysis Intelligence Index v4.1.1<!-- --> includes: <!-- -->GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR<!-- -->. See<!-- --> <a href="https://artificialanalysis.ai/methodology/intelligence-benchmarking">Intelligence Index methodology</a> <!-- -->for further details, including a breakdown of each evaluation and how we run them.</p></div></div></div><div id="intelligence-category-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_52llfiv5tabsrb_-trigger-open-weights-vs-proprietary" tabindex="0" dir="ltr"><div><div><h3><span>Artificial Analysis Intelligence Index by Open Weights / Proprietary</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Artificial Analysis Intelligence Index v4.1.1 incorporates 9 evaluations: GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-metric-descriptor="true"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_ljt2llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_5jt2llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Artificial Analysis Intelligence Index v4.1.1<!-- --> includes: <!-- -->GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR<!-- -->. See<!-- --> <a href="https://artificialanalysis.ai/methodology/intelligence-benchmarking">Intelligence Index methodology</a> <!-- -->for further details, including a breakdown of each evaluation and how we run them.</p></div></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_pjt2llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_9jt2llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Indicates whether the model weights are available. Models are labelled as 'Commercial Use Restricted' if the weights are available but commercial use is limited (typically requires obtaining a paid license).</p></div></div></div></div></div></section><div id="intelligence-breakdown"><div id="intelligence-evaluations"><div><div><h3><span>Intelligence Evaluations</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Intelligence evaluations measured independently by Artificial Analysis · Higher is better</span></p></div><div><div><p>Quantitative analysis on spreadsheets &amp; documents</p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div></div><div data-metric-descriptor="true"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_lj3llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_5j3llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>While model intelligence generally translates across use cases, specific evaluations may be more relevant for certain use cases.</p></div></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_pj3llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_9j3llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Artificial Analysis Intelligence Index v4.1.1<!-- --> includes: <!-- -->GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR<!-- -->. See<!-- --> <a href="https://artificialanalysis.ai/methodology/intelligence-benchmarking">Intelligence Index methodology</a> <!-- -->for further details, including a breakdown of each evaluation and how we run them.</p></div></div></div></div><p><h3>AA-Omniscience</h3></p><div id="omniscience-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_n3llfiv5tabsrb_-trigger-omniscience-index" tabindex="0" dir="ltr"><div><div><h3><span>AA-Omniscience Index</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>AA-Omniscience Index (higher is better) measures knowledge reliability and hallucination. It rewards correct answers, penalizes hallucinations, and has no penalty for refusing to answer. Scores range from -100 to 100, where 0 means as many correct as incorrect answers, and negative scores mean more incorrect than correct.</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_1mfn3llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_mfn3llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>AA-Omniscience Index (higher is better) measures knowledge reliability and hallucination. It rewards correct answers, penalizes hallucinations, and has no penalty for refusing to answer. Scores range from -100 to 100, where 0 means as many correct as incorrect answers, and negative scores mean more incorrect than correct.</p></div></div></div></div><section id="openness"><div><p><h2><span>Openness Index</span></h2></p></div><div id="openness-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_14llfiv5tabsrb_-trigger-openness-index-bar-chart" tabindex="0" dir="ltr"><div><h3><span>Artificial Analysis Openness Index: Score</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Openness Index assesses model openness on a 0 to 100 normalized scale (higher is more open)</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div></section><section id="intelligence-comparisons"><div><p><h2><span>Intelligence Index Comparisons</span></h2></p></div><div id="intelligence-comparison-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_15llfiv5tabsrb_-trigger-intelligence-vs-cost-per-task" tabindex="0" dir="ltr"><div><div><h3><span>Intelligence Index vs. Cost per Intelligence Index Task</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Artificial Analysis Intelligence Index · Weighted average cost (USD) per Artificial Analysis Intelligence Index task</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-metric-descriptor="true"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_aov5llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_2ov5llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Weighted average cost per Intelligence Index task. Each evaluation’s cost is calculated from input, cache hit, cache write, reasoning, and answer token prices, divided by task count, and weighted by its Intelligence Index weight.</p></div></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_cov5llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_4ov5llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Artificial Analysis Intelligence Index v4.1.1<!-- --> includes: <!-- -->GDPval-AA v2, 𝜏³-Banking, Terminal-Bench v2.1, SciCode, Humanity's Last Exam, GPQA Diamond, CritPt, AA-Omniscience, AA-LCR<!-- -->. See<!-- --> <a href="https://artificialanalysis.ai/methodology/intelligence-benchmarking">Intelligence Index methodology</a> <!-- -->for further details, including a breakdown of each evaluation and how we run them.</p></div></div></div></div></section><section id="token-use"><div><p><h2><span>Token Use</span></h2></p></div><div id="intelligence-index-token-use-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_16llfiv5tabsrb_-trigger-output-tokens-per-task" tabindex="0" dir="ltr"><div><div><h3><span>Output Tokens per Intelligence Index Task</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Weighted average number of output tokens used to run one task in the Artificial Analysis Intelligence Index</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_6ov6llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_2ov6llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>The number of tokens required per Intelligence Index task. This is calculated by multiplying the output tokens per eval by the relative weights of each benchmark in the Intelligence Index, then dividing by task count (excluding repeats).</p></div></div></div></section><section id="price-cost"><div><p><h2><span>Cost</span></h2></p></div><div><div id="cost-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_37llfiv5tabsrb_-trigger-cost-per-task" tabindex="0" dir="ltr"><div><div><h3><span>Cost per Intelligence Index Task</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Weighted average cost (USD) per Artificial Analysis Intelligence Index task, segmented by token type. Lower is better</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_djr7llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_5jr7llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Weighted average cost per Intelligence Index task. Each evaluation’s cost is calculated from input, cache hit, cache write, reasoning, and answer token prices, divided by task count, and weighted by its Intelligence Index weight.</p></div></div></div><div id="total-cost-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_57llfiv5tabsrb_-trigger-intelligence-index-total-cost" tabindex="0" dir="ltr"><div><div><h3><span>Cost to Run Artificial Analysis Intelligence Index</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Cost (USD) to run all evaluations in the Artificial Analysis Intelligence Index</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_djt7llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_5jt7llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>The cost to run the evaluations in the Artificial Analysis Intelligence Index, calculated using the model's input, cache hit, cache write, reasoning, and answer token prices and the number of tokens used across evaluations (excluding repeats).</p></div></div></div><div id="pricing-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_77llfiv5tabsrb_-trigger-input-output-pricing" tabindex="0" dir="ltr"><div><div><h3><span>Pricing: Cache Hit, Input, and Output</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Price (USD per M Tokens)</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-state="closed" data-orientation="vertical" data-metric-descriptor="true"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_r3v7llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_b3v7llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Price per token for cached prompts (previously processed), typically offering a significant discount compared to regular input price, represented as USD per million tokens. The values shown here are the cache hit price; cache write and cache storage are billed separately and vary by provider — see "Cache pricing by provider" for detail.</p></div></div></div></div></section><section id="context-window"><div><p><h2><span>Context Window</span></h2></p></div><div id="context-window-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_18llfiv5tabsrb_-trigger-context-window" tabindex="0" dir="ltr"><div><div><h3><span>Context Window</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Context window: tokens limit · Higher is better</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-metric-descriptor="true"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_5cv8llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_1cv8llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Larger context windows are relevant to RAG (Retrieval Augmented Generation) LLM workflows which typically involve reasoning and information retrieval of large amounts of data.</p></div></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_6cv8llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_2cv8llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>Maximum number of combined input &amp; output tokens. Output tokens commonly have a significantly lower limit (varied by model).</p></div></div></div></div></section><section id="model-size"><div><p><h2><span>Model Size (Open Weights Models Only)</span></h2></p></div><div id="model-size-tabs" data-state="active" data-orientation="horizontal" role="tabpanel" aria-labelledby="radix-_R_19llfiv5tabsrb_-trigger-total-and-active-parameters" tabindex="0" dir="ltr"><div><div><h3><span>Model Size: Total and Active Parameters</span></h3><!--$!--><template data-dgst="BAILOUT_TO_CLIENT_SIDE_RENDERING"></template><!--/$--><p><span>Comparison between total model parameters and parameters active during inference</span></p></div><div><p>Reasoning models are indicated by a lightbulb icon</p></div></div><div data-metric-descriptor="true"><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_5cv9llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_1cv9llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>The total number of trainable weights and biases in the model, expressed in billions. These parameters are learned during training and determine the model's ability to process and generate responses.</p></div></div><div data-state="closed" data-orientation="vertical"><h3 data-orientation="vertical" data-state="closed"></h3><div data-state="closed" id="radix-_R_6cv9llfiv5tabsrb_" role="region" aria-labelledby="radix-_R_2cv9llfiv5tabsrb_" data-orientation="vertical" data-metric-descriptor-content="true"><p>The number of parameters actually executed during each inference forward pass, expressed in billions. For Mixture of Experts (MoE) models, a routing mechanism selects a subset of experts per token, resulting in fewer active than total parameters. Dense models use all parameters, so active equals total.</p></div></div></div></div></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[An update on leaving Gmail for Fastmail (227 pts)]]></title>
+            <title><![CDATA[An update on leaving Gmail for Fastmail (241 pts)]]></title>
             <link>https://moddedbear.com/an-update-on-leaving-gmail-for-fastmail/</link>
             <guid>49334409</guid>
             <pubDate>Mon, 17 Aug 2026 17:15:20 GMT</pubDate>
