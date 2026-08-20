@@ -4,12 +4,288 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 20 Aug 2026 13:30:08 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 20 Aug 2026 14:30:08 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[AliExpress runs silent WebAudio fingerprinting that breaks Bluetooth multipoint (250 pts)]]></title>
+            <title><![CDATA[Show HN: I trained a 125M model to autocomplete piano on-device (154 pts)]]></title>
+            <link>https://simedw.com/2026/08/20/midi-autocomplete/</link>
+            <guid>49373456</guid>
+            <pubDate>Thu, 20 Aug 2026 12:04:38 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://simedw.com/2026/08/20/midi-autocomplete/">https://simedw.com/2026/08/20/midi-autocomplete/</a>, See on <a href="https://news.ycombinator.com/item?id=49373456">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+          <p><span>TL;DR:</span> I trained a 125M-parameter transformer to autocomplete piano performances in real time (~108 notes/sec on an iPhone 15). The biggest improvements came from finding the right MIDI representation, cleaning the training data aggressively, and adding DPO post-training. </p>
+<p>Almost a year ago, I started tinkering with an idea: connect my MIDI piano to my phone, play something, and have AI autocomplete the song for me. Think GitHub Copilot, but for piano. </p>
+<p>It turned out to be a deeper rabbit hole than I expected. Fourteen experiments later, it is finally at a point where I am happy enough with it to write about.</p>
+<figure>
+  <video controls="" width="100%" preload="metadata">
+    <source src="https://simedw.com/2026/08/20/midi-autocomplete/videos/rolltab-live-piano.mp4" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+  <figcaption>Potato-quality video because the good phone was busy running the MIDI model.</figcaption>
+</figure>
+
+<p>The app, RollTab, is available for free <a href="https://apps.apple.com/gb/app/rolltab/id6799679058">here</a> if you have a MIDI keyboard and an iPhone/iPad. <sup id="fnref:0"><a href="#fn:0">1</a></sup></p>
+<h2 id="a-few-sound-samples">A few sound samples</h2>
+<p>Each audio starts with a short prompt, followed by the model's continuation.</p>
+<p><strong>Pokémon, Pallet Town (8-note prompt)</strong></p>
+<p><audio controls="">
+  <source src="https://simedw.com/2026/08/20/midi-autocomplete/audio/rollbar_dpo_pokemon_pallet_8.wav" type="audio/wav">
+  Your browser does not support the audio tag.
+</audio></p>
+<p><strong>Final Fantasy VI, Terra's Theme (16-note prompt)</strong></p>
+<p><audio controls="">
+  <source src="https://simedw.com/2026/08/20/midi-autocomplete/audio/rollbar_dpo_ff6_terra_16.wav" type="audio/wav">
+  Your browser does not support the audio tag.
+</audio></p>
+<p><strong>Für Elise (16-note prompt)</strong></p>
+<p><audio controls="">
+  <source src="https://simedw.com/2026/08/20/midi-autocomplete/audio/rollbar_dpo_fur_elise_16.wav" type="audio/wav">
+  Your browser does not support the audio tag.
+</audio></p>
+<h2 id="whats-in-a-midi-file">What’s in a MIDI File?</h2>
+<p>A MIDI file is quite different from an MP3 or other audio formats. Rather than storing recorded sound, it stores music as a sequence of events: a key is pressed at a certain pitch and velocity, a key is released, the sustain pedal changes state, and so on. Other events include switching instruments or changing volume. </p>
+<p>These events are often organised into multiple tracks. A pop or game MIDI might have melody, chords, bass, drums, strings, and several synth parts. This project is focused on piano continuation, so I mostly kept piano-like material and removed or reduced the rest.</p>
+<h2 id="how-do-you-tokenize-music">How Do You Tokenize Music?</h2>
+<p>To train a transformer on these performances, I first needed to turn the MIDI events into a discrete sequence the model could read and predict.
+The most obvious mapping is to make a token for every MIDI event:</p>
+<div><pre><span></span><code>NOTE_ON_60_80 # {pitch}_{velocity}
+NOTE_OFF_60   # {pitch}
+TIME_SHIFT_12 # {time step}
+</code></pre></div>
+
+<p>If you include pitch and velocity directly in a <code>NOTE_ON</code> token, the vocabulary can grow quickly. There are 128 MIDI pitches and 128 velocity values, so the naive combined note-on vocabulary has up to:</p>
+
+
+<p>tokens just for note-on and note-off. In practice you would probably bucket
+velocity, but the basic issue remains: many combinations are rare, and the
+model has to learn a lot of structure from sparse tokens.</p>
+<p>A common improvement is to factor the representation with a grammar:</p>
+<div><pre><span></span><code>[NOTE_ON, PITCH, VELOCITY] | [NOTE_OFF, PITCH] | [TIME_SHIFT, DURATION]
+</code></pre></div>
+
+<p>Now the output spaces are smaller:</p>
+<div><pre><span></span><code>NOTE_ON / NOTE_OFF / TIME_SHIFT
+PITCH: 128 values
+VELOCITY: ~16
+DURATION: ~100
+</code></pre></div>
+
+<p>You can enforce the grammar during generation by masking invalid next tokens.
+After <code>NOTE_ON</code>, only pitch tokens are valid. After pitch, only velocity tokens
+are valid. This guarantees syntactically valid output.</p>
+<p>I tried note-on/note-off style representations, but my models tended to drift.
+They would forget to emit note-off, leave hanging notes, or lose track of active
+state. That was especially bad for my target: a small model running close to real
+time on a laptop or phone.</p>
+<p>Another representation I tried was closer to:</p>
+<div><pre><span></span><code>[NOTE, PITCH, VELOCITY, DURATION] | [TIME_SHIFT, DURATION]
+</code></pre></div>
+
+<p>This avoids note-off drift because note duration is explicit. The time shift token advances the playhead when no note is played.</p>
+<p>This worked better musically, but it was slow. One musical note took roughly
+four autoregressive transformer steps. It also burns through the context window quickly.</p>
+<h2 id="the-final-representation">The final representation</h2>
+<p>The representation I eventually settled on was:</p>
+<div><pre><span></span><code>NOTE(pitch, delta_onset, duration, velocity)
+</code></pre></div>
+
+<p>There is no separate <code>TIME_SHIFT</code> event in the final version. Silence is represented by <code>delta_onset</code> on the next note: the time since the previous note onset.</p>
+<p>For example:</p>
+<div><pre><span></span><code>NOTE(C4, delta=0,  duration=12, velocity=80)
+NOTE(D4, delta=24, duration=12, velocity=80)
+</code></pre></div>
+
+<p>means: play C4, wait 24 time steps before the next note onset, then play D4.</p>
+<p>Chords are represented as multiple notes with <code>delta_onset = 0</code>, sorted by
+pitch<sup id="fnref:1"><a href="#fn:1">2</a></sup>:</p>
+<div><pre><span></span><code>NOTE(C4, delta=24, duration=24, velocity=80)
+NOTE(E4, delta=0,  duration=24, velocity=78)
+NOTE(G4, delta=0,  duration=24, velocity=82)
+</code></pre></div>
+
+<p>It's also not a flat token stream like:</p>
+<div><pre><span></span><code>NOTE, PITCH, DELTA, DURATION, VELOCITY
+</code></pre></div>
+
+<p><strong>Instead of spending four transformer passes generating the attributes of a note, the transformer advances the music by one complete note at a time.</strong>
+In practice, this gets the large model to about 108 notes/second on an iPhone, well above anything a human would need for live playing.</p>
+<p>Internally each note has five categorical fields, each with its own vocabulary<sup id="fnref:2"><a href="#fn:2">3</a></sup>, with timing quantized to fixed steps.<sup id="fnref:3"><a href="#fn:3">4</a></sup></p>
+<div><pre><span></span><code>[event_type, pitch_id, delta_id, duration_id, velocity_id]
+</code></pre></div>
+
+<p>Each field gets its own embedding. The note token is the sum of all the embeddings:  </p>
+<div><pre><span></span><code><span>note</span> <span>=</span>
+    <span>event_type_embedding</span><span>[</span><span>NOTE</span><span>]</span>
+  <span>+</span> <span>pitch_embedding</span><span>[</span><span>C4</span><span>]</span>
+  <span>+</span> <span>delta_embedding</span><span>[</span><span>12</span><span>]</span>
+  <span>+</span> <span>duration_embedding</span><span>[</span><span>24</span><span>]</span>
+  <span>+</span> <span>velocity_embedding</span><span>[</span><span>80</span><span>]</span>
+</code></pre></div>
+
+<p>The model then has separate output heads: pitch, delta, duration, and so on. </p>
+<p>There is a small nested decoder between the fields, so later fields can condition on earlier predicted fields. But the expensive transformer backbone runs only once per note, not once per field.</p>
+<h2 id="sustain-pedal">Sustain Pedal</h2>
+<p>As you might know, pressing down the sustain pedal on a piano makes notes play even after you release them. I didn't want to muddy the implementation with adding sustain pedal events. Instead, sustain is baked into note duration during preprocessing.</p>
+<p>If the key is released while the sustain pedal is down, the note is extended to the pedal-up time. If the same pitch is played again first, the earlier note is cut off at the retrigger. The result is a note duration that approximates the actual sounding duration.</p>
+<p>This loses the explicit pedal gesture, but it makes the modeling problem much simpler: the model only has to predict pitch, onset, duration, and velocity.</p>
+<h2 id="dataset">Dataset</h2>
+<p>I searched through a lot of publicly available datasets and collections, focusing mostly on older classical music in the public domain. The quality varied wildly, so I ended up writing quite a few cleaning scripts.</p>
+<p>The final dataset contained a few hundred thousand MIDI files, representing roughly 300 million note events. </p>
+<p>The final pipeline:</p>
+<ul>
+<li>selected piano-focused material</li>
+<li>removed or reduced pathological multi-track mixtures</li>
+<li>filtered by density and pitch/time coverage</li>
+<li>deduplicated by fingerprints that ignore global transposition and uniform
+  tempo changes</li>
+<li>grouped alternate versions of the same composition into the same split</li>
+</ul>
+<p>I tried scaling the dataset to roughly 5x the size, hoping it would improve performance, but the resulting models were worse. Cleaning and selecting the data mattered more than simply adding more of it.</p>
+<h2 id="training">Training</h2>
+<p>Initially, training is just cross-entropy over the five output heads, summed together:</p>
+<div><pre><span></span><code>type_loss
++ pitch_loss
++ delta_loss
++ duration_loss
++ velocity_loss
+</code></pre></div>
+
+<p>This makes it easy to track pitch, duration, and velocity accuracy separately, rather than relying on a single aggregate next-token loss.</p>
+<p>Still, the training objective has an important limitation: music continuation does not have a single correct answer. A held-out song only gives the model one "correct" next note, even though there are often many continuations that would work musically. Cross-entropy is useful for learning the mechanics of music, but not a great proxy for how good a full continuation sounds.</p>
+<h2 id="augmentation">Augmentation</h2>
+<p>Augmentation was important because the live input is not a pristine MIDI file. It is me playing piano, badly enough that notes might be slightly early, late, too hard, etc. </p>
+<p>In the end I settled on the following augmentations:</p>
+<ul>
+<li>global transposition</li>
+<li>uniform tempo scaling</li>
+<li>duration/velocity jitter</li>
+<li>dropped prompt notes</li>
+</ul>
+<h2 id="model">Model</h2>
+<p>The architecture is essentially a fairly standard decoder-only transformer: RMSNorm, rotary positional embeddings, causal self-attention, SwiGLU/MLP blocks, and autoregressive generation. </p>
+<p>I mainly trained three model sizes:</p>
+<div><pre><span></span><code>small:  about 33M parameters
+medium: about 64M parameters
+large:  about 125M parameters
+</code></pre></div>
+
+<p>The small model was great for quick experiments, but the medium model almost always beat it. The large model performed better, although not by a huge margin.</p>
+<p>I am currently trying to get the medium model close to the large model's quality, mostly to reduce footprint and latency in the iOS app.</p>
+<h2 id="scheduled-sampling">Scheduled Sampling</h2>
+<p>My best base model used scheduled sampling between the fields of each note.
+Normally, during training, the duration and velocity predictions get to see the correct pitch. But at inference time they have to work with whatever pitch the model actually predicted.</p>
+<p>So during training I sometimes fed the model its own predicted pitch instead. I started at 0% for the first few epochs, then gradually increased it during training, up to 50% in the best model.</p>
+<p>Funnily enough, this increased validation loss but improved the continuations.</p>
+<figure role="img" aria-label="Scheduled sampling comparison: scheduled 50% received 64.3% pairwise preference with validation loss 2.9998; without scheduled sampling received 35.7% preference with validation loss 2.9495">
+  
+  <p><span>Gemini preference ↑</span></p>
+  <div>
+    <p><span>scheduled 50%</span></p>
+    <p><span>64.3%</span>
+  </p></div>
+  <div>
+    <p><span>without scheduled</span></p>
+    <p><span>35.7%</span>
+  </p></div>
+  <figcaption>Scheduled sampling hurt validation loss, but improved rollout quality. Pairwise preference scored by Gemini.</figcaption>
+</figure>
+
+<h2 id="evaluation">Evaluation</h2>
+<p>At first, evaluation was just me listening.</p>
+<p>I generated continuations from held-out songs using prompts of 4-32 notes, then compared model outputs manually. This was slow and annoying and after a while everything sounded like noise. </p>
+<p>Four-note prompts were the hardest: there simply was not much musical context to work with. Eight notes worked better, while 16–32 note prompts were substantially more reliable because the model had enough structure to infer what was happening.</p>
+<p>Unprompted generation is very much hit or miss, but that isn't the use-case I'm gunning for. </p>
+<p>I also wrote a bunch of automatic metrics:</p>
+<ul>
+<li>repeated pitch n-grams</li>
+<li>pitch entropy</li>
+<li>pitch-class entropy</li>
+<li>pitch range</li>
+<li>note density</li>
+<li>long pauses</li>
+<li>chord density</li>
+</ul>
+<p>These metrics were useful for catching obvious failures, but they were not good enough to select the best model.</p>
+<p>Eventually I used Gemini 3.5 Flash for pairwise evaluation. Asking it to give a single absolute score was inconsistent. Asking instead, "given A and B, which continuation is better?" worked much better, especially when I mirrored every comparison to reduce position bias. <sup id="fnref:4"><a href="#fn:4">5</a></sup> This let me build a reasonably large preference dataset, which I then used for DPO.</p>
+<p>Initially, Gemini overindexed on how good a continuation sounded in isolation, rather than how well it followed from the prompt. The outputs often sounded better on their own, but felt disconnected from what I had just played.</p>
+<p>Better prompting helped, but I eventually split the evaluation into two criteria: a continuation score, measuring how well the output follows from the prompt, and a sounds-good score, measuring its musical quality in isolation. I used the continuation score as the primary signal for DPO.</p>
+<h2 id="dpo-direct-preference-optimization">DPO: Direct Preference Optimization</h2>
+<p>DPO made the biggest difference after pretraining. It took the model from occasionally producing a good continuation to doing it much more reliably.</p>
+<p>For each prompt, I generated multiple continuations and used pairwise evaluation to choose a better and worse one:</p>
+<div><pre><span></span><code>prompt -&gt; chosen continuation
+prompt -&gt; rejected continuation
+</code></pre></div>
+
+<p>DPO trains the model to make the chosen continuation more likely than the rejected one, while keeping it reasonably close to the original model.</p>
+<p>After DPO, more than 69% of continuations were preferred over the base model in my pairwise evaluation.</p>
+<p>The β value controls how strongly DPO penalizes moving away from the base model. In my sweep, β=0.01 and β=0.03 improved the model, while β=0.10 pushed too hard and made it worse.</p>
+<p>I also tried a "consensus" dataset: instead of trusting every noisy preference judgment, I only kept preference pairs where the evaluator agreed consistently.
+That produced the best result in this sweep.</p>
+
+
+<figure role="img" aria-label="Pairwise preference rates: pretrained base, 24.55%; sum 01 beta .01 all, 61.08%; sum 03 beta .03 all, 57.14%; sum 10 beta .10 all, 38.10%; consensus beta .03, 69.05%">
+  <div>
+    <p><span>pretrained base</span></p>
+    <p><span>24.55%</span>
+  </p></div>
+  <div>
+    <p><span>β = 0.01</span></p>
+    <p><span>61.08%</span>
+  </p></div>
+  <div>
+    <p><span>β = 0.03</span></p>
+    <p><span>57.14%</span>
+  </p></div>
+  <div>
+    <p><span>β = 0.10</span></p>
+    <p><span>38.10%</span>
+  </p></div>
+  <div>
+    <p><span>consensus(β = 0.03)</span></p>
+    <p><span>69.05%</span>
+  </p></div>
+  <figcaption>Pairwise preference scored by Gemini.</figcaption>
+</figure>
+
+<p>My gut feeling is that the base model had already learned a reasonable mental model of music, just not what makes a good continuation.</p>
+<h2 id="what-did-not-work">What Did Not Work</h2>
+<p>A lot did not work:</p>
+<ul>
+<li>Note-on/note-off drifted too much for small real-time models.</li>
+<li>Grammar-masked token streams were valid but slow.</li>
+<li>Broader data made results worse when the data was noisy.</li>
+<li>Bigger models helped, but did not magically solve loops.</li>
+<li>Mirostat reduced repetition but often made outputs incoherent.</li>
+<li>Extra local auxiliary losses made training slower without clear listening
+  wins.</li>
+<li>Absolute scalar Gemini ratings were worse than pairwise judging.</li>
+<li>Validation loss alone missed important differences in rollout quality.</li>
+<li>Born-again networks (retraining a model on its own soft predictions) didn't improve quality here.</li>
+</ul>
+<h2 id="packaging-it">Packaging it</h2>
+<p>I exported the PyTorch model to Core ML and quantized the weights to INT8. The first launch is still annoyingly slow while Apple's runtime optimizes the model for the available hardware.</p>
+<p>The model was only trained with contexts of up to 512 notes, but I wanted to support longer sessions. Whenever the context gets close to the limit, I keep the most recent 384 notes, rebuild the context from those, and continue from there. This means rebuilding the KV cache, but the model is fast enough that it hasn't been a major problem.</p>
+<p>I used RoPE for positional encoding, so in theory I could do something neater with shifted positions and a ring buffer. Unfortunately Core ML does not expose Q, K, and V directly.</p>
+<p>At that point, though, I was mostly just happy that it worked.</p>
+<figure>
+  <video controls="" width="100%" preload="metadata" playsinline="">
+    <source src="https://simedw.com/2026/08/20/midi-autocomplete/videos/rolltab-app-store-preview-three-songs-text.mp4" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+  <figcaption>The final app running entirely on-device.</figcaption>
+</figure>
+
+<h2 id="conclusion">Conclusion</h2>
+<p>This has been a very fun project. There are plenty of interesting papers on music generation, but I deliberately avoided reading too deeply into them at first. I wanted the fun of working through the problem myself, rather than just implementing someone else’s research. Only afterward did I go back and compare my approach with the existing literature. <sup id="fnref:5"><a href="#fn:5">6</a></sup></p>
+<p>It is still far from perfect. It loops occasionally, short prompts are difficult, and there is plenty I want to improve. Think GPT-2, but for piano.</p>
+<p>But I have finally reached the point where I actually enjoy sitting down at the piano, playing a few notes, and seeing what we come up with together.</p>
+
+        </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[AliExpress runs silent WebAudio fingerprinting that breaks Bluetooth multipoint (337 pts)]]></title>
             <link>https://blog.laserphile.com/2026/08/aliexpress-webpage-keeping-multipoint.html</link>
             <guid>49372583</guid>
             <pubDate>Thu, 20 Aug 2026 10:08:52 GMT</pubDate>
@@ -20,7 +296,7 @@
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Don't Paste the AI, please (706 pts)]]></title>
+            <title><![CDATA[Don't Paste the AI, please (865 pts)]]></title>
             <link>https://dontpastetheai.com/</link>
             <guid>49371857</guid>
             <pubDate>Thu, 20 Aug 2026 08:20:44 GMT</pubDate>
@@ -87,7 +363,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Windows brings out the Rorschach test in everyone (261 pts)]]></title>
+            <title><![CDATA[Windows brings out the Rorschach test in everyone (284 pts)]]></title>
             <link>https://devblogs.microsoft.com/oldnewthing/20030825-00/?p=42803</link>
             <guid>49371006</guid>
             <pubDate>Thu, 20 Aug 2026 06:16:40 GMT</pubDate>
@@ -119,7 +395,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Turns are Better than Radians (2022) (263 pts)]]></title>
+            <title><![CDATA[Turns are Better than Radians (2022) (285 pts)]]></title>
             <link>https://www.computerenhance.com/p/turns-are-better-than-radians</link>
             <guid>49369408</guid>
             <pubDate>Thu, 20 Aug 2026 01:29:12 GMT</pubDate>
@@ -130,7 +406,7 @@
 y = _mm256_mul_ps(x, *(v8sf*)_ps256_cephes_FOPI);</code></pre><p><span>Again, not me making up an example - that’s from </span><a href="https://github.com/reyoung/avx_mathfun/blob/be617bbcf66993c4f7e7d267ed9926cd8e7d4f02/avx_mathfun.h#L346">this commonly referenced AVX2 implementation of sin</a><span>. It’s not unusual or weird - pretty much every fast trig library is going to do something very similar.</span></p><p>What does this line do? It multiplies the input by the constant 1.27323954473516. </p><p><span>Which just so happens to be </span><em>4/pi</em><span>.</span></p><p>So the calling code is doing this:</p><pre><code>sin(h * 2 * pi)</code></pre><p>but the library code immediately does this:</p><pre><code>y = (4 / pi) * x</code></pre><p><span>which means the calling code is multiplying by a factor of pi </span><em>just so the library code can immediately divide it back out again</em><span>. It’s literally a conversion to radians and back </span><em>for no reason</em><span>. If both programmers had just agreed not to use radians, and instead used the original [0, 1] domain that </span><em>h</em><span> was already on, both their jobs get simpler: the caller saves a multiply, while the library gets a simpler-to-understand, </span><em>exact</em><span> constant.</span></p><p><span>And the “exact” part is actually quite interesting. Not only do you pay for an extra multiply when you spuriously convert to radians, but it’s also worth noting that all common radian angles besides 0 are </span><em>difficult to represent.</em><span> Want to store 90 degrees in radians? No matter how many bits you use, it will never be exact.</span></p><p><span>90 degrees on [0, 1], however, is just 0.25 - a bit pattern that </span><em>doesn’t even require any bits of mantissa at all!</em><span> 0.5? Same! 0.75? Just </span><em>one bit</em><span> of mantissa to represent exactly.</span></p><p>So the [0, 1] range is not only more computationally efficient than radians, it is also more compact and precise when representing typical values that frequently occur in practical use.</p><p>I can understand why some people would be worried about making this switch. Even if you believe me that all user-side code multiplies by pi or tau, and all library-side code divides it back out, you still may have that sinking “math class feeling” that you’d be doing something wrong if you stopped using radians.</p><p>But math never decreed that sine and cosine have to take radian arguments!</p><p><span>The idea of parameterizing a circle from zero to one instead of from zero to tau is not a random idea I made up for this blog post. It’s actually a legitimate, existing mathematical construct, and it even has a name: it’s called a </span><em><a href="https://en.wikipedia.org/wiki/Turn_(angle)#:~:text=A%20turn%20is%20a%20unit,rot.)%20or%20full%20circle.">turn</a></em><span>.</span></p><p><span>In </span><em>turns</em><span>, 0 is 0 degrees, 0.5 is 180 degrees, 1 is 360 degrees, 2 is 720 degrees, and so on. It’s exactly what we wanted.</span></p><p><span>So if you are worried that your math teacher will get mad at you, there is no cause for concern. Just tell them that you considered the matter carefully, and decided that parameterizing your angles in </span><em>turns</em><span> instead of in radians was the most efficient method for the problem at hand!</span></p><p><span>If you wrote your own math library, or you copied someone else’s into your project, hopefully it is quite clear how you can switch away from radians and eliminate pi and tau from your codebase. All you have to do is take your sin and cos functions and make them take </span><em>turns </em><span>instead of radians, which usually involves nothing but a quick adjustment to a single constant.</span></p><p>If you want to support legacy code, pick a different name for the new turn-based trig functions. Then, for legacy code, you can still support the old radian-based sin and cos by making those routines thunk through to the new routines, doing the divide-by-tau along the way.</p><p>It’s very simple - just a few lines of code to make the switch.</p><p><span>However, although I find turns to be the most convenient reparameterization, it’s not the only alternative. Especially if you </span><em>don’t</em><span> roll your own math routines (and perhaps even if you do), you may instead want to consider using </span><em>half turns</em><span>, where a full circle is [0, 2]. It’s a bit more confusing, but…</span></p><p><span>It turns out (pun intended!) that if you go looking for it, in some math libraries you will already find sin and cos functions parameterized on half-turns instead of radians. For example, </span><a href="https://docs.nvidia.com/cuda/cuda-math-api/group__CUDA__MATH__SINGLE.html#group__CUDA__MATH__SINGLE_1gab8978300988c385e0aa4b6cba44225e">the CUDA sincospi intrinsic</a><span> computes the sine and cosine of the input </span><em>multiplied by pi</em><span>, which is a half-turn.</span></p><p>This is great. If you’re targeting a platform with sincospi already available, you can stop using pi and tau constants in your code right now without touching your libraries at all. Just start calling sincospi with half-turns instead of sin and cos with radians, and you’re good to go.</p><p>Having now managed entire codebases where I stopped using radians, I can safely say I never miss them. All the superfluous tau’s and pi’s disappear, and everything reads more clearly. </p><p><span>The same logic for modifying sin and cos applies to the rest of the standard trig functions as well, so you can eliminate radians everywhere if you choose. Libraries almost always convert away from radians internally anyway, and then convert back to radians on the way out, so switching to turns or half-turns everywhere is usually just a matter of </span><em>deleting</em><span> code and not much else.</span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Gardner police discontinue Flock cameras as license plate readers face scrutiny (128 pts)]]></title>
+            <title><![CDATA[Gardner police discontinue Flock cameras as license plate readers face scrutiny (129 pts)]]></title>
             <link>https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-plate-readers-privacy/73468724</link>
             <guid>49368625</guid>
             <pubDate>Wed, 19 Aug 2026 23:38:22 GMT</pubDate>
@@ -138,7 +414,7 @@ y = _mm256_mul_ps(x, *(v8sf*)_ps256_cephes_FOPI);</code></pre><p><span>Again, no
 Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-plate-readers-privacy/73468724: Error: Request failed with status code 451]]></description>
         </item>
         <item>
-            <title><![CDATA[Feature Request: Support AGENTS.md (320 pts)]]></title>
+            <title><![CDATA[Feature Request: Support AGENTS.md (331 pts)]]></title>
             <link>https://github.com/anthropics/claude-code/issues/6235</link>
             <guid>49367350</guid>
             <pubDate>Wed, 19 Aug 2026 21:19:50 GMT</pubDate>
@@ -147,7 +423,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 <p dir="auto">By contrast, CLAUDE.md feels too specific to Claude Code. It doesn’t work as well when collaborating with other developers who aren’t using Claude Code.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Os8088.com: IBM XT OS now has a Browser, CP/M 2.2 with Z80 core and MS Word 1.1a (108 pts)]]></title>
+            <title><![CDATA[Os8088.com: IBM XT OS now has a Browser, CP/M 2.2 with Z80 core and MS Word 1.1a (114 pts)]]></title>
             <link>https://os8088.com/spotlight/</link>
             <guid>49367256</guid>
             <pubDate>Wed, 19 Aug 2026 21:11:31 GMT</pubDate>
@@ -312,7 +588,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Unlocking a locked/deactivated e-waste Cricut Maker (239 pts)]]></title>
+            <title><![CDATA[Unlocking a locked/deactivated e-waste Cricut Maker (245 pts)]]></title>
             <link>https://sprocketfox.io/xssfox/2026/07/01/cricut-unlock/</link>
             <guid>49365841</guid>
             <pubDate>Wed, 19 Aug 2026 19:06:16 GMT</pubDate>
@@ -363,7 +639,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
     </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Police officer used Flock cameras to track estranged wife 717 times (185 pts)]]></title>
+            <title><![CDATA[Police officer used Flock cameras to track estranged wife 717 times (186 pts)]]></title>
             <link>https://www.wsbtv.com/news/trending/affidavit-police-officer-used-flock-cameras-track-estranged-wife-717-times/5DVBYU2XTJEVDJR7LPZCBR7M5M/</link>
             <guid>49365733</guid>
             <pubDate>Wed, 19 Aug 2026 18:58:29 GMT</pubDate>
@@ -377,7 +653,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 </center></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Unsloth Dynamic 3.0 GGUFs (299 pts)]]></title>
+            <title><![CDATA[Unsloth Dynamic 3.0 GGUFs (309 pts)]]></title>
             <link>https://unsloth.ai/docs/basics/dynamic-3.0-ggufs</link>
             <guid>49365443</guid>
             <pubDate>Wed, 19 Aug 2026 18:36:45 GMT</pubDate>
@@ -411,7 +687,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 </span></span><span><span>    --prompt "&lt;|header_start|&gt;user&lt;|header_end|&gt;\n\nCreate a Flappy Bird game.&lt;|eot|&gt;&lt;|header_start|&gt;assistant&lt;|header_end|&gt;\n\n"</span></span></code></pre></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Rules of good social skills (2025) (118 pts)]]></title>
+            <title><![CDATA[Rules of good social skills (2025) (119 pts)]]></title>
             <link>https://liamrosen.com/2025/07/24/33-rules-of-good-social-skills/</link>
             <guid>49365419</guid>
             <pubDate>Wed, 19 Aug 2026 18:34:45 GMT</pubDate>
@@ -419,7 +695,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 Couldn't get https://liamrosen.com/2025/07/24/33-rules-of-good-social-skills/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Go 1.27 (705 pts)]]></title>
+            <title><![CDATA[Go 1.27 (723 pts)]]></title>
             <link>https://go.dev/blog/go1.27</link>
             <guid>49365405</guid>
             <pubDate>Wed, 19 Aug 2026 18:33:49 GMT</pubDate>
@@ -538,7 +814,7 @@ you notice any problems, please <a href="https://go.dev/issue/new">file an issue
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google replaced Git tags for certain source code with obtaining via Google Drive (698 pts)]]></title>
+            <title><![CDATA[Google replaced Git tags for certain source code with obtaining via Google Drive (732 pts)]]></title>
             <link>https://grapheneos.social/@GrapheneOS/117057099753905023</link>
             <guid>49364745</guid>
             <pubDate>Wed, 19 Aug 2026 17:47:29 GMT</pubDate>
@@ -641,7 +917,7 @@ turns.</li>
 <p dir="auto"><em>No response</em></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenRouter is joining Stripe (907 pts)]]></title>
+            <title><![CDATA[OpenRouter is joining Stripe (923 pts)]]></title>
             <link>https://openrouter.ai/blog/announcements/openrouter-is-joining-stripe/</link>
             <guid>49364559</guid>
             <pubDate>Wed, 19 Aug 2026 17:32:38 GMT</pubDate>
@@ -670,7 +946,7 @@ turns.</li>
 <p><em>The transaction is subject to customary closing conditions. We expect to close in the coming weeks.</em></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Extensible Software in the age of LLMs (158 pts)]]></title>
+            <title><![CDATA[Extensible Software in the age of LLMs (159 pts)]]></title>
             <link>https://jeremymorrell.dev/blog/extensible-software-in-the-age-of-llms/</link>
             <guid>49363668</guid>
             <pubDate>Wed, 19 Aug 2026 16:26:05 GMT</pubDate>
@@ -1285,7 +1561,7 @@ removing a replica may cause a cascading failure.</li>
 <div data-slot="card"><div data-slot="card-header"><p><h3 data-slot="card-title">The shameless plug</h3></p></div><p>ngrok have a <a data-slot="anchor" href="https://github.com/ngrok/ngrok-operator"><span data-slot="anchor-label">first-party Kubernetes Operator</span></a>! It supports both the Ingress and Gateway APIs, as well as letting you declaratively create agent endpoints in your cluster. You can learn more at our <a data-slot="anchor" href="https://ngrok.com/docs/k8s"><span data-slot="anchor-label">docs</span></a>.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Civic Hygiene – avoid building technologies that could be used by a police state (2013) (439 pts)]]></title>
+            <title><![CDATA[Civic Hygiene – avoid building technologies that could be used by a police state (2013) (442 pts)]]></title>
             <link>https://shkspr.mobi/blog/2013/11/civic-hygiene/</link>
             <guid>49363433</guid>
             <pubDate>Wed, 19 Aug 2026 16:07:14 GMT</pubDate>
@@ -1309,7 +1585,7 @@ removing a replica may cause a cascading failure.</li>
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Remote workers report the highest well-being in study of 7,700 employees (593 pts)]]></title>
+            <title><![CDATA[Remote workers report the highest well-being in study of 7,700 employees (604 pts)]]></title>
             <link>https://www.colorado.edu/today/2026/08/12/remote-workers-report-highest-well-being-study-7700-employees</link>
             <guid>49362934</guid>
             <pubDate>Wed, 19 Aug 2026 15:32:08 GMT</pubDate>
@@ -1516,47 +1792,6 @@ Couldn't get https://www.casio.com/uk/watches/casio/product.F-B100W-1A/: Error: 
 					
 				</section>
 			</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Manabu Kosaka's Handmade Paper Sculptures (125 pts)]]></title>
-            <link>https://coca11272000.wixsite.com/manabukosaka</link>
-            <guid>49362001</guid>
-            <pubDate>Wed, 19 Aug 2026 14:20:10 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://coca11272000.wixsite.com/manabukosaka">https://coca11272000.wixsite.com/manabukosaka</a>, See on <a href="https://news.ycombinator.com/item?id=49362001">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="SITE_CONTAINER"><p><span>top of page</span></p><div id="site-root"><main id="PAGES_CONTAINER" tabindex="-1" data-main-content="true"><div data-mesh-id="Containervn5tninlineContent" data-testid="inline-content" id="SITE_PAGES" tabindex="-1" data-block-level-container="ClassicSection"><!--$--><div id="comp-mo1gzle6" data-testid="richTextElement"><p><span>Manabu Kosaka &nbsp;<br>
-Handmade Paper Sculptures</span></p>
-
-<p><span><span>​</span></span></p>
-
-<p><span>Transforming everyday objects into precise sculptural forms using only paper.</span></p>
-
-<p><span>Each work is entirely handmade, built through a process of cutting, assembling, and refining paper into highly detailed objects. &nbsp;</span></p>
-
-<p><span>​</span></p></div><!--/$--><!--$--><div id="comp-mo1ilhel" title="IMG_2599.jpg"><p><img fetchpriority="high" sizes="798px" srcset="https://static.wixstatic.com/media/387403_0293c29222984ad3b49242075e4488d3~mv2.jpg/v1/fill/w_798,h_599,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_2599_edited.jpg 1x, https://static.wixstatic.com/media/387403_0293c29222984ad3b49242075e4488d3~mv2.jpg/v1/fill/w_1596,h_1198,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_2599_edited.jpg 2x" id="img_comp-mo1ilhel" src="https://static.wixstatic.com/media/387403_0293c29222984ad3b49242075e4488d3~mv2.jpg/v1/fill/w_798,h_599,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_2599_edited.jpg" alt="IMG_2599_edited.jpg" width="798" height="599"></p></div><!--/$--><!--$--><div id="comp-mo1hgczx" title="IMG_4179.2.jpg"><p><img fetchpriority="high" sizes="798px" srcset="https://static.wixstatic.com/media/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg/v1/fill/w_798,h_599,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg 1x, https://static.wixstatic.com/media/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg/v1/fill/w_1596,h_1198,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg 2x" id="img_comp-mo1hgczx" src="https://static.wixstatic.com/media/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg/v1/fill/w_798,h_599,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_dd6021bc317449adb37a14bfb90079e5~mv2.jpg" alt="" width="798" height="599"></p></div><!--/$--><!--$--><div id="comp-mo1i008r" data-testid="richTextElement"><p><span>Each work is created entirely by hand using paper.</span></p>
-
-<p><span>The process involves cutting, shaping, and assembling small components over an extended period of time. &nbsp;<br>
-Through repetition and precision, the material gradually transforms into a solid and detailed object.</span></p>
-
-<p><span><span>​</span></span></p></div><!--/$--><!--$--><div id="comp-mnj3sj1x" title="#256-3.jpg"><p><img loading="lazy" sizes="764px" srcset="https://static.wixstatic.com/media/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg/v1/fill/w_764,h_573,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg 1x, https://static.wixstatic.com/media/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg/v1/fill/w_1528,h_1146,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg 2x" id="img_comp-mnj3sj1x" src="https://static.wixstatic.com/media/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg/v1/fill/w_764,h_573,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_8e6b136a61c14352a062f982a3723d88~mv2.jpg" alt="" width="764" height="573"></p></div><!--/$--><!--$--><div id="comp-mo1gyy5p" data-testid="richTextElement"><p><span><span><span><span><span><span>Title: #256 [BCL Radio]<br>
-Year: 2022</span></span></span></span></span></span></p>
-
-<p><span><span><span><span><span><span>Material: Paper<br>
-Size: 220 × 180 × 70 mm (variable)</span></span></span></span></span></span></p></div><!--/$--><!--$--><div id="comp-mo1hkcgk" title="IMG_0307.jpg"><p><img loading="lazy" sizes="478px" srcset="https://static.wixstatic.com/media/387403_2399346f7a6b469793e8921a26340303~mv2.jpg/v1/fill/w_478,h_302,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_0307_edited.jpg 1x, https://static.wixstatic.com/media/387403_2399346f7a6b469793e8921a26340303~mv2.jpg/v1/fill/w_956,h_604,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_0307_edited.jpg 2x" id="img_comp-mo1hkcgk" src="https://static.wixstatic.com/media/387403_2399346f7a6b469793e8921a26340303~mv2.jpg/v1/fill/w_478,h_302,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/IMG_0307_edited.jpg" alt="IMG_0307_edited.jpg" width="478" height="302"></p></div><!--/$--><!--$--><div id="comp-mo1j067q" title="IMG_2850.jpg"><p><img loading="lazy" sizes="446px" srcset="https://static.wixstatic.com/media/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg/v1/fill/w_446,h_314,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg 1x, https://static.wixstatic.com/media/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg/v1/fill/w_892,h_628,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg 2x" id="img_comp-mo1j067q" src="https://static.wixstatic.com/media/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg/v1/fill/w_446,h_314,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1eca8b8814404cee89b36960344cfb27~mv2.jpg" alt="" width="446" height="314"></p></div><!--/$--><!--$--><div id="comp-mo1j0689" title="IMG_3705.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg/v1/fill/w_419,h_314,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg 1x, https://static.wixstatic.com/media/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg/v1/fill/w_838,h_628,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg 2x" id="img_comp-mo1j0689" src="https://static.wixstatic.com/media/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg/v1/fill/w_419,h_314,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_ce40bd8332b4462c928eab5c87a8a0a5~mv2.jpg" alt="" width="419" height="314"></p></div><!--/$--><!--$--><div id="comp-mo1hkcgm" title="IMG_0319.jpg"><p><img loading="lazy" sizes="393px" srcset="https://static.wixstatic.com/media/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg/v1/fill/w_393,h_302,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg 1x, https://static.wixstatic.com/media/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg/v1/fill/w_786,h_604,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg 2x" id="img_comp-mo1hkcgm" src="https://static.wixstatic.com/media/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg/v1/fill/w_393,h_302,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_f91949f2e5a74b179c1c09484fb9c60b~mv2.jpg" alt="" width="393" height="302"></p></div><!--/$--><!--$--><div id="comp-mo1j068b" title="IMG_3110.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg 1x, https://static.wixstatic.com/media/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg/v1/fill/w_838,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg 2x" id="img_comp-mo1j068b" src="https://static.wixstatic.com/media/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_e18f53134ad749cfa739d6dc276361fe~mv2.jpg" alt="" width="419" height="309"></p></div><!--/$--><!--$--><div id="comp-mo1j0684" title="IMG_4155.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg 1x, https://static.wixstatic.com/media/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg/v1/fill/w_838,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg 2x" id="img_comp-mo1j0684" src="https://static.wixstatic.com/media/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_d257cd80224a4186b509e6a13e346488~mv2.jpg" alt="" width="419" height="309"></p></div><!--/$--><!--$--><div id="comp-mo1j0687" title="IMG_3859.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg 1x, https://static.wixstatic.com/media/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg/v1/fill/w_838,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg 2x" id="img_comp-mo1j0687" src="https://static.wixstatic.com/media/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_b384a3587e6c4acd8241b41b25029ead~mv2.jpg" alt="" width="419" height="309"></p></div><!--/$--><!--$--><div id="comp-mo1j0682" title="IMG_4345.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg 1x, https://static.wixstatic.com/media/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg/v1/fill/w_838,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg 2x" id="img_comp-mo1j0682" src="https://static.wixstatic.com/media/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6354f44ea6f34030be41a6eaa5582fe6~mv2.jpg" alt="" width="419" height="309"></p></div><!--/$--><!--$--><div id="comp-mo1j067w" title="IMG_4715.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg 1x, https://static.wixstatic.com/media/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg/v1/fill/w_838,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg 2x" id="img_comp-mo1j067w" src="https://static.wixstatic.com/media/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg/v1/fill/w_419,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_efb521861c5140d7810a07a46c014ad6~mv2.jpg" alt="" width="419" height="309"></p></div><!--/$--><!--$--><div id="comp-mo1j067z" title="IMG_4513.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg/v1/fill/w_419,h_310,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg 1x, https://static.wixstatic.com/media/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg/v1/fill/w_838,h_620,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg 2x" id="img_comp-mo1j067z" src="https://static.wixstatic.com/media/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg/v1/fill/w_419,h_310,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_1f532668ec9b474c98bec4213cc5add7~mv2.jpg" alt="" width="419" height="310"></p></div><!--/$--><!--$--><div id="comp-mo1j067u" title="IMG_4735.jpg"><p><img loading="lazy" sizes="419px" srcset="https://static.wixstatic.com/media/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg/v1/fill/w_419,h_310,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg 1x, https://static.wixstatic.com/media/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg/v1/fill/w_838,h_620,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg 2x" id="img_comp-mo1j067u" src="https://static.wixstatic.com/media/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg/v1/fill/w_419,h_310,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_6c33224563d84e1e9338bd30404fa114~mv2.jpg" alt="" width="419" height="310"></p></div><!--/$--><!--$--><div id="comp-mo1piuea" title="IMG_4708.jpg"><p><img loading="lazy" sizes="412px" srcset="https://static.wixstatic.com/media/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg/v1/fill/w_412,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg 1x, https://static.wixstatic.com/media/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg/v1/fill/w_824,h_618,al_c,q_85,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg 2x" id="img_comp-mo1piuea" src="https://static.wixstatic.com/media/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg/v1/fill/w_412,h_309,al_c,q_80,usm_0.66_1.00_0.01,enc_avif,quality_auto/387403_5c808a13f2b14f0eac685642fce90756~mv2.jpg" alt="" width="412" height="309"></p></div><!--/$--></div></main></div><p><span>bottom of page</span></p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Moderna reports first positive Phase 3 for mRNA neoantigen therapy in melanoma (550 pts)]]></title>
-            <link>https://twitter.com/NoubarAfeyan/status/2090050162441752787</link>
-            <guid>49361395</guid>
-            <pubDate>Wed, 19 Aug 2026 13:33:35 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://twitter.com/NoubarAfeyan/status/2090050162441752787">https://twitter.com/NoubarAfeyan/status/2090050162441752787</a>, See on <a href="https://news.ycombinator.com/item?id=49361395">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div dir="auto"><p><span>Today marks an important milestone for </span></p><a href="https://x.com/moderna_tx">@<!-- -->moderna_tx</a><p><span> , for the field of mRNA, and for the many people working to bring new possibilities to patients. 
-This morning, Moderna and Merck announced positive Phase 3 results for adjuvant treatment with intismeran autogene, an individualized mRNA therapy for melanoma, in combination with KEYTRUDA, in patients with completely resected stage IIB-IV melanoma. The study met its primary endpoint of recurrence-free survival and a key secondary endpoint of distant metastasis-free survival. 
-This is the first positive Phase 3 result for an individualized neoantigen therapy, and the first for an mRNA-based cancer therapy. 
-When we founded Moderna in 2010, the idea that mRNA could become a new class of medicines was outright rejected. The idea that we might use it to create a therapy designed around the unique mutations in an individual patient’s tumor was even further from reality. 
-Today’s result is a reminder of what can emerge from pioneering: asking questions others have not yet asked, following the science where it leads, and persevering through uncertainty. 
-There is important work still ahead but today is a moment to recognize the extraordinary work behind this milestone. 
-Congratulations to the entire Moderna team, our partners at Merck, and the investigators who made this study possible. Most importantly, my gratitude goes to the patients and families whose participation enables progress like this. 
-Proud of this milestone, and of everyone who helped bring us here.</span></p></div></div>]]></description>
         </item>
     </channel>
 </rss>
