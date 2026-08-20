@@ -4,12 +4,23 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Thu, 20 Aug 2026 11:30:08 GMT</lastBuildDate>
+        <lastBuildDate>Thu, 20 Aug 2026 12:30:09 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Don't Paste the AI, please (410 pts)]]></title>
+            <title><![CDATA[AliExpress runs silent WebAudio fingerprinting that breaks Bluetooth multipoint (166 pts)]]></title>
+            <link>https://blog.laserphile.com/2026/08/aliexpress-webpage-keeping-multipoint.html</link>
+            <guid>49372583</guid>
+            <pubDate>Thu, 20 Aug 2026 10:08:52 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.laserphile.com/2026/08/aliexpress-webpage-keeping-multipoint.html">https://blog.laserphile.com/2026/08/aliexpress-webpage-keeping-multipoint.html</a>, See on <a href="https://news.ycombinator.com/item?id=49372583">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="post-body-8716786672517632420" itemprop="description articleBody">
+<p>Recently I ran into a strange problem with my Bluetooth headphones. They support multipoint Bluetooth audio, so they can be connected to my PC and phone at the same time. Normally the PC takes priority playing audio, with my phone being able to play audio when nothing is playing on the PC.</p><p>Usually I listen to music on my phone but with notifications or youtrube playing through the PC, this works reliably until I open an AliExpress page in Firefox or Chrome (other browsers untested).</p><p>Shortly after loading the AliExpress homepage, audio from my phone would stop playing. Closing the AliExpress tab fixes it immediately. Muting the tab/firefox/Windows does not help, and there is no visible video, music, or other media playing on the page.&nbsp;</p><p>This seemed suspicious enough to investigate.</p><h2>Looking for hidden media</h2><p>My first thought was an autoplaying product video or advertisement, so I checked for the usual suspects:</p><ul><li>&lt;audio&gt; and &lt;video&gt; elements</li><li>calls to HTMLMediaElement.play()</li><li>active Media Session metadata</li><li>media requests</li><li>embedded frames containing media</li></ul><p>None of these showed anything useful. There were no audio or video elements, no media playback calls, and navigator.mediaSession.playbackState remained none.</p><p>A clue was that the problem did not begin immediately. It appeared after the page had been sitting idle for several seconds. I instrumented the page before loading it and watched the Web Audio API instead of only looking for conventional media elements.</p><p>The basic idea was to wrap the AudioContext constructor and record whenever a page created an audio-processing context:</p><div><p><span>const</span> <span>OriginalAudioContext</span> <span>=</span> <span>window</span>.<span>AudioContext</span>;</p><p><span>window</span>.<span>AudioContext</span> <span>=</span> <span>class</span> <span>extends</span> <span>OriginalAudioContext</span> {</p><p><span>constructor</span>(<span>...</span><span>args</span>) <span>{</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; </span><span>super</span><span>(</span><span>...</span><span>args);</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; console.</span><span>log</span><span>(</span><span>"AudioContext created"</span><span>, {</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; </span><span>state:</span><span> </span><span>this</span><span>.state,</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; </span><span>stack:</span><span> </span><span>new</span><span> </span><span>Error</span><span>().stack</span></p><p><span>&nbsp; &nbsp; &nbsp; &nbsp; });</span></p><p><span>&nbsp; &nbsp; }</span></p><p>};</p></div><p>I also wrapped AudioNode.prototype.connect() so I could see whether anything was connected to the context's audio destination.</p><p>That finally found it, two hidden audio contexts!</p><p>During an idle capture of the AliExpress homepage, the page created two AudioContext objects. Both entered the running state and both connected nodes to AudioContext.destination.</p><p>At the same time there were still:</p><ul><li>zero &lt;audio&gt; or &lt;video&gt; elements</li><li>zero media play() calls</li><li>no active Media Session</li><li>no audible sound</li></ul><p>The constructor stack traces pointed to two scripts:</p><blockquote><p>https://assets.aliexpress-media.com/g/AWSC/uab/1.140.0/collina.js</p><p>https://assets.aliexpress-media.com/g/AWSC/fireyejs/1.231.67/fireyejs.js</p></blockquote><p>The first context was created by collina.js, while the second came from fireyejs.js. Both sit under an AWSC directory and appear to be part of Alibaba's browser security and anti-abuse tooling.</p><p>The scripts are extremely obfuscated, but enough names and operations survive for AI to work out what the audio code is doing.</p><h2>What the audio code does</h2><p>Both scripts build a WebAudio graph resembling this:</p><blockquote><p>Sawtooth oscillator</p><p>&nbsp; &nbsp; -&gt; AnalyserNode</p><p>&nbsp; &nbsp; -&gt; ScriptProcessorNode</p><p>&nbsp; &nbsp; -&gt; GainNode set to zero</p><p>&nbsp; &nbsp; -&gt; AudioContext.destination</p></blockquote><p>The oscillator generates a known waveform. The analyser measures the result after it has passed through the browser's audio implementation, and the script reads frequency data from it.</p><p>The gain is set to zero, so the user should not hear anything. However, the graph is still connected to the system audio destination. Connecting it to the destination causes the browser to actively process the graph, even though the final volume is zero.</p><p>This is very different from an autoplaying video. There is no media element for the browser's normal tab mute control to stop. As far as the page is concerned, it is performing live audio processing.</p><p>In my case, that appears to have been enough for Firefox or Windows to keep the Bluetooth audio path active, preventing my multipoint headphones from switching cleanly back to the phone.</p><h2>This looks like fingerprinting</h2><p>The WebAudio test is not the only measurement in these scripts. Inspection of the bundles found code that queries or measures:</p><ul><li>canvas rendering and toDataURL()</li><li>WebGL renderer information, extensions, and shader precision</li><li>audio oscillator and analyser output</li><li>screen and viewport dimensions</li><li>device pixel ratio</li><li>hardware concurrency and device memory</li><li>installed browser plugins</li><li>supported audio and video formats</li><li>WebRTC behaviour</li><li>browser performance timing</li><li>mouse, touch, focus, and scroll events</li><li>device motion and orientation</li><li>properties commonly associated with browser automation</li></ul><p>There is also code for serialising and encrypting results, making requests to Alibaba telemetry services, and sending data with fetch() or sendBeacon().</p><p>This is a fairly comprehensive browser and device fingerprint.</p><p>Audio fingerprinting works because small differences in browser versions, operating systems, audio libraries, and hardware can produce slightly different results from the same generated signal. It is not necessarily enough to uniquely identify a device by itself, but it becomes much more useful when combined with canvas, WebGL, hardware, timing, and interaction data.</p><p>I cannot see what AliExpress does with the resulting data after it reaches their servers. It may be used as a persistent device identifier, but it could also be one input into a fraud or bot-detection score.&nbsp;</p><h2>Why AliExpress would want this</h2><p>AliExpress has plenty of reasons to distinguish normal shoppers from automated or suspicious clients as well as tracking users browsing habits. The site has to deal with account takeovers, fake accounts, scraping, automated purchasing, payment fraud, review manipulation, and abuse of coupons or new-customer promotions. They also like most large businesses make use of large datasets of user behaviour to better market products and services.</p><p>Cookies are not especially reliable for this purpose because they can be cleared, copied, or replaced. A fingerprint made from many independent browser measurements is harder to manipulate consistently.</p><p>Interaction data can also help determine whether a browser is controlled by a person or automation. From AliExpress's perspective, this could reduce fraud and allow trusted customers through without showing a CAPTCHA every few pages. (Not that Aliexpress shies away from their AI generated CAPTCHAs)</p><p>Personally I do not want a shopping homepage silently exercising my graphics, audio, WebRTC, hardware, and motion APIs, etc, to track my behaviours, especially if it has such an annoying effect as blocking my music.&nbsp;<i>Perhaps if AliExpress wasn't blocking my music I never would've looked into what the site was doing.</i></p><h2>Blocking it with uBlock Origin</h2><p>I tested blocking the two identified script families. With both requests blocked, the AliExpress homepage continued to render and no AudioContext objects or destination connections appeared during the control capture.</p><p>In Firefox, I use the official uBlock Origin extension by Raymond Hill. To block the scripts open the uBlock dashboard, select My filters, and add:</p><blockquote><p>! AliExpress AWSC fingerprinting scripts</p><p>||assets.aliexpress-media.com/g/AWSC/uab/*/collina.js$script,domain=aliexpress.com</p><p>||assets.aliexpress-media.com/g/AWSC/fireyejs/*/fireyejs.js$script,domain=aliexpress.com</p></blockquote><p>Click Apply changes, close any existing AliExpress tabs, and open the site again. Existing tabs need to be closed because blocking a script does not shut down an audio context that it has already created.</p><p>These rules are deliberately narrow. They block only the two observed script families and only when requested by AliExpress. I would not be surprised if this stops working in the future, I'll cross that bridge when it comes to it.</p><p>Because these scripts appear to be connected with anti-fraud systems, blocking them may cause extra CAPTCHAs or problems during login or checkout. So far the homepage and ordinary product browsing still work, but I would temporarily disable the rules if AliExpress refuses a legitimate login or payment.</p><h2>Why I am blocking it</h2><p>The anti-fraud use case is understandable, but this implementation has several problems.</p><p>It runs on the general shopping homepage before I perform a sensitive action. It collects a broad set of device and behavioural measurements, the implementation is deliberately difficult to inspect, and there is no visible indication that the page has started a live audio-processing graph.</p><p>It also produced a very real hardware side effect. A silent fingerprinting test was able to interfere with Bluetooth multipoint switching, while the browser's mute control did nothing.</p><p>If a hidden analytics or security feature can take ownership of an audio path strongly enough to change how external hardware behaves, blocking it seems like a reasonable trade-off.</p><p>I also cannot prove how long AliExpress stores the fingerprint or whether it is used across other Alibaba properties. The client code proves that extensive fingerprint-like measurements are collected and transmitted, but server-side retention and identity linkage are not visible from the browser. <i>Can you really trust anyone to have your best interests at heart?</i></p><h2>TL;DR</h2><p>The AliExpress homepage silently creates two running WebAudio graphs from heavily obfuscated Alibaba security scripts. The graphs generate and analyse a waveform as part of a much larger browser fingerprint, then connect through a zero-gain node to the system audio destination preventing the user from hearing anything.</p><p>On my setup, this appears to keep the PC's Bluetooth audio path active and prevents multipoint headphones from switching back to a phone. Muting the tab does not fix it because there is no conventional media element to mute.</p><p>Blocking collina.js and fireyejs.js with the two uBlock Origin rules above prevented the hidden audio contexts from being created and means I can happily listen to my music without being interrupted while browsing Aliexpress.</p>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Don't Paste the AI, please (561 pts)]]></title>
             <link>https://dontpastetheai.com/</link>
             <guid>49371857</guid>
             <pubDate>Thu, 20 Aug 2026 08:20:44 GMT</pubDate>
@@ -76,7 +87,7 @@
   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Windows brings out the Rorschach test in everyone (212 pts)]]></title>
+            <title><![CDATA[Windows brings out the Rorschach test in everyone (247 pts)]]></title>
             <link>https://devblogs.microsoft.com/oldnewthing/20030825-00/?p=42803</link>
             <guid>49371006</guid>
             <pubDate>Thu, 20 Aug 2026 06:16:40 GMT</pubDate>
@@ -108,7 +119,7 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Turns are Better than Radians (2022) (229 pts)]]></title>
+            <title><![CDATA[Turns are Better than Radians (2022) (245 pts)]]></title>
             <link>https://www.computerenhance.com/p/turns-are-better-than-radians</link>
             <guid>49369408</guid>
             <pubDate>Thu, 20 Aug 2026 01:29:12 GMT</pubDate>
@@ -119,7 +130,7 @@
 y = _mm256_mul_ps(x, *(v8sf*)_ps256_cephes_FOPI);</code></pre><p><span>Again, not me making up an example - that’s from </span><a href="https://github.com/reyoung/avx_mathfun/blob/be617bbcf66993c4f7e7d267ed9926cd8e7d4f02/avx_mathfun.h#L346">this commonly referenced AVX2 implementation of sin</a><span>. It’s not unusual or weird - pretty much every fast trig library is going to do something very similar.</span></p><p>What does this line do? It multiplies the input by the constant 1.27323954473516. </p><p><span>Which just so happens to be </span><em>4/pi</em><span>.</span></p><p>So the calling code is doing this:</p><pre><code>sin(h * 2 * pi)</code></pre><p>but the library code immediately does this:</p><pre><code>y = (4 / pi) * x</code></pre><p><span>which means the calling code is multiplying by a factor of pi </span><em>just so the library code can immediately divide it back out again</em><span>. It’s literally a conversion to radians and back </span><em>for no reason</em><span>. If both programmers had just agreed not to use radians, and instead used the original [0, 1] domain that </span><em>h</em><span> was already on, both their jobs get simpler: the caller saves a multiply, while the library gets a simpler-to-understand, </span><em>exact</em><span> constant.</span></p><p><span>And the “exact” part is actually quite interesting. Not only do you pay for an extra multiply when you spuriously convert to radians, but it’s also worth noting that all common radian angles besides 0 are </span><em>difficult to represent.</em><span> Want to store 90 degrees in radians? No matter how many bits you use, it will never be exact.</span></p><p><span>90 degrees on [0, 1], however, is just 0.25 - a bit pattern that </span><em>doesn’t even require any bits of mantissa at all!</em><span> 0.5? Same! 0.75? Just </span><em>one bit</em><span> of mantissa to represent exactly.</span></p><p>So the [0, 1] range is not only more computationally efficient than radians, it is also more compact and precise when representing typical values that frequently occur in practical use.</p><p>I can understand why some people would be worried about making this switch. Even if you believe me that all user-side code multiplies by pi or tau, and all library-side code divides it back out, you still may have that sinking “math class feeling” that you’d be doing something wrong if you stopped using radians.</p><p>But math never decreed that sine and cosine have to take radian arguments!</p><p><span>The idea of parameterizing a circle from zero to one instead of from zero to tau is not a random idea I made up for this blog post. It’s actually a legitimate, existing mathematical construct, and it even has a name: it’s called a </span><em><a href="https://en.wikipedia.org/wiki/Turn_(angle)#:~:text=A%20turn%20is%20a%20unit,rot.)%20or%20full%20circle.">turn</a></em><span>.</span></p><p><span>In </span><em>turns</em><span>, 0 is 0 degrees, 0.5 is 180 degrees, 1 is 360 degrees, 2 is 720 degrees, and so on. It’s exactly what we wanted.</span></p><p><span>So if you are worried that your math teacher will get mad at you, there is no cause for concern. Just tell them that you considered the matter carefully, and decided that parameterizing your angles in </span><em>turns</em><span> instead of in radians was the most efficient method for the problem at hand!</span></p><p><span>If you wrote your own math library, or you copied someone else’s into your project, hopefully it is quite clear how you can switch away from radians and eliminate pi and tau from your codebase. All you have to do is take your sin and cos functions and make them take </span><em>turns </em><span>instead of radians, which usually involves nothing but a quick adjustment to a single constant.</span></p><p>If you want to support legacy code, pick a different name for the new turn-based trig functions. Then, for legacy code, you can still support the old radian-based sin and cos by making those routines thunk through to the new routines, doing the divide-by-tau along the way.</p><p>It’s very simple - just a few lines of code to make the switch.</p><p><span>However, although I find turns to be the most convenient reparameterization, it’s not the only alternative. Especially if you </span><em>don’t</em><span> roll your own math routines (and perhaps even if you do), you may instead want to consider using </span><em>half turns</em><span>, where a full circle is [0, 2]. It’s a bit more confusing, but…</span></p><p><span>It turns out (pun intended!) that if you go looking for it, in some math libraries you will already find sin and cos functions parameterized on half-turns instead of radians. For example, </span><a href="https://docs.nvidia.com/cuda/cuda-math-api/group__CUDA__MATH__SINGLE.html#group__CUDA__MATH__SINGLE_1gab8978300988c385e0aa4b6cba44225e">the CUDA sincospi intrinsic</a><span> computes the sine and cosine of the input </span><em>multiplied by pi</em><span>, which is a half-turn.</span></p><p>This is great. If you’re targeting a platform with sincospi already available, you can stop using pi and tau constants in your code right now without touching your libraries at all. Just start calling sincospi with half-turns instead of sin and cos with radians, and you’re good to go.</p><p>Having now managed entire codebases where I stopped using radians, I can safely say I never miss them. All the superfluous tau’s and pi’s disappear, and everything reads more clearly. </p><p><span>The same logic for modifying sin and cos applies to the rest of the standard trig functions as well, so you can eliminate radians everywhere if you choose. Libraries almost always convert away from radians internally anyway, and then convert back to radians on the way out, so switching to turns or half-turns everywhere is usually just a matter of </span><em>deleting</em><span> code and not much else.</span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Gardner police discontinue Flock cameras as license plate readers face scrutiny (125 pts)]]></title>
+            <title><![CDATA[Gardner police discontinue Flock cameras as license plate readers face scrutiny (127 pts)]]></title>
             <link>https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-plate-readers-privacy/73468724</link>
             <guid>49368625</guid>
             <pubDate>Wed, 19 Aug 2026 23:38:22 GMT</pubDate>
@@ -127,7 +138,7 @@ y = _mm256_mul_ps(x, *(v8sf*)_ps256_cephes_FOPI);</code></pre><p><span>Again, no
 Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-plate-readers-privacy/73468724: Error: Request failed with status code 451]]></description>
         </item>
         <item>
-            <title><![CDATA[Feature Request: Support AGENTS.md (282 pts)]]></title>
+            <title><![CDATA[Feature Request: Support AGENTS.md (302 pts)]]></title>
             <link>https://github.com/anthropics/claude-code/issues/6235</link>
             <guid>49367350</guid>
             <pubDate>Wed, 19 Aug 2026 21:19:50 GMT</pubDate>
@@ -136,7 +147,172 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 <p dir="auto">By contrast, CLAUDE.md feels too specific to Claude Code. It doesn’t work as well when collaborating with other developers who aren’t using Claude Code.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Unlocking a locked/deactivated e-waste Cricut Maker (219 pts)]]></title>
+            <title><![CDATA[Os8088.com: IBM XT OS now has a Browser, CP/M 2.2 with Z80 core and MS Word 1.1a (101 pts)]]></title>
+            <link>https://os8088.com/spotlight/</link>
+            <guid>49367256</guid>
+            <pubDate>Wed, 19 Aug 2026 21:11:31 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://os8088.com/spotlight/">https://os8088.com/spotlight/</a>, See on <a href="https://news.ycombinator.com/item?id=49367256">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="main">
+<div>
+  
+  <p>One page per addition that a line on the releases page does not carry:
+  what it is, screenshots of it running, and the video if there is one.</p>
+</div>
+
+<div>
+  <h2>August 2026</h2>
+  <p>Newest first.</p>
+</div>
+
+<!-- One entry per spotlight: the screendump on one side, the pitch on the
+     other, so a reader takes in the picture and the point together instead of
+     scrolling past one to reach the other. Adding the next one means copying
+     this block and changing five things. -->
+<section>
+  <figure>
+    <p><span>Browser</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/browser/" aria-label="A web browser for the IBM PC XT">
+      <img src="https://os8088.com/img/browser/browser-wikipedia.png" srcset="https://os8088.com/img/browser/browser-wikipedia.png 640w, https://os8088.com/img/browser/browser-wikipedia@2x.png 1280w" sizes="(max-width: 692px) 100vw, 640px" width="640" height="480" fetchpriority="high" alt="The os8088 browser showing the Wikipedia article on the IBM PC XT, its infobox drawn as a bordered table."></a>
+  </figure>
+
+  <div>
+    <p>My latest experiment</p>
+    <h2><a href="https://os8088.com/spotlight/browser/">A web browser for the IBM PC XT</a></h2>
+    <p>os8088 now fetches real web pages and lays them out as text and tables, over an
+    Ethernet card or a parallel cable to a DOS machine standing next to it. The network is not
+    the slow part: drawing a window full of text takes longer than fetching the page.</p>
+    <dl>
+      <p><dt>the browser</dt><dd>13,889 bytes</dd></p>
+      <p><dt>the stack</dt><dd>ARP to TCP</dd></p>
+      <p><dt>machine</dt><dd>4.77 MHz 8088</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<section>
+  <figure>
+    <p><span>RunCPM</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/runcpm/" aria-label="CP/M in a window, on an 8086">
+      <img src="https://os8088.com/img/runcpm/runcpm-prompt.png" srcset="https://os8088.com/img/runcpm/runcpm-prompt.png 640w, https://os8088.com/img/runcpm/runcpm-prompt@2x.png 1280w" sizes="(max-width: 692px) 100vw, 640px" width="640" height="480" fetchpriority="high" alt="An os8088 window with a CP/M boot banner in it, ending in an A greater-than prompt."></a>
+  </figure>
+
+  <div>
+    <h2><a href="https://os8088.com/spotlight/runcpm/">CP/M, in a window</a></h2>
+    <p>CP/M was the operating system small computers ran before the IBM PC existed, on a processor
+    the PC does not have. os8088 now emulates that processor, so CP/M software runs here: the 1979
+    command processor at the prompt, Microsoft BASIC, an assembler and an editor, in a window you
+    can drag around like any other.</p>
+    <dl>
+      <p><dt>emulates</dt><dd>a Zilog Z80</dd></p>
+      <p><dt>written in</dt><dd>4,679 lines of C</dd></p>
+      <p><dt>machine</dt><dd>4.77 MHz 8088</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<section>
+  <figure>
+    <p><span>Written in C</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/cword/" aria-label="A word processor written in C, on an 8086">
+      <img src="https://os8088.com/img/cword/cword-welcome.png" srcset="https://os8088.com/img/cword/cword-welcome.png 640w, https://os8088.com/img/cword/cword-welcome@2x.png 1280w" sizes="(max-width: 692px) 100vw, 640px" width="640" height="480" fetchpriority="high" alt="A word processor open on the os8088 desktop showing a welcome document with a bold heading and bold, italic and underlined words in the text."></a>
+  </figure>
+
+  <div>
+    <p>A new program</p>
+    <h2><a href="https://os8088.com/spotlight/cword/">A word processor written in C</a></h2>
+    <p>Everything in os8088 up to now was written in assembly language, one processor instruction
+    at a time. There is now a C compiler for it, which is a far quicker way to write a program. To
+    find out whether it could carry something real, I wrote a second word processor with it -- and
+    it turned out too big for the memory a program gets, so it comes in two pieces.</p>
+    <dl>
+      <p><dt>written in</dt><dd>8,350 lines of C</dd></p>
+      <p><dt>the program</dt><dd>54,450 bytes</dd></p>
+      <p><dt>machine</dt><dd>4.77 MHz 8088</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<section>
+  <figure>
+    <p><span>Microsoft Word</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/word/" aria-label="Microsoft Word 1.1a on os8088">
+      <img src="https://os8088.com/img/word/word-welcome.png" srcset="https://os8088.com/img/word/word-welcome.png 640w, https://os8088.com/img/word/word-welcome@2x.png 1280w" sizes="(max-width: 692px) 100vw, 640px" width="640" height="480" fetchpriority="high" alt="Microsoft Word open on the os8088 desktop, showing a welcome document with a centred heading, bold and italic text and an indented paragraph."></a>
+  </figure>
+
+  <div>
+    <p>A new program</p>
+    <h2><a href="https://os8088.com/spotlight/word/">Microsoft Word, on an 8086</a></h2>
+    <p>I have added something I have wanted to see for a while: my own os8088 version of
+    Microsoft Word 1.1a. It has the familiar 1990 menus, uses the same clever tricks to show
+    bold and italics on a plain old PC screen, and saves Word .DOC files. The whole program fits
+    in 47KB.</p>
+    <dl>
+      <p><dt>the program</dt><dd>47,212 bytes</dd></p>
+      <p><dt>saves</dt><dd>Word .DOC files</dd></p>
+      <p><dt>machine</dt><dd>4.77 MHz 8088</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<section>
+  <figure>
+    <p><span>Two monitors</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/dual-display/" aria-label="Two monitors, one desktop, on an 8086">
+      <img src="https://os8088.com/img/dual-display/hardware.jpg" srcset="https://os8088.com/img/dual-display/hardware.jpg 800w, https://os8088.com/img/dual-display/hardware@2x.jpg 1600w" sizes="(max-width: 692px) 100vw, 640px" width="800" height="600" fetchpriority="high" alt="Two period PC monitors side by side, a green monochrome one and a colour one, both showing parts of the same os8088 desktop."></a>
+  </figure>
+
+  <div>
+    <p>A new feature</p>
+    <h2><a href="https://os8088.com/spotlight/dual-display/">Two monitors, one desktop</a></h2>
+    <p>A PC of this era could hold a monochrome card and a colour card at once, because their
+    picture memory sat at different addresses. Almost nothing used both together. os8088 now
+    spans one desktop across the pair -- 1,360 pixels wide, on a 4.77 MHz machine -- and a
+    window that lands over the join is drawn on both screens.</p>
+    <dl>
+      <p><dt>monitors</dt><dd>2</dd></p>
+      <p><dt>one desktop</dt><dd>1,360 x 348</dd></p>
+      <p><dt>machine</dt><dd>4.77 MHz 8088</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<section>
+  <figure>
+    <p><span>Frotz</span><i></i><i></i></p>
+    <a href="https://os8088.com/spotlight/frotz/" aria-label="Frotz: os8088 plays Infocom games now">
+      <img src="https://os8088.com/img/frotz/frotz-minizork.png" srcset="https://os8088.com/img/frotz/frotz-minizork.png 640w, https://os8088.com/img/frotz/frotz-minizork@2x.png 1280w" sizes="(max-width: 692px) 100vw, 640px" width="640" height="480" loading="lazy" alt="Mini-Zork I running in a window on the os8088 desktop, with a status line reading West of House and two typed commands in the transcript below it."></a>
+  </figure>
+
+  <div>
+    <p>A new program</p>
+    <h2><a href="https://os8088.com/spotlight/frotz/">os8088 plays Infocom games now</a></h2>
+    <p>A Z-machine interpreter in 23,722 bytes of 8086 assembly. The Z-machine is the pretend
+    computer Infocom invented in 1979 so one game could be sold for every machine at once --
+    which is why a story file from 1982 is still a plain file that still runs. Mini-Zork,
+    Colossal Cave Adventure, Zork: The Undiscovered Underground and Photopia all play, off a
+    floppy of their own.</p>
+    <dl>
+      <p><dt>the interpreter</dt><dd>23,722 bytes</dd></p>
+      <p><dt>story formats</dt><dd>v1 to v8</dd></p>
+      <p><dt>games it fetches</dt><dd>15</dd></p>
+    </dl>
+    
+  </div>
+</section>
+
+<div>
+  <h2>Everything else</h2>
+  
+</div>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Unlocking a locked/deactivated e-waste Cricut Maker (226 pts)]]></title>
             <link>https://sprocketfox.io/xssfox/2026/07/01/cricut-unlock/</link>
             <guid>49365841</guid>
             <pubDate>Wed, 19 Aug 2026 19:06:16 GMT</pubDate>
@@ -201,7 +377,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 </center></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Unsloth Dynamic 3.0 GGUFs (283 pts)]]></title>
+            <title><![CDATA[Unsloth Dynamic 3.0 GGUFs (294 pts)]]></title>
             <link>https://unsloth.ai/docs/basics/dynamic-3.0-ggufs</link>
             <guid>49365443</guid>
             <pubDate>Wed, 19 Aug 2026 18:36:45 GMT</pubDate>
@@ -243,7 +419,7 @@ Couldn't get https://www.kmbc.com/article/gardner-kansas-flock-cameras-license-p
 Couldn't get https://liamrosen.com/2025/07/24/33-rules-of-good-social-skills/: Error: timeout of 10000ms exceeded]]></description>
         </item>
         <item>
-            <title><![CDATA[Go 1.27 (667 pts)]]></title>
+            <title><![CDATA[Go 1.27 (685 pts)]]></title>
             <link>https://go.dev/blog/go1.27</link>
             <guid>49365405</guid>
             <pubDate>Wed, 19 Aug 2026 18:33:49 GMT</pubDate>
@@ -362,7 +538,7 @@ you notice any problems, please <a href="https://go.dev/issue/new">file an issue
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Google replaced Git tags for certain source code with obtaining via Google Drive (621 pts)]]></title>
+            <title><![CDATA[Google replaced Git tags for certain source code with obtaining via Google Drive (665 pts)]]></title>
             <link>https://grapheneos.social/@GrapheneOS/117057099753905023</link>
             <guid>49364745</guid>
             <pubDate>Wed, 19 Aug 2026 17:47:29 GMT</pubDate>
@@ -370,7 +546,7 @@ you notice any problems, please <a href="https://go.dev/issue/new">file an issue
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Opus 5.0 drives incoherence into the stratosphere (181 pts)]]></title>
+            <title><![CDATA[Opus 5.0 drives incoherence into the stratosphere (182 pts)]]></title>
             <link>https://github.com/anthropics/claude-code/issues/77136</link>
             <guid>49364658</guid>
             <pubDate>Wed, 19 Aug 2026 17:40:06 GMT</pubDate>
@@ -465,7 +641,7 @@ turns.</li>
 <p dir="auto"><em>No response</em></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[OpenRouter is joining Stripe (863 pts)]]></title>
+            <title><![CDATA[OpenRouter is joining Stripe (888 pts)]]></title>
             <link>https://openrouter.ai/blog/announcements/openrouter-is-joining-stripe/</link>
             <guid>49364559</guid>
             <pubDate>Wed, 19 Aug 2026 17:32:38 GMT</pubDate>
@@ -494,7 +670,7 @@ turns.</li>
 <p><em>The transaction is subject to customary closing conditions. We expect to close in the coming weeks.</em></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Extensible Software in the age of LLMs (154 pts)]]></title>
+            <title><![CDATA[Extensible Software in the age of LLMs (158 pts)]]></title>
             <link>https://jeremymorrell.dev/blog/extensible-software-in-the-age-of-llms/</link>
             <guid>49363668</guid>
             <pubDate>Wed, 19 Aug 2026 16:26:05 GMT</pubDate>
@@ -1109,7 +1285,7 @@ removing a replica may cause a cascading failure.</li>
 <div data-slot="card"><div data-slot="card-header"><p><h3 data-slot="card-title">The shameless plug</h3></p></div><p>ngrok have a <a data-slot="anchor" href="https://github.com/ngrok/ngrok-operator"><span data-slot="anchor-label">first-party Kubernetes Operator</span></a>! It supports both the Ingress and Gateway APIs, as well as letting you declaratively create agent endpoints in your cluster. You can learn more at our <a data-slot="anchor" href="https://ngrok.com/docs/k8s"><span data-slot="anchor-label">docs</span></a>.</p></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Civic Hygiene – avoid building technologies that could be used by a police state (2013) (438 pts)]]></title>
+            <title><![CDATA[Civic Hygiene – avoid building technologies that could be used by a police state (2013) (439 pts)]]></title>
             <link>https://shkspr.mobi/blog/2013/11/civic-hygiene/</link>
             <guid>49363433</guid>
             <pubDate>Wed, 19 Aug 2026 16:07:14 GMT</pubDate>
@@ -1133,7 +1309,7 @@ removing a replica may cause a cascading failure.</li>
 				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Remote workers report the highest well-being in study of 7,700 employees (582 pts)]]></title>
+            <title><![CDATA[Remote workers report the highest well-being in study of 7,700 employees (588 pts)]]></title>
             <link>https://www.colorado.edu/today/2026/08/12/remote-workers-report-highest-well-being-study-7700-employees</link>
             <guid>49362934</guid>
             <pubDate>Wed, 19 Aug 2026 15:32:08 GMT</pubDate>
@@ -1141,7 +1317,7 @@ removing a replica may cause a cascading failure.</li>
 <div id="readability-page-1" class="page"><div itemprop="articleBody"><p dir="ltr"><span>For years, many employers have worried that work-from-home arrangements leave employees isolated, disconnected from coworkers and more likely to leave their jobs.</span></p><p dir="ltr"><span>But according to a new study, remote workers are doing better than many employers realize.</span></p><p dir="ltr"><span>Researchers analyzed survey data from 7,704 employees at a large healthcare organization. One pattern stood out: Employees who worked fully remotely reported the highest levels of well-being, while those who worked entirely onsite reported the lowest. The study also found little evidence that remote workers felt less connected to colleagues or workplace culture.</span></p><p dir="ltr"><span>"This suggests you let people work remotely if they want to work remotely," said&nbsp;</span><a href="https://www.colorado.edu/business/leeds-directory/faculty/stefanie-johnson" rel="nofollow"><span>Stefanie Johnson</span></a><span>, professor of organizational leadership and information analytics at the&nbsp;</span><a href="https://www.colorado.edu/business/" rel="nofollow"><span>Leeds School of Business</span></a><span> and co-author of the study, published in July 2026 in the journal&nbsp;</span><a href="https://www.frontiersin.org/journals/psychology/articles/10.3389/fpsyg.2026.1848857/full" rel="nofollow"><span>Frontiers in Psychology</span></a><span>. "Taking away people's choice of how they work is probably not going to help them in terms of their well-being."</span></p><div><p><img loading="lazy" src="https://www.colorado.edu/today/sites/default/files/styles/small_500px_25_display_size_/public/2026-08/stefjohnson.png?itok=jAQ6McVT" width="375" height="319" alt="Stefanie Johnson"></p><p><span><p>Stefanie Johnson</p></span></p></div><p><span>As companies continue to debate remote work, many leaders worry that employees need to be in the office to stay connected, work well together and remain committed to their organization. Johnson said the research doesn't always support those concerns.</span></p><p dir="ltr"><span>"The data from our study and others suggest remote and hybrid work result in better outcomes than return-to-office mandates," she said. "Leaders are not making decisions based on data. I think they are just returning to what they are used to."</span></p><h2><span>Rethinking remote work</span></h2><p dir="ltr"><span>Johnson, who co-authored the study with Alyssa Lezcano, Stephanie Zajac and Courtney Holladay of the MD Anderson Leadership Institute in Houston, said the results surprised her. She thought employees who split their time between home and the office might have the best of both worlds.</span></p><p dir="ltr"><span>"I actually thought you would be happiest if you were part time out of the office," she said. "Then every once in a while you get to see people, get that human connection."</span></p><p dir="ltr"><span>Instead, the data pointed in a different direction.</span></p><p dir="ltr"><span>Among employees in the study, well-being was highest for fully remote workers, followed by hybrid employees and then onsite workers.&nbsp;</span></p><p dir="ltr"><span>The findings also cast doubt on one of the main arguments for bringing employees back to the office: that people need to be together in person to feel connected.</span></p><p dir="ltr"><span>Employees in the study were asked to describe their organization's culture in a handful of words. Remote workers were slightly more likely than their hybrid and onsite peers to use words associated with teamwork, inclusion and support.</span></p><p dir="ltr"><span>"People who are remote actually said more things that indicated they had more positive connections, even though they were remote," Johnson said.</span></p><p dir="ltr"><span>Still, Johnson said face-to-face interaction can play an important role in helping coworkers build relationships, especially if they are just starting out in their careers.</span></p><p dir="ltr"><span>"Remote works better after you know people," she said. "So there is still a benefit of having some face time."</span></p><h2><span>Staying power</span></h2><p dir="ltr"><span>The researchers also examined employee turnover one year after the survey was completed.</span></p><p dir="ltr"><span>They found that employees with higher well-being were less likely to leave the organization. Work location itself was not a strong direct predictor of turnover. Instead, remote work was associated with higher well-being, which in turn was associated with lower turnover.</span></p><p dir="ltr"><span>"It makes sense. If you have higher well-being, you're less likely to leave your job," Johnson said.</span></p><p dir="ltr"><span>Participants completed the workplace survey in 2023, and researchers compared those responses with actual turnover records one year later. Of the employees surveyed, roughly half worked onsite, with the remainder split between hybrid and fully remote arrangements.</span></p><h2><span>Flexibility matters</span></h2><p dir="ltr"><span>The study did not explore why remote workers reported higher well-being, but Johnson points to a growing body of research on autonomy and flexibility.</span></p><p dir="ltr"><span>One explanation is that remote workers have greater control over their work setup and daily schedule, she said.</span></p><p dir="ltr"><span>"If you have control over your environment, you tend to have more positive outcomes," she said.</span></p><p dir="ltr"><span>Working from home can also eliminate many everyday stressors.</span></p><p dir="ltr"><span>"Spending a lot of time in traffic is negatively related to well-being," Johnson said. "There are so many little stressors associated with being in the office."</span></p><p dir="ltr"><span>Those stressors can include arranging child care, hiring help for pets or managing the logistics of getting to and from work, she said.</span></p><p dir="ltr"><span>Johnson said the study points to a broader lesson for employers navigating return-to-office debates. Rather than focusing only on where employees work, organizations may get better results by investing in employee well-being.</span></p><p dir="ltr"><span>"I think flexibility is here to stay," she said.</span></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[New Casio F-B100W – Upgrade to the iconic F-91W after 40 years (402 pts)]]></title>
+            <title><![CDATA[New Casio F-B100W – Upgrade to the iconic F-91W after 40 years (413 pts)]]></title>
             <link>https://www.casio.com/uk/watches/casio/product.F-B100W-1A/</link>
             <guid>49362887</guid>
             <pubDate>Wed, 19 Aug 2026 15:28:01 GMT</pubDate>
@@ -1392,398 +1568,6 @@ Proud of this milestone, and of everyone who helped bring us here.</span></p></d
 One important use-case was full-text search. We could have used MySQL in conjunction with another system like Lucene / Solr to make our database searchable. But that would have meant running and maintaining two such systems. Complicated.</p><p>PostgreSQL allowed us to use a <a href="https://www.postgresql.org/docs/current/textsearch.html">fulltext search plugin</a> to do everything in one system. No need to sync any data. No need to maintain and run two systems. It just worked and made us smile (after some tweaks of course). Simplicity.</p><p>Since then I used PostgreSQL for many use-cases throughout my career as <a href="https://www.raphaelbauer.com/interim-cto/">CTO / Interim Manager</a>. Most recently I used PostgreSQL to store very high volume web analytics time series data via its <a href="https://www.timescale.com/">TimescaleDB plugin</a>. Check out <a href="https://www.privatracker.com/">Privatracker - the best way to do web analytics and respect the privacy of your visitors</a> - to see it in action.</p><p>Many others discussed the topic from different angles. And each article is really worth your time (<a href="https://lucumr.pocoo.org/2012/12/29/sql-is-agile/">SQL is Agile</a>, <a href="https://www.amazingcto.com/postgres-for-everything/">Stephan Schmidt on Using SQL for Everything</a>). Also check out my <a href="https://www.linkedin.com/posts/raphaelabauer_postgresql-for-everything-activity-7163447276114317313-mSrw?utm_source=share&amp;utm_medium=member_desktop">Linkedin post</a>.</p><p>And if you are using PostgreSQL I can highly recommend reading Hazel Bachrach’s nice post on <a href="https://challahscript.com/what_i_wish_someone_told_me_about_postgres">“What I Wish Someone Told Me About Postgres”</a>.</p><p>In my humble opinion the power of PostgreSQL comes from three sources:</p><ol><li>It is <u>rock-solid and stable</u>.</li><li>It is <u>easy to run, install and scale</u>.</li><li>It massively <u>simplifies your IT setup</u> by being not only a RDBMS, but also a full-text search engine, a document storage and much much more…</li></ol><p>Let’s have a closer look…</p><h2 id="rock-solid-and-stable">Rock Solid and Stable</h2><p>PostgreSQL is boring old technology. <a href="https://de.wikipedia.org/wiki/PostgreSQL">The first PostgreSQL release dates back to 1996</a>. PostgreSQL is also very widely used - for a very long amount of time. Ironing out bugs - especially in database systems - takes time. PostgreSQL had that time.</p><p>It also has a very active community that diligently adds more and more features without breaking any old parts of it. In recent years PostgreSQL got many amazing features like json document storage, partitioning support, common table expressions and much much more. Each new release of PostgreSQL is exciting and brings new nice features.</p><p><u>True - PostgreSQL is old - but the features are very very modern - and PostgreSQL becomes better with every release.</u></p><h2 id="easy-to-run-install-and-scale">Easy to Run, Install and Scale</h2><p>PostgreSQL can be installed very easily locally. It is bundled with all major Linux distributions, part of <a href="https://wiki.postgresql.org/wiki/Homebrew">Mac brew</a>, but can also be installed with applications like <a href="https://postgresapp.com/">PostgresApp</a>.</p><p>When running tests, it comes in handy using <a href="https://java.testcontainers.org/modules/databases/postgres/">Testcontainers with PostgreSQL</a>. It was never easier running your tests against a real PostgreSQL database that is 100% similar to the production thing.</p><p>If you want to run PostgreSQL on a server then you can simply apt-get install it. Or run it in a <a href="https://hub.docker.com/_/postgres">docker container</a>.</p><p>All cloud providers allow you to run (and scale!) PostgreSQL by clicking a single button. You got ample of choice at your fingertips:</p><ul><li><a href="https://aws.amazon.com/rds/postgresql/">Amazon AWS</a></li><li><a href="https://cloud.google.com/sql/docs/postgres">Google GCP</a></li><li><a href="https://azure.microsoft.com/en-gb/products/postgresql/">Microsoft Azure</a></li><li><a href="https://www.elephantsql.com/">ElephantSQL</a></li><li><a href="https://www.crunchydata.com/">CrunchyData</a></li><li><a href="https://www.timescale.com/">Timescale</a></li><li>… and many more …</li></ul><p><u>That makes PostgreSQL one of the most widely supported software systems in the market. And for you this means less maintenance and more time for creating new features for clients.</u></p><h2 id="simplifies-your-it-setup">Simplifies Your IT Setup</h2><p>Running PostgreSQL in the cloud is already just one click. But it gets even better. PostgreSQL can replace many systems that youd’d have to run otherwise.</p><h3 id="postgresql-replaces-solr-and-elastic-full-text-search">PostgreSQL Replaces Solr and Elastic: Full-Text Search</h3><p>PostgreSQL allows you to turn your text data into user-searchable data. Without a separate system. It’s also language agnostic and you’ll never have any sync problems between your data and your fulltext search system.</p><p>The most impressive article on the topic is how <a href="https://www.contentful.com/blog/contentful-faster-full-text-search/">Contentful used PostgreSQL to enable fulltext search for their users</a>. It’s a tale in simplicity that enables growth.</p><p>Instacart did something very similar: They <a href="https://tech.instacart.com/how-instacart-built-a-modern-search-infrastructure-on-postgres-c528fa601d54">built their modern search infrastructure on Postgres</a> instead of running a separate search cluster. Same story, different company.</p><p>More on the topic: <a href="https://www.postgresql.org/docs/current/textsearch.html">https://www.postgresql.org/docs/current/textsearch.html</a></p><h3 id="postgresql-replaces-mongodb-excellent-json-support">PostgreSQL replaces MongoDB: Excellent Json Support</h3><p>PostgreSQL has excellent support for <a href="https://www.postgresql.org/docs/current/datatype-json.html">storing and querying(!) json</a>. It also features an index type (GIN) that makes these operations blazingly fast. <u>Is there a need for MongoDB any more?</u>.</p><p>The Guardian also wrote an excellent article how they <a href="https://www.theguardian.com/info/2018/nov/30/bye-bye-mongo-hello-postgres">switched from
 Mongo to PostgreSQL</a>. Thanks for sharing <a href="https://www.linkedin.com/feed/update/urn:li:activity:7163447276114317313?commentUrn=urn%3Ali%3Acomment%3A%28activity%3A7163447276114317313%2C7163615175755874304%29&amp;dashCommentUrn=urn%3Ali%3Afsd_comment%3A%287163615175755874304%2Curn%3Ali%3Aactivity%3A7163447276114317313%29">Jan-Otto</a>! Hazel also <a href="https://challahscript.com/what_i_wish_someone_told_me_about_postgres#jsonb-is-a-sharp-knife">wrote a nice piece on jsonb</a> and what to take into account when using it.</p><h3 id="postgresql-replaces-kafka-and-rabbitmq-postgresql-as-a-queue">PostgreSQL replaces Kafka and RabbitMQ: PostgreSQL as a queue</h3><p>Events, queues and persistent logs are getting more and more important in today’s software systems. Systems like Kafka, RabbitMQ, SQS and others provide that functionality. But maintaining them is annoying, custom and you need the skillset.</p><p>The good news: You can just use PostgreSQL. The magic comes from</p><ul><li>SELECT .. FOR UPDATE</li><li>SELECT .. SKIP LOCKED</li></ul><p>Using these SQL features you can effectively use a table as queue. Either in a persistent fashion with a cursor and many consumers, or in a read-once fashion.</p><p>The article at <a href="https://www.crunchydata.com/blog/message-queuing-using-native-postgresql">crunchydata explains this concept very well</a>.</p><p><u>My tip: Start with PostgreSQL as a queueing system. Only when that does no longer perform well switch to other systems like Kafka, RabbitMQ or SQS. You’ll be surprised how well PostgreSQL works.</u></p><h3 id="postgresql-replaces-clickhouse-high-volume-time-series-data">PostgreSQL Replaces Clickhouse: High Volume Time Series Data</h3><p>Time series data is special. Often you get many data points in a very short amount of time. And then you have to aggregate the data frequently, doing some statistics on it and so on.</p><p>There are specialized software systems like Clickhouse (amazing by the way…). But you can also use a plugin for PostgreSQL that allows you to do (nearly) the same: <a href="https://github.com/timescale/timescaledb">Timescale</a>.</p><p><u>I’ve used Timescale and can recommend it. The good news is that you can continue using PostgreSQL - even for high volume data easily. No need to learn and maintain something new.</u></p><h3 id="postgresql-as-vector-database-for-ai-workflows">PostgreSQL as Vector Database for AI Workflows</h3><p>Timescale lately released the <a href="https://docs.timescale.com/use-timescale/latest/extensions/pgvector/?ref=timescale.com">pgvector extension</a>, that turns your PostgreSQL into a vector database.
 This allows you to use the tech you already know for indexing and retrieval of relevant data. That’s an essential part of AI LLM workflows.</p><p>Timescale also recently announced <a href="https://github.com/timescale/pgai">pgai</a> that includes pgvector, but also a lot of other nice extensions that make it super simple to index data, call LLM models and retrieve data based on similarity.</p><h3 id="postgresql-replaces-redis-non-persistent-high-performance-caching">PostgreSQL Replaces Redis: Non-Persistent High Performance Caching</h3><p>Caching is important. Most applications use something like Redis as a cache to get information like sessions and more quickly. A cache can by definition lose data and can be regenerated from the original source.</p><p>But. Why use Redis when PostgreSQL can be tuned to be as fast (in most usecases) as a Redis cache? The secret is using an UNLOGGED table. You can even emulate Redis’ automatic expire by a trigger. <a href="https://martinheinz.dev/blog/105">A lot has been written about this</a> - I can just recommend trying it out.</p><h3 id="postgresql-replaces-file-system-for-raw-data">PostgreSQL Replaces File System: For Raw Data</h3><p>For one of my clients we had to read and write a huge amount of small pieces of binary encoded information. We initially thought that doing this via the file system was the fastest way to do so.</p><p>After some performance checks it became clear that PostgreSQL was even faster than reading from the file system for our use-case. PostgreSQL uses the file system very efficiently for its data - and it adds a lot of caching and efficient reading and writing strategies that can outperform writing and reading raw data on a file system.</p><p>We used <a href="https://github.com/google/flatbuffers">Flatbuffers</a> to store the data in a blob column. Data was then de-serialized on the client. You might want to try that approach as well.</p><h3 id="postgresql-replacing-your-graph-database">PostgreSQL Replacing Your Graph Database</h3><p>Hierarchical data can be managed in SQL via recursive queries. That’s ok, but also super-hard to read, maintain and debug. Not even speaking of performance.</p><p>The better way is the <a href="https://www.postgresql.org/docs/current/ltree.html">LTREE datatype of PostgreSQL</a>. It helped me not only once to implement hierarchical tag structures. Easy to read, maintain and blazingly fast.</p><h3 id="postgresql-replacing-your-microservice">PostgreSQL Replacing Your Microservice</h3><p>Most of the “microservices” these days are only about models, getting data from a database and returning json to the client.</p><p>But you know what? PostgreSQL can turn any query into a Json result. That effectively replaces your server middleware. There are Pros and Cons to this approach, but it shows the capabilities of PostgreSQL. The amazing <a href="https://blog.jooq.org/stop-mapping-stuff-in-your-middleware-use-sqls-xml-or-json-operators-instead/">Lukas Eder wrote about the topic</a> - not PostgreSQL specific - but everything mentioned there is very well doable in PostgreSQL as well</p><h3 id="postgresql---replacing-your-playstation-5">PostgreSQL - Replacing your Playstation 5</h3><p>Well. Some enthusiast implemented <a href="https://github.com/nuno-faria/tetris-sql/blob/main/game.sql">Tetris as Common Table Expressions in pure SQL</a>. Crazy. And maybe not to be taken too seriously.</p><h2 id="conclusion">Conclusion</h2><p>The list above is not very exhaustive. PostgreSQL is a very flexible piece of software. And it can be extended with plugins to do more and more.</p><p>You need simplicity if you want to move fast. If you come across a new requirement always ask: Can’t PostgreSQL do this? And do we really need that shiny new technology X?</p><p>PostgreSQL might not be the answer to everything - but it is the answer to a lot more than you might think!</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Geolocating a random island using geometry and CUDA programming (442 pts)]]></title>
-            <link>https://yassa9.github.io/osint/gralhix-004/</link>
-            <guid>49360545</guid>
-            <pubDate>Wed, 19 Aug 2026 12:19:52 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://yassa9.github.io/osint/gralhix-004/">https://yassa9.github.io/osint/gralhix-004/</a>, See on <a href="https://news.ycombinator.com/item?id=49360545">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-    <h2>gralhix004 | Geolocating Random Islet Image Using Geometry &amp; CUDA GPU Programming</h2>
-<blockquote>
-<p>16-08-2026</p>
-<p>NOTE: this is a genuine human work, didnt use LLM generation. </p>
-</blockquote>
-<p>I'm writing this page as a writeup for this challenge <a target="_blank" rel="noopener" href="https://gralhix.com/list-of-osint-exercises/osint-exercise-004/">gralhix 004 made by Sofia Santos | Gralhix</a>.</p>
-<blockquote>
-<p>You can view, clone and locally try all code files and the final report with all instructions <a target="_blank" rel="noopener" href="https://github.com/yassa9/geoint/tree/main/gralhix_004">here at github.</a></p>
-</blockquote>
-<hr>
-<h2>Task briefing:</h2>
-<p><img alt="main" src="https://yassa9.github.io/osint/gralhix-004/main.jpg"></p>
-<p>This is a photo of a resort located on an island.</p>
-<blockquote>
-<p>a) What is the name of the resort? <br>
-b) What are the coordinates of the island? <br>
-c) In which cardinal direction was the camera facing when the photo was taken?</p>
-</blockquote>
-
-
-<p>In my opinion, solving this challenge with <code>google lens</code> is wasting a fun opportunity, so decided to solve it with math and programming.  </p>
-<hr>
-<h2>a] Metadata</h2>
-<p>Of course, first thing u look for is the <code>metadata</code>. Ran that on my <code>linux void</code>: </p>
-<div><pre><span></span><code><span>&gt;</span> <span>exiftool</span> <span>main</span><span>.</span><span>png</span>
-
-<span>File</span> <span>Type</span>                       <span>:</span> <span>WEBP</span> <span>(</span><span>lossless</span><span>)</span>
-<span>MIME</span> <span>Type</span>                       <span>:</span> <span>image</span><span>/</span><span>webp</span>
-<span>Image</span> <span>Width</span>                     <span>:</span> <span>736</span>
-<span>Image</span> <span>Height</span>                    <span>:</span> <span>515</span>
-</code></pre></div>
-
-<p>As expected, nothing useful here. No EXIF, no GPS, no camera make or model.</p>
-<hr>
-<h2>b] Building the fingerprint</h2>
-<p><img alt="01_00" src="https://yassa9.github.io/osint/gralhix-004/01_00.jpg"></p>
-
-
-<p>U can see from the img, there are 3 landmasses: </p>
-<ul>
-<li>P0: the islet itself, </li>
-<li>P1: the right island, </li>
-<li>P2: the left front island ( having mountain peak )</li>
-</ul>
-<p>I couldnt make a correct perspective model of birdview of this image, as clearly the image is taken by a drone and cant estimate the elevation at all (and not found in the metadata).</p>
-<p>So I had to estimate that by intuition, I just want the relative distances between the 3 islands and angles of that triangle.</p>
-<p><img alt="01_01" src="https://yassa9.github.io/osint/gralhix-004/01_01.jpg"></p>
-<p>I built a small click GUI <code>01_triangle_gui.py</code> that records pixel coordinates for each point in order and computes the triangle's geometry.</p>
-<p>Since clicking exact centers by eye isn't perfectly precise, I added a <code>±20% tolerance</code> band around both values when searching. </p>
-
-
-<hr>
-<h2>c] SEARCH</h2>
-<p>With the fingerprint locked in, the next step is checking every real landmass on Earth against it !</p>
-<blockquote>
-<p>I used <code>OpenStreetMap's split land polygon set</code> as the dataset <a target="_blank" rel="noopener" href="https://osmdata.openstreetmap.de/data/land-polygons.html">land-polygons-split-4326</a>, full global coastline vectors in WGS84 which has size of <code>882 MB</code>.</p>
-</blockquote>
-<p>I created heuristic filters (all by just intuition and non tangible proofs), spent days (yea full days) tweaking values and tons of trial and error 😭 untill I got this working filters recipe.</p>
-<h3>01] Tropical latitude bounding box</h3>
-<p>$$ -30° \le latitude \le 30° $$</p>
-<p>the islet in the photo reads as tropical, so I decided that anything outside the tropics is thrown out immediately, before doing any expensive geometry work.</p>
-<blockquote>
-<p>Exactly <code>141,131</code> land polygons survive that band filter.</p>
-</blockquote>
-<h3>02] Local density filter</h3>
-<p>$$ N_{5\text{km}}(p) \le 10 $$</p>
-<p>$ N_{5\text{km}}(p) $ counts how many other centroids fall within 5km of point (p). <code>Cap is 10</code>: if an islet has more than 10 neighbors that close, it's sitting in a dense reef field, a crowded coastline or a archipelago clutter, not a small isolated 3-4 island group like the photo shows.</p>
-<blockquote>
-<p>This dropped candidates down to <code>51,576</code>.</p>
-</blockquote>
-<h3>03] Clustering</h3>
-<p>For every surviving point, find every other point within 20km (heuristic, by eye from the image). If it has at least 2 neighbors that close (3 points total), it's a cluster. Points with no cluster of 3+ nearby are dropped, they can't form a triangle at all.</p>
-<div><pre><span></span><code><span>tree</span> <span>=</span> <span>cKDTree</span><span>(</span><span>f_coords</span><span>)</span>
-<span>neigh</span> <span>=</span> <span>tree</span><span>.</span><span>query_ball_point</span><span>(</span>
-                            <span>f_coords</span><span>,</span> 
-                            <span>CLUSTER_RADIUS_KM</span> <span>/</span> <span>111.0</span><span>)</span>
-<span>clusters</span> <span>=</span> <span>set</span><span>(</span><span>tuple</span><span>(</span><span>sorted</span><span>(</span><span>n</span><span>))</span> <span>for</span> <span>n</span> <span>in</span> <span>neigh</span> <span>if</span> <span>len</span><span>(</span><span>n</span><span>)</span> <span>&gt;=</span> <span>3</span><span>)</span>
-</code></pre></div>
-
-<p>$$ \left|\{q : \text{dist}(p,q) \le 20\,\text{km}\}\right| \ge 3 $$</p>
-<blockquote>
-<p>That collapses down to <code>23,500</code> clusters.</p>
-</blockquote>
-<h3>04] Generating Triplets</h3>
-<p>For every cluster, every combination of 3 points inside it becomes a candidate triangle. That's $ C(n, 3) $, which explodes fast for big clusters, for example: a cluster of 60 points already gives <code>34,220</code> triples on its own. So each cluster gets capped at 60 points first, sampled by size, not randomly.</p>
-<p>$$ \binom{n}{3} = \frac{n(n-1)(n-2)}{6} $$</p>
-<div><pre><span></span><code><span>def</span><span> </span><span>stratified_sample</span><span>(</span><span>idx_arr</span><span>,</span> <span>area_arr</span><span>,</span> <span>cap</span><span>):</span>
-    <span>order</span> <span>=</span> <span>np</span><span>.</span><span>argsort</span><span>(</span><span>area_arr</span><span>[</span><span>idx_arr</span><span>])</span>
-    <span>n_small</span> <span>=</span> <span>cap</span> <span>//</span> <span>3</span>
-    <span>n_large</span> <span>=</span> <span>cap</span> <span>//</span> <span>3</span>
-    <span>n_mid</span> <span>=</span> <span>cap</span> <span>-</span> <span>n_small</span> <span>-</span> <span>n_large</span>
-    <span>mid_start</span> <span>=</span> <span>max</span><span>(</span><span>0</span><span>,</span> <span>(</span><span>len</span><span>(</span><span>idx_arr</span><span>)</span> <span>-</span> <span>n_large</span> <span>-</span> <span>n_mid</span><span>)</span> <span>//</span> <span>2</span><span>)</span>
-    <span>keep</span> <span>=</span> <span>np</span><span>.</span><span>unique</span><span>(</span><span>np</span><span>.</span><span>concatenate</span><span>([</span>
-        <span>order</span><span>[:</span><span>n_small</span><span>],</span> 
-        <span>order</span><span>[</span><span>-</span><span>n_large</span><span>:],</span> 
-        <span>order</span><span>[</span><span>mid_start</span><span>:</span><span>mid_start</span> <span>+</span> <span>n_mid</span><span>],</span>
-    <span>]))</span>
-    <span>return</span> <span>idx_arr</span><span>[</span><span>keep</span><span>]</span>
-
-<span>def</span><span> </span><span>gen_cluster_triples</span><span>(</span><span>idx_arr</span><span>):</span>
-    <span>local</span> <span>=</span> <span>np</span><span>.</span><span>array</span><span>(</span><span>list</span><span>(</span>
-                <span>itertools</span><span>.</span><span>combinations</span><span>(</span><span>range</span><span>(</span><span>len</span><span>(</span><span>idx_arr</span><span>)),</span> <span>3</span><span>)),</span> 
-                <span>dtype</span><span>=</span><span>np</span><span>.</span><span>int64</span><span>)</span>
-    <span>return</span> <span>idx_arr</span><span>[</span><span>local</span><span>]</span>
-</code></pre></div>
-
-<p>The sampling takes a third small islands, a third large, a third from the middle of the size distribution, instead of the full cluster or a random cut. </p>
-<blockquote>
-<p><code>23,500</code> clusters produce <code>80,690,777</code> triples total !!</p>
-</blockquote>
-<h3>05] Matching, on the GPU</h3>
-<p>I gave every triple one CUDA thread. Each thread sorts its 3 points by land area to pick out P0 (smallest, the resort islet), then uses the winding direction of the other two to assign P1 and P2:</p>
-<div><pre><span></span><code><span>long</span><span> </span><span>long</span><span> </span><span>i</span><span> </span><span>=</span><span> </span><span>blockIdx</span><span>.</span><span>x</span><span> </span><span>*</span><span> </span><span>(</span><span>long</span><span> </span><span>long</span><span>)</span><span>blockDim</span><span>.</span><span>x</span><span> </span><span>+</span><span> </span><span>threadIdx</span><span>.</span><span>x</span><span>;</span>
-<span>if</span><span> </span><span>(</span><span>i</span><span> </span><span>&gt;=</span><span> </span><span>n_triples</span><span>)</span><span> </span><span>return</span><span>;</span>
-
-<span>int</span><span> </span><span>pos</span><span>[</span><span>3</span><span>]</span><span> </span><span>=</span><span> </span><span>{</span><span>0</span><span>,</span><span> </span><span>1</span><span>,</span><span> </span><span>2</span><span>};</span>
-<span>for</span><span> </span><span>(</span><span>int</span><span> </span><span>a1</span><span> </span><span>=</span><span> </span><span>1</span><span>;</span><span> </span><span>a1</span><span> </span><span>&lt;</span><span> </span><span>3</span><span>;</span><span> </span><span>a1</span><span>++</span><span>)</span><span> </span>
-<span>{</span>
-<span>    </span><span>int</span><span> </span><span>key</span><span> </span><span>=</span><span> </span><span>pos</span><span>[</span><span>a1</span><span>];</span>
-<span>    </span><span>double</span><span> </span><span>keyval</span><span> </span><span>=</span><span> </span><span>a</span><span>[</span><span>key</span><span>];</span>
-<span>    </span><span>int</span><span> </span><span>j</span><span> </span><span>=</span><span> </span><span>a1</span><span> </span><span>-</span><span> </span><span>1</span><span>;</span>
-<span>    </span><span>while</span><span> </span><span>(</span><span>j</span><span> </span><span>&gt;=</span><span> </span><span>0</span><span> </span><span>&amp;&amp;</span><span> </span><span>a</span><span>[</span><span>pos</span><span>[</span><span>j</span><span>]]</span><span> </span><span>&gt;</span><span> </span><span>keyval</span><span>)</span><span> </span>
-<span>    </span><span>{</span>
-<span>        </span><span>pos</span><span>[</span><span>j</span><span> </span><span>+</span><span> </span><span>1</span><span>]</span><span> </span><span>=</span><span> </span><span>pos</span><span>[</span><span>j</span><span>];</span>
-<span>        </span><span>j</span><span>--</span><span>;</span>
-<span>    </span><span>}</span>
-<span>    </span><span>pos</span><span>[</span><span>j</span><span> </span><span>+</span><span> </span><span>1</span><span>]</span><span> </span><span>=</span><span> </span><span>key</span><span>;</span>
-<span>}</span>
-</code></pre></div>
-
-<p>P1 vs P2 comes from a 2D cross product, no branching on which cluster the triple came from, just the sign:</p>
-<p>$$ \text{cross} = x_a y_b - x_b y_a $$ 
-$$ P1 = \begin{cases} a &amp; \text{cross} &gt; 0 \\ b &amp; \text{cross} \le 0 \end{cases} $$</p>
-<p>Walk from P0 to a, then to b. If cross &gt; 0, that's a left turn (counterclockwise). If cross &lt; 0, it's a right turn (clockwise). It's the same sign trick used to tell if 3 points curve one way or the other.</p>
-<p>then angle at P0 and the distance ratio, same formulas as the fingerprint step, computed independently by every thread:</p>
-<p>$$ \theta_0 = \arccos\left(\frac{\vec{d_1} \cdot \vec{d_2}}{|\vec{d_1}||\vec{d_2}|}\right), \qquad r = \frac{|\vec{d_1}|}{|\vec{d_2}|} $$</p>
-<p>A triple survives if angle, ratio, P0's size, the separation between P0 and P1, and both side lengths all land inside the fingerprint's tolerance windows. Threads that pass write their result into a shared output array using an atomic counter, so two threads finishing at the same time never overwrite each other:</p>
-<div><pre><span></span><code><span>if</span><span> </span><span>(</span><span>hit</span><span>)</span><span> </span>
-<span>{</span>
-<span>    </span><span>unsigned</span><span> </span><span>long</span><span> </span><span>long</span><span> </span><span>slot</span><span> </span><span>=</span><span> </span><span>atomicAdd</span><span>(</span><span>out_count</span><span>,</span><span> </span><span>1ULL</span><span>);</span>
-<span>    </span><span>out_p0</span><span>[</span><span>slot</span><span>]</span><span> </span><span>=</span><span> </span><span>p0idx</span><span>;</span>
-<span>    </span><span>out_p1</span><span>[</span><span>slot</span><span>]</span><span> </span><span>=</span><span> </span><span>p1idx</span><span>;</span>
-<span>    </span><span>out_p2</span><span>[</span><span>slot</span><span>]</span><span> </span><span>=</span><span> </span><span>p2idx</span><span>;</span>
-<span>}</span>
-</code></pre></div>
-
-<p>Now printed in the CLI directly from the kernel:</p>
-<div><pre><span></span><code><span>gpu</span><span>:</span> <span>NVIDIA</span> <span>GeForce</span> <span>RTX</span> <span>3050</span> <span>(</span><span>sm_86</span><span>)</span>
-<span>vram</span> <span>used</span><span>:</span> <span>5169</span> <span>MB</span>
-<span>kernel</span> <span>time</span><span>:</span> <span>204.1</span> <span>ms</span>
-</code></pre></div>
-
-<blockquote>
-<p><code>80.7 million</code> triples go in, one thread each, in parallel. <code>158,784</code> pass the mask.</p>
-</blockquote>
-<h3>06] Dedup</h3>
-<p>Since same physical triple can get hit by multiple GPU threads if it belonged to more than one overlapping cluster, so raw matches get collapsed by identity first:</p>
-<div><pre><span></span><code><span>seen</span> <span>=</span> <span>set</span><span>()</span>
-<span>uniq</span> <span>=</span> <span>[]</span>
-<span>for</span> <span>i</span> <span>in</span> <span>range</span><span>(</span><span>len</span><span>(</span><span>p0_all</span><span>)):</span>
-    <span>key</span> <span>=</span> <span>(</span><span>p0_all</span><span>[</span><span>i</span><span>],</span> <span>p1_all</span><span>[</span><span>i</span><span>],</span> <span>p2_all</span><span>[</span><span>i</span><span>])</span>
-    <span>if</span> <span>key</span> <span>not</span> <span>in</span> <span>seen</span><span>:</span>
-        <span>seen</span><span>.</span><span>add</span><span>(</span><span>key</span><span>)</span>
-        <span>uniq</span><span>.</span><span>append</span><span>(</span><span>i</span><span>)</span>
-</code></pre></div>
-
-<blockquote>
-<p><code>8,915</code> unique triples after dedup.</p>
-</blockquote>
-<h3>07] The Open Rectangle</h3>
-<p><img alt="02_00" src="https://yassa9.github.io/osint/gralhix-004/02_00.jpg"></p>
-
-
-<p>Every surviving triple gets one more test: is the space next to it actually open water, like the photo shows ? A rectangle gets built along the P0→P1 edge, on whichever side P2 is not on, then checked against the land dataset for anything else sitting inside it.</p>
-<div><pre><span></span><code><span>width</span> <span>=</span> <span>np</span><span>.</span><span>hypot</span><span>(</span><span>x1</span><span>,</span> <span>y1</span><span>)</span>
-<span>u</span> <span>=</span> <span>np</span><span>.</span><span>array</span><span>([</span><span>x1</span><span>,</span> <span>y1</span><span>])</span> <span>/</span> <span>width</span>
-<span>v</span> <span>=</span> <span>np</span><span>.</span><span>array</span><span>([</span><span>-</span><span>u</span><span>[</span><span>1</span><span>],</span> <span>u</span><span>[</span><span>0</span><span>]])</span>
-
-<span># p2 sits on the +v side by construction, </span>
-<span># so the check goes on -v</span>
-<span>length</span> <span>=</span> <span>2</span> <span>*</span> <span>width</span>
-<span>corners_local</span> <span>=</span> <span>[</span>
-    <span>(</span><span>0</span><span>,</span> <span>0</span><span>),</span> <span>(</span><span>x1</span><span>,</span> <span>y1</span><span>),</span>
-    <span>(</span><span>x1</span> <span>-</span> <span>v</span><span>[</span><span>0</span><span>]</span><span>*</span><span>length</span><span>,</span> <span>y1</span> <span>-</span> <span>v</span><span>[</span><span>1</span><span>]</span><span>*</span><span>length</span><span>),</span>
-    <span>(</span><span>-</span><span>v</span><span>[</span><span>0</span><span>]</span><span>*</span><span>length</span><span>,</span> <span>-</span><span>v</span><span>[</span><span>1</span><span>]</span><span>*</span><span>length</span><span>),</span>
-<span>]</span>
-</code></pre></div>
-
-<p>If anything other than the 3 candidate islands themselves intersects that rectangle, the candidate is dropped. Land sitting there means it's not the open, unobstructed water the photo actually shows.</p>
-<blockquote>
-<p><code>8,915</code> unique triples down to <code>948</code>.</p>
-</blockquote>
-<p>and below is the map of places of the 948 candidates.</p>
-<p><img alt="02_01" src="https://yassa9.github.io/osint/gralhix-004/02_01.jpg"></p>
-
-
-<hr>
-<h2>d] Coral Cay Shape Check</h2>
-<p>In this stage, we look only at P0, the resort islet, and check whether its shape actually looks like a coral cay.</p>
-<h3>1] <code>Compactness</code>, how close to a circle the shape is:</h3>
-<p><code>Polsby Popper Score:</code>
-$$ PP = \frac{4\pi \cdot \text{area}}{\text{perimeter}^2} $$</p>
-<div><pre><span></span><code><span>def</span><span> </span><span>compactness</span><span>(</span><span>row</span><span>):</span>
-    <span>return</span> <span>(</span><span>4</span> <span>*</span> <span>np</span><span>.</span><span>pi</span> <span>*</span> <span>row</span><span>.</span><span>area_km2</span><span>)</span> <span>/</span> <span>(</span><span>row</span><span>.</span><span>perim_km</span> <span>**</span> <span>2</span> <span>+</span> <span>1e-12</span><span>)</span>
-</code></pre></div>
-
-<p><img alt="03_00" src="https://yassa9.github.io/osint/gralhix-004/03_00.jpg"></p>
-
-
-<p><code>1.0</code> is a perfect circle, lower means a more jagged or elongated outline. Coral cays tend to be round from wave deposition, so anything <code>&lt; 0.5</code> gets dropped.</p>
-<h3>2] Micro Cay Halo Check:</h3>
-<div><pre><span></span><code><span>def</span><span> </span><span>micro_cay_count</span><span>(</span><span>gdf</span><span>,</span> <span>sindex</span><span>,</span> <span>lon</span><span>,</span> <span>lat</span><span>):</span>
-    <span>dists_km</span> <span>=</span> <span>nearby</span><span>.</span><span>geometry</span><span>.</span><span>distance</span><span>(</span><span>pt</span><span>)</span> <span>*</span> <span>111.0</span>
-    <span>mask</span> <span>=</span> <span>(</span><span>dists_km</span> <span>&gt;</span> <span>0</span><span>)</span> 
-           <span>&amp;</span> <span>(</span><span>dists_km</span> <span>&lt;=</span> <span>HALO_KM</span><span>)</span> 
-           <span>&amp;</span> <span>(</span><span>nearby</span><span>[</span><span>"area_km2"</span><span>]</span><span>.</span><span>values</span> <span>&lt;</span> <span>MICRO_KM2</span><span>)</span>
-    <span>return</span> <span>int</span><span>(</span><span>mask</span><span>.</span><span>sum</span><span>())</span>
-</code></pre></div>
-
-<p>We Count land fragments under 0.05 km² within 1.5km of P0 ( just heuristic ). Real reef systems scatter tiny sandbars around the main island, not just one isolated landmass (I knew that with the hardway 😭). So we need at least 1.</p>
-<blockquote>
-<p><code>213/948</code> candidates survive both checks.</p>
-</blockquote>
-<hr>
-<h2>e] Oval Shape Check</h2>
-<p>Another geometric filter on P0's own polygon. Fits the minimum rotated rectangle around it and measures two ratios from that box.</p>
-<div><pre><span></span><code><span>def</span><span> </span><span>aspect_and_fill</span><span>(</span><span>geom</span><span>):</span>
-    <span>mrr</span> <span>=</span> <span>geom</span><span>.</span><span>minimum_rotated_rectangle</span>
-    <span>coords</span> <span>=</span> <span>list</span><span>(</span><span>mrr</span><span>.</span><span>exterior</span><span>.</span><span>coords</span><span>)</span>
-    <span>s1</span> <span>=</span> <span>math</span><span>.</span><span>hypot</span><span>(</span><span>coords</span><span>[</span><span>1</span><span>][</span><span>0</span><span>]</span> <span>-</span> <span>coords</span><span>[</span><span>0</span><span>][</span><span>0</span><span>],</span> 
-                    <span>coords</span><span>[</span><span>1</span><span>][</span><span>1</span><span>]</span> <span>-</span> <span>coords</span><span>[</span><span>0</span><span>][</span><span>1</span><span>])</span>
-    <span>s2</span> <span>=</span> <span>math</span><span>.</span><span>hypot</span><span>(</span><span>coords</span><span>[</span><span>2</span><span>][</span><span>0</span><span>]</span> <span>-</span> <span>coords</span><span>[</span><span>1</span><span>][</span><span>0</span><span>],</span> 
-                    <span>coords</span><span>[</span><span>2</span><span>][</span><span>1</span><span>]</span> <span>-</span> <span>coords</span><span>[</span><span>1</span><span>][</span><span>1</span><span>])</span>
-    <span>long_side</span><span>,</span> <span>short_side</span> <span>=</span> <span>max</span><span>(</span><span>s1</span><span>,</span> <span>s2</span><span>),</span> <span>min</span><span>(</span><span>s1</span><span>,</span> <span>s2</span><span>)</span>
-    <span>return</span> <span>long_side</span> <span>/</span> <span>short_side</span><span>,</span> <span>geom</span><span>.</span><span>area</span> <span>/</span> <span>mrr</span><span>.</span><span>area</span>
-</code></pre></div>
-
-<p><code>Aspect ratio</code> is long side over short side of that box:</p>
-<p>$$ \text{aspect} = \frac{\text{long side}}{\text{short side}} \in [1.05,\ 2.2] $$</p>
-<p>Too close to 1.0 and it's basically a perfect circle, not the slightly elongated shape in the photo. Too high are shapes too much elongated more than 2:1.</p>
-<p><code>Fill ratio</code> is how much of that bounding box the shape actually fills, and this one has an identity behind it: any ellipse fills precisely $ \pi / 4 $ of its own minimum area bounding rectangle, regardless of how stretched it is.</p>
-<p>$$ \frac{\text{area}_{\text{ellipse}}}{\text{area}_{\text{box}}} = \frac{\pi}{4} \approx 0.785 $$</p>
-<p>that's the theoretical ceiling for a perfectly smooth oval. Real coral cays aren't perfect ellipses, so the cutoff is set as a heuristic safe fraction of that ceiling:</p>
-<p>$$ \text{FILL\_RATIO\_MIN} = 0.75 \times \frac{\pi}{4} \approx 0.589 $$</p>
-<p>A shape needs to retain at least 75% of a perfect ellipse's fill to survive. Crescents, rings, and notched coastlines fall well below that, solid rounded cays don't.</p>
-<blockquote>
-<p><code>137/213</code> candidates survive.</p>
-</blockquote>
-<hr>
-<h2>f] NDVI Vegetation Check</h2>
-<p>We reached the final API phase, I put it at the end, because it is network bound not compute bound.</p>
-<blockquote>
-<p>We gonna connect to <code>Earth Search, run by Element84</code>, a public STAC API that indexes Sentinel-2 imagery hosted on AWS's Open Data program, free, no API key.</p>
-</blockquote>
-<p>You can look at it <a target="_blank" rel="noopener" href="https://earth-search.aws.element84.com/v1">https://earth-search.aws.element84.com/v1</a></p>
-<p>We now check whether P0 is actually vegetated, palm cover, not bare sand or rock. It pulls the most recent low cloud Sentinel-2 scene over the point from a public STAC catalog, samples the red and near infrared bands at that exact pixel.</p>
-<p>$$ \text{NDVI} = \frac{\text{NIR} - \text{Red}}{\text{NIR} + \text{Red}} $$</p>
-<p>Live vegetation reflects strongly in near infrared and absorbs red light, so healthy palm cover pushes NDVI well above 0, bare sand or open water sits near 0 or negative. </p>
-<p><img alt="04_00" src="https://yassa9.github.io/osint/gralhix-004/04_00.jpg"></p>
-
-
-<p>You can view this image I got from this nice <a target="_blank" rel="noopener" href="https://geoawesome.com/eo-hub/understanding-aerial-data-normalized-difference-vegetation-index-ndvi/">Geoawesome Blog.</a></p>
-<p><code>Threshold is set at 0.6</code>, high enough to require real tree cover, not just scattered units.</p>
-<blockquote>
-<p><code>66/137</code> survive the NDVI check.</p>
-</blockquote>
-<hr>
-<h2>g] Elevation &amp; Mountain Check</h2>
-<p><img alt="05_00" src="https://yassa9.github.io/osint/gralhix-004/05_00.jpg"></p>
-
-
-<p>Last check before the final reveal. There are two conditions: </p>
-<ul>
-<li>P0 itself must be low and flat, consistent with a small reef islet, </li>
-<li>P2 must have real elevated terrain in the direction the camera was actually facing.</li>
-</ul>
-<p>The "front" of the shot is the bisector between the bearing to P1 and the bearing to P2:</p>
-
-
-<p>$$ \theta(P_0, P_i) = $$ 
-$$ \text{atan2}\Big(\sin(\Delta\lambda)\cos\phi_i,\ \cos\phi_0\sin\phi_i - \sin\phi_0\cos\phi_i\cos(\Delta\lambda)\Big) $$</p>
-<p>$$ \theta_{\text{front}} = $$
-$$ \theta(P_0, P_2) + \frac{\big((\theta(P_0,P_1) - \theta(P_0,P_2) + 180) \bmod 360\big) - 180}{2} $$</p>
-<p>That gives one heading, the direction the lens was pointed. From there, a fan of sample points gets swept ±50° around that heading, at radii from 2km out to 20km:</p>
-<p>$$ (\text{lat}, \text{lon}) = \Big(\text{lat}_0 + \frac{r\cos\theta}{111},\ \ \text{lon}_0 + \frac{r\sin\theta}{111\cos(\text{lat}_0)}\Big) $$</p>
-<p>Every one of those points gets sampled against real <code>30m Copernicus DEM tiles</code>. </p>
-<blockquote>
-<p><code>Copernicus DEM GLO-30</code>, published by the EU's Copernicus program, hosted as free public Cloud-Optimized GeoTIFFs on AWS Open Data, no account or key needed.</p>
-</blockquote>
-<p>For more info, you can view <a target="_blank" rel="noopener" href="https://registry.opendata.aws/copernicus-dem/">https://registry.opendata.aws/copernicus-dem/</a></p>
-<p>Finally, those two simple heuristic conditions decide survival (yea I know, everything became heuristic haha):</p>
-<p>$$ \text{elev}(P_0) \le 50\text{m} $$ 
-$$ 100\text{m} \le \max_{\text{arc}}(\text{elev}) \le 500\text{m} $$</p>
-
-
-<p><img alt="05_01" src="https://yassa9.github.io/osint/gralhix-004/05_01.jpg"></p>
-
-
-<p>You can see from this abstract graph image, the dashed line is the camera's front bearing, the wedge is the ±50° search arc swept out to 20km for the elevation check.</p>
-
-
-<blockquote>
-<p><code>26/66</code> survive the elevation check.</p>
-</blockquote>
-
-<p>You can see the 26 survivors, all are located in southern Asia, Australia and Oceania, except one near Brazil!</p>
-<p><img alt="05_02" src="https://yassa9.github.io/osint/gralhix-004/05_02.jpg"></p>
-
-
-<hr>
-<h2>h] Final Report</h2>
-<p>Finally, last stage, it just makes the final candidates checkable by eye. Each survivor gets its country name via a <code>point in polygon lookup</code> against a country boundary file, then a direct Google Maps satellite link for P0, P1, and P2.</p>
-<p>Output is a plain HTML table, index, country, three clickable coordinate pairs per row. </p>
-<p><img alt="06_00" src="https://yassa9.github.io/osint/gralhix-004/06_00.jpg"></p>
-
-
-<p>I got this final list, lets check each one by eye.</p>
-
-
-<p>Won't go one by one here, but those first 7 are totally off for me.</p>
-<p><img alt="06_01" src="https://yassa9.github.io/osint/gralhix-004/06_01.jpg"></p>
-
-
-<p>Till I opened that 8th one in the table of country of Micronesia 😍 (first time to know that a country named Micronesia):</p>
-<p><img alt="06_03" src="https://yassa9.github.io/osint/gralhix-004/06_03.jpg"></p>
-
-
-<p>and ensured through P1 and P2:</p>
-<p><img alt="06_04" src="https://yassa9.github.io/osint/gralhix-004/06_04.jpg"></p>
-
-
-<p>and that is the solution 🥳 ...</p>
-<p>you can view it here on <a target="_blank" rel="noopener" href="https://www.google.com/maps/@7.3633,151.755983,50m/data=!3m1!1e3">google maps</a></p>
-<hr>
-<h2>i] FINALLY, ANSWERS ...</h2>
-<div><pre><span></span><code>a) What is the name of the resort? 
-</code></pre></div>
-
-<p>$$ \text{Oan} $$ </p>
-<div><pre><span></span><code>b) What are the coordinates of the island?
-</code></pre></div>
-
-<p>$$7^\circ\,21^\prime\,48.4^{\prime\prime}\,\text{N} \qquad 151^\circ\,45^\prime\,20.7^{\prime\prime}\,\text{E}$$</p>
-<p>$$ \text{or} $$ </p>
-<p>$$7.363444^\circ,\ 151.755750^\circ$$</p>
-<div><pre><span></span><code>c) In which cardinal direction was the 
-camera facing when the photo was taken?
-</code></pre></div>
-
-<p>$$ \because\quad \theta = \text{atan2}\Big(\sin(\Delta\lambda)\cos\phi_1,\ \cos\phi_0\sin\phi_1 - \sin\phi_0\cos\phi_1\cos(\Delta\lambda)\Big) $$</p>
-<p>$$ P_0 = (7.3633,\ 151.755983), \quad P_1 = (7.386573,\ 151.739534) $$</p>
-<p>$$ \therefore\quad \theta = 324.97^\circ \implies \textbf{NW} $$</p>
-<hr>
-<h2>j] Data &amp; Licenses</h2>
-<p><strong>Coastline polygons</strong>:<br>
-<a target="_blank" rel="noopener" href="https://osmdata.openstreetmap.de/data/land-polygons.html">land-polygons-split-4326</a>
-© OpenStreetMap contributors, available under the
-<a target="_blank" rel="noopener" href="https://opendatacommons.org/licenses/odbl/">Open Database License (ODbL) 1.0</a>.
-The candidate sets and final report in the repo are a Derived Database and are
-published under the same license.</p>
-<p><strong>Elevation </strong>: <br>
-Copernicus DEM GLO-30.
-© DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018 provided under
-COPERNICUS by the European Union and ESA; all rights reserved.</p>
-<p><strong>Satellite imagery </strong>: <br>
-Contains modified Copernicus Sentinel data 2025-2026,
-accessed through <a target="_blank" rel="noopener" href="https://earth-search.aws.element84.com/v1">Earth Search</a>
-by Element 84 on AWS Open Data.</p>
-<p><strong>Country boundaries </strong>: <br>
-<a target="_blank" rel="noopener" href="https://www.naturalearthdata.com/">Natural Earth</a> 10m
-admin-0, public domain.</p>
-<p><strong>Challenge &amp; source photo </strong>: <br>
-<a target="_blank" rel="noopener" href="https://gralhix.com/list-of-osint-exercises/osint-exercise-004/">OSINT Exercise #004</a>
-by Sofia Santos (<a target="_blank" rel="noopener" href="https://gralhix.com/">gralhix</a>).</p>
-<p>Satellite screenshots in section (h) are from Google Maps / Google Earth <br></p>
-  </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[GrapheneOS in 2027 available on high-end Motorola phones (590 pts)]]></title>
-            <link>https://grapheneos.social/@GrapheneOS/117078064184215730</link>
-            <guid>49360242</guid>
-            <pubDate>Wed, 19 Aug 2026 11:46:58 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://grapheneos.social/@GrapheneOS/117078064184215730">https://grapheneos.social/@GrapheneOS/117078064184215730</a>, See on <a href="https://news.ycombinator.com/item?id=49360242">Hacker News</a></p>
-&lt;Unparsable&gt;]]></description>
         </item>
     </channel>
 </rss>
