@@ -4,12 +4,179 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Sun, 11 Oct 2026 00:30:09 GMT</lastBuildDate>
+        <lastBuildDate>Sun, 11 Oct 2026 01:30:06 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[A city-building game in which the city would prefer you didn't (144 pts)]]></title>
+            <title><![CDATA[Build your own decision model (106 pts)]]></title>
+            <link>https://nishtahir.com/build-your-own-decision-model/</link>
+            <guid>50037949</guid>
+            <pubDate>Sat, 10 Oct 2026 22:50:10 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://nishtahir.com/build-your-own-decision-model/">https://nishtahir.com/build-your-own-decision-model/</a>, See on <a href="https://news.ycombinator.com/item?id=50037949">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+            <p><a href="https://thedecisionlab.com/reference-guide/philosophy/system-1-and-system-2-thinking?ref=nishtahir.com">"System one"</a> decision models are models that infer and respond with calibrated probabilities or every allowed answer.</p><p>Consider your everyday language model, to get typed output from it (JSON), you may use <a href="https://nishtahir.com/how-llm-structured-decoding-works/">Structured Output</a> to constrain the output to guaranteed valid JSON. While model prefills the input in one pass, it still has to go perform a pass for every token in order to generate a valid response.</p><p>In this example, 11 passes are required to generate the final output. (We're not accounting for speculative decoding and other inference optimization techniques.)</p>
+<!--kg-card-begin: html-->
+
+
+<section id="dm-causal">
+    
+    <p><span><i></i>prompt (prefill)</span>
+      <span><i></i>generated (predicted)</span>
+      <span><i></i>being predicted</span>
+    </p>
+  </section>
+
+
+<!--kg-card-end: html-->
+<p>Decision models such as <a href="https://typesafe.ai/blog/introducing-system-one-models-and-jev?ref=nishtahir.com">Jev</a>, make the assumption that there are fixed options we can select from and we can do so quickly by making a single pass. In this example we constrain the set of possible outputs to the options <code>A</code>, <code>B</code>, <code>C</code>, <code>D</code>, <code>E</code>. By masking other items in the vocabulary, the model can only emit those tokens. By selecting the highest probability output, we get our answer.</p>
+<!--kg-card-begin: html-->
+
+
+<section id="dm-constrained">
+    
+    <p><span><i></i>prompt (prefill)</span>
+      <span><i></i>generated (predicted)</span>
+      <span><i></i>being predicted</span>
+    </p>
+  </section>
+
+
+<!--kg-card-end: html-->
+<p>Since the outputs are constrained to only a fixed set of options, the model can't select anything outside of those. This however does not guarantee that the output will be correct. It's also common to treat the output token probabilities a confidence scores in this context, but without additional training, those scores likely reflect its confidence in what the next token will be rather than the true probability of the response being the correct answer.</p><h2 id="build-your-own">Build your own</h2><p>We can emulate this behavior by constraining output tokens using an LLM. Here I'm using <code>Qwen/Qwen3-1.7B</code></p><pre><code>import argparse
+import json
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_name = "Qwen/Qwen3-1.7B"
+options = ["A", "B", "C", "D", "E"]
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", default="question.json")
+args = parser.parse_args()
+
+# load the tokenizer and the model
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype="auto",
+    device_map="auto"
+)
+
+# the token the model would emit for each option as the first assistant token
+option_token_ids = [tokenizer.encode(opt, add_special_tokens=False)[0] for opt in options]
+
+
+def format_prompt(item):
+    prompt = item["question"] + "\n"
+    for opt in options:
+        prompt += f"{opt}. {item[opt]}\n"
+    prompt += "Answer:"
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False
+    )
+
+
+with open(args.input) as f:
+    item = json.load(f)
+
+model_inputs = tokenizer(format_prompt(item), return_tensors="pt").to(model.device)
+with torch.no_grad():
+    logits = model(**model_inputs).logits[0, -1]
+# constrained decoding: only the option tokens are allowed
+probs = torch.softmax(logits[option_token_ids].float(), dim=-1)
+
+print(f"prediction: {options[probs.argmax().item()]}")
+for opt, prob in zip(options, probs.tolist()):
+    print(f"{opt}: {prob:.4f}  {item[opt]}")</code></pre><p>Running it with an simple question to test it yeilds the following output</p><pre><code>// input
+
+{
+    "question": "What color is the sky?",
+    "A": "Red",
+    "B": "Blue",
+    "C": "Green",
+    "D": "Purple",
+    "E": "I don't know"
+}
+
+// output
+
+prediction: B
+A: 0.0000  Red
+B: 0.9988  Blue
+C: 0.0000  Green
+D: 0.0000  Purple
+E: 0.0012  I don't know</code></pre><p>The model was able to make sense of our input and make a prediction that reasonably corresponds to the correct answer.</p><p>We can test the accuracy of the model by running it against public datasets. I ran this against a random sample holdout of <a href="https://huggingface.co/datasets/tau/commonsense_qa?ref=nishtahir.com">CommonsenseQA</a></p><pre><code>    precision    recall        f1   support
+A    0.5733    0.7197    0.6382       239
+B    0.5506    0.7686    0.6416       255
+C    0.5372    0.6598    0.5922       241
+D    0.7206    0.3904    0.5065       251
+E    0.7519    0.4255    0.5435       235
+accuracy: 725/1221 = 0.5938
+macro f1: 0.5844</code></pre><p>Not bad for a 1.7B model, Running a quick finetune on the dataset gives us slightly better performance</p><pre><code>    precision    recall        f1   support
+A    0.6475    0.6611    0.6542       239
+B    0.6113    0.6784    0.6431       255
+C    0.6234    0.5975    0.6102       241
+D    0.6700    0.5418    0.5991       251
+E    0.5808    0.6426    0.6101       235
+accuracy: 762/1221 = 0.6241
+macro f1: 0.6234</code></pre><h2 id="calibrating-your-model">Calibrating your model</h2><p>Testing the model against a very ambiguous problem demonstrates an interesting problem.</p><pre><code>// input
+{
+    "question": "Where would you most likely find a bat?",
+    "A": "Cave",
+    "B": "Baseball game",
+    "C": "Attic",
+    "D": "Zoo",
+    "E": "Sporting goods store"
+}
+
+// output
+
+prediction: A
+A: 0.9978  Cave
+B: 0.0004  Baseball game
+C: 0.0017  Attic
+D: 0.0000  Zoo
+E: 0.0001  Sporting goods store</code></pre><p>There should be no clear answer here, but treating the output probabilities as a pseudo "confidence" score, shows that the model is extremely overconfident in this answer.</p><p>If we bin the confidence score ranges in the eval I ran earlier, we can see that the model's confidence does not match its accuracy. This means that the model is not <a href="https://towardsdatascience.com/a-comprehensive-guide-on-model-calibration-part-1-of-4-73466eb5e09a/?ref=nishtahir.com">calibrated</a>.</p><pre><code>         bin   count  confidence  accuracy
+(0.00, 0.10]       0      0.0000    0.0000
+(0.10, 0.20]       0      0.0000    0.0000
+(0.20, 0.30]       3      0.2834    0.0000
+(0.30, 0.40]      26      0.3761    0.2692
+(0.40, 0.50]      41      0.4538    0.2683
+(0.50, 0.60]      70      0.5490    0.3286
+(0.60, 0.70]      74      0.6476    0.3649
+(0.70, 0.80]      77      0.7495    0.4286
+(0.80, 0.90]     121      0.8555    0.4711
+(0.90, 1.00]     809      0.9855    0.7009</code></pre><p>We can notice that the model tends to be extremely overconfident in the 0.9 - 1.0 bin but it's only correct 70% of the time. When it makes a prediction with  0.8 - 0.9 confidence it's only accurate ~40% of the time. This means that the model is generally overconfident in its predictions.</p><p>Since our goal is to have the model output scores that is reflective of its accuracy, one method we can use to callibrate it is through temperature scaling. By modifying the temperature value, we can flatten its output probability distribution curve and scale it to approximate its accuracy.</p>
+<!--kg-card-begin: html-->
+
+
+
+
+
+<!--kg-card-end: html-->
+<p>Curve fitting fit the temperature parameter to the model's accuracy, I found <code>3.797280788421631</code> as a temp value.</p><pre><code>         bin   count  confidence  accuracy
+(0.00, 0.10]       0      0.0000    0.0000
+(0.10, 0.20]       0      0.0000    0.0000
+(0.20, 0.30]      82      0.2712    0.2317
+(0.30, 0.40]     217      0.3507    0.3917
+(0.40, 0.50]     199      0.4472    0.5126
+(0.50, 0.60]     166      0.5475    0.5482
+(0.60, 0.70]     139      0.6562    0.5827
+(0.70, 0.80]     140      0.7492    0.7714
+(0.80, 0.90]     169      0.8507    0.7988
+(0.90, 1.00]     109      0.9333    0.9541</code></pre><p>This gets us a much better calibration. If you want to play around with this, I made a <a href="https://github.com/nishtahir/build-your-own-jev?ref=nishtahir.com">GitHub repo</a> with scripts that walk you through building a dataset, evaluating, finetuning and calibrating your own model. I encourage pulling it and trying it on other bigger models.</p>
+        </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[A city-building game in which the city would prefer you didn't (165 pts)]]></title>
             <link>https://housing.over.pizza/</link>
             <guid>50036864</guid>
             <pubDate>Sat, 10 Oct 2026 20:31:50 GMT</pubDate>
@@ -20,7 +187,7 @@
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Nvidia in talks to acquire US 'open' model startup Reflection AI (107 pts)]]></title>
+            <title><![CDATA[Nvidia in talks to acquire US 'open' model startup Reflection AI (117 pts)]]></title>
             <link>https://www.ft.com/content/052610c5-22b4-4dd4-932e-b7f9f0628b6a</link>
             <guid>50035886</guid>
             <pubDate>Sat, 10 Oct 2026 18:48:35 GMT</pubDate>
@@ -28,7 +195,7 @@
 Couldn't get https://www.ft.com/content/052610c5-22b4-4dd4-932e-b7f9f0628b6a: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Why DuckDB 2.0 is faster (128 pts)]]></title>
+            <title><![CDATA[Why DuckDB 2.0 is faster (141 pts)]]></title>
             <link>https://motherduck.com/blog/why-duckdb-20-is-faster/</link>
             <guid>50035530</guid>
             <pubDate>Sat, 10 Oct 2026 18:08:49 GMT</pubDate>
@@ -1053,7 +1220,7 @@ UPDATE ev <span>SET</span> type <span>=</span> payload.type::<span>VARCHAR</span
 </code></pre><p>And of course, MotherDuck will support 2.0 close to the release, so feel free to get your hands on the duck in the cloud and enjoy all the nuggets we talked about here.</p></section></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Knuth reward check (134 pts)]]></title>
+            <title><![CDATA[Knuth reward check (146 pts)]]></title>
             <link>https://www.thomas-huehn.com/knuth-reward-check/</link>
             <guid>50034081</guid>
             <pubDate>Sat, 10 Oct 2026 15:47:01 GMT</pubDate>
@@ -1061,7 +1228,7 @@ UPDATE ev <span>SET</span> type <span>=</span> payload.type::<span>VARCHAR</span
 <div id="readability-page-1" class="page"><div><article><header id="articleheader"></header><p>It’s been twenty years now that I’ve gotten one of the best letters ever. Donald Knuth confirmed the error I had found in one of his books and sent me <a href="https://en.wikipedia.org/wiki/Knuth_reward_check">the coveted check!</a></p><p>Donald Knuth and his reward for any error in one of his books (even typographical ones) are computer science folklore. Preposterous to think that I could possibly earn one! His books have been combed through by thousands and thousands of people. Smarter people than I am. More patient people.</p><p>And then it happened. I thought I had found an error. But I did not report it right away, I waited and re-checked it for months, lest I make a fool of myself. I even told our local genius at university who did not care much and dismissed my excitement.</p><p>See, the error I found is in a very special place. The book is “Computer Modern Typefaces”, so it’s a less read book (not the TeXbook or The Art of Computer Programmming), but still, practically everybody who has given that book a shot will have read over that error.</p><p>Because it’s on page Arabic one. In the first paragraph. The very first word.</p><figure><img src="https://www.thomas-huehn.com/knuth-reward-check/bug-report-knuth-2006.jpg" alt="bug-report-knuth-2006.jpeg" width="600" height="800"></figure><p>That’s why the Memo field says “E1”: Computer Modern Typefaces is Volume E in the Computers &amp; Typesetting series. Page 1.</p><figure><img src="https://www.thomas-huehn.com/knuth-reward-check/knuth-scheck-256.jpg" alt="knuth-scheck-256.jpg" width="640" height="480"></figure><p>I have censored the check slightly, because Knuth is afraid someone might do bad things with those numbers, and he hasn’t been handing out real checks for many years now. Today you get a fantasy certificate of a fantasy bank, the <a href="https://www-cs-faculty.stanford.edu/~knuth/boss.html">Bank of San Serriffe</a>.</p><p>But why will you find me there with the entry “0x$1.20”, i.e. decimal $2.88? A few years later I sent in another proposed error, but I was wrong. Knuth actually wrote a few paragraphs why exactly I’m wrong, but because he counted some throwaway sentence in my bug report as a good suggestion, I got another check for $0.32.</p></article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[PVX-001: open-source Covid-19 vaccine starts Phase 1 trial (116 pts)]]></title>
+            <title><![CDATA[PVX-001: open-source Covid-19 vaccine starts Phase 1 trial (119 pts)]]></title>
             <link>https://chronicles.popvax.com/p/popvax-goes-clinical</link>
             <guid>50033721</guid>
             <pubDate>Sat, 10 Oct 2026 15:10:24 GMT</pubDate>
@@ -1069,7 +1236,7 @@ UPDATE ev <span>SET</span> type <span>=</span> payload.type::<span>VARCHAR</span
 <div id="readability-page-1" class="page"><div><article><div dir="auto"><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!gTE1!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!gTE1!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 424w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 848w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 1272w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!gTE1!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png" width="728" height="546" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:false,&quot;imageSize&quot;:&quot;normal&quot;,&quot;height&quot;:1086,&quot;width&quot;:1448,&quot;resizeWidth&quot;:728,&quot;bytes&quot;:2323158,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:&quot;https://chronicles.popvax.com/i/219640548?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:&quot;center&quot;,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!gTE1!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 424w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 848w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 1272w, https://substackcdn.com/image/fetch/$s_!gTE1!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F46e2c79c-e1ad-4521-aeba-3c2f4fce928d_1448x1086.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>Holy shit.</p><p>What a ride. What a fucking ride. What an insane fucking ride this has been.</p><p><span>I’ve waited 5 years to write these words: On 31 August 2026, the first two participants each received a dose of PVX-001, our broadly-protective COVID-19 vaccine candidate designed to protect against future variants of SARS-CoV-2 that may emerge, in a first-in-human Phase I clinical trial in Melbourne, Australia (</span><a href="https://www.anzctr.org.au/Trial/Registration/TrialReview.aspx?id=392094&amp;isReview=true">ACTRN12626000891325</a><span>).</span></p><p>This trial, which will enroll a total of 36 healthy adult volunteers, is intended to assess the safety and tolerability of the vaccine candidate, while also providing early data on the magnitude and breadth of the immune response it elicits against multiple variants of SARS-CoV-2. As of 6 October 2026, we have enrolled and dosed 14 participants meeting our screening criteria, with no serious adverse events (SAEs) reported. Participant follow-up and safety monitoring are ongoing.</p><p>This vaccine embodies PopVax’s full-stack philosophy of developing new medicines – we built it on our own computational protein design pipeline, mRNA-encoded VLP display architecture, fridge-stable lipid nanoparticle delivery vehicle based on our novel ionizable lipid PVXL-150, and in-house manufacturing process at our RNA Foundry in Hyderabad, all of which we have constructed from the ground up over the past 4.5 years. Once the Phase I trial is concluded, PVX-001 will be made open-source for others to build on.</p><p>The start of this trial is an essential step on PopVax’s path to fulfilling our Million Lives Mission: to develop novel vaccines and therapeutics over the next decade that save 1 million lives each year. Safety and immunogenicity data on our mRNA-LNP platform will allow us to accelerate the translation of our preclinical vaccine programs – including a single-dose rabies vaccine, a multivalent HCV vaccine, an adult &amp; adolescent TB vaccine, and a Strep A vaccine, all potentially first-in-class – into clinical trials over the next 2 years.</p><p>I’ve waited 5 years to write these words, from when I first read about AlphaFold 2 and realized that machine learning was the future of medicine – before the company even existed, when it was just the kernel of an idea in my mind, still pristine and not yet popped open by the heat of reality.</p><p>I’ve waited 5 years to write these words, from when I took an uncharacteristic run on my beloved Juhu beach, along the sea that’s echoed in my ear since I was born, drenching myself in the pouring rain on my birthday as the pandemic-cursed 2020 was washed away to reveal the virgin sands of 2021, and decided that something fundamental had to change – in our response to infectious diseases, in how we make new medicines, and in the direction my life was going.</p><p>I’ve waited 5 years to write these words, from when Harish Iyer at the Gates Foundation took a $100k bet on me – a computer scientist with a minimal biology background – that nobody else thought was a good idea, 5 years from when I first spoke with Ethereum co-founder Vitalik Buterin and the team at his scientific investment fund Balvi and convinced them this was possible and worth funding with the Shiba Inu memecoin money with which he’d been entrusted without his consent, 5 years from every Indian investor I spoke to politely telling me that I was embarking on a fool’s errand.</p><p>And yet, and yet, and yet – after I flew all the way to Australia, waited patiently as the first participant was checked, waited for the appointed second to strike, and saw the nurse push in the plunger – after I saw something I’d made be injected into a fellow human being for the first time… I felt nothing. I felt numb to the world. I felt disconnected from reality, as if time was flowing forward without me.</p><p>Phew. Let’s take a deep breath. What the hell is going on here?</p><p>I started PopVax in large part because I didn’t see Indian companies responding to the threat of new COVID-19 variants fast enough, or even at all – the first COVID-19 vaccines quickly lost efficacy as the virus mutated. We didn’t have variant-updated boosters in India for years after the emergence of the Delta and Omicron variants, which collectively killed millions of my countrymen. From the beginning, we aimed to design vaccines resilient to viral mutation that would continue to provide protection against not the current dominant strain at the time of manufacture, but even future variants yet to come.</p><p><span>For PVX-001, we turned to the virus-like particle (VLP) architecture, used in vaccines such as Gardasil (HPV) and R21 (malaria), which displays many copies of the protein immunogen on a ball-like self-assembling structure, inducing the clustering of B cell receptors on antibody-producing immune cells and eliciting a much more potent antibody response than the immunogen on its own. This clustering also often induces a </span><em>broader</em><span> antibody response – one that is able to neutralize a wider set of mutated variants of the pathogen.</span></p><p><span>The catch is that VLP vaccines are notoriously hard to manufacture </span><em>in vitro</em><span>, with each immunogen variant you put on the VLP demanding its own painstaking cycle of optimization for the necessary conditions to successfully assemble and purify it after the individual monomer subunits are produced in cells. Merck’s HPV vaccine Gardasil 9, for example, takes as much as four years to manufacture from start to finish. That is just too long for a vaccine against a virus that births a new dominant variant as rapidly as the seasons change.</span></p><p><span>Enter RNA, which is produced via </span><em>in vitro</em><span> transcription (IVT), a synthesis process performed using enzymes in a largely cell-free fashion, and purified with methods that don’t change all that much from sequence to sequence. We produce mRNA in a ‘one-pot’ reaction that takes a single day, and our whole production process takes a week, a far cry from the many months to years required for conventional VLP vaccines produced today.</span></p><p>PVX-001 is built around messenger RNA (mRNA) that instructs cells in the human body to produce a designed protein that self-assembles within the cell into a VLP that displays an engineered version of the SARS-CoV-2 Receptor-Binding Domain (RBD). We turn the body into the factory for the VLP, and let it handle the difficult parts of the process, combining the manufacturing ease of RNA with the immunological potency of VLP display.</p><p>When applied to the design of a wild-type COVID-19 vaccine, our RNA-encoded VLP approach results in a &gt;50x increase in the elicited neutralizing antibody (nAb) titer in mice compared with the same dose of RNA encoding the same immunogen as is, as well as a &gt;20x increase in nAb titer compared to the same dose of the mRNA sequence from a US FDA-approved first-generation wild-type COVID-19 vaccine.</p><p>While it’s easy to update the mRNA sequence in our vaccine to target new variants without changing the manufacturing process, we may not need to do so as often as existing vaccines do – our wild-type SARS-CoV-2 RBD-based VLP display construct was able to elicit potent neutralization titers against the Gamma, Lambda, and Omicron BA.1 variants of SARS-CoV-2, while a US FDA-approved mRNA-based COVID-19 vaccine comparator sequence at the same dose was not, demonstrating that the VLP immunogen display approach results in the elicitation of antibodies that neutralize a greater breadth of variants.</p><p>We’ve now applied this design approach to a more recent SARS-CoV-2 variant, which we’ve used as the basis for the version of PVX-001 that has now entered the Phase I clinical trial. Our preclinical immunogenicity in mice is competitive with that of mNEXSPIKE, Moderna’s much-improved second-generation vaccine. We hope that this vaccine will require fewer boosters and less frequent variant-specific updates to maintain its efficacy over time, even as the virus mutates rapidly.</p><p>Being able to make the vaccine, however, only solves half the problem – you also need to be able to transport it all over the world to all of the people who need it.</p><p>Our lipid nanoparticle (LNP) formulation, the key component that allows the mRNA to enter human cells, is based on our novel ionizable lipid PVXL-150. We’re particularly proud of the fact that vaccines using this LNP formulation can be stored at 2-8 °C, regular refrigerator temperatures, for at least 9 months without lyophilization (freeze-drying), rather than the frozen -20 °C or ultracold -80 °C storage required by the first-generation mRNA vaccines approved for COVID-19. This will allow for easy distribution across the world using established refrigerated supply chains for medicines, making our vaccines straightforward to deploy at scale in developing countries.</p><p>Every dose of PVX-001 was built at the RNA Foundry, PopVax’s full-stack R&amp;D lab and global Good Manufacturing Practices-aligned clinical dose production facility in Hyderabad. Our computational researchers and protein designers sit just feet away from experiments being conducted by our scientists, who can gaze through the glass to watch the manufacturing process in full swing. This allows for rapid and seamless collaboration that substantially increases the velocity of our engine for translating AI into medicine. In just under 5000 square feet of GMP manufacturing space, the RNA Foundry can produce up to 1 million doses of new medicines each year, from plasmid DNA to formulated mRNA-LNP, including testing every batch against an extensive panel of analytical methods we developed and operationalized at our on-site Quality Control lab. We even make our own GMP-grade ionizable lipids here!</p><p>Every dose of PVX-001 is also the product of a global collaborative effort. Our work was initially seeded by the Gates Foundation, substantially funded by Vitalik Buterin’s Balvi fund, and was helped across the finish line by an investment from Meta co-founder Dustin Moskovitz and Cari Tuna’s Good Ventures, advised by the good folks at Coefficient Giving. The vaccine was part of the US National Institute of Allergy and Infectious Diseases’ (NIAID) Project NextGen, which gave us access to vital scientific and regulatory advice, and under which the doses we manufactured at the RNA Foundry in Hyderabad were filled in vials at ABL in Rockville, Maryland. The trial was approved by an Australian Human Research Ethics Committee run by Bellberry, and is being conducted by Nucleus Network at their facility in Melbourne with support from Emerald Clinical.</p><p>Before reaching a participant, every single dose journeyed through four continents, from being manufactured in India and filled into a vial in the United States to catching a flight via Germany to the trial site in Australia.</p><p>Once the Phase I trial of PVX-001 concludes, we will open-source the design and manufacturing information needed for others to produce and build on it, and we will not enforce any of our intellectual property rights against anyone who uses it to make vaccines against any betacoronavirus – the viral genus that includes SARS-CoV-2, SARS-CoV, and MERS-CoV.</p><p>We are doing this because SARS-CoV-2 and its close cousins remain a substantial pandemic risk. In just the past few decades, they have caused one major epidemic (SARS), one close call (MERS), and one global pandemic that killed millions. The designs developed after the original SARS outbreak gave the first generation of COVID-19 vaccines a crucial head start in 2020. We want humanity to have an even better head start next time: a broadly-protective, refrigerator-stable vaccine that any scientist, vaccine producer, or member of the public, located anywhere, can improve, adapt to their needs, and manufacture without having to worry about IP.</p><p>We are also doing it because of what we saw during the pandemic. The best and most up-to-date RNA vaccines were largely unavailable to poorer countries, as rich countries secured the bulk of the supply, and vaccine manufacturers in countries like India never updated their products for Omicron and later variants. As Vitalik has argued in his writing on d/acc – defensive accelerationism – the capability to design, develop, and manufacture the next generation of vaccines must be globally distributed. An open-source vaccine, built on an mRNA-LNP platform that can use existing medical supply chains in developing countries, is a concrete step towards making sure that the rising world in Asia, Africa, and South America is never again left waiting at the back of the queue.</p><p>PVX-001 is only the beginning. We’re developing six new vaccines, personalized cancer medicines, and targeted autoimmune therapies to fulfill our mission to save 1 million lives each year. Sometimes I lie awake at night and agonize over all the screwups we’ve made – the botched experiments, the missed opportunities, all the fumbles and stumbles that delayed us by a year, or maybe even two, and I wonder whether we can really pull that off in the next decade.</p><p>But now that we’ve traversed the thorny path from concept to clinic, we’ll combine our newfound knowledge of how to get something from insight to injection with our full-stack approach to rapidly accelerate these new medicines towards patients, without compromising rigour or safety. This will be the first of many first-in-human trials, each following sooner than the last, with increasing rapidity until we are translating new medicines to patients in weeks, not years.</p><p>I’m the prodigal son of two homoeopathic doctors who don’t like vaccines very much, a lapsed computer scientist who moved my Y Combinator-backed robotics software company from San Francisco to Pune at the height of the pandemic, and a certified madman who, on the advice of a high-schooler, turned down multiple term sheets and shut down my software startup to start an AI-powered biotech company without knowing very much biology, in a pre-ChatGPT and Claude Code era when it wasn’t yet clear that AI could do all that much biology, in a city I’d never been to before signing my lab lease, and in a country that doesn’t do – or fund – very much biotech R&amp;D, where most of the local pharmaceutical titans are engaged in a multi-generational game of ‘the floor is lava’, in which any investment in the development of new medicines is the floor. Luckily, their private jets keep their feet off the fast-heating ground.</p><p>With me so far?</p><p>The charismatic and scarily energetic Nalam ‘Madhu’ Rao at the Centre for Cellular and Molecular Biology granted me 100 square feet of shared lab space in his incubator hours after I landed in Hyderabad in late 2021, still the fastest I’ve ever seen Indian academia move, I bankrupted myself buying lab equipment, managed to recruit excellent scientists who were so bored at Indian generics and biosimilars companies that they responded to a LinkedIn post asking for ‘people to make mRNA’, and convinced Harish Iyer, a Gates Foundation officer who used to run the pioneering Indian vaccine company Shantha Biotechnics, to give us a $100k contract for ‘public awareness’ of global health – that is, the awareness that someone in India could make mRNA vaccines at all.</p><p>We couldn’t get our hands on DNA templates fast enough until Stanford’s Rhiju Das recommended Twist Bioscience, but we had to get a friend in an SF lab to trans-ship them to us because Twist didn’t yet have India logistics set up, and it all took so long! – so interminably long! – until Suresh made the mRNA late one night in the lab and, lo and behold, it worked, it expressed (yay!) in cells… but the LNPs didn’t quite work in mice (boo!). So Sourav, our first employee, used a torture device with a manual plunger over and over to squeeze out the invisible particles until they finally got to the consistent size they needed to be. Meanwhile, Maunish, the son of one of my father’s closest colleagues, neither of whom I had seen for over a decade, turned out to be a star student of Pieter Cullis, one of the great pioneers of lipid nanoparticles – on seeing that we had managed to get synthetic mRNA to express proteins in cells in India, Maunish went into some kind of rapturous trance in which he decided to move to Hyderabad and do science with us.</p><p>Experimental success bred faster spending, which brought our bank account close to negative territory once more. So, as usual, I wrote an angry op-ed that a Thai gentleman liked enough to connect me with his good buddy who was interested in COVID-19 – a good buddy who turned out to be the uncommonly thoughtful and uncompromisingly ethical Vitalik Buterin. We got fantastic data from our RNA-encoded VLP approach, but when we tried to get someone else to manufacture the vaccine, we realized it would be much too expensive and would take too long, so Thiru and Praveen helped design and build a facility so compact our contractors told us it wasn’t buildable, only to suddenly face-</p><p>You get the idea.</p><p>The final act of this frantic theatrical production played out early this year. We were part of NIAID’s Project NextGen, with the trial set to happen in Maryland, funded by the US government. Unfortunately, after the change of administration and attendant rearranging of priorities, we were told that the trial would not go ahead. In shock, we scrambled to move the trial to Australia, finding a site and a contract research organization on the fly, with Darshit writing the docs for the ethics committee and Hannah working across two oceans to get the clinical protocol locked down while we juggled the maintenance and shipment of the vaccine vials back from the US to an as-yet-unknown location.</p><p>No wonder I was numb.</p><p>And yet, against all odds, we persevered and prevailed. The vaccine company that no one thought was a good idea has become a clinical-stage AI-powered biotech that is starting to hit its stride. A few days after the first injection, I stood by the sea on Sydney’s Bondi Beach, I felt it all sink in – both the joyous significance of what we’d just done, and the enormity of what is yet left to achieve.</p><p>PopVax is accelerating to match the scale of our vision. From a standing start, we’ve generated millions of candidate proteins using frontier machine learning methods and AI models, designed 1000+ novel lipids, screened over 5000 unique LNP formulations, injected over 1300 distinct vaccine constructs into animals, and conducted 10s of 1000s of functional assays. Each experiment allows us to improve our designs and raises the ceiling of what our medicines can do to help people in need. </p><p>We will take many, many shots on goal – more than may seem well-advised. More than are comfortable for a spectator to contemplate, even. We won’t win ’em all – life is stochastic – but we’ve made peace with that. Watch closely, else the future of medicine will happen in the present without you.</p><p>If what we do excites you, PopVax is hiring for several critical roles at the moment:</p><ol><li><p><a href="https://jobs.popvax.com/30208">Principal Scientist - Analytical Method Development</a><span> and </span><a href="https://jobs.popvax.com/41508">Senior Scientist - HPLC Method Development</a><span>: We design millions of new molecules – proteins, RNA, LNPs, and more. Your job is to figure out how to characterize them at high-throughput without sacrificing rigour, repeatability, and robustness, as well as to help make those methods GMP-grade as part of the handover to QC. We intend to take new medicines into clinical trials in weeks, not years, so we need to build adaptable analytical platforms, not bespoke methods that work for only one molecule. We strongly prefer candidates with the ability to write code to build automated data analysis pipelines for their methods – LLM-generated code is fine as long as you are able to comprehensively validate the logic and output of the pipelines.</span></p></li></ol><ol start="2"><li><p><a href="https://jobs.popvax.com/41525">Head of Quality Control</a><span> – We manufacture our own clinical doses at the RNA Foundry, and every analytical method we develop for a new molecule eventually has to become a validated QC method. You’ll lead the team that tests every batch to international GMP standards, take on method transfers from analytical development, and build a QC function that can keep pace with a pipeline aiming to reach the clinic in weeks, not years.</span></p></li></ol><ol start="3"><li><p><a href="https://jobs.popvax.com/37003">Junior Scientist - Vaccine Immunology</a><span> – Our vaccine programs halt or advance on the immunogenicity data that comes back from animal and organoid studies. You’ll run the assays that produce that data – ELISAs, pseudovirus neutralization, and bacterial growth-inhibition assays – and coordinate animal studies with our internal teams and CROs, following each study from plan to samples to result. We prefer candidates who can write code for routine data analysis.</span></p></li></ol><ol start="4"><li><p><a href="https://jobs.popvax.com/41524">Head of Legal</a><span> – Our first vaccine was manufactured in India, was filled into vials in the US, and has now entered a clinical trial in Australia. We work with dozens of counterparties – funders, governments, universities, CROs, and suppliers – with more added each week. You’ll own the day-to-day of our Indian legal work, from contracts to compliance to labour law, work with the legal teams supporting our UK and Australian operations, and make sure paperwork is never the bottleneck between our new medicines and the clinic.</span></p></li></ol><ol start="5"><li><p>Chief of Staff to the Chief Science Officer: Our CSO needs a partner who can take experimental planning and coordination off his plate so that he can spend more time thinking hard about our thorniest problems. Your complex scientific hypotheses into clear executable plans, coordinate with scientists to see each experiment through, and analyze the data to help plan the next round of iteration. You’ll need a strong scientific background, a sharp eye for detail, and boundless energy to keep ambitious scientific work moving. To apply, email dhruv [at] popvax [dot] com with a human-written explanation of why you’re the best person for the job.</p></li></ol><p><span>If none of these are a good fit, take a look at our </span><a href="https://popvax.com/jobs">jobs page</a><span> or email us at work [at] popvax [dot] com.</span></p><p>I’m Soham Sankaran, the founder &amp; CEO of PopVax. Feel free to email soham [at] popvax [dot] com if you’re interested in discussing the challenges of rapidly turning machine intelligence into medicines.</p><p><span>You can find me on Twitter/X </span><a href="https://x.com/sohamsankaran">@sohamsankaran</a><span>. You can also follow PopVax on </span><a href="https://x.com/popvaxindia">Twitter/X</a><span>, </span><a href="https://www.linkedin.com/company/popvax/?originalSubdomain=in">LinkedIn</a><span>, and </span><a href="https://www.youtube.com/@popvax">YouTube</a><span>, or email us at hello [at] popvax [dot] com.</span></p></div></article></div><div><div id="discussion"><h4>Discussion about this post</h4></div><div><h3>Ready for more?</h3></div></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tom Brown used GOP ties to broker a $1.25B/month SpaceX compute deal (124 pts)]]></title>
+            <title><![CDATA[Tom Brown used GOP ties to broker a $1.25B/month SpaceX compute deal (127 pts)]]></title>
             <link>https://wsj.com/tech/ai/tom-brown-athropic-669005ad</link>
             <guid>50033678</guid>
             <pubDate>Sat, 10 Oct 2026 15:04:38 GMT</pubDate>
@@ -1077,7 +1244,7 @@ UPDATE ev <span>SET</span> type <span>=</span> payload.type::<span>VARCHAR</span
 Couldn't get https://wsj.com/tech/ai/tom-brown-athropic-669005ad: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[FDA may allow some toxic chemicals to be added to food without safety review (168 pts)]]></title>
+            <title><![CDATA[FDA may allow some toxic chemicals to be added to food without safety review (171 pts)]]></title>
             <link>https://www.theguardian.com/us-news/2026/oct/10/fda-toxic-chemicals-food-analysis</link>
             <guid>50033638</guid>
             <pubDate>Sat, 10 Oct 2026 15:00:36 GMT</pubDate>
@@ -1085,7 +1252,7 @@ Couldn't get https://wsj.com/tech/ai/tom-brown-athropic-669005ad: Error: Request
 <div id="readability-page-1" class="page"><div id="maincontent"><p>The US <a href="https://www.theguardian.com/food" data-link-name="in body link" data-component="auto-linked-tag">Food</a> and Drug Administration (FDA) is proposing to expand a controversial loophole to allow some of the world’s most toxic chemicals to be added directly to food without a safety review.</p><p>The “threshold of regulation” (TOR) exemption currently allows dangerous compounds to be used without review in food contact materials, such as packaging or processing equipment, if they are not carcinogenic, and are added at levels below 0.5 parts per billion (ppb).</p><p>But campaigners say many chemicals, especially hormone disruptors linked to brain damage and reproductive harm in children, are considered dangerous at levels far below 0.5ppb. Even in its limited form, the loophole has already raised alarm. One TOR exemption that allows the rocket fuel chemical perchlorate to be used in grain bags <a href="https://blogs.edf.org/health/2019/01/11/fda-perchlorate-in-food/" data-link-name="in body link">dramatically increased</a> the amount of the compound found in kids’ cereal, which advocates say could cause <a href="https://blogs.edf.org/health/2019/10/29/edf-joins-court-challenge-of-fdas-refusal-to-ban-use-of-perchlorate-in-food-contact-materials/" data-link-name="in body link">brain damage</a>.</p><figure id="04afae72-87b3-419d-97f3-c2664b81c8a0" data-spacefinder-role="richLink" data-spacefinder-type="model.dotcomrendering.pageElements.RichLinkBlockElement"><gu-island name="RichLinkComponent" priority="feature" deferuntil="idle" props="{&quot;richLinkIndex&quot;:3,&quot;element&quot;:{&quot;_type&quot;:&quot;model.dotcomrendering.pageElements.RichLinkBlockElement&quot;,&quot;prefix&quot;:&quot;Related: &quot;,&quot;text&quot;:&quot;Food-borne illnesses, funding cuts and layoffs: Maha movement’s glaring limitations are now showing&quot;,&quot;elementId&quot;:&quot;04afae72-87b3-419d-97f3-c2664b81c8a0&quot;,&quot;role&quot;:&quot;richLink&quot;,&quot;url&quot;:&quot;https://www.theguardian.com/us-news/2026/sep/13/maha-movement-food-illness-funding-cuts-layoffs&quot;},&quot;ajaxUrl&quot;:&quot;https://api.nextgen.guardianapps.co.uk&quot;,&quot;format&quot;:{&quot;design&quot;:6,&quot;display&quot;:0,&quot;theme&quot;:0}}"></gu-island></figure><p>The new proposed TOR expansion would allow companies to use the chemicals as an ingredient added directly to food, as flavorings, preservatives, emulsifiers, processing aids, enzymes, stabilizers and binders, and for myriad other uses, in ultra-processing.</p><p>The revelation comes after Robert F Kennedy Jr and the FDA claimed victory and declared “<a href="https://www.hhs.gov/promisesmade-promiseskept/index.html" data-link-name="in body link">promises kept</a>” in August for “closing” a different controversial regulatory loophole called “generally regarded as safe” (Gras), which over the decades was used to send ingredients to the market that campaigners said could <a href="https://www.fda.gov/food/hfp-constituent-updates/fda-update-post-market-assessment-tara-flour" data-link-name="in body link">sicken</a>, injure or <a href="https://www.gao.gov/assets/hrd-93-28r.pdf" data-link-name="in body link">kill</a> people.</p><p>But Kennedy and the FDA did not mention in their public relations material that the proposed Gras rule <a href="https://www.govinfo.gov/content/pkg/FR-2026-08-11/pdf/2026-16296.pdf" data-link-name="in body link">submitted quietly to the Federal Register</a> includes the TOR expansion, which public health advocates warn will also send alarming levels of toxic chemicals to grocery store shelves. Some advocates have accused Kennedy of deception.</p><p>Regardless, the proposal represents a major win for big food, advocates say, and is based on flawed science.</p><p>“The FDA and industry have this position that if there’s only a little bit of something in the diet, then it’s not going to be problematic, but that isn’t supported by science of any kind,” said Maricel Maffini, an independent food consultant who worked on TOR issues.</p><p>“I don’t know how they’re going to square that circle because there are many ingredients that at very low levels also cause serious issues in the body,” Maffini added.</p><p>The FDA did not respond to a request for comment.</p><p>The proposed rule states that “any substance used in food (both directly or indirectly added) will be exempted from regulation as a food additive” if there is “no appreciable risk to human health”.</p><p>Advocates say the problem lies in the definition of “appreciable risk”. Chemicals like perchlorate, some phthalates, some bisphenols, some Pfas “forever chemicals” and some flame retardants are not classified as carcinogenic, but they can cause harm at doses far lower than 0.5ppb. These could in theory be used as TOR ingredients, as could chemicals that are neurotoxic, cause brain damage, attack the immune system, harm the microbiota or give rise to any number of other adverse health impacts.</p><p>Maffini said she was particularly concerned about flavorings because ultra-processed food companies use chemicals that “play around with the nervous system and receptors in your mouth to try to make us eat more and more of something”.</p><p>Advocates say the rule also does not take into account cumulative effects – one small dose of a TOR-exempted chemical may not be harmful, but many small doses of multiple toxic chemicals could be a problem. It also creates a secondary loophole in allowing carcinogens if the substance is created as an impurity.</p><p>Meanwhile, there is no way for consumers to know if a product contains a TOR-exempted chemical.</p><p>“They’re widening another loophole, but trying to say they made our food safer,” said Maria Doa, a scientist with the Environmental Defense Fund (EDF) non-profit. “They did not make our food safer.”</p><h2 id="how-tor-led-to-children-eating-rocket-fuel-chemicals">How TOR led to children eating rocket fuel chemicals</h2><p>The problems with perchlorate in kids’ cereal are a warning about TOR’s risks, advocates say. In 2005, German chemical giant BASF used TOR to exempt perchlorate from regulations for use in “super sacks”, which are one-ton polypropylene plastic storage bags used on farms to move grains, including rice, flour and oats.</p><p>Perchlorate stops grains from sticking to super sacks. But the grains are loaded into and emptied from the sacks at high velocity, which can cause perchlorate and microplastics to break off. The <a href="https://www.fda.gov/food/environmental-contaminants-food/preliminary-estimation-perchlorate-dietary-exposure-based-fda-20042005-exploratory-data" data-link-name="in body link">FDA’s own data published in 2017 showed</a> the number of samples of kids’ cereal with perchlorate increased after the 2005 TOR exemption. The agency similarly detailed a broad increase in the levels in each sample.</p><p>Perchlorate reduces the thyroid gland’s ability to absorb iodine, which is a raw material needed to produce the hormone T4, an essential component of <a href="https://www.regulations.gov/document?D=EPA-HQ-OW-2016-0438-0019" data-link-name="in body link">proper brain development</a>. Very low levels of perchlorate exposure are <a href="https://pubmed.ncbi.nlm.nih.gov/25057878/" data-link-name="in body link">linked to</a> lower T4 production, and lower IQ scores for children.</p><p>Still, six months after it published its data, the FDA reapproved perchlorate for use in super sacks. Advocates say the agency used flawed science and manipulated the data. The FDA wrote that there was no meaningful increase in perchlorate across all the 250 foods it measured. But critics countered that the problem was not in all the food – the problem was in kids’ cereal.</p><p>The FDA largely ignored the cereal findings, and mostly does not consider endocrine system harms when developing regulations, said Tom Neltner, a former scientist with the EDF who is now director of the Unleaded Kids non-profit. He helped lead litigation over perchlorate, which was ultimately dismissed.</p><p>“They put their blinders on and approved the exemption based on data that never considered the harms posed by endocrine disruptors,” Neltner said.</p><h2 id="kennedy-deceived-on-gras">Kennedy deceived on Gras?</h2><p>Kennedy leads the Make America Healthy Again (Maha) movement, of which eliminating toxic chemicals from food is a cornerstone. During the run-up to the 2024 US presidential election, he held up the Gras standard as an example of the broken regulatory system that he would take bold steps to fix as he stands up to big food and makes America healthy again. The loophole drew outrage because campaigners say it <a href="https://www.theguardian.com/us-news/2026/mar/07/fda-food-product-safety-checks-substances" data-link-name="in body link">virtually eliminates regulatory oversight</a> for new ingredients, chemicals and products, allowing food companies to self-certify that substances are safe without alerting the FDA.</p><p>The Gras standard does require companies to demonstrate a new food product is safe by making “<a href="https://www.fda.gov/food/generally-recognized-safe-gras/how-us-fdas-gras-notification-program-works" data-link-name="in body link">widely accepted” scientific evidence</a> to support its claim publicly available. But some companies bury the “public” announcement deep in their websites, push the boundaries of “widely accepted” research or hire from a cottage industry of scientists who are paid to declare food products “safe”, advocates say.</p><p>A <a href="https://www.ewg.org/research/secret-gras-how-100-food-chemicals-bypassed-government-safety-review" data-link-name="in body link">2026 review</a> of FDA and other federal food records by Maffini and the Environmental Working Group non-profit found at least 111 food chemicals or substances exploited the Gras standard, and they are used across thousands of products. Upon his appointment to oversee Trump’s health agency, the FDA and Kennedy <a href="https://www.fda.gov/news-events/fda-direct-podcast/fda-direct-no-one-thinks-its-good-idea-kids-consume-petroleum-products?utm_source=chatgpt.com" data-link-name="in body link">reiterated his promise to</a> “close the loophole”, and in 2026 he appeared to make good on it. He and the FDA <a href="https://www.hhs.gov/promisesmade-promiseskept/index.html" data-link-name="in body link">stated</a> that they were “closing critical information gaps”.</p><p>Critics warned the “closure” was at best a modest loophole tightening that effectively only requires voluntary compliance, and the quiet opening of the TOR exemption counteracted any gains.</p><p>Either the White House or the office of management and budget were involved in the Gras rule negotiations, though it is unclear who added the TOR expansion. Regardless, the controversial exemption is consistent with the administration’s philosophy more broadly, Maffini said.</p><p>“This administration is not keen on regulating anything,” she said.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Bitwarden Dual License Model (338 pts)]]></title>
+            <title><![CDATA[Bitwarden Dual License Model (346 pts)]]></title>
             <link>https://community.bitwarden.com/t/published-version-update-in-app-stores/102750</link>
             <guid>50033407</guid>
             <pubDate>Sat, 10 Oct 2026 14:32:50 GMT</pubDate>
@@ -1724,7 +1891,7 @@ Couldn't get https://wsj.com/tech/ai/tom-brown-athropic-669005ad: Error: Request
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[I would like the value of my home to rise, while my property taxes fall (204 pts)]]></title>
+            <title><![CDATA[I would like the value of my home to rise, while my property taxes fall (216 pts)]]></title>
             <link>https://conversableeconomist.com/2026/09/28/i-would-like-the-value-of-my-home-to-rise-while-my-property-taxes-fall/</link>
             <guid>50032758</guid>
             <pubDate>Sat, 10 Oct 2026 13:29:03 GMT</pubDate>
@@ -1812,7 +1979,7 @@ Simple, basique.</p>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple/macOS silently removed from official Unix registry (241 pts)]]></title>
+            <title><![CDATA[Apple/macOS silently removed from official Unix registry (252 pts)]]></title>
             <link>https://www.opengroup.org//openbrand/register/</link>
             <guid>50031653</guid>
             <pubDate>Sat, 10 Oct 2026 10:57:31 GMT</pubDate>
@@ -1849,7 +2016,7 @@ Simple, basique.</p>
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Talorys – A self-hosted personal AI agent on Cloudflare's free tier (237 pts)]]></title>
+            <title><![CDATA[Talorys – A self-hosted personal AI agent on Cloudflare's free tier (247 pts)]]></title>
             <link>https://github.com/rociiu/talorys</link>
             <guid>50031614</guid>
             <pubDate>Sat, 10 Oct 2026 10:52:09 GMT</pubDate>
@@ -2108,7 +2275,7 @@ docs/                   Architecture, deployment, development, security, trouble
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[`123456' password used in Danish CPR data breach (377 pts)]]></title>
+            <title><![CDATA[`123456' password used in Danish CPR data breach (378 pts)]]></title>
             <link>https://cphpost.dk/2026-10-10/news/round-up/123456-password-used-in-massive-danish-cpr-data-breach/</link>
             <guid>50031269</guid>
             <pubDate>Sat, 10 Oct 2026 09:51:49 GMT</pubDate>
@@ -3330,7 +3497,7 @@ Unauthorized people misused a private Danish company’s legal access to obtain 
 </li></ul></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Computers Cannot Make Decisions (194 pts)]]></title>
+            <title><![CDATA[Computers Cannot Make Decisions (195 pts)]]></title>
             <link>https://wiki.cateat.fish/art:computers_cannot_make_decisions</link>
             <guid>50029982</guid>
             <pubDate>Sat, 10 Oct 2026 05:47:46 GMT</pubDate>
@@ -3374,6 +3541,47 @@ All of these incidents are the fault of <em>people</em>. Computers are not decid
                                     </div></div>]]></description>
         </item>
         <item>
+            <title><![CDATA[Food processing influences metabolism and brain activity (107 pts)]]></title>
+            <link>https://news.vt.edu/articles/2026/10/research_fralinbiomed_upfhutelin.html</link>
+            <guid>50029830</guid>
+            <pubDate>Sat, 10 Oct 2026 05:22:30 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://news.vt.edu/articles/2026/10/research_fralinbiomed_upfhutelin.html">https://news.vt.edu/articles/2026/10/research_fralinbiomed_upfhutelin.html</a>, See on <a href="https://news.ycombinator.com/item?id=50029830">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="text_-186020732" data-emptytext="Text"><p>Most nutrition science suggests that meals with the same basic nutritional profile will have the same impact on a person’s blood sugar.</p>
+<p>But is there something about food processing itself that influences how our bodies respond?&nbsp;</p>
+<p>Researchers exploring that question were surprised to find that minimally and highly processed meals nutritionally matched on calories, carbohydrates,&nbsp;fats, proteins, water, salt, and weight produced distinct metabolic responses.&nbsp;</p>
+<p>The ultraprocessed meals prompted the body to release more insulin and expend more energy while burning less carbohydrate for fuel.&nbsp;They also evoked different responses in the part of the brain involved in motivation and reward.</p>
+<p>The results suggest that food processing may affect how the body and brain respond to food in ways that go beyond carbohydrates, fat, and protein — potentially helping researchers understand why ultraprocessed foods have been associated with overconsumption and long-term health effects and pointing to new areas for research.</p>
+<p>Virginia Tech researchers with the Fralin Biomedical Research Institute at VTC published their findings&nbsp;this month in <a href="https://www.nature.com/articles/s42255-026-01618-5">Nature Metabolism</a>.</p>
+<p>Ultraprocessed foods represent more than half of the average American’s daily calories.&nbsp;Diets worldwide are also shifting to include more of such&nbsp;foods, which&nbsp;are formulated to be convenient, accessible, affordable, and highly palatable, making them easy to overeat.</p>
+<p>“If you look at that population-level data, people who consume large amounts of ultraprocessed foods have higher rates of poor health outcomes — obesity, cardiac events, Type 2 diabetes, and even some metrics of mental health,” said <a href="https://fbri.vtc.vt.edu/people-directory/primary-faculty/difeliceantonio.html">Alex DiFeliceantonio</a>, a Fralin Biomedical Research Institute associate professor whose lab led the study.</p>
+<p>While highly processed foods have been linked to disease, the mechanisms connecting processing with their health outcomes and overconsumption are less understood.</p>
+<h2>What they did</h2>
+<p>“We know that the majority of ultraprocessed foods are high in fat, they're high in sugar, they're low in fiber, and they're low in protein,” DiFeliceantonio said. “But if we artificially hold all of those things constant, is there something about the processing that leads to a different outcome?”</p>
+<p>The team recruited healthy adults between 18 and 45 years old. The full study consisted of 57 adults. Of those, 32 completed both the brain functional magnetic resonance imaging (fMRI) and the metabolic sessions.</p>
+<p>Each participant ate both types of meals in separate sessions, with three or more days between sessions. This allowed researchers to compare how the same person responded to each meal.</p>
+<p>To examine metabolic effects, participants arrived at the testing site after fasting overnight. They climbed onto a twin-size bed in a metabolic chamber — a sealed, airtight room used to measure human energy expenditure and metabolism. Researchers then took baseline measurements.</p>
+<p>An hour later, participants were given 10 minutes to eat either a minimally or highly processed meal of 300 nutritionally matched calories.&nbsp;In selecting the meals, the study used the Nova scale, which categorizes food in four groups based on the level of industrial processing.&nbsp;</p>
+</div><div id="text_872216588_-1845077610" data-emptytext="Text"><p>The highly processed meal included a bite of peanut butter and jelly sandwich, deli turkey, veggie chips, a cookie, cereal, instant mashed potatoes, and a little bit of water. The minimally processed meal included a sliced banana, dried cranberries, cheese, and egg.</p>
+<p>“The two meals are matched within 1 percent of carbs, fat, proteins, calories, water, and salt,” said Zach Hutelin, a researcher at the institute and the study’s first author. The study was part of his doctoral research through Virginia Tech’s Translational Biology, Medicine, and Health Graduate Program. “If these meals had a nutritional label, they would be practically identical.”</p>
+<p>Blood draws were again taken immediately after the meal, then six more times over the next three hours. Researchers measured post-meal metabolism, including insulin response, energy expenditure, and carbohydrate oxidation.</p>
+<p>“We were shocked when every single metabolic metric differed,” Hutelin said.&nbsp;“What we noticed with the ultraprocessed food is that insulin response was much higher and blood sugar stays a little bit higher for a little bit longer.”&nbsp;</p>
+<p>Chronically elevated blood sugar increases the risk of conditions like diabetes.</p>
+<h2>The brain’s reward system</h2>
+<p>DiFeliceantonio is a neuroscientist who works to understand the basic mechanisms of food choice — why we eat what we eat. She wanted to see if the metabolic response to the meals connected to the brain's response to food cues.</p>
+<p>On a separate day, participants viewed pictures of nutritionally matched highly and minimally processed foods while undergoing functional MRI. The scan measures brain activity by tracking changes in blood flow across different regions of the brain. The foods served during the metabolic tests were among those shown in the pictures.</p>
+<p>While viewing each food, participants reported how much they would be willing to pay for it. This let researchers compare how participants’ subjective value of the foods corresponded with their brain activity.</p>
+<p>One notable result involved the ventral striatum and nucleus accumbens, part of the brain involved in learning, motivation, and reward. Differences in how participants burned carbohydrates for energy after each type of meal were linked to differences in how their brains responded to pictures of food.</p>
+<p>Participants did not say they were willing to pay more for the ultraprocessed or minimally processed foods, but the results suggested that metabolic differences produced by food processing are related to differences in how the brain responds to food cues.</p>
+<p>“A key debate in the literature is whether [ultraprocessed food] associations with poor health outcomes are driven by nutrient composition rather than processing,” Carlos A. Monteiro of the University of São Paulo told Nature Metabolism. Monteiro is a Brazilian epidemiologist whose research into obesity led to the development of the international NOVA classification of food processing used in nutrition and public health studies. He noted that beyond metabolic response, the Roanoke team looked at brain activity. “This is a novel and important contribution, as the brain ultimately regulates eating behavior.”</p>
+<h2>What comes next</h2>
+<p>This study looked at one set of matched 300-calorie meals, and study subjects were young and healthy. DiFeliceantonio, who also holds an appointment in the Department of Human Nutrition, Foods, and Exercise in Virginia Tech’s College of Agriculture and Life Sciences, would like to examine different populations, longer time periods, bigger meals, and more pairings of minimally and highly processed foods. While the meals served were matched on protein, for example, protein sources were different and could have influenced the outcome.&nbsp;</p>
+<p>The ultraprocessed&nbsp;meal also contained more additives, and while the study did measure total fiber, it not explicitly measure physical and chemical structures of the food studied.&nbsp;</p>
+<p>“We want to examine specific factors, such as commercial additives or specific processing steps, that might lead to different metabolic responses,” DiFeliceantonio said.</p>
+<p>The research was funded by a National Institutes of Health research grant through the National Institute of Diabetes and Digestive and Kidney Diseases and a National Science Foundation graduate research fellowship.</p>
+<p>Original study DOI:&nbsp;<a href="https://doi.org/10.1038/s42255-026-01619-4">10.1038/s42255-026-01619-4</a></p>
+</div></div>]]></description>
+        </item>
+        <item>
             <title><![CDATA[Lobbying (183 pts)]]></title>
             <link>https://geohot.github.io//blog/jekyll/update/2026/10/10/lobbying.html</link>
             <guid>50029630</guid>
@@ -3403,7 +3611,7 @@ All of these incidents are the fault of <em>people</em>. Computers are not decid
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[The Lightbulb Computer (201 pts)]]></title>
+            <title><![CDATA[The Lightbulb Computer (235 pts)]]></title>
             <link>https://lightbulbcomputer.com/</link>
             <guid>50029487</guid>
             <pubDate>Sat, 10 Oct 2026 04:12:26 GMT</pubDate>
@@ -3559,7 +3767,7 @@ All of these incidents are the fault of <em>people</em>. Computers are not decid
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Telegram Desktop vulnerability allowed any user's file to be stolen (404 pts)]]></title>
+            <title><![CDATA[Telegram Desktop vulnerability allowed any user's file to be stolen (413 pts)]]></title>
             <link>https://beaksec.github.io/posts/telegram-desktop-one-click-account-takeover/</link>
             <guid>50029123</guid>
             <pubDate>Sat, 10 Oct 2026 03:02:47 GMT</pubDate>
@@ -3699,523 +3907,6 @@ caption: poc
   ;OPEN:interpret:../../../Downloads/Telegram%20Desktop/instructions2.txt
   ;OPEN:interpret:../../../Downloads/Telegram%20Desktop/instructions3.txt
 </pre></td></tr></tbody></table></code></p></div></li><li><p>The operating system launches a second Telegram process, which forwards the URL to the running one over the socket. The unescaped semicolons split it, and the injection fires.</p></li><li><p>The three <code>interpret:</code> commands execute, and the three files are uploaded to the attacker’s group. No confirmation dialog is shown.</p></li><li><p>The attacker rebuilds <code>tdata</code> from the three files and opens the victim’s account.</p></li></ol><h2 id="mitigations"><span>Mitigations</span><a href="#mitigations"><i></i></a></h2><p><strong>Upgrade to 7.2.9 or later.</strong> That is the only thing that actually closes the problem. The rest reduces exposure.</p><ul><li><p><strong>Turn on “ask where to save each file”.</strong> With that setting, automatic download does not happen at all, and the instruction file never reaches the disk. It is the most effective mitigation short of upgrading.</p></li><li><p><strong>Limit who can add you to groups to your contacts only.</strong> Stolen files can only be sent to a channel or a supergroup, so this takes away the place the attacker would have them delivered to.</p></li><li><p><strong>Set a local passcode, and choose it like a real password.</strong> It does not prevent the files from being stolen; it only makes the stolen session unusable.</p></li></ul><h2 id="fix"><span>Fix</span><a href="#fix"><i></i></a></h2><p>Fixed by commit <code>db3405699f</code> on 16 September 2026. The changelog dates 7.2.9 to the same day; the release was published the following morning. The commit removes the <code>interpret://</code> scheme and <code>Support::InterpretSendPath</code> entirely, and escapes the record separator on the single-instance socket: values are escaped with a percent-prefixed hex encoding before being written and decoded after the split, so a semicolon in the data can no longer become a boundary.</p><p>It also adds two measures beyond that: <code>CMD:</code> and <code>CTRL:</code> records are skipped when the same connection carries an <code>OPEN:</code>, and local file paths are dropped once a non-local URL has appeared on that connection.</p><h2 id="timeline"><span>Timeline</span><a href="#timeline"><i></i></a></h2><div><table><thead><tr><th>Date</th><th>Event</th></tr></thead><tbody><tr><td>2026-06-25</td><td>Reported through ZDI</td></tr><tr><td>2026-09-16</td><td>Vendor fixes the issue independently, commit <code>db3405699f</code></td></tr><tr><td>2026-09-17</td><td>Telegram Desktop 7.2.9 published</td></tr><tr><td>2026-09-30</td><td>ZDI closes the case as already fixed; disclosure rights return to me</td></tr><tr><td>2026-10-03</td><td>This writeup</td></tr><tr><td>2026-10-07</td><td>CVE-2026-107181 assigned</td></tr></tbody></table></div><p>The fix shipped quietly: the 7.2.9 changelog mentions only a rendering fix, the commit that closes the chain is titled “Remove legacy interpret path helper”, and no advisory accompanied it.</p><h2 id="beaksec-on-youtube"><span>BeakSec on YouTube</span><a href="#beaksec-on-youtube"><i></i></a></h2><blockquote><p>If you’re into this kind of thing, I publish cybersecurity stuff on <strong><a href="https://www.youtube.com/@BeakSec" target="_blank" rel="noopener" data-goatcounter-click="yt-telegram-post">BeakSec</a></strong>, my YouTube channel. It’s new, so subscribing helps.</p></blockquote></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[REA Reverse – Engineer Anything (689 pts)]]></title>
-            <link>https://rea.tools/</link>
-            <guid>50028275</guid>
-            <pubDate>Sat, 10 Oct 2026 00:37:07 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://rea.tools/">https://rea.tools/</a>, See on <a href="https://news.ycombinator.com/item?id=50028275">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="main">
-      <div id="setup">
-          <div>
-            <p>Reverse engineering, with your coding agent</p>
-            <h2>Find out how<br>software works.</h2>
-            <p>
-              REA gives your agent the tools to inspect a program and explain
-              what it does.
-            </p>
-            
-            <p>
-              Already know RE?
-              <a href="#analysis-guides">Skip to analysis guides →</a>
-            </p>
-          </div>
-          <div>
-            <h2>Set up REA</h2>
-            <p>Copy this into your coding agent:</p>
-            <div>
-              
-              <p>
-                <span id="home-install-prompt">Install REA and connect it to this coding agent using npx
-                  rea-agents@latest setup. Show me the setup plan for approval,
-                  then verify the installation.</span>
-              </p>
-            </div>
-            <p>Or run this in your terminal:</p>
-            <p><code id="setup-command">npx rea-agents@latest setup</code>
-              
-            </p>
-            <p>
-              Approve the setup plan, then restart your agent.
-            </p>
-          </div>
-        </div>
-
-      <div id="what-is-re">
-          <div>
-            <h2>What is reverse engineering?</h2>
-            <p>
-              Finding out how software works by
-              <strong>examining the program itself.</strong>
-            </p>
-          </div>
-          <p>
-            The goal: understand a feature well enough to
-            <mark>explain it</mark>,
-            <mark>change it</mark> or
-            <mark>rebuild it.</mark>
-          </p>
-          <p>
-            One question:
-            <strong>why does Calculator give 220 for 200 + 10%?</strong>
-          </p>
-          <figure id="how-rea-helps">
-            <div data-step-comparison="">
-              <p>
-                Before REA · You investigate it
-                <strong>yourself</strong>
-              </p>
-              
-              <div>
-                <details data-expert-assembly="" open="">
-                  
-                  <pre><code id="expert-assembly"><span data-step="1">0x180124945: MOV EAX, dword ptr [R13 + 0x18]
-0x180124949: CMP EAX, 0x5c
-0x18012494c: JZ 0x180124aba
-0x180124952: CMP EAX, 0x5b
-0x180124955: JZ 0x180124aba</span>
-<span data-step="2">0x18012495b: MOV EDX, 0x64
-0x180124960: LEA RCX, [RSP + 0x160]
-0x180124968: CALL 0x180122650
-0x18012496e: LEA RDX, [R13 + 0x160]
-0x180124975: LEA RCX, [RSP + 0x78]
-0x18012497a: CALL 0x180109720</span>
-0x18012497f: MOV RSI, RAX
-0x180124982: MOV qword ptr [RSP + 0x28], RAX
-<span data-step="2">0x180124987: LEA RDX, [RSP + 0x160]
-0x18012498f: MOV RCX, RAX
-0x180124992: CALL 0x180123190</span>
-<span>; … value-copy instructions omitted …</span>
-<span data-step="3">0x180124a14: MOV RDX, RDI
-0x180124a17: LEA RCX, [RSP + 0xf8]
-0x180124a1f: CALL 0x180109720
-0x180124a24: LEA R8, [RSP + 0x30]
-0x180124a29: MOV RDX, RAX
-0x180124a2c: LEA RCX, [RSP + 0xb8]
-0x180124a34: CALL 0x180123c10</span></code></pre>
-                </details>
-                
-              </div>
-              <p>
-                <strong>You decode the instructions, follow the calls and reconstruct
-                  the calculation.</strong>
-              </p>
-            </div>
-            <div id="ask-your-agent">
-              <p>
-                With REA · You ask
-                <strong>your agent</strong>
-              </p>
-              <h3>One prompt.</h3>
-              <p>
-                Ask your agent <strong>in plain English.</strong>
-              </p>
-              <div>
-                
-                <p>
-                  <span id="home-analysis-prompt">Use REA to inspect Windows Calculator. Why does 200 + 10%
-                    give 220?</span>
-                </p>
-                <div>
-                  <p>
-                    Example answer · based on the findings
-                  </p>
-                  <p>
-                    After +, the % button takes
-                    <strong>a percentage of the first number.</strong>
-                  </p>
-                  <p><code>10% of 200 = 20</code><strong>200 + 20 = 220</strong>
-                  </p>
-                </div>
-              </div>
-              <dl>
-                <p>
-                  <dt>REA supplies</dt>
-                  <dd>
-                    The handler’s instructions, decompiled code and calls.
-                  </dd>
-                </p>
-                <p>
-                  <dt>Your agent explains</dt>
-                  <dd>
-                    Which branch applies, what it calculates and how to rebuild
-                    it.
-                  </dd>
-                </p>
-              </dl>
-            </div>
-            <figcaption>
-              Selected assembly from the installed Calculator DLL. The thoughts
-              and reply illustrate the findings.
-              <a href="#calculator">Continue with the Calculator example ↓</a>
-            </figcaption>
-          </figure>
-        </div>
-
-      <div id="dinosaur">
-          <p>
-            <strong>Let's try two examples.</strong>
-            Change a game's speed, then return to Calculator and rebuild its %
-            button.
-          </p>
-          <div>
-            <p>Example 01 · Chrome’s dinosaur game</p>
-            <h2>Why does the dinosaur get faster?</h2>
-          </div>
-          <dl>
-            <p>
-              <dt>Goal</dt>
-              <dd>
-                Rebuild the game with
-                <mark>adjustable speed.</mark>
-              </dd>
-            </p>
-            <p>
-              <dt>Why reverse engineer it?</dt>
-              <dd>
-                To reproduce its acceleration, we need
-                <strong>the rule in the running game</strong>: how fast it
-                starts, how much it increases and when it stops.
-              </dd>
-            </p>
-          </dl>
-          <div>
-            <figure data-dino-demo="">
-              <p>Play the reconstruction</p>
-              <p>
-                <svg viewBox="0 0 600 180" role="img" aria-label="A small dinosaur running toward a cactus. Recovered speed: starts at 6, increases by 0.001 per update while below 13.">
-                  <path d="M0 150H600 M55 113v-30h17V65h27v24H85v17H72v16H62v13h-7v-22m-5-8v-8h-8v-9h-6v22h19m14 15v15h8v-7h-4v-8 M420 150v-48h10v48m-10-15h-12v-22h7v15h5m10-4h12v-22h-7v15h-5" fill="currentColor"></path>
-                  <text x="300" y="65" text-anchor="middle" fill="currentColor" font-size="18">
-                    6 → 10 → 13
-                  </text>
-                </svg>
-                
-              </p>
-              
-              <p data-dino-status="" role="status">
-                Original rule: start at 6, then increase toward 13.
-              </p>
-              <figcaption>
-                Move the slider to set your own speed. Space or Jump clears a
-                cactus.
-              </figcaption>
-              
-            </figure>
-            <div>
-              <div>
-                <p>REA returned</p>
-                <p>
-                  <strong>The script actually running in the page.</strong> The
-                  agent reads its update function and speed settings, then uses
-                  that rule in a new game.
-                </p>
-              </div>
-              <div>
-                
-                <p>
-                  <span id="dino-analysis-prompt">Use REA to inspect this dinosaur game. Why does it get
-                    faster? Show the speed rule, then build a small version with
-                    an adjustable speed.</span>
-                </p>
-              </div>
-              <p>
-                Inspected target:
-                <a href="https://wayou.github.io/t-rex-runner/">wayou’s Chromium-derived browser edition</a>.
-              </p>
-              <div>
-                
-                <pre><code>if (this.currentSpeed &lt; this.config.MAX_SPEED) {
-  <span>this.currentSpeed += this.config.ACCELERATION;</span>
-}</code></pre>
-              </div>
-              <p>
-                <strong>Start at 6.</strong> Add <strong>0.001</strong> each
-                update without a collision, while speed is below
-                <strong>13</strong>.
-              </p>
-              <p><a href="https://rea.tools/examples/dino-lab/">Open the speed lab →</a>
-            </p></div>
-          </div>
-          <figure>
-            <p>What each part does</p>
-            <ol>
-              <li>
-                <span>01 · REA</span><span>Read the running game’s script</span><span>Return its actual code and settings to the agent.</span>
-              </li>
-              <li>
-                <span>02 · Your agent</span><span>Rebuild the rule, add a control</span><span>Use the recovered acceleration in a small game with a speed
-                  slider.</span>
-              </li>
-              <li>
-                <span>03 · You</span><span>Change the speed and play</span><span>Try the original acceleration, then choose your own
-                  pace.</span>
-              </li>
-            </ol>
-          </figure>
-          <details>
-            <summary>
-              See the script, checks and how to try the analysis
-            </summary>
-            <p>
-              REA inspected the HTTP browser edition through a local debugging
-              connection and returned the loaded <code>index.js</code>,
-              including its source and digest.
-            </p>
-            <div>
-              
-              <pre><code>ACCELERATION: 0.001,
-MAX_SPEED: 13,
-SPEED: 6</code></pre>
-            </div>
-            <p>
-              We called the original game’s update function in a controlled
-              browser check, with obstacles and automatic scheduling disabled.
-              After 4,000 updates, speed was 10.0; after 10,000, it was 13.0,
-              rounded to one decimal.
-            </p>
-            <p>
-              The new mini-game keeps that speed rule. Its drawing, jumping and
-              collision code are a small teaching implementation.
-              <a href="https://rea.tools/examples/dino-lab/">Open the lab</a> to see the new code
-              and run the same speed check.
-            </p>
-            <p>
-              To inspect the target yourself, follow the
-              <a href="https://rea.tools/guides/browser/#prepare">browser connection steps</a>
-              using
-              <a href="https://wayou.github.io/t-rex-runner/">the dinosaur page</a>. Give your agent that page URL and your local debugging
-              endpoint, then copy the prompt above.
-            </p>
-            <p>
-              <a href="https://github.com/wayou/t-rex-runner/blob/5455bfa408ec6b707c7300ff194b7390733a766d/index.js#L565-L571">Inspected speed code</a>
-              ·
-              <a href="https://rea.tools/assets/licenses/dinosaur.txt">Chromium Authors · BSD license</a>
-            </p>
-          </details>
-        </div>
-
-      <div id="calculator">
-          <div>
-            <p>Example 02 · Windows Calculator</p>
-            <h2>Rebuild Calculator’s % button.</h2>
-            <p>
-              We saw why <strong>200 + 10% gives 220.</strong> Now let’s recover
-              the rules for both + and ×, and try them.
-            </p>
-          </div>
-          <dl>
-            <p>
-              <dt>Goal</dt>
-              <dd>
-                Build a small calculator that handles
-                <mark>both + and × correctly.</mark>
-              </dd>
-            </p>
-            <p>
-              <dt>Why reverse engineer it?</dt>
-              <dd>
-                The same button uses
-                <strong>different rules after + and ×.</strong> We inspect the
-                installed app to find which number the percentage is applied to.
-              </dd>
-            </p>
-          </dl>
-          <div>
-            <figure data-percent-demo="">
-              <p>Try the calculation</p>
-              
-              <p><span data-percent-expression="">200 +</span>
-                <strong data-percent-display="">20</strong>
-              </p>
-              
-              <p data-percent-status="" role="status">
-                10% of 200 = 20. Then 200 + 20 = 220.
-              </p>
-              <figcaption>
-                Interactive illustration of the inspected percentage rule.
-              </figcaption>
-            </figure>
-            <div>
-              <div>
-                <p>REA returned</p>
-                <p>
-                  <strong>One branch divides by 100. The other also multiplies by the
-                    first number.</strong>
-                  The agent uses both to recreate the % button.
-                </p>
-              </div>
-              <p>
-                For this example, <code>previous = 200</code> and
-                <code>current = 10</code>.
-              </p>
-              <div>
-                
-                <p>
-                  <span id="calculator-analysis-prompt">Use REA to inspect Windows Calculator’s % button. Recover
-                    the rules after + and ×, then build a small calculator that
-                    uses both.</span>
-                </p>
-              </div>
-              <div>
-                
-                <pre><code>if (operation == multiply || operation == divide) {
-  percent = current / 100;
-} else {
-  <span>percent = current * previous / 100;</span>
-}</code></pre>
-              </div>
-              <dl>
-                <p>
-                  <dt>With +</dt>
-                  <dd>
-                    <strong>Take 10% of the first number.</strong><code>10% of 200 = 20 → 200 + 20 = 220</code>
-                  </dd>
-                </p>
-                <p>
-                  <dt>With ×</dt>
-                  <dd>
-                    <strong>Turn 10% into 0.1.</strong><code>200 × 0.1 = 20</code>
-                  </dd>
-                </p>
-              </dl>
-            </div>
-          </div>
-          <figure>
-            <p>
-              From the installed app to a working % button
-            </p>
-            <ol>
-              <li>
-                <span>01 · REA reads calc.exe</span><span>It launches the Calculator app</span><span>The code opens <code>ms-calculator:</code>. The agent then
-                  selects the installed app’s library.</span>
-              </li>
-              <li>
-                <span>02 · REA reads the library</span><span>Return the % handler’s code</span><span>The function checks the operator and uses the constant
-                  <code>100</code>.</span>
-              </li>
-              <li>
-                <span>03 · Your agent interprets it</span><span>Explain and reproduce the rules</span><span>Crosscheck the branch with Microsoft’s source, then try + and
-                  × above.</span>
-              </li>
-            </ol>
-          </figure>
-          <details>
-            <summary>See the real code and how the answer was checked</summary>
-
-            <div>
-              <div>
-                
-                <pre><code>0x180124945: MOV EAX, dword ptr [R13 + 0x18]
-0x180124949: <span>CMP EAX, 0x5c</span>
-0x18012494c: JZ 0x180124aba
-0x180124952: <span>CMP EAX, 0x5b</span>
-0x180124955: JZ 0x180124aba
-0x18012495b: <span>MOV EDX, 0x64</span></code></pre>
-              </div>
-              <div>
-                
-                <pre><code>#define IDC_MUL 92      // 0x5c
-#define IDC_DIV 91      // 0x5b
-#define IDC_PERCENT 118 // 0x76
-
-0x64 = 100</code></pre>
-              </div>
-            </div>
-
-            <p>
-              Inspected with REA 4.1.0: Windows Calculator 11.2508.4.0, x64. The
-              readable summary uses names from Microsoft’s public source to
-              explain the recovered branch.
-            </p>
-            <p>
-              <a href="https://github.com/microsoft/calculator/blob/d125246a4e19842ce1332e6c7839cf0e110027d8/src/CalcManager/CEngine/scifunc.cpp#L98-L111">Percentage implementation</a>
-              ·
-              <a href="https://github.com/microsoft/calculator/blob/d125246a4e19842ce1332e6c7839cf0e110027d8/src/CalculatorUnitTests/CalculatorManagerTest.cpp#L350-L370">Microsoft’s test cases</a>
-              · <a href="https://rea.tools/guides/native/">Native setup guide</a>
-            </p>
-          </details>
-        </div>
-
-      <div id="try-rea">
-          <div>
-            <p>Your first investigation</p>
-            <h2>Try REA on a small app.</h2>
-            <p>
-              Download our Notes example, trace its CSV export, and check one
-              changed input.
-            </p>
-          </div>
-          <p><a href="https://rea.tools/first-investigation/">Try the guided example</a>
-        </p></div>
-
-      <div id="analyze">
-          <div>
-            <h2>Want to go deeper?</h2>
-            <p>
-              Tell your agent what you want to understand or build. With REA,
-              you can work together on anything from
-              <strong>cloning this website</strong> to
-              <strong>reconstructing a game from its executable.</strong>
-            </p>
-          </div>
-          <div>
-            <div>
-              <div>
-                
-                <p>
-                  <span id="website-project-prompt">Use REA to inspect https://rea.tools/. Clone this website
-                    for me.</span>
-                </p>
-              </div>
-              <p>Yes, this one.</p>
-            </div>
-            <div>
-              <div>
-                
-                <p>
-                  <span id="game-project-prompt">Use REA to reconstruct this game from its executable.
-                    Recover the gameplay logic in C and test it against the
-                    original.</span>
-                </p>
-              </div>
-              <p>
-                <a href="https://rea.tools/showcase/dx-ball/">See the DX-Ball case study →</a>
-              </p>
-            </div>
-          </div>
-          <p>
-            For setup and analysis steps, choose your target:
-          </p>
-          <div id="analysis-guides">
-            <div>
-              <h3>Native binaries</h3>
-              <p>
-                Inspect functions, strings, references and call relationships in
-                executables and libraries.
-              </p>
-              <p><a href="https://rea.tools/guides/native/">Native analysis guide</a>
-            </p></div>
-            <div>
-              <h3>JavaScript &amp; Electron</h3>
-              <p>
-                Map modules, routes, IPC and native dependencies from an
-                application folder or ASAR archive.
-              </p>
-              <p><a href="https://rea.tools/guides/javascript/">Application workflows</a>
-            </p></div>
-            <div>
-              <h3>Browser &amp; runtime activity</h3>
-              <p>
-                Capture selected browser or process activity, then compare the
-                results across runs.
-              </p>
-              <p><a href="https://rea.tools/guides/browser/">Browser observation guide</a>
-            </p></div>
-          </div>
-        </div>
-      
-    </div></div>]]></description>
         </item>
     </channel>
 </rss>
