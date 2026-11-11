@@ -4,12 +4,34 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 11 Nov 2026 14:30:12 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 11 Nov 2026 15:30:11 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Google SWE points 48 AI agents at NASA Lidar, finds unmapped Maya pyramid in 72h (321 pts)]]></title>
+            <title><![CDATA[Can a Linear Program Do Weight-Space Programming? (112 pts)]]></title>
+            <link>https://nathan.rs/posts/weight-space-lp/</link>
+            <guid>50452655</guid>
+            <pubDate>Wed, 11 Nov 2026 12:30:17 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://nathan.rs/posts/weight-space-lp/">https://nathan.rs/posts/weight-space-lp/</a>, See on <a href="https://news.ycombinator.com/item?id=50452655">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div id="introduction"><p>Last week, MIT CSAIL published <a href="https://rikiyat.github.io/blog/weight-space-programming/"><em>Sparks of Weight-Space Programming</em></a>. Given the raw weights of a small network, GPT-6 Astra could tell which game it had been trained to play. Given only a game’s rules, it could write the weights of a small network from scratch and beat networks trained with PPO for 100 million steps. No gradients, no training loop, just reasoning about what the weights compute. They coined this <strong>weight-space programming</strong>.</p><p>In another experiment, they asked Astra to make Qwen3.5-0.8B better at math by editing its weights. Astra changed only 0.016% of the weights, and MATH-500 accuracy jumped from 7.9% to 48.1%.<sup id="fnref:1"><a href="#fn:1" role="doc-noteref">1</a></sup></p><p>Looking at Astra’s edit, I realized most of its search was solving a linear program by trial and error. It spent about 8 hours and 28 forward passes choosing which weights to change and by how much. A couple of LP solves, about a minute each, do the same job with 8× fewer changed weights. In this post I’ll walk through the edit, why it’s an LP, and what that says about the fix itself.</p><h2 id="thinking-loops">Thinking loops<a href="#thinking-loops">#</a></h2><p>Small reasoning models have a common failure: they get stuck in <strong>thinking loops</strong>, repeating the same few lines over and over instead of finishing their reasoning. Qwen3.5-0.8B is especially prone to it, and its model card says so. On MATH-500, 93% of the base model’s answers ran into the 32,768-token limit without ever reaching an answer.</p><figure><canvas data-anim="loop-trace" role="img" aria-label="Eight of the base model's answers drawn as bars along the 32,768-token budget. Most turn almost entirely to repeated text within the first thousand tokens and run to the limit; one finishes early."></canvas></figure><p>The edit fixes the loops, so it helps anywhere the model loops. That includes instruction following: IFEval went from 21% to 62%.</p><table><thead><tr><th>Qwen3.5-0.8B</th><th>MATH-500</th><th>GSM8K</th><th>IFEval</th><th>Hit token limit</th></tr></thead><tbody><tr><td>Base</td><td>7.9</td><td>13.8</td><td>21.0</td><td>93.0%</td></tr><tr><td>Astra’s edit</td><td>48.1</td><td>67.1</td><td>62.3</td><td>33.1%</td></tr></tbody></table><p>On Gemma 3 270M, which rarely loops, Astra couldn’t meaningfully improve its math ability. As the authors put it, editing the weights could remove an obstacle hiding an ability, but couldn’t add one the model lacked.</p><h2 id="how-astra-fixed-the-loops">How Astra fixed the loops<a href="#how-astra-fixed-the-loops">#</a></h2><p>Transformers use residual connections: each layer’s output is added to its input rather than replacing it. Follow one token through the network and you get a single vector that every layer adds to, called the <strong>residual stream</strong> (1,024-dimensional in this model). When the model is looping, the residual stream shifts in a consistent direction. Astra’s fix was to edit two layers so that what they add points the opposite way.</p><h3 id="finding-the-loop-direction">Finding the loop direction<a href="#finding-the-loop-direction">#</a></h3><p>Astra wrote four pairs of short texts, each a piece of productive reasoning and a looping version of the same reasoning. It ran all eight through the model and recorded each token’s residual stream vector at one layer. Averaging over the looping texts gives one vector, and averaging over the productive texts gives another. Their difference, normalized, is the <strong>loop direction</strong> $u$: the way the residual stream moves when the model loops.</p><figure><canvas data-anim="loop-direction" role="img" aria-label="Residual stream vectors of productive tokens sit in one region. As the model starts looping, its residual stream drifts along a single direction, u."></canvas></figure><h3 id="editing-the-weights">Editing the weights<a href="#editing-the-weights">#</a></h3><p>Each MLP ends with a matrix $W$ (called <code>down_proj</code>). At every token, it turns the MLP’s 3,584-dimensional hidden activation $h$ into a 1,024-dimensional output $Wh$, which gets added to the residual stream $x$:</p><p>$$x \leftarrow x + Wh, \qquad Wh = \sum_j h_j \, w_j$$</p><p>So the MLP’s output is always a weighted sum of the same 3,584 vectors, the columns $w_j$ of $W$. $W$ fixes what those vectors are; the activations $h_j$ decide how much of each one gets added at each token.</p><figure><canvas data-anim="down-proj" role="img" aria-label="Each entry of the hidden activation scales its own column of W, and the scaled columns add up to the update written into the residual stream."></canvas></figure><p>Each column points partly along $u$. That amount, $u^\top w_j$, is how much column $j$ pushes the model toward looping whenever $h_j$ is active. Astra’s edit subtracts a multiple $\alpha$ of it:</p><p>$$w_j \to w_j - \alpha \, (u^\top w_j) \, u$$</p><p>At $\alpha = 1$ the component along $u$ is gone, so the column no longer pushes toward looping. Doing this to every column in layers 15 and 19 took accuracy from 9% to 33% on GSM8K and MATH training problems. At $\alpha = 6$ the component is flipped: a column that wrote $+a$ along $u$ now writes $-5a$, and pushes the model <em>away</em> from looping whenever it’s used.</p><figure><canvas data-anim="flip" role="img" aria-label="One column of W and its component along u. At alpha 1 the component is removed; at alpha 6 it is reversed and five times as long."></canvas></figure><p>Every edited column changes by a multiple of the same vector $u$. So the whole edit is one direction $u$ plus one number per column, $v_j = -\alpha\,(u^\top w_j)$, which is zero for columns left alone. That’s a <strong>rank-1</strong> change:</p><p>$$\Delta W = u\,v^\top$$</p><p>At each token, it adds $(v \cdot h_t)\,u$ to the residual stream: some amount of $u$, set by how active the edited columns are. No other direction changes.</p><p>That leaves $v$ to choose: which columns to edit, and how large $\alpha$ should be. Astra worked it out by trial and error, testing each edit on a fresh batch of those training problems:</p><table><thead><tr><th>Edit on layers 15 and 19</th><th>Accuracy</th></tr></thead><tbody><tr><td>Base model</td><td>~9%</td></tr><tr><td>Every column, α = 1</td><td>33%</td></tr><tr><td>Every column, α = 2</td><td>43%</td></tr><tr><td>Every column, α = 3</td><td>48%</td></tr><tr><td>Random direction (control)</td><td>12.5%</td></tr><tr><td>Top 64 columns, α = 6</td><td>55%</td></tr></tbody></table><p>Pushing harder than $\alpha = 1$ helped more, and a random direction did nothing. The final edit used $\alpha = 6$ on only the 64 columns per layer that wrote the most $u$ on looping text.</p><h3 id="where-the-time-went">Where the time went<a href="#where-the-time-went">#</a></h3><p>The paper released Astra’s full logs: every tool call, every forward pass, every note it wrote to itself. Astra had a Python kernel with the weights loaded and a budget of 50 forward passes, each a batched run of the model on training problems or texts of its choosing.</p><figure><canvas data-anim="timeline" role="img" aria-label="Astra's 20-hour run split into phases: 15 minutes to find the loop direction, about two hours to choose layers, about eight hours to tune the edit, and the rest confirming it."></canvas></figure><p>The edit was frozen after about 10 hours, and the last 17 passes re-tested it without changing anything.<sup id="fnref:2"><a href="#fn:2" role="doc-noteref">2</a></sup> Of those 10 hours, finding $u$ took 15 minutes. Finding $v$ took about 8 hours.</p><h2 id="choosing-v-is-a-linear-program">Choosing v is a linear program<a href="#choosing-v-is-a-linear-program">#</a></h2><p>Astra was searching for a $v$ that strongly pushes looping tokens away from $u$ while barely touching productive ones. Since the push at token $t$ is $v \cdot h_t$, linear in $v$, both requirements are linear inequalities.</p><p>I labeled tokens from the base model’s own traces: <strong>looping</strong> tokens ($R$), deep inside a loop, and <strong>productive</strong> tokens ($P$), well before any loop starts,<sup id="fnref:3"><a href="#fn:3" role="doc-noteref">3</a></sup> and recorded their activations $h_t$ at layers 15 and 19. Each one becomes a constraint, and the LP picks the $v$ with the smallest L1 norm $\sum_j |v_j|$:</p><p>$$
+\begin{aligned}
+\min_v \quad &amp; \sum_j |v_j| \\
+\text{s.t.} \quad &amp; v \cdot h_t \le -\delta &amp;&amp; t \in R \quad \text{(at least } \delta \text{ away from } u\text{)} \\
+&amp; |v \cdot h_t| \le \varepsilon &amp;&amp; t \in P \quad \text{(at most } \varepsilon\text{)}
+\end{aligned}
+$$</p><p>In practice no $v$ satisfies every constraint, so each one gets a penalized slack variable.</p><p>Minimizing L1 tends to make $v$ sparse. The L1 ball is a diamond, and when you grow it until it touches the feasible region, it usually touches at a corner, where most coordinates are exactly zero. So the LP picks the columns as well as the amounts.</p><figure><canvas data-anim="l1-corner" role="img" aria-label="Constraints from looping and productive tokens cut out a feasible region. An L1 diamond grows from the origin and first touches that region at a corner, where one coordinate is zero."></canvas></figure><p>To get exactly 8 columns per layer, I kept the 8 with the largest effect and solved again with the rest fixed at zero.<sup id="fnref:4"><a href="#fn:4" role="doc-noteref">4</a></sup></p><p>That replaces Astra’s 8-hour search, including its choice of columns and $\alpha$, with a couple of LP solves. An off-the-shelf solver (HiGHS) took over 20 minutes each on these constraints, so I wrote a GPU solver (PDHG, the algorithm behind PDLP) that gets within 0.2% of its optimum in about a minute.<sup id="fnref:5"><a href="#fn:5" role="doc-noteref">5</a></sup></p><figure><canvas data-anim="timeline-lp" role="img" aria-label="The same timeline, with the eight-hour search for v replaced by a couple of LP solves."></canvas></figure><h2 id="results">Results<a href="#results">#</a></h2><p>I tested two LP edits. Both use Astra’s layers. One uses Astra’s direction $u$. The other uses a <strong>heuristic direction</strong>: label tokens in the model’s own traces as looping or productive with a simple repetition detector, then take the difference of their average residual streams. It’s the same recipe Astra used, minus the hand-written texts, so no LLM is involved. I tuned the LP’s settings on a separate 128-problem dev set; everything in the chart and table is on data never used for fitting or tuning.</p><figure><canvas data-anim="benchmarks" role="img" aria-label="Accuracy of the base model, Astra's edit, and the two LP edits on GSM8K test, MATH-500, unseen training problems and IFEval. Both LP edits land within a few points of Astra's edit."></canvas></figure><table><thead><tr><th></th><th>Changed weights</th><th>GSM8K test</th><th>MATH-500</th><th>IFEval</th></tr></thead><tbody><tr><td>Base model</td><td>0</td><td>14.1</td><td>7.0</td><td>22.9</td></tr><tr><td>Astra’s edit</td><td>130,188</td><td>68.2</td><td>50.9</td><td>61.9</td></tr><tr><td>LP, Astra’s direction</td><td>16,291</td><td>69.6</td><td>51.7</td><td>59.7</td></tr><tr><td>LP, heuristic direction</td><td>16,271</td><td>65.4</td><td>47.8</td><td>60.4</td></tr></tbody></table><p>With Astra’s direction, the LP matches Astra’s edit on every benchmark, within noise, while changing 8× fewer weights. With the heuristic direction, it gets about 93% of the way there.</p><p>A few other things showed up:</p><ul><li><strong>The search mattered, and the LP replaces it.</strong> On the dev set, reusing Astra’s recipe (top 64 columns, $\alpha = 6$) on the heuristic direction without searching again scores 44.5. The LP scores 54.7.</li><li><strong>Different columns, same fix.</strong> The LP’s 8 columns share only 3 (layer 15) and 1 (layer 19) with Astra’s 64. Many sparse solutions work; what matters is the total push along $u.$</li><li><strong>A random direction does nothing.</strong> On the dev set, a random $u$ of the same size scores 10.2, against 10.9 for the base model.</li></ul><h2 id="a-steering-vector-does-the-same-job">A steering vector does the same job<a href="#a-steering-vector-does-the-same-job">#</a></h2><p>An edit can only tell a looping token apart from a productive one through its activations, and a loop isn’t recognizable from them until it’s well under way.<sup id="fnref:6"><a href="#fn:6" role="doc-noteref">6</a></sup> So on the dev set, asking the LP to push only on loop-like tokens did no better than pushing on every token.</p><p>The LP’s 8 columns in layer 15 are active on 89% of tokens, and the push they add barely varies from token to token, so the edit is close to a constant push along $u$. A constant push doesn’t need a weight edit. It can be added directly as a <strong>steering vector</strong>, a fixed vector added to the residual stream at every token.</p><p>The table below adds the LP edit’s average push along $u$ to the unedited model at layers 15 and 19, at three strengths:</p><table><thead><tr><th>Steering strength (× the LP edit’s average push)</th><th>Dev set</th><th>MATH-500</th></tr></thead><tbody><tr><td>0.5×</td><td>51.6</td><td></td></tr><tr><td>1×</td><td>57.8</td><td>50.8</td></tr><tr><td>2×</td><td>31.2</td><td></td></tr></tbody></table><p>For comparison, on the same runs: the LP edit scores 62.5 on the dev set and 53.2 on MATH-500, Astra’s edit 59.4 and 50.0, the base model 10.9 and 7.0. MATH-500 here is one sample per problem.</p><p>At 1×, the steering vector recovers essentially the whole fix. The window is narrow: at 0.5× the loops come back, and at 2× they stop but the reasoning falls apart.</p><figure><canvas data-anim="dose" role="img" aria-label="The same problem at three steering strengths: too weak and the model loops, the right dose and it finishes, too strong and its reasoning breaks."></canvas></figure><p>The only difference is delivery. The LP edit is an ordinary checkpoint; the steering vector needs extra code at inference time.</p><h2 id="limitations-and-whats-next">Limitations and what’s next<a href="#limitations-and-whats-next">#</a></h2><p>This is one model. The LP still relies on Astra for the layers, and the best results use Astra’s direction too. The heuristic direction gets most of the way without an LLM, but not all of it.</p><p>Loops also turned out to be fixable with a constant push, so the LP’s per-token constraints didn’t end up mattering much. A behavior that should change some tokens and leave others alone would be a better test of them. Choosing the layers without an agent is the other open piece.</p><p>Lastly, this was only tested on removing loops. Many other behaviors, like refusal or sycophancy, can be steered by adding or removing a single direction in the residual stream.<sup id="fnref:7"><a href="#fn:7" role="doc-noteref">7</a></sup> If a behavior can be steered with one direction, choosing how to build it into the weights should be the same LP, but that still needs testing.</p><p>Code, edits, and the full write-up are on <a href="https://github.com/nathanrs/weight-space-lp">GitHub</a>.</p><h2 id="citation">Citation<a href="#citation">#</a></h2><p>Please cite this work as:</p><pre tabindex="0"><code>Barry, Nathan. "Can a Linear Program Do Weight-Space Programming?"
+nathan.rs (Nov 2026). https://nathan.rs/posts/weight-space-lp.</code></pre><p>Or use the BibTex citation:</p><pre tabindex="0"><code>@article{barry2026wslp,
+  title   = "Can a Linear Program Do Weight-Space Programming?",
+  author  = "Barry, Nathan",
+  journal = "nathan.rs",
+  year    = "2026",
+  month   = "Nov",
+  url     = "https://nathan.rs/posts/weight-space-lp"
+}</code></pre></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Google SWE points 48 AI agents at NASA Lidar, finds unmapped Maya pyramid in 72h (490 pts)]]></title>
             <link>https://pietromiotti.com/latest/maya-site/?maya</link>
             <guid>50452455</guid>
             <pubDate>Wed, 11 Nov 2026 12:05:22 GMT</pubDate>
@@ -120,7 +142,853 @@
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Protecting SSH Keys with macOS Secure Enclave (291 pts)]]></title>
+            <title><![CDATA[Using voltage glitching to unleash the A100 in my mining card (118 pts)]]></title>
+            <link>https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/</link>
+            <guid>50451903</guid>
+            <pubDate>Wed, 11 Nov 2026 10:48:40 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/">https://blog.kate.land/posts/using-voltage-glitching-to-unlock-the-a100/</a>, See on <a href="https://news.ycombinator.com/item?id=50451903">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><h2 id="summary">Summary</h2>
+<p>I’ve discovered a voltage fault injection vulnerability on the GA100 die, allowing an operator to blow arbitrary fuses. Utilizing this vulnerability, I’ve converted my CMP 170HX 8GB card into what is effectively an A100-80G! Further, my unlocked cards actually perform ~1.2x faster than a retail A100 by having all functional SMs enabled (~120-126, die-lottery dependent), rather than the yield-safe 108 SMs NVIDIA chose for all production A100 cards. Finally, CMP-disabled features like NVLink, PCIe Gen4, NVJPG, NVDEC, MIG are all unlockable with this approach, though I haven’t specifically tested NVJPG/NVDEC/MIG.</p>
+<p>Here’s how my “A100-80G” appears and functions.</p>
+<figure><figcaption>GPU inventory and topology</figcaption><div><p><strong>GPU 0</strong><span>81920 MiB</span><span>NVIDIA Graphics Device</span><code>00000000:81:00.0</code><small>0x20C210DE</small></p><p><strong>GPU 1</strong><span>81920 MiB</span><span>NVIDIA Graphics Device</span><code>00000000:C1:00.0</code><small>0x20C210DE</small></p></div><p><span>GPU 0</span><strong>NV12</strong><span>GPU 1</span><small>CPU affinity 0–127 · NUMA 0</small></p><details><summary>Full nvidia-smi output</summary><pre><code>$ nvidia-smi --query-gpu=index,pci.bus_id,pci.device_id,name,memory.total; nvidia-smi topo -m
+index, pci.bus_id, pci.device_id, name, memory.total [MiB]
+0, 00000000:81:00.0, 0x20C210DE, NVIDIA Graphics Device, 81920 MiB
+1, 00000000:C1:00.0, 0x20C210DE, NVIDIA Graphics Device, 81920 MiB
+	GPU0	GPU1	CPU Affinity	NUMA Affinity	GPU NUMA ID
+GPU0	 X 	NV12	0-127	0		N/A
+GPU1	NV12	 X 	0-127	0		N/A</code></pre></details></figure>
+<figure aria-labelledby="ga100-fp16-summary-title" aria-describedby="ga100-fp16-summary-desc"><p><strong id="ga100-fp16-summary-title">FP16 FMA throughput</strong><span>TFLOP/s</span></p><div><p>retail A100</p><p>1.00×</p></div><div><p>hardware-unlocked CMP 170HX</p><p>1.18× retail A100</p></div><span id="ga100-fp16-summary-desc">Retail A100 72.488 TFLOP/s; hardware-unlocked CMP 170HX 85.858 TFLOP/s from the raw OpenCL output below.</span><details><summary>Full OpenCL output</summary><pre><code>.-----------------------------------------------------------------------------.
+|----------------.------------------------------------------------------------|
+| Device ID    0 | NVIDIA Graphics Device                                     |
+| Device ID    1 | NVIDIA Graphics Device                                     |
+|----------------'------------------------------------------------------------|
+|----------------.------------------------------------------------------------|
+| Device ID      | 0                                                          |
+| Device Name    | NVIDIA Graphics Device                                     |
+| Device Vendor  | NVIDIA Corporation                                         |
+| Device Driver  | 610.43.03 (Linux)                                          |
+| OpenCL Version | OpenCL C 3.0                                               |
+| Compute Units  | 124 at 1410 MHz (7936 cores, 22.380 TFLOPs/s)              |
+| Memory, Cache  | 81338 MB VRAM, 3472 KB global / 48 KB local                |
+| Buffer Limits  | 20334 MB global, 64 KB constant                            |
+| Max Workgroup  | 1024 threads                                               |
+|----------------'------------------------------------------------------------|
+| Info: OpenCL C code successfully compiled.                                  |
+| FP64   Compute   (double, fma  )                     11.287 TFLOPs/s (1/2 ) |
+| FP32   Compute   (float , fma  )                     22.781 TFLOPs/s ( 1x ) |
+| FP16   Compute   (half2 , fma  )                     85.858 TFLOPs/s ( 4x ) |
+| INT64  Compute   (long  , a*b+c)                      2.759  TIOPs/s (1/8 ) |
+| INT32  Compute   (int   , a*b+c)                     22.769  TIOPs/s ( 1x ) |
+| INT16  Compute   (short2, a*b+c)                     20.273  TIOPs/s ( 1x ) |
+| INT8   Compute   (char4 , dp4a )                     81.169  TIOPs/s ( 4x ) |
+| Memory Bandwidth ( coalesced read      )                       1883.17 GB/s |
+| Memory Bandwidth ( coalesced      write)                       2137.93 GB/s |
+| Memory Bandwidth (misaligned read      )                       1460.81 GB/s |
+| Memory Bandwidth (misaligned      write)                        250.13 GB/s |
+| PCIe   Bandwidth (send                 )                         13.10 GB/s |
+| PCIe   Bandwidth (   receive           )                         11.69 GB/s |
+| PCIe   Bandwidth (        bidirectional)            (Gen3 x16)   11.58 GB/s |
+|-----------------------------------------------------------------------------|
+'-----------------------------------------------------------------------------'</code></pre></details></figure>
+<p>NVIDIA uses fuses for product segmentation, security features, and other fun access control features - and crucially, there are several functions where blowing a fuse on an NVIDIA die can grant you <em>more</em> access, not less. In a properly secured design, a blown fuse should always induce a more restrictive state, because a blown fuse cannot be unblown in an economically feasible way. NVIDIA’s design allows one to <em>relax</em> restrictions by blowing more fuses!</p>
+<p>In this post, I will go over the GA100 die, its fuse controller, the use of VFI, and future research directions. I’ve decided to publish some of the work that enabled my research <a href="https://github.com/kate-land/ga100vfi">here</a>.</p>
+<h2 id="acknowledgements">Acknowledgements</h2>
+<p>My work builds on <a href="https://www.researchgate.net/publication/408132536_A_Canary_in_the_Crypto_Mine_Defeating_Stack_Protection_in_a_GPU_Secure_Coprocessor">prior research by Jon Pry</a> and numerous others who have dedicated much of their time towards better understanding the GA100 die. I am disclosing my findings subsequent to another security researcher independently discovering the same vulnerability; I believe it to be in the best interest of the public to make this information publicly available. These findings were disclosed to NVIDIA’s product security team ahead of the publication of this article.</p>
+<h2 id="ga100-versions">GA100 versions</h2>
+<p>The GA100 is an NVIDIA die that has been used to power almost 20 different SKUs - the A100 being the most well-known variant. I won’t delve into <a href="https://www.techpowerup.com/gpu-specs/nvidia-ga100.g931">every SKU</a>, but I will present the GA100 manifestations that matter to my work, covering the different versions of the CMP 170HX and the A100.</p>
+<p>As fabbed, the GA100 die has 128 SMs, 12 FBPs, 5 NVDEC units, a PCIe Gen4 x16 controller, and depending on the framebuffer size, comes with 4-6 stacks of HBM co-packaged with the die. NVIDIA uses eFuses for yield-control and product segmentation–undifferentiated GA100s turn into more restrictive variants based on defect testing and manufacturer demand.</p>
+<p>In one of the most extreme manifestations of product segmentation, the CMP 170HX, an Ethereum mining card with nominally 8 or 10 GB of application-exposed framebuffer capacity, actually comes with, respectively, ~80 and ~40 GB of HBM onboard! This work chiefly centers around how to fully unlock and use that capacity. Previous work has made great strides in unlocking the GA100 via software methods; VFI takes us across the last mile.</p>
+<table>
+<thead>
+<tr>
+<th>SKU</th>
+<th>Out-of-box</th>
+<th>Software (cmpunlocker)</th>
+<th>GA100VFI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><span>CMP 170HX 8GB</span></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><span>Framebuffer</span></td>
+<td><span>8 GB</span></td>
+<td><span>64 GB</span></td>
+<td><span>64-80 GB</span><sup><a href="#user-content-fn-1" id="user-content-fnref-1" data-footnote-ref="" aria-describedby="footnote-label">1</a></sup></td>
+</tr>
+<tr>
+<td><span>CMP 170HX 10GB</span></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><span>Framebuffer</span></td>
+<td><span>10 GB</span></td>
+<td><span>40 GB</span><sup><a href="#user-content-fn-2" id="user-content-fnref-2" data-footnote-ref="" aria-describedby="footnote-label">2</a></sup></td>
+<td><span>40-48 GB</span></td>
+</tr>
+<tr>
+<td><span>Both CMPs</span></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><span>SMs</span></td>
+<td><span>70</span></td>
+<td><span>70</span></td>
+<td><span>120-128</span></td>
+</tr>
+<tr>
+<td><span>PCIe generation</span></td>
+<td><span>1</span></td>
+<td><span>2</span></td>
+<td><span>4</span></td>
+</tr>
+<tr>
+<td><span>NVLink</span></td>
+<td><span>No</span></td>
+<td><span>No</span></td>
+<td><span>Yes</span><sup><a href="#user-content-fn-3" id="user-content-fnref-3" data-footnote-ref="" aria-describedby="footnote-label">3</a></sup></td>
+</tr>
+<tr>
+<td><span>ECC</span></td>
+<td><span>No</span></td>
+<td><span>No</span></td>
+<td><span>Yes</span><sup><a href="#user-content-fn-4" id="user-content-fnref-4" data-footnote-ref="" aria-describedby="footnote-label">4</a></sup></td>
+</tr>
+<tr>
+<td><span>Multi-Instance GPUs</span></td>
+<td><span>No</span></td>
+<td><span>No</span></td>
+<td><span>Yes</span><sup><a href="#user-content-fn-4" id="user-content-fnref-4-2" data-footnote-ref="" aria-describedby="footnote-label">4</a></sup></td>
+</tr>
+<tr>
+<td><span>NVDEC</span></td>
+<td><span>0</span></td>
+<td><span>0</span></td>
+<td><span>5</span><sup><a href="#user-content-fn-4" id="user-content-fnref-4-3" data-footnote-ref="" aria-describedby="footnote-label">4</a></sup></td>
+</tr>
+</tbody>
+</table>
+<h2 id="hardware-restrictions">Hardware restrictions</h2>
+<p>So, how does NVIDIA utilize fuses to produce both a datacenter A100 and a mining CMP card from one die? To understand this, we need to take a closer look at the fuse controller located on the GA100.</p>
+<p>The fuse controller is a block that contains 16,384 eFuses (512 rows of 32) and a bunch of logic surrounding that raw fuse macro. Its job is to perform fuse readout and programming, protect the underlying fuses, and provide usable “option words” to the rest of the die. These option words subsequently decide how the die functions and what features are enabled.</p>
+<p>Each eFuse can be in one of two states (blown=1, unblown=0), and the 512 rows are divided into 4 regions:</p>
+<ol>
+<li>Regular fuses (rows 0-221). These are straightforward; often single (pairs of) fuses will map to an option word, such as OPT_ENABLE_FUSE_PROGRAM (an option word that determines whether further fuse programming is allowed or not). Regular fuses have built-in redundancy: for example, OPT_ENABLE_FUSE_PROGRAM consists of a PRI and RED (primary and redundant) fuse, in this case the primary instance is fuse 0 of row 0, and the redundant is fuse 0 of row 1. Some option words are scalars, such as OPT_X_COORDINATE, which is 9 bits wide and ostensibly holds the x-coordinate of the die on the fabbed wafer. <strong>Importantly, if a regular fuse is blown, there is basically no remedy to persistently unblow it (save for RIR later).</strong></li>
+<li>Fuseless fuses (rows 222-487). This is a weird one. Apparently NVIDIA got frustrated with accidentally blowing regular fuses and ruining their engineering samples, and came up with a system to encode effective option words in a JTAG chain-like format (see <a href="https://patents.google.com/patent/US9230678B2/en">this patent</a>). Think about FF as essentially a <em>script</em> that describes what option words should have what values. FF fuses (excuse the <a href="https://en.wikipedia.org/wiki/RAS_syndrome">RAS syndrome</a>) concern most of the functionality we can unlock using VFI. This is because FF option words can be trivially cleared by simply writing new FF rows! We’ll about this more in depth, later. For now, you should know that NVIDIA also knows this, because under normal conditions, you are strictly prevented from performing any FF fuse blows.</li>
+<li>IFF fuses (rows 487-512). These contain instructions in a different format than the FF one. They’re out of scope for this post, and they’re mainly useful for on-the-fly reprogramming of fuse controller option words. They are usually not accessible in a production card.</li>
+<li>RIR fuses (8 rows of 32 fuses, which are technically not part of the 512 rows). These are provided by the designer of the fuse macro (TSMC datasheet <a href="https://www.scribd.com/document/656604701/DB-TEF07F32X32HD18-PHRM-C180518-120A">here</a>) and are essentially the first party designer’s intended “fuse repair” mechanism. The RIR section on a GA100 has space for 16 repair instructions, each overriding the value of an identified single fuse in the main 512 rows. Unfortunately for us, specifically in the 8 GB 170HX SKU, 15 of the 16 RIR words are all ones, and the 16th word encodes a useless repair instruction that can only be rarely leveraged for any interesting unlock. The story is different for the 10 GB SKU, but that’s a matter for another day…</li>
+</ol>
+<p>There are two really interesting groups of fuses for the VFI-based unlock:</p>
+<ol>
+<li>“Control fuses”. The term comes from NVIDIA’s Tegra hardware headers, they use it to refer specifically to rows 0 and 1, which specify the values of highly security-sensitive option words.</li>
+<li>Fuseless fuses, which encode all of the interesting option words that decide whether a GA100 is born to be a measly mining card or an AI datacenter workhorse.</li>
+</ol>
+<p>Before we name some of the FF-encoded option words, we’ll have to first understand the FF record format in a bit more detail, then talk about the die blocks that govern the features we are interested in.</p>
+<h3 id="fuseless-fuses">Fuseless fuses</h3>
+<p>Each FF row is a 32-bit record. Bits 0–4 select a chain, bit 5 distinguishes FF from IFF (0 for FF), bits 6–15 select a 16-bit block, and bits 16–31 supply that block’s new value. The JTAG-chain picture from the patent is quite literal here: the controller builds the option data by replaying these records into chains. Fixed locations in each chain correspond to individual option words.</p>
+<p>If two records address the same chain and block, the later record wins. For example, <code>0x0fe805c1</code> means chain 1, block 23, data <code>0x0fe8</code>. Appending that record can clear an <em>effective</em> bit set by an earlier FF record. No physical fuse is unblown; a new row replaces the old 16-bit block. This works for FF-backed options, not the regular control fuses in rows 0 and 1.</p>
+<p>Now that we know how FF words are encoded, here’s a list of the interesting words and their locations. These were discovered by a particularly helpful researcher who cross-compared FF values and effective option words from different GA100 SKUs in order to differentially understand the FF chain/block to option word mappings, as there is no known official mapping.</p>
+<table>
+<thead>
+<tr>
+<th>Named option</th>
+<th>Inferred FF location</th>
+<th>Use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NV_FUSE_OPT_FBIO_DISABLE</code></td>
+<td>Chain 1 bits 83–106; blocks 5–6</td>
+<td>Memory I/O floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_FBPA_DISABLE</code></td>
+<td>Chain 1 bits 107–130; blocks 6–8</td>
+<td>Memory subpartition floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_GPC_DISABLE</code></td>
+<td>Chain 1 bits 131–138; block 8</td>
+<td>GPC floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_TPC_GPC0_DISABLE</code> through <code>NV_FUSE_OPT_TPC_GPC7_DISABLE</code></td>
+<td>Chain 1 bits <code>187+8i</code> through <code>194+8i</code> for GPC <code>i</code>; blocks 11–15</td>
+<td>Eight TPC masks</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PES_DISABLE</code></td>
+<td>Chain 1 bits 251–274; blocks 15–17</td>
+<td>PES floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_FBP_DISABLE</code></td>
+<td>Chain 1 bits 307–318; block 19</td>
+<td>Framebuffer partition floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_ROP_L2_DISABLE</code></td>
+<td>Chain 1 bits 319–342; blocks 19–21</td>
+<td>ROP/L2 floorsweep</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_NVLINK_DISABLE</code></td>
+<td>Chain 1 bits 368–370; block 23</td>
+<td>NVLink disable mask</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_DISABLE_GEN3_SPEED</code></td>
+<td>Chain 2 block 39; <strong>which of bits 1 and 9 is unresolved</strong></td>
+<td>PCIe Gen3 speed restriction</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PCIE_MAGIC_BITS_D[25]</code></td>
+<td>Chain 2 block 47 bit 3</td>
+<td>Gen4 speed-disable flag</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PCIE_BOOT_GEN23_DISABLE</code></td>
+<td>Chain 2 block 49 bit 6</td>
+<td>PCIe boot policy</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PCIE_BOOT_GEN3_DISABLE</code></td>
+<td>Chain 2 block 49 bit 7</td>
+<td>PCIe boot policy</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PCIE_DEVIDA</code></td>
+<td>Chain 2, bits 593–608; blocks 37–38</td>
+<td>Device identity</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_PCIE_DEVIDB</code></td>
+<td>Chain 2, bits 609–624; blocks 38–39</td>
+<td>Device identity</td>
+</tr>
+<tr>
+<td><code>NV_FUSE_OPT_SYS_PIPE_DISABLE</code></td>
+<td>Chain 1, bits 372–379; block 23</td>
+<td>Multi-instance GPU enabled pipes</td>
+</tr>
+</tbody>
+</table>
+<p>The acronyms FBIO/FBPA/FBP/TPC/GPC/PES/ROP all refer to microarchitectural elements, please see this diagram from the GA100 whitepaper to further understand how these are related to each other:</p>
+<p><img src="https://blog.kate.land/images/ga100-block-diagram.png" alt="GA100 die block diagram from the GA100 whitepaper"></p><p>FBP is the internal NVIDIA term for a “framebuffer partition”, with 2 FBPs to one HBM stack. FBPAs are subpartitions, 2 FBPAs to one FBP. PES/ROP are blocks (seemingly graphics-related) that are required for an SM to function.</p>
+<p>With this knowledge in hand, <em>what if</em> we could write new FF rows that set the _DISABLE words to be all zeroes, or at least, as permissive as possible given die defects? If we look at how the _DISABLE options are used in conjunction with other elements, we’ll quickly see that these _DISABLE words are the primary lever we have in preventing parts of the die from being “floorswept”. After illuminating the “what-if”, I’ll talk about the “how”: the exact application of voltage fault injection and the fuse controller safeguards we can defeat with VFI.</p>
+<h3 id="floorsweeping">Floorsweeping</h3>
+<p>NVIDIA puts these options in charge of setting floorsweep signals, which will render a die element unreachable (and likely powered down). From experiments, I believe the floorsweep lines are specified in RTL, emanating from the fuse controller and terminating in individual functional blocks and controlling some master power/clock domain switch within the block. I have observed the floorsweeping behavior to correspond with very little latency with the value of the fuse controller’s effective status words for each functional block.</p>
+<p>Let’s take FBP floorsweeping, for example. On one of my 8 GB cards, <code>OPT_FBP_DISABLE</code> was <code>0x852</code>: FBPs 1, 4, 6, and 11 were masked. The separate <code>OPT_FBP_DEFECTIVE</code> mask was <code>0x840</code>, covering 6 and 11. After I reduced the FF-backed disable mask to <code>0x840</code> with a replacement FF row, the extra masks on 1 and 4 were gone, but the defective 6 and 11 stayed disabled. That leaves 10 of the die’s 12 FBPs in the effective mask. Functionally, FBPs 1 and 4, which refused register reads and writes when <code>OPT_FBP_DISABLE</code> was <code>0x852</code>, became responsive after this fuse write.</p>
+<p>Although the functional blocks can be “unfloorswept” with FF writes, this does not fully suffice to render the block fully available to an end application - the default framebuffer geometry configuration uses only a portion of each available HBM stack, for example.</p>
+<p>To bypass that, we can utilize what is essentially a small modification to <a href="https://github.com/amoghmunikote/cmpunlocker">cmpunlocker</a>’s method. The usual driver patch for the 8 -&gt; 64 GB unlocks writes to a particular set of feature configuration words (FBPA_CFG, SM_SPEED_SELECT, etc.). The default values are chosen to succeed for the commonly found variant of the 170HX, which has the _DISABLE FF-derived option words preventing certain functional blocks from being used (any attempt to use them will return floorswept errors). With the unlocking FF burns in place, we can write even more permissive words into the configuration registers, resulting in what is functionally an A100-80G.</p>
+<h2 id="achieving-the-ff-burn">Achieving the FF burn</h2>
+<p>With the information we have, it seems straightforward that if one could blow arbitrary FF fuses, any GA100 could be fully unlocked to its maximum capability, as determined by die yield and the populated memory stacks. But how do we blow FF fuses? Let’s take a look at the fuse programming functionality of the fuse controller to understand more.</p>
+<p>To request a fuse blow, one must write to the FUSEADDR, FUSEWDATA, and FUSECTRL registers belonging to the fuse controller. Although not nominally accessible to the host or to unprivileged requesters, with the <em>Canary in the Crypto Mine</em> ROP, opening up the responsible privilege level masks is trivial. And so, many researchers have attempted to coerce the fuse controller to blow fuses in the FF region. Some of our shared observations follow:</p>
+<ol>
+<li>The fuse controller has an internal FSM, and it indicates its current state via the FUSECTRL_STATE bits.</li>
+<li>The fuse controller enters a WRITE_PROGRAM state per each “hot” bit in the requested FUSEWDATA value. This tracks with the expected fuse programming behavior.</li>
+<li>However, unless a specific option word is cleared, writes to fuse addresses outside of the FPF range (rows 96-221) do not actually take place. Fuses in this region (believed to be “field programmable fuses” indicating a watermark of which ucode versions have run, alongside other field-relevant information) <em>do</em> take effect, and the fuse controller state machine behaves identically between FPF and non-FPF regions.</li>
+</ol>
+<p>The specific option word I am referring to is OPT_SECURED_BURN_FEATURE_ENABLE (“SBFE”), and it is set to be 1 in all production cards. When this option word is clear, fuse programming is allowed in any address. When it is set, only FPF fuses may be blown. To date, no one has found any way to burn FF fuses with SBFE=1, even when operating the fuse controller from HS contexts. It is not clear what “secured burn” truly means, I speculate that there must be a software-only way to perform non-FPF burns even with SBFE=1, and we just don’t know what the “secured” adjective really means here.</p>
+<blockquote>
+<p><span>Note</span>
+<em>PLM</em>, <em>HS</em>, <em>ucode</em>, …; I am delving into using a bunch of NVIDIA-specific terminology in this section as the explanation gets deeper. For a really in-depth explanation of what these mean, I refer you to other sources such as <a href="https://hexkyz.blogspot.com/2021/11/je-ne-sais-quoi-falcons-over-horizon.html">Je Ne Sais Quoi - Falcons over the Horizon</a>.</p>
+</blockquote>
+<p>Importantly, as people have figured out on more permissive cards, it is possible to perform FF burns with SBFE=0! And as it turns out, achieving this state is how we achieve the GA100 unlock. After much trial-and-error, I have resorted to inducing this state via voltage fault injection, and I was able to achieve it. Let’s talk some more about voltage glitching.</p>
+<h3 id="voltage-fault-injection">Voltage fault injection</h3>
+<p>Much has been said about VFI, and I’ll leave the in-depth explanation to other sources. In short, applying brief pulses of low supply voltage will often cause unexpected behavior in integrated circuits. I asked GPT-6 Astra to design an STM32G4 based board that taps into the PWMVID signal on the CMP PCB. PWMVID is an NVIDIA standard for voltage regulators, and my glitcher intercepts the PWM signal emitted by the GA100 die, and replaces it with its own waveform fed into the MP2888B VRM driver IC. With my setup, I can induce the card’s own VRM to produce timed glitches for me, which is simpler than MOSFET-based setups and enables faster glitching than attempting to directly drive the PMBus.</p>
+<p>The glitcher requires two connections to the PCB, ideally done with magnet/enameled wire. One wire taps NVVDD for voltage sensing, and another wire taps the PWMVID signal. The only other required step for the glitcher to function is the removal of a 0402 0ohm resistor, which will break the connection between the GA100 output PWM pin and the VRM IC. Finding where to place the taps is trivial by tracing the pinout of the MP2888B, specifically its PWMVID and VOSEN pins (the MP2888B shares a footprint with its sibling public chip MP2888A). Test points directly adjacent to the MP2888B enable relatively easy installation of the PWMVID tap.</p>
+<p>With this tap in place, a single glitch attempt involves this sequence:</p>
+<ol>
+<li>Remove card power</li>
+<li>Apply card power</li>
+<li>Start a timer (“glitch timer”) as soon as NVVDD crosses a threshold</li>
+<li>Execute a proposed voltage waveform by issuing a PWMVID signal, aligned to the glitch timer</li>
+<li>Observe card behavior, repeat from step 1 as needed</li>
+</ol>
+<p>My setup achieves steps 1/2 with a simple ACPI S0 -&gt; S3 -&gt; S0 transition, which can be done in a few seconds on a modern desktop platform. More intrusive modifications or expensive rigs can probably achieve a better experiment rate, but in my experience this setup suffices to unlock cards in somewhere between 1 hour and 48 hours of glitching time using the approach described later.</p>
+<p>For the NVVDD threshold, the Astra-authored firmware uses an STM32 comparator to detect when NVVDD crosses 225mV, after which a tight DMA loop drives the desired duties on the PWMVID pin. After S0, the host inspects the card state and decides what to do next; if it involves another glitch, the glitcher board will be commanded over USB with a glitch pattern. Then the host induces S3 with an RTC timer to wake back up in ~3s (empirically derived period for decent stability).</p>
+<p>Sometimes the host will fail to return to S0, I’ve remedied this with relegating bookkeeping and glitch campaign preparation to an SBC (Radxa Cubie A5E) which also can drive the motherboard power/reset button pins via GPIO if the glitch target host is unresponsive.</p>
+<p>More specifics are shared in the <a href="https://github.com/kate-land/ga100vfi">GA100VFI repository</a> if you’re interested. For now, let’s take a look at the different interesting states we can trigger via VFI, as well as the specific glitch state that we need to burn FF rows. To help illuminate the differences between each glitch state, I have built an empirical model of how the fuse controller starts up when voltage is applied. Note that without the RTL that implements the fuse controller, all we have are guesses. Here are the hypothesized boot stages:</p>
+<ol>
+<li>Sense RIR, as required by the fuse macro</li>
+<li>Sense (from fuse macro into readout register) control rows</li>
+<li>Latch control rows into control row-derived option words</li>
+<li>Sense remaining rows</li>
+<li>Latch regular fuse values into their option words</li>
+<li>Parse FF chain</li>
+<li>Latch FF chain values into their option words</li>
+</ol>
+<p>These hypothetical stages are based on what I can actually read from the die: controller states, raw rows when <code>CMD_READ</code> works, the published option words, and whether the PRI ring can still reach the rest of the GPU. By looking at a few key values, we can tell glitch outcomes apart. Importantly, glitch patterns and outcomes are very much die-specific, so consider these example waveforms and responses to be just that, examples. Let’s take a look at 3 interesting glitch states.</p>
+<h4 id="1-all-fuses-sensed-as-zero">1. All fuses sensed as zero</h4>
+<figure id="ga100-all-zero-wave"><p><span>Commanded PWMVID duty · 59.58% / 0.8333%</span><span>Expected NVVDD · simulated</span></p><p tabindex="0" aria-label="Scroll horizontally for the complete plot"><svg viewBox="0 0 720 185" role="img" aria-labelledby="ga100-all-zero-wave-title ga100-all-zero-wave-desc"><title id="ga100-all-zero-wave-title">Issued duty and modeled NVVDD</title><desc id="ga100-all-zero-wave-desc">The orange series is commanded PWMVID duty after the MCU ADC's NVVDD 225 mV boot trigger at t=0, then a marked gap to 200–1015 ms. Pulse intervals: 210.000–1010.000 ms. The teal series is simulated NVVDD, with a modeled boot rise through 225 mV and slew-limited responses to the commanded pulses. It is not a same-run voltage capture. This attempt had 668/672 zero option reads; the section's 669/672 example is a different capture.</desc><text x="8" y="17">t=0</text><line x1="33.50" x2="33.50" y1="23" y2="153"></line><circle cx="33.50" cy="133.75" r="3"></circle><line x1="33.50" x2="110" y1="35" y2="35"></line><path d="M 123 26 l -8 18 M 137 26 l -8 18 M 123 109 l -8 18 M 137 109 l -8 18"></path><text x="8" y="166">NVVDD ≥225 mV</text><text x="8" y="179">MCU ADC trigger</text><path d="M 160 35 L 166.50 35 L 166.50 65 L 686.75 65 L 686.75 35 L 690 35"></path><rect x="166.50" y="23" width="520.25" height="51"><title>Pulse 1: 210.000–1010.000 ms, 800 ms duration</title></rect><path d="M 8.00 149.90 L 12.25 146.93 L 16.50 144.75 L 20.75 141.75 L 25.00 138.83 L 29.25 136.29 L 33.50 133.75 L 33.50 133.75 L 37.75 130.96 L 42.00 128.14 L 46.25 125.21 L 50.50 122.63 L 54.75 120.51 L 59.00 117.29 L 63.25 114.82 L 67.50 112.06 L 71.75 109.44 L 76.00 106.79 L 80.25 104.06 L 84.50 101.14 L 88.75 98.13 L 93.00 95.84 L 97.25 93.14 L 101.50 90.22 L 105.75 87.91 L 110.00 85.18"></path><path d="M 160.00 85.74 L 162.94 84.92 L 165.89 84.49 L 166.43 84.53 L 166.45 84.57 L 166.48 85.27 L 166.49 85.78 L 166.50 84.78 L 166.52 96.22 L 166.53 107.08 L 166.55 128.28 L 166.56 128.59 L 166.58 128.57 L 168.83 128.88 L 171.78 128.07 L 174.72 128.87 L 177.67 128.70 L 180.61 128.41 L 183.56 128.38 L 186.50 128.10 L 189.44 128.60 L 192.39 128.13 L 195.33 128.64 L 198.28 128.55 L 201.22 128.73 L 204.17 128.37 L 207.11 128.65 L 210.06 128.86 L 213.00 128.73 L 215.94 128.18 L 218.89 128.50 L 221.83 128.34 L 224.78 128.84 L 227.72 128.31 L 230.67 128.21 L 233.61 128.89 L 236.56 128.36 L 239.50 128.82 L 242.44 128.06 L 245.39 128.63 L 248.33 128.67 L 251.28 128.37 L 254.22 128.04 L 257.17 128.16 L 260.11 128.98 L 263.06 128.16 L 266.00 128.62 L 268.94 128.02 L 271.89 128.81 L 274.83 127.99 L 277.78 128.50 L 280.72 128.48 L 283.67 128.07 L 286.61 128.89 L 289.56 128.96 L 292.50 128.15 L 295.44 128.89 L 298.39 128.53 L 301.33 128.25 L 304.28 128.55 L 307.22 128.54 L 310.17 128.56 L 313.11 128.67 L 316.06 127.99 L 319.00 128.57 L 321.94 128.58 L 324.89 128.59 L 327.83 128.62 L 330.78 128.30 L 333.72 128.33 L 336.67 128.26 L 339.61 128.54 L 342.56 128.85 L 345.50 128.64 L 348.44 128.50 L 351.39 128.52 L 354.33 128.98 L 357.28 128.96 L 360.22 128.41 L 363.17 128.24 L 366.11 128.17 L 369.06 128.94 L 372.00 128.57 L 374.94 128.93 L 377.89 128.74 L 380.83 128.34 L 383.78 128.01 L 386.72 128.43 L 389.67 128.18 L 392.61 128.42 L 395.56 128.49 L 398.50 128.48 L 401.44 128.12 L 404.39 128.45 L 407.33 128.55 L 410.28 128.78 L 413.22 128.36 L 416.17 128.11 L 419.11 128.68 L 422.06 128.25 L 425.00 128.00 L 427.94 128.62 L 430.89 128.37 L 433.83 128.28 L 436.78 128.46 L 439.72 128.28 L 442.67 128.45 L 445.61 128.71 L 448.56 128.79 L 451.50 128.90 L 454.44 128.00 L 457.39 128.10 L 460.33 128.97 L 463.28 128.65 L 466.22 128.71 L 469.17 129.00 L 472.11 128.76 L 475.06 128.13 L 478.00 128.81 L 480.94 128.29 L 483.89 127.99 L 486.83 128.16 L 489.78 128.22 L 492.72 128.64 L 495.67 128.19 L 498.61 128.47 L 501.56 128.47 L 504.50 128.71 L 507.44 128.68 L 510.39 128.87 L 513.33 128.35 L 516.28 128.21 L 519.22 128.24 L 522.17 128.75 L 525.11 128.14 L 528.06 128.34 L 531.00 128.73 L 533.94 128.84 L 536.89 128.72 L 539.83 128.12 L 542.78 128.49 L 545.72 128.14 L 548.67 128.39 L 551.61 128.35 L 554.56 128.16 L 557.50 128.65 L 560.44 128.87 L 563.39 128.34 L 566.33 128.92 L 569.28 128.34 L 572.22 128.06 L 575.17 128.42 L 578.11 128.74 L 581.06 128.46 L 584.00 128.26 L 586.94 128.97 L 589.89 128.14 L 592.83 128.28 L 595.78 128.52 L 598.72 128.52 L 601.67 128.10 L 604.61 128.32 L 607.56 128.63 L 610.50 128.06 L 613.44 128.10 L 616.39 128.29 L 619.33 128.77 L 622.28 128.01 L 625.22 128.62 L 628.17 128.82 L 631.11 128.07 L 634.06 128.25 L 637.00 128.93 L 639.94 128.43 L 642.89 128.97 L 645.83 128.13 L 648.78 128.85 L 651.72 128.57 L 654.67 128.47 L 657.61 128.77 L 660.56 128.97 L 663.50 128.71 L 666.44 128.22 L 669.39 128.67 L 672.33 128.62 L 675.28 128.21 L 678.22 128.08 L 681.17 128.76 L 684.11 128.18 L 686.67 128.47 L 686.70 128.68 L 686.72 128.97 L 686.74 128.29 L 686.75 128.06 L 686.76 115.66 L 686.77 103.15 L 686.79 85.53 L 686.80 84.32 L 686.83 85.56 L 687.06 85.54 L 690.00 85.14"></path><text x="688" y="80" text-anchor="end">900 mV</text><text x="688" y="124.49" text-anchor="end">297.8 mV</text></svg></p><p>ms after t=0; left gap omits 0–200 ms</p></figure>
+<p>Some glitches make almost every published option word read as zero. In one captured state, 669 of 672 named option reads were zero; the other three were error responses. The controller’s CRC status was <code>0x00</code> (not parsed yet), the PCIe ID read as <code>2080</code> (the base GA100 PCIe product ID, does not correspond to a real retail product), and the GPU’s PRI ring was held in reset.</p>
+<p>This state is consistent with a catastrophic failure on behalf of the fuse controller. The card comes up basically unusable, because almost all boot functions are disrupted by the all-zero state. However, interesting enough, the card trains at PCIe Gen4 natively! Some slightly altered variants may showcase sections of fuses being successfully latched, or containing garbled values instead of all-zeroes. I was not able to push any of these states towards an FF burn; in almost all of them the fuse controller is unreachable or dysfunctional.</p>
+<h4 id="2-rir-read-disrupted">2. RIR read disrupted</h4>
+<figure id="ga100-rir-sense-wave"><p><span>Commanded PWMVID duty · 59.58% / 0.8333%</span><span>Expected NVVDD · simulated</span></p><p tabindex="0" aria-label="Scroll horizontally for the complete plot"><svg viewBox="0 0 720 185" role="img" aria-labelledby="ga100-rir-sense-wave-title ga100-rir-sense-wave-desc"><title id="ga100-rir-sense-wave-title">Issued duty and modeled NVVDD</title><desc id="ga100-rir-sense-wave-desc">The orange series is commanded PWMVID duty after the MCU ADC's NVVDD 225 mV boot trigger at t=0, then a marked gap to 977–1008 ms. Pulse intervals: 980.000–1005.000 ms. The teal series is simulated NVVDD, with a modeled boot rise through 225 mV and slew-limited responses to the commanded pulses. It is not a same-run voltage capture. The row-18-only readback recurred on a second boot; RIR involvement is a hypothesis.</desc><text x="8" y="17">t=0</text><line x1="33.50" x2="33.50" y1="23" y2="153"></line><circle cx="33.50" cy="133.75" r="3"></circle><line x1="33.50" x2="110" y1="35" y2="35"></line><path d="M 123 26 l -8 18 M 137 26 l -8 18 M 123 109 l -8 18 M 137 109 l -8 18"></path><text x="8" y="166">NVVDD ≥225 mV</text><text x="8" y="179">MCU ADC trigger</text><path d="M 160 35 L 211.29 35 L 211.29 65 L 638.71 65 L 638.71 35 L 690 35"></path><rect x="211.29" y="23" width="427.42" height="51"><title>Pulse 1: 980.000–1005.000 ms, 25 ms duration</title></rect><path d="M 8.00 149.87 L 12.25 147.46 L 16.50 144.37 L 20.75 141.90 L 25.00 139.13 L 29.25 136.89 L 33.50 133.75 L 33.50 133.75 L 37.75 131.19 L 42.00 128.02 L 46.25 125.99 L 50.50 122.63 L 54.75 120.53 L 59.00 117.77 L 63.25 114.53 L 67.50 111.99 L 71.75 109.48 L 76.00 106.57 L 80.25 104.03 L 84.50 101.19 L 88.75 98.94 L 93.00 95.83 L 97.25 92.80 L 101.50 90.32 L 105.75 87.72 L 110.00 85.00"></path><path d="M 160.00 84.74 L 162.94 84.99 L 165.89 84.47 L 168.83 85.44 L 171.78 84.71 L 174.72 85.35 L 177.67 84.90 L 180.61 85.59 L 183.56 85.16 L 186.50 84.23 L 189.44 85.32 L 192.39 84.16 L 195.33 85.86 L 198.28 84.27 L 201.22 85.60 L 204.17 84.49 L 207.11 84.67 L 209.24 84.61 L 209.92 84.50 L 210.06 84.45 L 210.61 85.75 L 210.95 85.63 L 211.29 84.46 L 211.63 96.18 L 211.97 108.26 L 212.60 128.78 L 212.66 128.49 L 213.00 128.48 L 213.34 128.90 L 215.94 128.29 L 218.89 128.72 L 221.83 128.60 L 224.78 128.31 L 227.72 128.72 L 230.67 128.29 L 233.61 128.54 L 236.56 128.60 L 239.50 128.68 L 242.44 128.95 L 245.39 128.48 L 248.33 128.47 L 251.28 128.22 L 254.22 128.79 L 257.17 128.05 L 260.11 128.38 L 263.06 128.26 L 266.00 128.39 L 268.94 128.25 L 271.89 128.72 L 274.83 128.21 L 277.78 128.25 L 280.72 128.10 L 283.67 128.78 L 286.61 128.03 L 289.56 128.21 L 292.50 128.93 L 295.44 128.07 L 298.39 128.24 L 301.33 128.17 L 304.28 128.34 L 307.22 128.71 L 310.17 128.85 L 313.11 128.21 L 316.06 128.75 L 319.00 128.82 L 321.94 128.92 L 324.89 128.66 L 327.83 128.65 L 330.78 128.77 L 333.72 128.86 L 336.67 128.93 L 339.61 128.93 L 342.56 128.59 L 345.50 128.93 L 348.44 128.72 L 351.39 128.63 L 354.33 128.60 L 357.28 128.09 L 360.22 128.78 L 363.17 128.61 L 366.11 128.35 L 369.06 128.11 L 372.00 128.26 L 374.94 128.61 L 377.89 128.68 L 380.83 128.29 L 383.78 128.27 L 386.72 128.59 L 389.67 128.62 L 392.61 128.34 L 395.56 128.53 L 398.50 128.79 L 401.44 128.52 L 404.39 128.42 L 407.33 128.21 L 410.28 128.84 L 413.22 128.85 L 416.17 128.04 L 419.11 128.24 L 422.06 128.07 L 425.00 128.51 L 427.94 128.83 L 430.89 128.68 L 433.83 128.26 L 436.78 128.07 L 439.72 128.30 L 442.67 128.93 L 445.61 128.50 L 448.56 128.29 L 451.50 128.01 L 454.44 128.63 L 457.39 128.80 L 460.33 128.33 L 463.28 128.28 L 466.22 128.68 L 469.17 128.72 L 472.11 128.90 L 475.06 128.52 L 478.00 128.44 L 480.94 128.25 L 483.89 128.89 L 486.83 128.84 L 489.78 128.54 L 492.72 128.05 L 495.67 128.80 L 498.61 128.74 L 501.56 128.43 L 504.50 128.75 L 507.44 128.04 L 510.39 128.42 L 513.33 128.06 L 516.28 128.05 L 519.22 128.92 L 522.17 128.12 L 525.11 128.40 L 528.06 128.71 L 531.00 128.33 L 533.94 128.28 L 536.89 128.60 L 539.83 128.99 L 542.78 128.43 L 545.72 128.70 L 548.67 128.66 L 551.61 128.08 L 554.56 128.43 L 557.50 128.71 L 560.44 128.17 L 563.39 128.18 L 566.33 128.95 L 569.28 128.28 L 572.22 128.35 L 575.17 128.67 L 578.11 128.68 L 581.06 128.06 L 584.00 128.61 L 586.94 128.37 L 589.89 128.80 L 592.83 128.06 L 595.78 128.68 L 598.72 128.89 L 601.67 128.90 L 604.61 128.66 L 607.56 128.80 L 610.50 128.20 L 613.44 128.76 L 616.39 128.32 L 619.33 128.69 L 622.28 128.59 L 625.22 128.54 L 628.17 128.92 L 631.11 128.53 L 634.06 128.02 L 636.66 128.93 L 637.00 128.62 L 637.34 128.08 L 638.03 128.34 L 638.37 128.90 L 638.71 128.46 L 639.05 116.38 L 639.39 103.89 L 639.91 84.97 L 639.94 85.51 L 640.08 85.84 L 640.76 84.65 L 642.89 85.50 L 645.83 85.71 L 648.78 85.07 L 651.72 84.18 L 654.67 85.27 L 657.61 85.25 L 660.56 84.85 L 663.50 84.55 L 666.44 85.74 L 669.39 85.31 L 672.33 84.75 L 675.28 85.60 L 678.22 85.82 L 681.17 84.19 L 684.11 85.50 L 687.06 85.52 L 690.00 85.13"></path><text x="688" y="80" text-anchor="end">900 mV</text><text x="688" y="124.49" text-anchor="end">297.8 mV</text></svg></p><p>ms after t=0; left gap omits 0–977 ms</p></figure>
+<p>Reading the RIR data on the CMP 170HX 8GB reveals its exact effect: 15 noop repair instructions, and one write that changes the value of a fuse in row 18, whose option word we can monitor. Further, because the RIR sense is consumed internally by the fuse macro instead of directly by the fuse controller, we can observe a disrupted RIR latch by attempting to read the raw row - the observed bitflip remains consistent across the flipped option word as well as the raw fuse row. This sets an interesting chronological checkpoint in investigating die boot (RIR sense must happen prior to other fuse sensing), but is not a useful glitch in itself.</p>
+<h4 id="3-goldilocks-glitch">3. Goldilock’s glitch</h4>
+<figure id="ga100-goldilocks-wave"><p><span>Commanded PWMVID duty · 59.58% / 0.8333%</span><span>Expected NVVDD · simulated</span></p><p tabindex="0" aria-label="Scroll horizontally for the complete plot"><svg viewBox="0 0 720 185" role="img" aria-labelledby="ga100-goldilocks-wave-title ga100-goldilocks-wave-desc"><title id="ga100-goldilocks-wave-title">Issued duty and modeled NVVDD</title><desc id="ga100-goldilocks-wave-desc">The orange series is commanded PWMVID duty after the MCU ADC's NVVDD 225 mV boot trigger at t=0, then a marked gap to 978–992 ms. Pulse intervals: 979.940–981.940 ms, 983.940–985.940 ms, 987.940–989.940 ms. The teal series is simulated NVVDD, with a modeled boot rise through 225 mV and slew-limited responses to the commanded pulses. It is not a same-run voltage capture. </desc><text x="8" y="17">t=0</text><line x1="33.50" x2="33.50" y1="23" y2="153"></line><circle cx="33.50" cy="133.75" r="3"></circle><line x1="33.50" x2="110" y1="35" y2="35"></line><path d="M 123 26 l -8 18 M 137 26 l -8 18 M 123 109 l -8 18 M 137 109 l -8 18"></path><text x="8" y="166">NVVDD ≥225 mV</text><text x="8" y="179">MCU ADC trigger</text><path d="M 160 35 L 233.44 35 L 233.44 65 L 309.16 65 L 309.16 35 L 384.87 35 L 384.87 65 L 460.59 65 L 460.59 35 L 536.30 35 L 536.30 65 L 612.01 65 L 612.01 35 L 690 35"></path><rect x="233.44" y="23" width="75.71" height="51"><title>Pulse 1: 979.940–981.940 ms, 2 ms duration</title></rect><rect x="384.87" y="23" width="75.71" height="51"><title>Pulse 2: 983.940–985.940 ms, 2 ms duration</title></rect><rect x="536.30" y="23" width="75.71" height="51"><title>Pulse 3: 987.940–989.940 ms, 2 ms duration</title></rect><path d="M 8.00 150.00 L 12.25 147.16 L 16.50 144.19 L 20.75 142.20 L 25.00 139.38 L 29.25 136.52 L 33.50 133.75 L 33.50 133.75 L 37.75 131.32 L 42.00 128.77 L 46.25 125.74 L 50.50 122.62 L 54.75 119.96 L 59.00 117.30 L 63.25 115.05 L 67.50 112.06 L 71.75 109.30 L 76.00 106.27 L 80.25 103.67 L 84.50 101.19 L 88.75 98.32 L 93.00 95.82 L 97.25 93.55 L 101.50 90.25 L 105.75 88.14 L 110.00 85.29"></path><path d="M 160.00 84.81 L 162.94 84.46 L 165.89 85.07 L 168.83 85.81 L 171.78 85.16 L 174.72 84.68 L 177.67 85.02 L 180.61 85.78 L 183.56 85.52 L 186.50 85.36 L 189.44 85.58 L 192.39 84.42 L 195.33 85.79 L 198.28 85.20 L 201.22 85.33 L 204.17 84.47 L 207.11 85.69 L 210.06 84.44 L 213.00 85.77 L 215.94 85.35 L 218.89 84.43 L 221.83 85.07 L 224.78 84.38 L 227.72 85.58 L 228.90 84.60 L 230.41 84.97 L 230.67 85.73 L 231.93 84.20 L 232.69 84.30 L 233.44 84.80 L 233.61 87.86 L 234.20 96.99 L 234.96 107.50 L 236.34 128.60 L 236.47 128.16 L 236.56 128.38 L 237.99 128.10 L 239.50 128.56 L 242.44 128.32 L 245.39 128.31 L 248.33 128.62 L 251.28 128.70 L 254.22 128.54 L 257.17 128.66 L 260.11 128.02 L 263.06 128.34 L 266.00 128.92 L 268.94 128.57 L 271.89 128.89 L 274.83 129.00 L 277.78 128.27 L 280.72 128.00 L 283.67 128.75 L 286.61 128.67 L 289.56 128.96 L 292.50 128.38 L 295.44 128.42 L 298.39 128.85 L 301.33 128.56 L 304.28 128.22 L 304.61 128.63 L 306.13 128.08 L 307.22 128.04 L 307.64 128.35 L 308.40 128.63 L 309.16 128.62 L 309.91 116.02 L 310.17 112.55 L 310.67 103.92 L 311.81 84.44 L 312.19 84.99 L 313.11 84.93 L 313.70 85.83 L 316.06 84.23 L 319.00 85.34 L 321.94 84.63 L 324.89 84.76 L 327.83 84.33 L 330.78 85.62 L 333.72 85.44 L 336.67 84.15 L 339.61 85.22 L 342.56 84.50 L 345.50 84.72 L 348.44 84.78 L 351.39 85.11 L 354.33 85.63 L 357.28 84.92 L 360.22 85.24 L 363.17 85.79 L 366.11 85.45 L 369.06 84.71 L 372.00 85.66 L 374.94 85.75 L 377.89 84.28 L 380.33 85.37 L 380.83 84.85 L 381.84 84.54 L 383.36 85.74 L 383.78 84.61 L 384.11 85.59 L 384.87 84.59 L 385.63 96.57 L 386.39 107.81 L 386.72 112.45 L 387.77 128.24 L 387.90 128.75 L 389.41 128.61 L 389.67 128.12 L 392.61 128.03 L 395.56 128.16 L 398.50 128.31 L 401.44 128.68 L 404.39 128.96 L 407.33 128.58 L 410.28 128.58 L 413.22 128.83 L 416.17 128.52 L 419.11 128.38 L 422.06 128.86 L 425.00 128.12 L 427.94 128.47 L 430.89 128.19 L 433.83 128.11 L 436.78 128.93 L 439.72 128.22 L 442.67 128.64 L 445.61 128.04 L 448.56 128.27 L 451.50 128.20 L 454.44 128.58 L 456.04 128.86 L 457.39 128.52 L 457.56 128.13 L 459.07 128.62 L 459.83 128.78 L 460.33 128.63 L 460.59 128.06 L 461.34 116.63 L 462.10 103.23 L 463.24 85.50 L 463.28 84.69 L 463.61 85.80 L 465.13 85.28 L 466.22 85.51 L 469.17 85.53 L 472.11 85.34 L 475.06 85.05 L 478.00 84.35 L 480.94 84.28 L 483.89 85.31 L 486.83 84.28 L 489.78 85.79 L 492.72 85.50 L 495.67 85.19 L 498.61 85.83 L 501.56 84.57 L 504.50 84.92 L 507.44 84.35 L 510.39 84.28 L 513.33 85.17 L 516.28 84.66 L 519.22 85.64 L 522.17 84.35 L 525.11 85.13 L 528.06 85.27 L 531.00 85.86 L 531.76 85.00 L 533.27 84.33 L 533.94 84.60 L 534.79 85.34 L 535.54 85.18 L 536.30 85.18 L 536.89 94.40 L 537.06 95.96 L 537.81 107.77 L 539.20 128.90 L 539.33 128.93 L 539.83 127.99 L 540.84 128.53 L 542.78 128.41 L 545.72 128.85 L 548.67 128.27 L 551.61 128.26 L 554.56 128.00 L 557.50 128.92 L 560.44 128.02 L 563.39 128.75 L 566.33 128.11 L 569.28 128.11 L 572.22 128.85 L 575.17 128.69 L 578.11 128.10 L 581.06 128.92 L 584.00 128.85 L 586.94 128.18 L 589.89 128.09 L 592.83 128.55 L 595.78 128.55 L 598.72 128.45 L 601.67 128.37 L 604.61 128.45 L 607.47 128.82 L 607.56 128.79 L 608.99 128.20 L 610.50 128.25 L 610.50 128.50 L 611.26 128.62 L 612.01 128.90 L 612.77 115.51 L 613.44 104.73 L 613.53 103.68 L 614.67 85.82 L 615.04 85.39 L 616.39 84.19 L 616.56 84.40 L 619.33 84.13 L 622.28 84.67 L 625.22 85.69 L 628.17 84.87 L 631.11 85.64 L 634.06 85.66 L 637.00 85.63 L 639.94 84.71 L 642.89 85.65 L 645.83 84.64 L 648.78 85.19 L 651.72 85.15 L 654.67 84.99 L 657.61 85.19 L 660.56 85.47 L 663.50 84.88 L 666.44 85.31 L 669.39 84.16 L 672.33 84.34 L 675.28 84.77 L 678.22 85.09 L 681.17 85.64 L 684.11 85.03 L 687.06 84.83 L 690.00 84.53"></path><text x="688" y="80" text-anchor="end">900 mV</text><text x="688" y="124.49" text-anchor="end">297.8 mV</text></svg></p><p>ms after t=0; left gap omits 0–978 ms</p></figure>
+<p>The successful three-pulse state on my first card seemed to disrupt precisely the row0/1 based option words, while leaving other fuses and option words intact. In this state, all of the row0/1 derived option words are zero. The initial readbacks look like this:</p>
+<table>
+<thead>
+<tr>
+<th><span>Signal</span></th>
+<th>Initial readback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PCI ID and access</td>
+<td><code>20c2</code>; BAR0 and the PRI ring respond</td>
+</tr>
+<tr>
+<td><code>FUSECTRL</code></td>
+<td><code>0xe0040000</code> (<code>IDLE</code>)</td>
+</tr>
+<tr>
+<td><code>CRC_<wbr>STATUS</code></td>
+<td><code>0x55</code> (both halves parsed without errors)</td>
+</tr>
+<tr>
+<td><code>DISABLE_<wbr>SW_<wbr>OVERRIDE</code></td>
+<td><code>0</code></td>
+</tr>
+<tr>
+<td><code>OPT_<wbr>SECURED_<wbr>BURN_<wbr>FEATURE_<wbr>ENABLE</code></td>
+<td><code>0</code></td>
+</tr>
+<tr>
+<td><code>ENABLE_<wbr>FUSE_<wbr>PROGRAM</code></td>
+<td><code>0</code></td>
+</tr>
+<tr>
+<td>FUSECTRL/FUSEOPT privilege masks</td>
+<td><code>0xffffffff</code> for both</td>
+</tr>
+<tr>
+<td>Raw rows 0 and 1</td>
+<td>Both still <code>0x53557c3d</code>, unchanged from before the glitch</td>
+</tr>
+</tbody>
+</table>
+<p>At this stage, we are still not yet capable of issuing FF writes, because ENABLE_FUSE_PROGRAM=0. I am honestly not sure why ENABLE_FUSE_PROGRAM would <em>ever</em> be zero, given it’s 1 in retail boards, so this almost reads to me like a way to implement a glitch-detection canary (or at least it would be elegant to do so).</p>
+<p>Fuse sensing happens one row at a time, with all 32 fuses powered for sensing with one line, meaning it is much more challenging for an attacker to make a single fuse appear as cleared or set. It would make sense, then, to include a “canary” fuse that disables security-critical features (like fuse burning) when it is cleared, because usually the attacker can only manipulate fuse sensing at the row granularity at most. So, when the row0/1 option words come up as all cleared, ENABLE_FUSE_PROGRAM=0 stops us from burning any fuses.</p>
+<p>However, take a look at what we have in this state: DISABLE_SW_OVERRIDE=0. This word is normally 1, and it stops us from setting the EN_SW_OVERRIDE register to 1, which then lets us “shadow” most of the option words exposed by the fuse controller. Doing so involves writing to a register CTRL_OPT_*, corresponding to option word OPT_*, which then determines the effective value STATUS_OPT_*. This is what lets us shadow SBFE to be 0. But, even though we have DSOV=0, ENABLE_FUSE_PROGRAM turns out to be one of the option words that are impossible to shadow, even with DSOV=0. So it seems we’re stuck.</p>
+<p>At least that’s what I thought, and I banged my head against the wall in this state for a while. Then I noticed that there is one fuse controller command I haven’t tried issuing yet: SENSE_CTRL. I had refrained from issuing this, because on the face of it it seems like all of the row0/1 (control fuse) derived option words would match their fused values, which would reset SBFE, turn off software option word shadowing, and leave us unable to fuse. To my surprise, when I issued this command, all of the control-fuse-derived options went to their fused value, <em>except</em> DISABLE_SW_OVERRIDE, which remained 0!</p>
+<p>With DSOV=0, we can trivially set SBFE to 0, ENABLE_FUSE_PROGRAM is 1 because it matches its fused value, and we are off to the races! One wrinkle remains in that FUSEWDATA may have a locked down PLM, but with DSOV=0, we can just write 0 to OPT_SECURE_FUSE_WDATA_WR_SECURE to set the PLM to be all-ones, opening host access for fusing.</p>
+<p>At this point, all that’s left to do is to calculate _DISABLE words that match the _DEFECTIVE values for the features we are interested in, and issue FF burns. Note that the occupied FF space and defective bits differ per die, so each burn must be die-tailored.</p>
+<h2 id="end-results">End results</h2>
+<h3 id="framebuffer-unlock">Framebuffer unlock</h3>
+<p>On 8 GB cards with 80 GB intact (seems to be around ~90% of 8 GB cards from my limited sample size), the unlock yields the full 80 GB as a usable framebuffer. Multiple synthetic tests (writing pseudorandom words throughout the full framebuffer and reading them back after L2 invalidation) as well as real workloads (such as vLLM and SGLand) are fully functional.
+As mentioned, one of my cards has only 64 GB intact. In this case, the hardware unlock yields no framebuffer advantage.</p>
+<h3 id="compute-unlock">Compute unlock</h3>
+<p>The 170HX is limited to 70 SMs out of the box. In practice, there are almost always &gt;120 SMs non-defective on the die, and the unlock allows using them all. This results in a significant performance uplift, ~1.7x compared to the software-only 170HX unlock, and even an impressive ~1.2x over a retail A100!</p>
+<figure aria-labelledby="ga100-fp16-bars-title" aria-describedby="ga100-fp16-bars-desc">
+  <p><strong id="ga100-fp16-bars-title">FP16 FMA throughput</strong>
+    <span>TFLOP/s</span>
+  </p>
+  <div>
+    <p>software-unlocked CMP 170HX</p>
+    
+    <p>0.69× retail A100</p>
+  </div>
+  <div>
+    <p>retail A100</p>
+    
+    <p>1.00×</p>
+  </div>
+  <div>
+    <p>hardware-unlocked CMP 170HX</p>
+    
+    <p>1.18× retail A100</p>
+  </div>
+  
+  <span id="ga100-fp16-bars-desc">ProjectPhysX OpenCL-Benchmark FP16 half2 FMA: software-unlocked CMP 170HX, 50.129 TFLOP/s; retail A100, 72.488 TFLOP/s; hardware-unlocked CMP 170HX, 85.861 TFLOP/s. Retail A100 is the 1.00 times reference.</span>
+</figure>
+<h3 id="pcie-generation">PCIe generation</h3>
+<p>The only thing that stops <a href="https://github.com/amoghmunikote/cmpunlocker">cmpunlocker</a> from advancing beyond PCIe Gen2 are the FF option words. With relevant bits cleared, Gen3/4 train and are confirmed to be fully functional. When combined with the PCIe decoupling capacitor mod, up to PCIe Gen4 x16 is attainable, matching a retail A100 PCIe variant.</p>
+<h3 id="nvlink">NVLink</h3>
+<p>Zeroing out the OPT_NVLINK_DISABLE word is only one of the required mods for NVLink to actually work. Because the CMP 170HX PCB is missing the U11 IC (which connects PCIe 3.3v to an NVLink bridge pin), a stock board fails to bring up the reference clock generator on attached NVLink bridges. Simply bridging two of the pins on the footprint of U11 resolves this issue, although it removes whatever regulation or protection was provided by U11. Be careful if you’re bridging GPUs powered by different power supplies, as this will connect the +3.3V rails together unless you leave U11 unpopulated on some of your GPUs! The NVLink bridge works fine if you just patch U11 on one of the boards in the pair.</p>
+<p>On the firmware side of NVLink enablement, there is a ROM check that needs to be bypassed with additional host-side commands. I’m sure your clanker can figure it out ;)</p>
+<p>While investigating the NVLink unlock, I also found a few interesting quirks with NVIDIA’s NVLink implementation on the GA100. I will be posting a further blog post on this, so stay tuned!</p>
+<h2 id="future-directions">Future directions</h2>
+<p>With arbitrary fuse burning, we mostly gain feature unlocks. Some security-sensitive options are shipped unblown by default, and burning them may lead to interesting footholds. But what’s more interesting to me are the deeper glitch states where many default-blown security-sensitive fuses sense unblown, enabling routes like debug HS execution, which grant unprecedented access to die internals.</p>
+<h2 id="references">References</h2>
+<ul>
+<li>Jon Pry, <a href="https://www.researchgate.net/publication/408132536_A_Canary_in_the_Crypto_Mine_Defeating_Stack_Protection_in_a_GPU_Secure_Coprocessor">A Canary in the Crypto Mine: Defeating Stack Protection in a GPU Secure Coprocessor</a> (2026).</li>
+<li>Amogh Munikote, <a href="https://github.com/amoghmunikote/cmpunlocker">cmpunlocker</a> (2026).</li>
+<li>Otto Bittner et al., <a href="https://arxiv.org/abs/2108.06131">The Forgotten Threat of Voltage Glitching: A Case Study on Nvidia Tegra X2 SoCs</a> (2021).</li>
+<li>NVIDIA, <a href="https://patents.google.com/patent/US9230678B2/en">US9230678B2: Integrated circuit having an enhanced fuseless fuse structure</a> (2016).</li>
+<li>TSMC, <a href="https://www.scribd.com/document/656604701/DB-TEF07F32X32HD18-PHRM-C180518-120A">TEF07F32X32HD18_PHRM_C180518 electrical fuse datasheet, rev. 120A</a> (2018).</li>
+<li>hexkyz and SciresM, <a href="https://hexkyz.blogspot.com/2021/11/je-ne-sais-quoi-falcons-over-horizon.html">Je Ne Sais Quoi - Falcons over the Horizon</a> (2021).</li>
+<li>TechPowerUp, <a href="https://www.techpowerup.com/gpu-specs/nvidia-ga100.g931">NVIDIA GA100 GPU specifications</a>.</li>
+<li><a href="https://github.com/kate-land/ga100vfi">GA100VFI source repository</a>.</li>
+</ul>
+<hr>
+<section data-footnotes="">
+<ol>
+<li id="user-content-fn-1">
+<p>Anecdotally, out of the 10 specimens of CMP 170HX 8 GB I have examined, only one has shipped with only 64 GB usable, the rest all have a functional framebuffer size of 80 GB. <a href="#user-content-fnref-1" data-footnote-backref="" aria-label="Back to reference 1">↩</a></p>
+</li>
+<li id="user-content-fn-2">
+<p>Although the <em>Canary in the Crypto Mine</em> paper claims a stable 80 GB on the 10 GB SKU, very few, if any, cards in the wild have been able to achieve this, and solid evidence is scarce. It remains plausible that some number of 10 GB SKUs really do come shipped with 80 GB on-board, however the percentage seems very low according to the community. Most “unstable” 80 GB unlocks are explained with a combination of L2 caching and memory aliasing over a true 40 GB framebuffer. <a href="#user-content-fnref-2" data-footnote-backref="" aria-label="Back to reference 2">↩</a></p>
+</li>
+<li id="user-content-fn-3">
+<p>Enabling NVLink further requires a very small hardware mod due to a missing component on the 170HX PCB, I’ll talk more about this later. <a href="#user-content-fnref-3" data-footnote-backref="" aria-label="Back to reference 3">↩</a></p>
+</li>
+<li id="user-content-fn-4">
+<p>Untested. <a href="#user-content-fnref-4" data-footnote-backref="" aria-label="Back to reference 4">↩</a> <a href="#user-content-fnref-4-2" data-footnote-backref="" aria-label="Back to reference 4-2">↩<sup>2</sup></a> <a href="#user-content-fnref-4-3" data-footnote-backref="" aria-label="Back to reference 4-3">↩<sup>3</sup></a></p>
+</li>
+</ol>
+</section>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Greg Kurtzer's Ginux is now a userspace kernel (102 pts)]]></title>
+            <link>https://github.com/gmkurtzer/ginux</link>
+            <guid>50450007</guid>
+            <pubDate>Wed, 11 Nov 2026 05:25:54 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://github.com/gmkurtzer/ginux">https://github.com/gmkurtzer/ginux</a>, See on <a href="https://news.ycombinator.com/item?id=50450007">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div data-hpc="true" containertiming="hpc"><article itemprop="text">
+<p dir="auto"><strong>Ginux is a configurable userspace kernel for isolated Linux compatibility
+instances.</strong> It runs as an ordinary Linux process and places an explicit,
+versioned contract between managed workloads and the host kernel.</p>
+<div dir="auto"><p dir="auto">Important</p><p dir="auto">Ginux began as an independent Rust kernel that booted directly through UEFI
+and ran a Rocky Linux 10 userspace. That research phase is complete. Its
+final source is permanently preserved on the
+<a href="https://github.com/gmkurtzer/ginux/tree/bootable-kernel"><code>bootable-kernel</code></a>
+branch and at the
+<a href="https://github.com/gmkurtzer/ginux/tree/bootable-kernel-final"><code>bootable-kernel-final</code></a>
+tag. Active development now continues here as a userspace kernel.</p>
+</div>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Why the project changed direction</h2><a id="user-content-why-the-project-changed-direction" aria-label="Permalink: Why the project changed direction" href="#why-the-project-changed-direction"></a></p>
+<p dir="auto">The standalone-kernel experiment proved that an AI coding agent, directed by
+an experienced human through architecture, gates, and executable tests, could
+construct a new kernel capable of running meaningful Linux userspace. It also
+made the limits of that result obvious.</p>
+<p dir="auto">Linux is much more than source code. It is a stable interface, a development
+process, a global community, vendor and hardware alignment, and decades of
+compatibility and operational experience. Reimplementing kernel mechanisms
+does not reproduce that ecosystem, and competing with Linux was never the
+goal.</p>
+<p dir="auto">The more useful result is the boundary the experiment exposed. Linux must
+preserve a broad userspace ABI; as Linus Torvalds put it, <strong>“And we simply do
+not break user space.”</strong> The
+<a href="https://docs.kernel.org/process/handling-regressions.html" rel="nofollow">kernel regression documentation</a>
+records that rule. Ginux can sit above Linux and deliberately offer a smaller
+contract to each managed instance. Before a managed syscall has a host effect,
+Ginux decides whether to emulate it, perform a validated mediated operation,
+or deny it.</p>
+<p dir="auto">Put bluntly: <strong>Linux must not break userspace; Ginux is designed to break the
+full Linux ABI guarantee deliberately and selectively.</strong> A instance receives
+only the capabilities and interface behavior its approved workload requires.
+Every departure is intended to be explicit, versioned, reviewable, and tested,
+rather than accidental incompatibility.</p>
+<p dir="auto">This pivot is also a result of the development method. AI made it practical to
+build disposable but executable prototype code, test an architectural idea,
+learn from the running system, and carry the valuable parts into a better
+design. The prototype was evidence, not an obligation to turn every experiment
+into a product.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">What Ginux is now</h2><a id="user-content-what-ginux-is-now" aria-label="Permalink: What Ginux is now" href="#what-ginux-is-now"></a></p>
+<div data-snippet-clipboard-copy-content="Host Linux kernel
+  `- host systemd (real PID 1)
+       `- ginux (ordinary trusted host process)
+            `- instance contract
+                 |- virtual processes and identities
+                 |- virtual descriptors and kernel views
+                 |- assigned devices and resources
+                 `- managed Rocky Linux userspace
+                      `- instance systemd (virtual PID 1)"><pre lang="text"><code>Host Linux kernel
+  `- host systemd (real PID 1)
+       `- ginux (ordinary trusted host process)
+            `- instance contract
+                 |- virtual processes and identities
+                 |- virtual descriptors and kernel views
+                 |- assigned devices and resources
+                 `- managed Rocky Linux userspace
+                      `- instance systemd (virtual PID 1)
+</code></pre></div>
+<p dir="auto">Ginux supervises native x86-64 programs and intercepts managed syscalls before
+their host effect. Its central dispatcher resolves the instance contract and
+chooses one of three outcomes:</p>
+<ul dir="auto">
+<li><strong>Emulate:</strong> answer entirely from Ginux-owned state.</li>
+<li><strong>Mediate:</strong> validate and translate the request, then perform a narrow
+Ginux-owned host operation.</li>
+<li><strong>Deny:</strong> return a configured Linux-compatible error or terminate the task.</li>
+</ul>
+<p dir="auto">The current implementation includes:</p>
+<ul dir="auto">
+<li>a security-focused x86-64 interpreter and a balanced native ptrace backend;</li>
+<li>strict, versioned instance configuration and lifecycle;</li>
+<li>a digest-pinned OCI root, immutable filesystem index, and bounded overlay;</li>
+<li>Ginux-owned process, credential, signal, synchronization, timer, and event
+models;</li>
+<li>virtual devices with explicit assignment, ownership, and revocation; and</li>
+<li>bounded virtual <code>/proc</code>, <code>/sys</code>, cgroup v2, mount, namespace, machine, and
+boot-identity views;</li>
+<li>a host-shared network backend that remains syscall-mediated; and</li>
+<li>a pinned Rocky Linux 10 systemd baseline that reaches <code>multi-user.target</code>,
+authenticates a managed console login, updates through Rocky's enabled
+repositories, and shuts the instance down cleanly.</li>
+</ul>
+<p dir="auto">This is a named compatibility baseline, not a claim of complete Linux or
+systemd compatibility. Its exact image, readiness marker, tests, evidence, and
+limitations are recorded in
+<a href="https://github.com/gmkurtzer/ginux/blob/main/hdae/gates-todo/9-systemd-baseline.md"><code>hdae/gates-todo/9-systemd-baseline.md</code></a>.</p>
+<p dir="auto"><h3 tabindex="-1" dir="auto">Agent containment research</h3><a id="user-content-agent-containment-research" aria-label="Permalink: Agent containment research" href="#agent-containment-research"></a></p>
+<p dir="auto">Ginux is also being tested as a containment boundary for AI agents and other
+automated software that can execute commands, modify files, open network
+connections, and start additional processes. Instead of giving an agent the
+host's complete Linux ABI, an operator can place its process tree inside a
+instance whose kernel contract exposes only the operations and virtual resources
+required for the task.</p>
+<p dir="auto">The research goal is a reviewable boundary spanning syscalls, ioctls,
+filesystems, devices, networking, process authority, and virtual <code>/proc</code> and
+<code>/sys</code> state. For example, a contract may allow an agent to read time, inspect
+its own processes, and modify one assigned workspace while denying clock
+changes, host filesystem access, unapproved network listeners, and unrelated
+devices. Ginux can then audit the contract decisions made while the agent and
+its child processes run.</p>
+<p dir="auto">This is an active verification target, not a claim that Ginux is currently a
+production-grade agent sandbox. The contract inventory, configurable policy,
+adversarial tests, performance costs, and escape boundaries are tracked through
+the HDAE gates and must be demonstrated before stronger containment claims are
+made.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Relationship to other systems</h2><a id="user-content-relationship-to-other-systems" aria-label="Permalink: Relationship to other systems" href="#relationship-to-other-systems"></a></p>
+<p dir="auto">The userspace-kernel idea is established research and engineering territory.
+Ginux explores a particular point in that design space:</p>
+<markdown-accessiblity-table><table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Primary boundary</th>
+<th>Difference in emphasis</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux <a href="https://docs.kernel.org/userspace-api/seccomp_filter.html" rel="nofollow">seccomp</a></td>
+<td>Filters host syscalls</td>
+<td>Restricts the existing ABI rather than defining a complete virtual contract</td>
+</tr>
+<tr>
+<td><a href="https://kernel.org/doc/html/latest/virt/uml/user_mode_linux.html" rel="nofollow">User-Mode Linux</a></td>
+<td>Runs Linux as a host process</td>
+<td>Reuses a complete Linux kernel over virtual hardware</td>
+</tr>
+<tr>
+<td><a href="https://gvisor.dev/docs/" rel="nofollow">gVisor</a></td>
+<td>Implements an application kernel in userspace</td>
+<td>Closely related model with different compatibility and performance goals</td>
+</tr>
+<tr>
+<td><a href="https://gramine.readthedocs.io/en/stable/" rel="nofollow">Gramine</a></td>
+<td>Packages applications with a library OS</td>
+<td>Uses manifests and a library-OS boundary</td>
+</tr>
+<tr>
+<td><a href="https://www.usenix.org/legacy/events/osdi06/tech/ta-min.html" rel="nofollow">Proxos</a></td>
+<td>Routes calls between private and commodity OSes</td>
+<td>Makes trust placement configurable across the syscall interface</td>
+</tr>
+<tr>
+<td><strong>Ginux</strong></td>
+<td>Gives each instance a versioned kernel contract</td>
+<td>Treats the declared contract, virtual state, devices, resources, and lifecycle as one reviewable boundary</td>
+</tr>
+</tbody>
+</table></markdown-accessiblity-table>
+<p dir="auto">Ginux does <strong>not</strong> promise the complete Linux ABI. Compatibility claims apply
+only to named contracts, workloads, and executable evidence.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Development and testing</h2><a id="user-content-development-and-testing" aria-label="Permalink: Development and testing" href="#development-and-testing"></a></p>
+<p dir="auto">The reference development environment is macOS arm64. QEMU TCG boots a pinned
+Rocky Linux 10 x86-64 host where Ginux runs as an ordinary unprivileged
+process. The host systemd remains real PID 1.</p>
+<p dir="auto">Check prerequisites:</p>
+
+<p dir="auto">Prepare the pinned assets with explicit network operations:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="make host-image-fetch
+make image-helper-fetch
+make instance-image-fetch
+make systemd-image-fetch"><pre>make host-image-fetch
+make image-helper-fetch
+make instance-image-fetch
+make systemd-image-fetch</pre></div>
+<p dir="auto">Build and run the deterministic suite offline after the caches are populated:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="make build
+make check
+make test"><pre>make build
+make check
+make <span>test</span></pre></div>
+<p dir="auto">Inspect the latest completed capability directly:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="make test-systemd       # cached image, external networking disabled
+make bench-prepare      # one-time networked setup for the pinned benchmark image
+make bench              # matched native/Ginux matrix plus mandatory budget checks
+make bench-modes-prepare # one-time setup for the three-way dispatch comparison
+make bench-modes        # native/selective/paranoid tables and graphs
+make demo-gate-15       # bounded reproducible three-way comparison
+make test-systemd-live  # shared network plus real upstream dnf -y update
+make host-run           # general interactive Rocky host with Ginux installed
+make host-reset         # discard that host's cache, instances, and writable state
+make demo-gate-9        # Gate 9 checkpoint through the same host workflow"><pre>make test-systemd       <span><span>#</span> cached image, external networking disabled</span>
+make bench-prepare      <span><span>#</span> one-time networked setup for the pinned benchmark image</span>
+make bench              <span><span>#</span> matched native/Ginux matrix plus mandatory budget checks</span>
+make bench-modes-prepare <span><span>#</span> one-time setup for the three-way dispatch comparison</span>
+make bench-modes        <span><span>#</span> native/selective/paranoid tables and graphs</span>
+make demo-gate-15       <span><span>#</span> bounded reproducible three-way comparison</span>
+make test-systemd-live  <span><span>#</span> shared network plus real upstream dnf -y update</span>
+make host-run           <span><span>#</span> general interactive Rocky host with Ginux installed</span>
+make host-reset         <span><span>#</span> discard that host's cache, instances, and writable state</span>
+make demo-gate-9        <span><span>#</span> Gate 9 checkpoint through the same host workflow</span></pre></div>
+<p dir="auto">Instance recipes select syscall control under <code>[contract.syscalls]</code>:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="[contract.syscalls]
+control = &quot;selective&quot; # default; use &quot;paranoid&quot; for all-syscall mediation
+default = &quot;deny&quot;
+allow = [&quot;*&quot;]
+deny = []"><pre>[<span>contract</span>.<span>syscalls</span>]
+<span>control</span> = <span><span>"</span>selective<span>"</span></span> <span><span>#</span> default; use "paranoid" for all-syscall mediation</span>
+<span>default</span> = <span><span>"</span>deny<span>"</span></span>
+<span>allow</span> = [<span><span>"</span>*<span>"</span></span>]
+<span>deny</span> = []</pre></div>
+<p dir="auto"><code>selective</code> is the default and permits direct host execution only
+when the instance contract allows the operation and Ginux's versioned catalog
+independently classifies it as direct-safe. Denials, virtual state, inspection,
+translation, emulation, pointer or descriptor validation, and modified results
+remain Ginux-dispatched in both modes. <code>paranoid</code> is an explicit opt-in that
+sends every syscall through the Ginux userspace dispatcher before completion.</p>
+<p dir="auto"><code>make bench-compare</code> checks every row against the 4% native budget and, after an
+accepted baseline is published under <code>benchmarks/gate11/</code>, against that Ginux
+baseline as well. Environment mismatches are reported separately from
+performance regressions. <code>make demo-gate-11</code> runs a bounded human-inspectable
+comparison and returns nonzero when a mandatory row misses its budget.</p>
+<p dir="auto">Gate 15 provides a separate characterization workflow across native Rocky,
+selective Ginux, and paranoid Ginux. Native is the no-mediation control, not a
+Ginux instance mode. The checked-in templates under
+<a href="https://github.com/gmkurtzer/ginux/blob/main/benchmarks/gate15"><code>benchmarks/gate15/</code></a> fix the complete test protocol and
+may be copied without editing scripts. <code>make bench-modes</code> produces paired raw
+samples, metadata, a Markdown table, and an SVG graph under <code>build/gate15/</code>.
+See <a href="https://github.com/gmkurtzer/ginux/blob/main/docs/performance.md">Reproducible performance measurement</a> for the exact
+protocol, customization workflow, output schema, and interpretation limits.</p>
+<p dir="auto"><code>make host-run</code> boots the QEMU Rocky host and logs you into its ordinary shell.
+Ginux is installed in <code>PATH</code>. The first <code>create</code> or <code>import</code> downloads and verifies
+the pinned Rocky OCI image with live per-layer progress; later operations reuse the
+cache. The writable Rocky host overlay persists across <code>make host-run</code>, ordinary
+cleanup, builds, and tests, so cached images, instance definitions, roots, and
+stopped status remain available. <code>make host-reset</code> is the explicit destructive
+operation that stops the host and removes that overlay; the next <code>make host-run</code>
+starts from the pinned clean Rocky image.
+A complete first session is:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="ginux create rocky
+ginux list
+ginux status rocky
+ginux start rocky --attach"><pre>ginux create rocky
+ginux list
+ginux status rocky
+ginux start rocky --attach</pre></div>
+<p dir="auto"><code>create</code> starts from the documented default recipe. Use
+<code>ginux import NAME FILE</code> to create or atomically replace an instance from a
+self-contained recipe, <code>ginux export NAME</code> to print that recipe, and
+<code>ginux edit NAME</code> to validate and atomically apply an editor session.</p>
+<p dir="auto">Instances are contract-locked by default. For an explicit maintenance window,
+stop the instance, run <code>ginux unlock NAME</code>, perform the required maintenance,
+stop it again, and run <code>ginux lock NAME</code>. <code>ginux list</code> and <code>ginux status NAME</code>
+show the current state, and starting an unlocked instance prints a warning.
+Unlocking relaxes configurable recipe restrictions only; Ginux still owns the
+virtual kernel boundary, rejects unsupported authority, reduces host identity,
+and applies <code>NoNewPrivs</code>. Lock state is host deployment state and is never
+written into an exported portable recipe.</p>
+<p dir="auto">Syscall auditing is disabled by default with <code>[audit] enabled = false</code>. Add
+<code>--audit</code> to <code>ginux start</code> to enable it for that run, or set <code>enabled = true</code>
+to enable it for every start. Enabled audit records always go to the instance's
+<code>audit.log</code>; they are kept separate from the attached console.
+Existing recipes using <code>mode = "stderr"</code> or <code>mode = "disabled"</code> remain
+read-compatible and normalize to the new boolean form when rewritten.</p>
+<p dir="auto">The instance specification supports typed recipe overrides, ingress and egress
+contract policy, volumes, virtual identity, and ordered pre-boot hooks. Host
+network attachment and translated ports are deployment settings, supplied as
+repeatable flags when the instance is created or changed:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="ginux import web /etc/ginux/examples/rocky-systemd.toml \
+    --network eth0:1 \
+    --forward protocol=tcp,external_port=8080,instance_port=80 \
+    --forward protocol=tcp,external_port=8443,instance_port=443
+ginux set web \
+    --network default \
+    --forward none"><pre>ginux import web /etc/ginux/examples/rocky-systemd.toml \
+    --network eth0:1 \
+    --forward protocol=tcp,external_port=8080,instance_port=80 \
+    --forward protocol=tcp,external_port=8443,instance_port=443
+ginux <span>set</span> web \
+    --network default \
+    --forward none</pre></div>
+<p dir="auto">Omitting <code>--network</code> uses the host's default network. Multiple flags are
+validated and persisted atomically; an invalid combination changes nothing.
+Hooks run only as
+mediated instance processes; Ginux does not support arbitrary host-context hooks.
+See <a href="https://github.com/gmkurtzer/ginux/blob/main/docs/gate-9.75-instance-specification.md">Gate 9.75 instance specification</a>
+for the schema, precedence rules, examples, and verification targets.</p>
+<p dir="auto">The same instance file contains a self-contained hierarchical contract under
+<code>[contract]</code> and its <code>syscalls</code>, <code>filesystem</code>, <code>network</code>, <code>devices</code>,
+<code>privileges</code>, <code>process</code>, and <code>kernel</code> subsections. Syscall names accept bounded
+globs compiled against the pinned catalog; explicit denies always win. The
+contract is part of the instance rather than a separate operator object.
+Validate and inspect the complete instance recipe before launch:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="ginux validate /etc/ginux/examples/rocky-systemd.toml
+ginux inspect /etc/ginux/examples/rocky-systemd.toml
+ginux explain /etc/ginux/examples/rocky-systemd.toml filesystem.path.write"><pre>ginux validate /etc/ginux/examples/rocky-systemd.toml
+ginux inspect /etc/ginux/examples/rocky-systemd.toml
+ginux explain /etc/ginux/examples/rocky-systemd.toml filesystem.path.write</pre></div>
+<p dir="auto">See <a href="https://github.com/gmkurtzer/ginux/blob/main/docs/configurable-contract.md">Self-contained userspace contract</a> for the
+syntax, precedence, migration behavior, and complete CLI workflow.</p>
+<p dir="auto">The attached terminal becomes the Ginux instance console. Log in as <code>root</code> with
+password <code>ginux</code>, explore normally, press <code>Ctrl-]</code> to detach while leaving the
+instance running, and run <code>kill -RTMIN+4 1</code> as instance root to
+shut down systemd and return to the host. Detached operation uses
+<code>ginux start rocky</code>, <code>ginux status rocky</code>, and
+<code>ginux stop rocky</code>. Exit the Rocky host shell to stop QEMU cleanly.
+This stops the VM without deleting its persistent overlay; <code>make clean</code> resets
+that host state. <code>make demo-gate-9</code> uses the same operator workflow;
+<code>make run-systemd</code> remains as a compatibility alias, and
+<code>make test-systemd-interactive</code> is the automated regression.</p>
+<p dir="auto">The live test and interactive demonstration enable shared external networking.
+An upstream DNF update can take many minutes under QEMU TCG because every
+managed syscall is intercepted and audited. The offline systemd test uses only
+the prepared, digest-pinned cache.</p>
+<p dir="auto">Individual component and gate targets are documented in the <code>Makefile</code> and the
+corresponding files under <a href="https://github.com/gmkurtzer/ginux/blob/main/docs"><code>docs/</code></a> and <a href="https://github.com/gmkurtzer/ginux/blob/main/hdae"><code>hdae/</code></a>.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Security model and limitations</h2><a id="user-content-security-model-and-limitations" aria-label="Permalink: Security model and limitations" href="#security-model-and-limitations"></a></p>
+<p dir="auto">The primary adversary controls a process inside an instance. The host kernel,
+hardware, Ginux executable and approved configuration, boot chain, and
+operator are currently trusted. The balanced native backend still relies on
+the host for ELF loading, address spaces, page faults, signals, scheduling,
+and ptrace; those remain host-kernel attack surface.</p>
+<p dir="auto">Ginux is research software. It has not received independent security
+certification, does not provide complete Linux compatibility, and is not ready
+for production workloads. Unknown contract operations fail closed, but current
+coverage and guarantees are limited to the tested gates.</p>
+<p dir="auto">The precise supported claims, retained supervisor authority, trusted
+components, exclusions, compatibility gaps, performance limitation, and
+reproducible boundary tests are documented in
+<a href="https://github.com/gmkurtzer/ginux/blob/main/docs/security-boundary.md">Security boundary and limitations</a>.</p>
+<p dir="auto">For agent containment, the protected object is the host and any authority not
+explicitly assigned to the instance. Ginux constrains the Linux processes in
+which an agent and its tools execute; it does not inspect model reasoning,
+secure an external model provider, or make untrusted code safe outside the
+enforced instance boundary.</p>
+<p dir="auto">The full intent, threat model, invariants, and gate plan live in:</p>
+<ul dir="auto">
+<li><a href="https://github.com/gmkurtzer/ginux/blob/main/hdae/PROJECT.md"><code>hdae/PROJECT.md</code></a></li>
+<li><a href="https://github.com/gmkurtzer/ginux/blob/main/hdae/ARCHITECTURE.md"><code>hdae/ARCHITECTURE.md</code></a></li>
+<li><a href="https://github.com/gmkurtzer/ginux/blob/main/hdae/PLAN.md"><code>hdae/PLAN.md</code></a></li>
+<li><a href="https://github.com/gmkurtzer/ginux/blob/main/hdae/STATUS.md"><code>hdae/STATUS.md</code></a></li>
+</ul>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Development method</h2><a id="user-content-development-method" aria-label="Permalink: Development method" href="#development-method"></a></p>
+<p dir="auto">Ginux is developed with
+<a href="https://github.com/gmkurtzer/hdae">Human-Directed Agentic Engineering (HDAE)</a>:
+human-owned product intent, architecture, constraints, and acceptance
+boundaries combined with agent-executed implementation, diagnosis, and test
+loops. Each approved gate records its scope, non-goals, acceptance criteria,
+verification, evidence, and stopping point in <code>hdae/</code>.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Historical standalone kernel</h2><a id="user-content-historical-standalone-kernel" aria-label="Permalink: Historical standalone kernel" href="#historical-standalone-kernel"></a></p>
+<p dir="auto">The independent bootable kernel remains available for research and historical
+reference:</p>
+<ul dir="auto">
+<li><a href="https://github.com/gmkurtzer/ginux/tree/bootable-kernel">final branch: <code>bootable-kernel</code></a></li>
+<li><a href="https://github.com/gmkurtzer/ginux/tree/bootable-kernel-final">final tag: <code>bootable-kernel-final</code></a></li>
+<li><a href="https://doi.org/10.5281/zenodo.23682548" rel="nofollow">technical report and DOI</a></li>
+</ul>
+<p dir="auto">It is no longer the active development line. The code remains available under
+the repository's existing terms for anyone who independently chooses to study
+or fork it.</p>
+<p dir="auto">The name remains a joke in the same family as Linux: <strong>Ginux</strong> combines Linux,
+GPT, and Greg. To keep the author's ego within its configured resource limit,
+the <code>G</code> officially stands for GPT.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">License</h2><a id="user-content-license" aria-label="Permalink: License" href="#license"></a></p>
+<p dir="auto">Ginux is available under the Apache License 2.0. See <a href="https://github.com/gmkurtzer/ginux/blob/main/LICENSE"><code>LICENSE</code></a> and
+<a href="https://github.com/gmkurtzer/ginux/blob/main/NOTICE"><code>NOTICE</code></a>.</p>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Configured native launch</h2><a id="user-content-configured-native-launch" aria-label="Permalink: Configured native launch" href="#configured-native-launch"></a></p>
+<p dir="auto">On x86-64 Linux, <code>ginux launch &lt;config&gt; &lt;root&gt; [--result-file &lt;fresh host path&gt;]</code>
+executes <code>[instance].init</code> with the configured arguments and environment inside
+the supplied host root directory. The bootstrap requires chroot and credential
+change privileges, and a kernel with <code>close_range</code> (Linux 5.9 or later).
+It drops to UID/GID 1000 before executing the workload. The configuration must
+select <code>profile = "balanced"</code> and <code>backend = "ptrace-native"</code>; storage and device
+assignments are not implemented by this command and are rejected.</p>
+<p dir="auto"><code>[instance].workdir</code> is optional and defaults to <code>/work</code>; <code>/</code> is also supported.
+The bootstrap creates the working directory if its parent exists, then enters
+it after dropping privileges. Init and working-directory paths are limited to
+128 bytes and must be absolute without <code>..</code> path components. Up to seven
+arguments of 128 bytes each and eight <code>NAME=value</code> environment entries of
+256 bytes each are accepted. Invalid or oversized input fails before launch.</p>
+<p dir="auto">Workload stdout stays separate from supervisor diagnostics on stderr. Only
+stdin, stdout, and stderr are inherited by the workload. The launcher returns
+the workload exit code, or <code>128 + signal</code> for signal termination. Startup
+failure returns 2; supervision or result-writing failure returns 1. Native
+fork, clone, and subsequent exec are unsupported; fork returns <code>ENOSYS</code> until
+child supervision is implemented. Non-x86-64 syscall ABIs and job-control
+group stops fail explicitly. Audit output is capped at 64 KiB plus a truncation
+notice. This path does not implement resource quotas from the instance metadata.</p>
+<p dir="auto">When requested, the result file is reserved exclusively before launch, with
+mode 0600 and a maximum path length of 512 bytes. Existing files are never
+overwritten. After completion, it contains one synced JSON object:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="{&quot;version&quot;:1,&quot;outcome&quot;:&quot;exited&quot;,&quot;code&quot;:0,&quot;signal&quot;:null,&quot;generation&quot;:null}"><pre>{<span>"version"</span>:<span>1</span>,<span>"outcome"</span>:<span><span>"</span>exited<span>"</span></span>,<span>"code"</span>:<span>0</span>,<span>"signal"</span>:<span>null</span>,<span>"generation"</span>:<span>null</span>}</pre></div>
+<p dir="auto"><code>outcome</code> is <code>exited</code>, <code>signaled</code>, or <code>supervisor-error</code>; only the relevant
+<code>code</code> or <code>signal</code> is populated. Storage generations are not implemented, so
+<code>generation</code> is null. A missing, empty, or malformed result is a protocol failure.
+A failure to write, sync, or close the result returns 1 even if the workload
+succeeded. Consumers should wait for launcher completion before reading it.</p>
+<p dir="auto">The focused Linux integration scenario consumes existing binaries:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="make build
+make build-launch-fixture
+make build-gate1-fixture
+sudo make test-gate1-setup
+sudo make test-launch
+sudo make test-native-supervision"><pre>make build
+make build-launch-fixture
+make build-gate1-fixture
+sudo make test-gate1-setup
+sudo make test-launch
+sudo make test-native-supervision</pre></div>
+<p dir="auto"><h2 tabindex="-1" dir="auto">Native process scenarios</h2><a id="user-content-native-process-scenarios" aria-label="Permalink: Native process scenarios" href="#native-process-scenarios"></a></p>
+<p dir="auto">The separate <code>process-native &lt;config&gt; &lt;executable&gt;</code> command exercises native
+fork, clone, vfork, exec, threads, waits, termination signals, and pipes. It
+executes a trusted host fixture as the caller, without chroot; it does not
+require root on a host that permits tracing child processes. Configured
+<code>launch</code> remains a separate entry point and does not yet use this process loop.</p>
+<p dir="auto">Process creation returns virtual identities, including clone TID cells.
+Untraced, reparenting, namespace, and unsupported clone flags are denied.
+Thread slots are reclaimed on exit. <code>CLONE_FILES</code> shares one descriptor table;
+ordinary fork copies it, and exec unshares it before closing CLOEXEC entries.
+Worker-thread exec preserves the group's process identity. Inherited host
+files above stderr are closed before execution. PI futex operations and queries
+for another task's robust list are unsupported.</p>
+<p dir="auto">Build the fixtures explicitly, then run their independent scenarios:</p>
+<div dir="auto" data-snippet-clipboard-copy-content="make build build-process-fixtures
+make test-process-native
+make test-process-native SCENARIO=shared_pipe
+make test-process-native SCENARIO=thread_exec"><pre>make build build-process-fixtures
+make test-process-native
+make test-process-native SCENARIO=shared_pipe
+make test-process-native SCENARIO=thread_exec</pre></div>
+<p dir="auto">The scenarios consume existing binaries under <code>.artifacts/process</code>, including
+checks for syscall ABI dispatch, clone restrictions, descriptor inheritance,
+thread reuse, successful and failed worker exec, signals, wait-status writes,
+nonblocking waits, and vfork. The existing native fork fixture also runs. These
+checks do not claim complete libc, job-control, or systemd compatibility.</p>
+</article></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Protecting SSH Keys with macOS Secure Enclave (320 pts)]]></title>
             <link>https://gatezh.com/posts/macos-secure-enclave-ssh-keys/</link>
             <guid>50449748</guid>
             <pubDate>Wed, 11 Nov 2026 04:28:57 GMT</pubDate>
@@ -152,7 +1020,7 @@ p-256-ne A71277F0BC5825A7B3576D014F31282A866EF3BC bio  ssh-MacBook ssh-MacBook  
 </span></span></code></pre></div><p>SSH tries identity files in order, so put the Secure Enclave key first if you want it to be the default.</p><p>⚠️ <strong>Note:</strong> If you’re using 1Password’s SSH agent (<code>IdentityAgent</code>), it might conflict with this setup. I had to comment it out while testing.</p><h3 id="step-7-test-it">Step 7: Test It</h3><p>You should get a Touch ID prompt, then connect.</p><h2 id="the-ugly-touch-id-prompt">The Ugly Touch ID Prompt</h2><figure><img src="https://gatezh.com/cdn-cgi/image/format=auto,width=auto/posts/macos-secure-enclave-ssh-keys/images/Touch%20ID%20prompt.png" alt="Touch ID prompt" loading="lazy"><figcaption>Touch ID prompt</figcaption></figure><p>One thing I’m not thrilled about: the Touch ID dialog says <strong>“ctccardtoken needs to authenticate to continue”</strong> instead of something friendly like “SSH wants to use your key.”</p><p>This is because the prompt comes from CryptoTokenKit — a low-level framework that Apple hasn’t polished for end-user SSH. If this bothers you, <strong>Secretive</strong> provides a much nicer UI while still using Secure Enclave under the hood.</p><h2 id="why-touch-id-for-everything">Why Touch ID for Everything?</h2><p>I initially thought about creating two keys — one with Touch ID for “important” servers, one without for convenience (like Git operations).</p><p>But then I realized: without <code>-t bio</code>, malware could use my key silently. With <code>-t bio</code>, I always know when something is using my SSH key. A few extra taps per day is a small price for that visibility.</p><p>So my recommendation if you’re planning to store your SSH keys this way: just use <code>-t bio</code> for everything. If it ever gets annoying, you can always create a second key later.</p><h2 id="the-catch-no-backups">The Catch: No Backups</h2><p>Secure Enclave keys are tied to your specific Mac. If your Mac dies, the keys die with it.</p><p>That’s by design: the key can’t be exported, so it can’t be backed up either. Keep more than one key instead. Add your Secure Enclave key AND a backup key (from a YubiKey, or another Mac) to your servers’ <code>authorized_keys</code>. If one device is lost, you still have access via the other.</p><h2 id="final-thoughts">Final Thoughts</h2><p>It seems to be a proper way to store your SSH keys securely, and it is way better than storing them on your hard drive.</p><p>With the implementation above you get:</p><ul><li>✅ Private key literally cannot be stolen (it’s in hardware)</li><li>✅ Every SSH operation requires Touch ID (I know when my key is used)</li><li>✅ No third-party apps needed</li><li>✅ Works with existing <code>authorized_keys</code> workflow</li></ul><p>However, I’ve been somewhat surprised by the ugliness of the UI. Not sure why Apple released such an unpolished thing. In each and every presentation they have a section on security (where their Apple logo becomes an Apple lock), so I was expecting an actual aesthetically appealing look for their security features. It is definitely not the case. My sense of beauty is not compatible with this ugliness, so I will be looking into other solutions to store my SSH keys in Secure Enclave such as <a href="https://github.com/maxgoedjen/secretive" target="_blank" rel="noopener noreferrer">Secretive</a>.</p><p>I also still need a backup option in case anything happens to my Mac.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[To deter bioterrorism, U.S. imposes new rules on ordering synthetic DNA (136 pts)]]></title>
+            <title><![CDATA[To deter bioterrorism, U.S. imposes new rules on ordering synthetic DNA (141 pts)]]></title>
             <link>https://www.science.org/content/article/deter-bioterrorism-u-s-imposes-new-rules-ordering-synthetic-dna</link>
             <guid>50449275</guid>
             <pubDate>Wed, 11 Nov 2026 02:57:08 GMT</pubDate>
@@ -160,7 +1028,7 @@ p-256-ne A71277F0BC5825A7B3576D014F31282A866EF3BC bio  ssh-MacBook ssh-MacBook  
 Couldn't get https://www.science.org/content/article/deter-bioterrorism-u-s-imposes-new-rules-ordering-synthetic-dna: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[A great old-timey game-programming hack (2013) (216 pts)]]></title>
+            <title><![CDATA[A great old-timey game-programming hack (2013) (225 pts)]]></title>
             <link>https://blog.moertel.com/posts/2013-12-14-great-old-timey-game-programming-hack.html</link>
             <guid>50448921</guid>
             <pubDate>Wed, 11 Nov 2026 01:56:31 GMT</pubDate>
@@ -696,7 +1564,7 @@ This septet’s address corresponded to the start of the buffer.<a href="#fnref2
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[After 7 months, Glasswing overwelms maintainers with underwhelming findings (432 pts)]]></title>
+            <title><![CDATA[After 7 months, Glasswing overwelms maintainers with underwhelming findings (437 pts)]]></title>
             <link>https://www.vulncheck.com/blog/anthropic-glasswing-november-update</link>
             <guid>50447074</guid>
             <pubDate>Tue, 10 Nov 2026 22:17:56 GMT</pubDate>
@@ -705,7 +1573,7 @@ This septet’s address corresponded to the start of the buffer.<a href="#fnref2
 Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made public and just 217 have been marked fixed.<!--]--></li><li><!--[-->Since September, Anthropic has added nearly 12,000 findings while recording just 15 additional fixes, widening the gap between discovery and remediation.<!--]--></li><li><!--[-->Roughly 1,654 findings (4.4%) have been marked as duplicates, nearly eight times the number fixed, and another 419 have been withdrawn.<!--]--></li><li><!--[-->Anthropic’s claimed true positive rate has risen from 90.8% to 94.2%, raising questions about how it accounts for duplicates and withdrawn findings.<!--]--></li><li><!--[-->Anthropic’s OSS Scanner shifts validation work to maintainers, with curl rejecting 19 of 34 published reports as vulnerabilities, confirming six as low severity and leaving nine awaiting assessment. Also putting Anthropic's true positive rates into question.<!--]--></li><!--]--></ul><p><!--[-->We're seven months into Anthropic's flagship Project Glasswing, and it's time for another update on the results. I've been tracking the project to see whether its claims are overhyped or grounded in reality.<!--]--></p><p><!--[-->As we all recall, Anthropic launched Project Glasswing on April 7th, claiming, "We have identified thousands of additional high- and critical-severity vulnerabilities that we are working on responsibly disclosing to open source maintainers." What surprised me was how little evidence the project offered, which made me wonder whether this was more of an overhyped marketing campaign.<!--]--></p><p><!--[-->That said, we shouldn't overlook that AI is an effective tool for finding vulnerabilities. But that story goes well beyond any single frontier model's capabilities.<!--]--></p><p><!--[-->If you're just catching up, this builds on my earlier posts:<!--]--></p><p><!--[-->So let's look at the results…<!--]--></p><p><!--[-->I started tracking Anthropic's discovered vulnerabilities on April 17th, shortly after launch, in an open source repo called <a href="https://github.com/patrickmgarrity/Anthropic-Credited-CVEs" rel="nofollow"><!--[--><!--[--><!--[-->Anthropic Credited CVEs<!--]--><!--]--><!--]--></a>. The goal was to see whether Anthropic's claims lived up to the hype. This was before Anthropic launched its own <a href="https://red.anthropic.com/2026/cvd/ledger/" rel="nofollow"><!--[--><!--[--><!--[-->disclosure ledger<!--]--><!--]--><!--]--></a>, which is only updated in infrequent bulk batches.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-credited-cves.png" alt="anthropic credited cves" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->My repo tracks every vulnerability attributable to Anthropic using CVE records, GHSAs, Linux kernel commits, and Anthropic's own ledger. I also manually audit advisories to catch CVEs that might otherwise get overlooked.<!--]--></p><p><!--[-->After seven months, I've tracked 442 CVEs attributable to Anthropic. That's an average of just 63 per month. Out of the 93,450 CVEs published this year, that's only about 0.5% of all CVEs.<!--]--></p><p><!--[-->For comparison, Anthropic's own public ledger lists just 217 fixed vulnerabilities, so I've tracked more than twice as many as Anthropic has disclosed itself.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-exploited.png" alt="Anthropic exploited vulnerabilties" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->You may recall that Glasswing launched with the message that we'd entered the Mythos era of vulnerability discovery. But are these vulnerabilities actually useful to attackers? To find out, I've been tracking Anthropic-discovered CVEs against VulnCheck KEV. So far, only 2 of the 442 have been exploited in the wild, just 0.45%. (CVE-2026-61500 and CVE-2026-26980)<!--]--></p><p><!--[-->When Anthropic first launched its ledger in May, it reported 23,019 findings and a 90.8% true positive rate. As of its most recent update on November 2nd, there are 37,966 findings and just 217 fixes. That looks like a staggering failure to me, but let's take a closer look.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-ledger-november-update.png" alt="Anthropic November Ledger Update" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->Of the 37,966 findings Anthropic reports, only 7,349 (19.4%) have been made public. Just 217 of those have been marked fixed. The more glaring number is that 4.4% (1,654) of the project's findings have already been marked as duplicates, 7.5x more duplicates than fixes. On top of that, 419 findings have been withdrawn. It seems odd that the ledger now claims a 94.2% true positive rate, up from 90.8% at launch, when more findings have been withdrawn or marked as duplicates than fixed, likely a feedback loop missing to the triage rates listed as “True Positives”.<!--]--></p><p><!--[-->The trend since my September update is even more telling:<!--]--></p><div><table><!--[--><thead><!--[--><tr><!--[--><th><!--[--><!--]--></th><th><!--[-->September 8<!--]--></th><th><!--[-->November 2<!--]--></th><th><!--[-->Change<!--]--></th><!--]--></tr><!--]--></thead><tbody><!--[--><tr><!--[--><td><!--[-->Total findings<!--]--></td><td><!--[-->26,153<!--]--></td><td><!--[-->37,966<!--]--></td><td><!--[-->+11,813<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Made public<!--]--></td><td><!--[-->2,736 (10.5%)<!--]--></td><td><!--[-->7,349 (19.4%)<!--]--></td><td><!--[-->+4,613<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Fixed<!--]--></td><td><!--[-->202<!--]--></td><td><!--[-->217<!--]--></td><td><!--[-->+15<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Withdrawn<!--]--></td><td><!--[-->245<!--]--></td><td><!--[-->419<!--]--></td><td><!--[-->+174<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Duplicates<!--]--></td><td><!--[-->2<!--]--></td><td><!--[-->1,670<!--]--></td><td><!--[-->+1,668<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Claimed true positive rate<!--]--></td><td><!--[-->91.4%<!--]--></td><td><!--[-->94.2%<!--]--></td><td><!--[-->+2.8 pts<!--]--></td><!--]--></tr><!--]--></tbody><!--]--></table></div><p><!--[-->In two months, Anthropic added nearly 12,000 findings and fixed just 15 more. Duplicates went from two to thousands, which is exactly what I warned about in September: the longer findings sit, the more likely someone else finds and fixes them first. I don't know how anyone can read these numbers as anything but damning.<!--]--></p><p><!--[-->You may also notice a correction in my visual. There appears to be a bug on Anthropic's ledger that inflates the number of findings marked as disclosed. Check for yourself using the "disclosed" filter.<!--]--></p><p><!--[-->Having humans triage every finding clearly didn't scale, and Anthropic has said as much. In its <a href="https://www.anthropic.com/research/launching-opt-in-vuln-finding-service-for-open-source" rel="nofollow"><!--[--><!--[--><!--[-->OSS Scanner launch post<!--]--><!--]--><!--]--></a> on October 8th, Anthropic said it had found more than 29,000 candidate vulnerabilities but had manually reviewed only about 6,000, and that it remains "bottlenecked on our human capacity to validate these findings." It had also already sent nearly 5,000 unverified reports to maintainers who asked for everything in bulk.<!--]--></p><p><!--[-->So with the Glasswing open source initiative hitting a wall, launching a self-service <a href="https://github.com/anthropics/oss-scanner" rel="nofollow"><!--[--><!--[--><!--[-->OSS Scanner<!--]--><!--]--><!--]--></a> that projects can opt into makes sense. Maintainers can now request a scan and triage the findings themselves. Anthropic is upfront that these reports are "fully model-generated, without human review or triage" and that "it is possible reports will be incorrect or invalid."<!--]--></p><p><!--[-->In other words, the triage bottleneck didn't go away. It moved to the maintainers. If the true positive rate is really as high as Anthropic claims, that shouldn't be a problem.<!--]--></p><p><!--[-->Three days ago, <a href="https://www.linkedin.com/in/danielstenberg/" rel="nofollow"><!--[--><!--[--><!--[-->Daniel Stenberg<!--]--><!--]--><!--]--></a>, who maintains curl, <a href="https://www.linkedin.com/feed/update/urn:li:share:7524224297595269120/" rel="nofollow"><!--[--><!--[--><!--[-->announced<!--]--><!--]--><!--]--></a> that the project had received a batch of 45 vulnerability reports from Anthropic. Anthropic rated only one as medium severity and the rest as low. Daniel is moving them over to GitHub at a deliberate pace "to soften the impact for the team," with plans to have them all published by the end of the week. This gives us a rare look at what Anthropic's findings look like once a maintainer actually validates them.<!--]--></p><p><!--[-->Of the 34 reports published so far, 19 have been marked as not a vulnerability, 6 have been confirmed as low severity, and 9 are still awaiting assessment. That puts the false positive rate at 55.9% so far, and only 17.6% of findings have been confirmed, all of them low severity. That's a lot of work dumped on open source maintainers for a small handful of low-impact bugs, and when a maintainer has to pace reports just to protect his team, that says plenty about the burden.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/curl-vulns-none.png" alt="Curl Vulnerabilities" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->This also isn't new for curl. Back in May, Daniel <a href="https://daniel.haxx.se/blog/2026/05/11/mythos-finds-a-curl-vulnerability/" rel="nofollow"><!--[--><!--[--><!--[-->wrote<!--]--><!--]--><!--]--></a> that five Mythos findings boiled down to a single confirmed vulnerability.<!--]--></p><p><!--[-->It's a far cry from the 94.2% true positive rate Anthropic currently claims on its ledger. It also undercuts the "high- and critical-severity" framing Glasswing launched with. In September, I found that Claude rated 91.5% of ledger findings as critical or high, while maintainers rated only 51.3% that way. I'm curious whether other open source projects are seeing the same thing.<!--]--></p><p><!--[-->curl took a bold move by deciding to publish low and medium vulnerabilities findings publicly as issues for full transparency and we encourage other open source maintainers to follow their lead.<!--]--></p><p><!--[-->AI is a valuable tool for finding vulnerabilities, and I'm not discounting that. But seven months in, the evidence still doesn't match the launch narrative. The CVEs are a sliver of this year's total, almost none are being exploited, fixes have stalled while duplicates and withdrawals pile up, and the triage burden is shifting onto the open source maintainers Glasswing promised to help. The receipts keep coming in. They still don't reconcile.<!--]--></p><p><!--[-->VulnCheck is helping organizations not just to solve the vulnerability prioritization challenge - we’re working to help equip any product manager, CSIRT/PSIRT or SecOps team and Threat Hunting team to get faster and more accurate with infinite efficiency using VulnCheck solutions.<!--]--></p><p><!--[-->We knew that we needed better data, faster across the board, in our industry. So that’s what we deliver to the market. We’re going to continue to deliver key insights on vulnerability management, exploitation and major trends we can extrapolate from our dataset to continuously support practitioners.<!--]--></p><p><!--[-->Are you interested in learning more? If so, VulnCheck's <a href="https://vulncheck.com/product/exploit-intelligence" rel="nofollow"><!--[--><!--[--><!--[-->Exploit &amp; Vulnerability Intelligence<!--]--><!--]--><!--]--></a> has broad threat actor coverage. Register and demo our data today.<!--]--></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[$30M Raised to Redo the CPU (122 pts)]]></title>
+            <title><![CDATA[$30M Raised to Redo the CPU (126 pts)]]></title>
             <link>https://tendrils.co/blog/2026-11-10/30m-raised</link>
             <guid>50447036</guid>
             <pubDate>Tue, 10 Nov 2026 22:14:03 GMT</pubDate>
@@ -722,7 +1590,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple has new Mac app coming to make running local AI models easy (374 pts)]]></title>
+            <title><![CDATA[Apple has new Mac app coming to make running local AI models easy (409 pts)]]></title>
             <link>https://9to5mac.com/2026/11/10/apple-has-new-mac-app-coming-to-make-running-local-ai-models-easy/</link>
             <guid>50446520</guid>
             <pubDate>Tue, 10 Nov 2026 21:25:03 GMT</pubDate>
@@ -831,7 +1699,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
 	<div><p><em>FTC: We use income earning auto affiliate links.</em> <a href="https://9to5mac.com/about/#affiliate">More.</a></p><p><a href="https://bit.ly/3XgoDyD"><img src="https://9to5mac.com/wp-content/uploads/sites/6/2026/11/Gemini_Text_Image_Agnostic_750x150-1.png" alt="" width="750" height="150"></a></p></div>				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Six Math Essentials by Terence Tao (292 pts)]]></title>
+            <title><![CDATA[Six Math Essentials by Terence Tao (303 pts)]]></title>
             <link>https://teorth.github.io/tao-web/six-math-essentials.html</link>
             <guid>50446246</guid>
             <pubDate>Tue, 10 Nov 2026 20:58:44 GMT</pubDate>
@@ -848,7 +1716,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Toyota brand Scion is back and it's going to sell a kei truck in America (515 pts)]]></title>
+            <title><![CDATA[Toyota brand Scion is back and it's going to sell a kei truck in America (524 pts)]]></title>
             <link>https://www.theautopian.com/scion-is-back-and-its-going-to-sell-a-freaking-kei-truck-in-america/</link>
             <guid>50445401</guid>
             <pubDate>Tue, 10 Nov 2026 19:50:46 GMT</pubDate>
@@ -884,7 +1752,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
 		</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[What objective is reasoning solving? (149 pts)]]></title>
+            <title><![CDATA[What objective is reasoning solving? (151 pts)]]></title>
             <link>https://alexwang.ai/posts/reasoning-as-pathfinding/</link>
             <guid>50445013</guid>
             <pubDate>Tue, 10 Nov 2026 19:25:14 GMT</pubDate>
@@ -904,7 +1772,7 @@ Then $\Scal_x$, the set of answers the verifier accepts, isn’t the same as the
 <label> imperfect verifier</label></p></figure><p>This visualization also shows why scaling up RL (generating more samples and longer samples) makes reward hacking more likely. The more extensively we “fuzz” the verifier, the more likely we’ll find a path that lands in the misspecified region of $\Scal_x$. Once the model finds this shortcut, training pushes the model towards similar behavior.</p><h2 id="so-what-objective-is-reasoning-solving">So what objective is reasoning solving?<a href="#so-what-objective-is-reasoning-solving" aria-label="Link to this section">#</a></h2><p>Reasoning isn’t actually solving any objective at all. A path is not guaranteed to converge to the correct answer. It’s only in aggregate, over the distribution of paths, do we get a high probability of success.</p><p>RL training directly raises the success probability $p_x$, by spending a lot of compute on searching for successful paths and then training the model to reproduce them. Thinking longer helps because training taught the model to use the extra tokens, not because generating more tokens is intrinsically better. The cost of sampling during RL is amortized into the weights. At inference time the model is likely to succeed with a single sample, but any individual sample is not guaranteed to succeed.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[A comprehensive study of how fingerprintable users are (121 pts)]]></title>
+            <title><![CDATA[A comprehensive study of how fingerprintable users are (124 pts)]]></title>
             <link>https://fingerprinting.study/</link>
             <guid>50444684</guid>
             <pubDate>Tue, 10 Nov 2026 19:03:54 GMT</pubDate>
@@ -1361,7 +2229,7 @@ Then $\Scal_x$, the set of answers the verifier accepts, isn’t the same as the
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Starlink Mini 2 (459 pts)]]></title>
+            <title><![CDATA[Starlink Mini 2 (479 pts)]]></title>
             <link>https://starlink.com/mini-2</link>
             <guid>50444129</guid>
             <pubDate>Tue, 10 Nov 2026 18:22:32 GMT</pubDate>
@@ -1369,7 +2237,7 @@ Then $\Scal_x$, the set of answers the verifier accepts, isn’t the same as the
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Synaptics patent claims stop work on DisplayLink drivers (435 pts)]]></title>
+            <title><![CDATA[Synaptics patent claims stop work on DisplayLink drivers (450 pts)]]></title>
             <link>https://lwn.net/SubscriberLink/1102549/acbc92e00cee3a3f/</link>
             <guid>50443824</guid>
             <pubDate>Tue, 10 Nov 2026 18:02:02 GMT</pubDate>
@@ -1633,7 +2501,7 @@ free-software developers and users.</p>
 </main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Get your coding agent off ~2019 JavaScript, onto modern web primitives (407 pts)]]></title>
+            <title><![CDATA[Show HN: Get your coding agent off ~2019 JavaScript, onto modern web primitives (414 pts)]]></title>
             <link>https://github.com/GoogleChrome/modern-web-guidance</link>
             <guid>50443812</guid>
             <pubDate>Tue, 10 Nov 2026 18:01:15 GMT</pubDate>
@@ -2647,7 +3515,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Claude Whiteboards, Claude Sheets, and Claude Data (258 pts)]]></title>
+            <title><![CDATA[Claude Whiteboards, Claude Sheets, and Claude Data (264 pts)]]></title>
             <link>https://claude.com/resources/articles/sheets-whiteboards-data</link>
             <guid>50443716</guid>
             <pubDate>Tue, 10 Nov 2026 17:55:07 GMT</pubDate>
@@ -2655,7 +3523,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 <div id="readability-page-1" class="page"><div><p>Today we’re launching Claude Whiteboards and Claude Sheets in beta, and <a href="https://claude.com/resources/articles/dashboards-and-motion" target="_blank" rel="noopener noreferrer">Claude Dashboards<span lang="en" data-export-skip=""> (opens in new tab)</span></a> becomes generally available as Claude Data. Whiteboards is a shared board where your team brainstorms with Claude, Sheets is a spreadsheet Claude builds and edits with you, and Claude Data adds data stories, certified queries, and live sharing. These are available on all paid plans.</p><figure><p data-youtube-id="YewAJPawE7I"><iframe src="https://www.youtube-nocookie.com/embed/YewAJPawE7I?enablejsapi=1&amp;rel=0&amp;playsinline=1&amp;modestbranding=1" title="Demo of new Claude Artifacts: a team and Claude build a whiteboard, spreadsheet, and dashboard for a holiday pie launch." allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" sandbox="allow-scripts allow-same-origin allow-presentation allow-popups" allowfullscreen=""></iframe></p></figure><p>Working with Claude on a project often meant moving the output over to another tool or program, where Claude didn’t have live access to follow progress and changes. Now, your documents, boards, sheets, and dashboards can stay in Claude, with access for your team to continue editing together. When ready, you can bring the outputs directly into tools from our partners and continue working there.</p><h2 id="claude-whiteboards">Claude Whiteboards</h2><p>Many people use Claude as a thought partner, but brainstorming with it has typically meant copy-pasting the results elsewhere so you can then start brainstorming or collaborating with your coworkers. Now, you can talk through a messy plan out loud with Claude, and Claude can turn it into a board with a timeline with owners and dates, so you and your team can collaborate in real time. In a retro meeting, for example, everyone can add their notes, and Claude can group them by theme and draft the action items for each person. You can focus on any part of the board by dragging a box around it and asking Claude questions. When you’re done brainstorming, Claude can turn the board into a doc or deck, or bring it into tools like Lucid, Miro, or Vani by Zoho, where you can continue working on it with your team.</p><h2 id="claude-sheets">Claude Sheets</h2><p>Claude can now generate spreadsheets with tabs, formulas, formatting, and drop-downs, often from just a prompt like asking for a campaign tracker or a hiring budget. It can edit in the cells, outlining each new edit so you can track changes. You can share sheets with your team, so you and Claude can work on them together.</p><p>For now, sheets have simple spreadsheet functionality, but we are working on adding more. When you need the full functionality of Excel, you can export your file to .xlsx or CSV, or use <a href="https://claude.com/claude-for-microsoft-365" target="_blank" rel="noopener noreferrer">Claude for Excel<span lang="en" data-export-skip=""> (opens in new tab)</span></a>. You can also continue working in partner tools including Airtable, Asana, monday.com, and Smartsheet.</p><h2 id="claude-data">Claude Data</h2><p><a href="https://claude.com/resources/articles/dashboards-and-motion" target="_blank" rel="noopener noreferrer">Claude Dashboards<span lang="en" data-export-skip=""> (opens in new tab)</span></a> launched in beta in October, enabling teams to ask quick questions of their company’s data in tools like Amazon Redshift, BigQuery, and ClickHouse. Starting today, it’s generally available as Claude Data. We changed the name because the way companies use their data is broader than dashboards, and the product now covers how they work more broadly. Certified queries and live sharing are in beta. Here are some ways teams can use Claude Data:</p><ul><li><strong>Create certified definitions of metrics. </strong>Your data team can certify the queries everyone should use, so you don’t end up building or working on dashboards with conflicting data. Charts built on these metrics carry a "certified" badge showing they’re certified.</li><li><strong>Craft stories</strong> <strong>from data.</strong> You can work with Claude in Claude Data to draft data stories or narrated videos from your metrics, for you to review before sharing.</li><li><strong>Share current numbers with</strong> <strong>everyone.</strong> With live sharing, your colleagues can see up-to-date numbers when they open a shared dashboard, even if they don’t have access to the connectors that keep that data current. Viewers see the results of the queries you’ve approved, and can’t run others with your access.</li><li><strong>Match your look-and-feel. </strong>Design systems are now supported in Claude Data.</li><li><strong>Get faster loading with caching. </strong>Previously, every dashboard would reload on every load. Now, dashboards support caching, and refresh cadences can be set on a per-dashboard basis.</li><li><strong>Track changes over time. </strong>Claude Data now has tracked changes, so you can see who has made edits and roll back to a specific version if needed.</li></ul><p>Our partners for Claude Data include Amplitude, Mixpanel, Omni, PostHog, and Sigma.</p><p>Starting today, <a href="https://claude.com/resources/articles/interactive-connectors-full-tool" target="_blank" rel="noopener noreferrer">interactive connectors<span lang="en" data-export-skip=""> (opens in new tab)</span></a> can open as full apps beside your conversation or in full screen, so you can work in tools like Adobe, Atlassian, Box, and Notion yourself, or ask Claude to make changes with you.</p><h2 id="getting-started">Getting started</h2><p>Claude Whiteboards, Sheets, and Data work on web, desktop, and mobile. Claude Data needs a data connector, such as a warehouse or CRM.</p><p><strong>For admins:</strong> On Team plans, all three are on by default. On Enterprise plans, Claude Whiteboards and Sheets are off by default, and Claude Data turns on by default on November 19, 2026. You can change these anytime in Organization settings &gt; Artifacts.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Life on Claude Nine (116 pts)]]></title>
+            <title><![CDATA[Life on Claude Nine (121 pts)]]></title>
             <link>https://babuschk.in/posts/2026-01-25-life-on-claude-nine.html</link>
             <guid>50443587</guid>
             <pubDate>Tue, 10 Nov 2026 17:44:44 GMT</pubDate>
@@ -2844,7 +3712,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
     </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Val Town is winding down (407 pts)]]></title>
+            <title><![CDATA[Val Town is winding down (410 pts)]]></title>
             <link>https://blog.val.town/winding-down</link>
             <guid>50443427</guid>
             <pubDate>Tue, 10 Nov 2026 17:31:14 GMT</pubDate>
@@ -5048,377 +5916,6 @@ dotnet run --project HelloDotnet11</code></pre>
         <hr>
         <h3>Transcript</h3>
         <p>LEILA FADEL, HOST: </p><p> The tech industry is bracing for a new Democrat-controlled Congress. A company that is likely to face scrutiny has just hired a prominent Democrat. NPR's Luke Garrett reports.</p><p>LUKE GARRETT, BYLINE: Palantir is a secretive software firm with $2 billion worth of contracts across the federal government. The majority are with the departments of Defense and Homeland Security. Last year, former employees told NPR the company's products gave DHS near-real-time visibility into the movements of migrants in the U.S. Now some Democrats have vowed to investigate Palantir's work with the Trump administration and whether it's helping the government conduct mass surveillance. Jon Tester, who was a Democratic senator for 18 years, has been hired to advise the company.</p><p>JON TESTER: You know, a perception is reality in Washington, D.C. and in politics in general. But the fact is that I think Palantir's got a good story to tell, and they need to tell it. And hopefully folks will be receptive to it.</p><p>GARRETT: The company was founded by billionaire investor Peter Thiel, who named Palantir after the mythical seeing stone from "The Lord Of The Rings." Its CEO, Alex Karp, is a self-described liberal who has worked closely with the Trump administration, and he's been highly critical of Democrats on issues like immigration. Here's Karp on "The Axios Show" last year.</p><p>(SOUNDBITE OF TV SHOW, "THE AXIOS SHOW")</p><p>ALEX KARP: I would say to my Democratic friends, also of which I still have, I hope, many, there - you have to grow a spine because a lot of these people actually agree with me in private.</p><p>GARRETT: Tester tells NPR he'll be focused on Palantir's work streamlining government services for farmers and veterans.</p><p>TESTER: And I think that's what it's about. I mean, it's about saving money. It's about making sure government works for people.</p><p>GARRETT: As a senator, Tester aggressively opposed the Bush-era PATRIOT Act, which expanded government surveillance. When asked if he had the same surveillance concerns about Palantir, Tester said he didn't.</p><p>TESTER: I've talked to many people within Palantir. They believe the same way I do. This is an organization that believes in privacy.</p><p>GARRETT: Tester's employment at Palantir comes as other tech companies have also gone on a hiring spree of former Democratic lawmakers and aides in anticipation of changing power in Washington. Senior fellow at the AI Now Institute and former State Department official Aya Ibrahim says that's not a coincidence.</p><p>AYA IBRAHIM: I think, at the end of the day, these companies have an inordinate amount of money. And they will try and put it wherever they can in order to stave off any real accountability.</p><p>GARRETT: Ibrahim says the midterm results are an opportunity to check the growing power of the tech industry.</p><p>Luke Garrett, NPR News, Washington.</p></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Smart home devices should work without the internet (840 pts)]]></title>
-            <link>https://docodethatmatters.com/home-automation-overnight-success/</link>
-            <guid>50441707</guid>
-            <pubDate>Tue, 10 Nov 2026 15:25:20 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://docodethatmatters.com/home-automation-overnight-success/">https://docodethatmatters.com/home-automation-overnight-success/</a>, See on <a href="https://news.ycombinator.com/item?id=50441707">Hacker News</a></p>
-<div id="readability-page-1" class="page"><article itemprop="blogPost" itemscope="" itemtype="http://schema.org/BlogPosting"><meta itemprop="wordCount" content="4506"><meta itemprop="mainEntityOfPage" content="https://docodethatmatters.com/home-automation-overnight-success/"><header><!-- Metadata: date · reading time · author --><p><time itemprop="datePublished" datetime="2026-10-28T00:00:00.000Z">Oct 2026</time><span>4506 words</span><span>23 min read</span><span itemprop="publisher" itemscope="" itemtype="https://schema.org/Organization"><meta itemprop="name" content="Do Code That Matters"><span itemprop="logo" itemscope="" itemtype="https://schema.org/ImageObject"><meta itemprop="url" content="https://docodethatmatters.com/images/agile.jpg"></span></span></p><!-- Audio player: MP3 is generated by main.py after astro build --><p><audio controls="" preload="metadata"><source src="https://docodethatmatters.com/audio/home-automation-overnight-success/index.opus" type="audio/ogg; codecs=opus"><source src="https://docodethatmatters.com/audio/home-automation-overnight-success/index.mp3" type="audio/mpeg">Your browser does not support the audio element.</audio><a href="https://docodethatmatters.com/audio/home-automation-overnight-success/index.mp3" download="">Download audio</a></p><figure itemprop="image" itemscope="" itemtype="https://schema.org/ImageObject"><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-07.webp"><img itemprop="url contentUrl" src="https://docodethatmatters.com/images/home-automation/t1-07.webp" alt="Scissors cutting an ethernet cable under the words No Internet, No Problem." width="1500" height="844" loading="eager" fetchpriority="high" decoding="async"></picture><figcaption itemprop="caption">Scissors cutting an ethernet cable under the words No Internet, No Problem.</figcaption></figure></header><section itemprop="articleBody"><blockquote>
-<p><strong>AI;DR:</strong> I wrote the first draft, AI helped me edit and rewrite it, and I made the final pass. The rules, setups, and talks are my own.</p>
-</blockquote>
-<p>TLDR; Nothing core in my house depends on a vendor’s server. If the internet goes down, the house keeps running. That’s been rule one for about ten years, and my other rules came out of it. This post has the rules, then both talks I’ve given on home automation, slide by slide.</p>
-<h2 id="why-local">Why local</h2>
-<p>My Nest integration worked until Google broke the API. That’s the failure I plan around now. The talks have a few more: a Samsung fridge showing a TLS certificate error on its own screen, and a Camp Chef grill controller that needs Wi-Fi to show you the temperature.</p>
-<p>Everything that matters runs on hardware I own. That’s Tasmota on ESP boards, an MQTT broker, and Node-RED on a Raspberry Pi. I do use some cloud services, mostly Alexa and a few AWS ones. Alexa is just another way to flip a switch. If it’s down, the wall switches and the wall dashboard still work.</p>
-<h2 id="the-rules">The rules</h2>
-<p>From the first talk, restated in the second:</p>
-<ol>
-<li>No internet, no problem. Core stuff has to work with the internet unplugged. Alexa can be a way in, but never the only way.</li>
-<li>Don’t remove the old way while adding the new one. If someone tapes a wall switch on so a smart bulb keeps power, I skipped this rule.</li>
-<li>Be agile. Rooms get used differently and people move in and out, so it all has to be cheap to change.</li>
-<li>Check your automations. I once had four scheduled triggers hitting the same garden pump.</li>
-<li>Exceptions must be exceptional. I can break a rule, but only for a reason I’d still agree with six months later.</li>
-</ol>
-<p>Added after year five, once more people lived in the house:</p>
-<ol start="6">
-<li>A cloud device needs an API with logs or it doesn’t get installed. I don’t want a black box in the house.</li>
-<li>Config lives in one place instead of five vendor apps.</li>
-<li>More than one way in: an app, Alexa, a QR code, or an NFC tag.</li>
-<li>If I keep doing the same steps, they become a routine.</li>
-<li>Devices talk pub/sub over MQTT instead of point to point.</li>
-<li>No batteries unless they last a year or more between changes. Nobody wants to swap a door sensor battery at 2am.</li>
-</ol>
-<p>The build I get asked about most is <a href="https://docodethatmatters.com/automate-sprinkler-with-tasmota/">the Tasmota sprinkler controller</a>. It’s in both talks, and so is the garage door setup, which has been running about as long.</p>
-<h2 id="talk-one-home-automation">Talk One: Home Automation</h2>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-01.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-01.webp" alt="Home Automation, for fun and convenience" title="Title slide: Home Automation, for fun and convenience"></picture></p>
-<p>Nobody needs any of this. I do it because I like building things that work in the background, and every automation is a small puzzle with a real payoff when it’s solved.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-02.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-02.webp" alt="Connected Everything collage of icons" title="Connected Everything: the modern everything-is-online mess"></picture></p>
-<p>This is the backdrop for the whole talk. Phones, laptops, tablets, thermostats, and locks all talk to clouds that may or may not be up when you need them. Connectivity is fine. Just know what you’re opting into before you plug it in.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-03.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-03.webp" alt="Nest thermostat, Amazon smart plug, and Yale smart lock keypad" title="The retail starting point: Nest, an Amazon smart plug, and a Yale lock"></picture></p>
-<p>Most people start here with a thermostat, a plug, and a lock, and that’s a fine place to start. Each one ships with its own app and its own account.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-04.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-04.webp" alt="Privacy, Integration/Flexibility, and Cost triangle" title="Privacy, Integration and Flexibility, Cost: pick your tradeoffs"></picture></p>
-<p>Every device you add lands somewhere on this triangle. A cloud camera is cheap and convenient, and you pay for it with privacy. A switch I flash myself takes more setup time, and in return I can integrate it with anything. I figure out where a device lands before it goes in the cart.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-05.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-05.webp" alt="A light switch taped on with a note reading Leave Switch On, This is BAD" title="This is bad: a switch taped in the on position so automation can take over"></picture></p>
-<p>Someone (often me) automates a light and then has to tape the wall switch on so the smart bulb always has power. If you’ve ever walked into a room and the switch did nothing, this is why.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-06.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-06.webp" alt="Wemo Wi-Fi Light Switch retail box" title="A Wemo Wi-Fi light switch, the in-wall alternative to a taped switch"></picture></p>
-<p>The better fix for the taped switch is an in-wall Wi-Fi switch like this one. The wall switch keeps working the normal way and I still get a hook to automate. It takes more work to install than a smart plug, but nobody has to retrain their hand.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-07.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-07.webp" alt="No Internet, No Problem: scissors cutting an ethernet cable" title="No internet, no problem"></picture></p>
-<p>Rule one, and the one I don’t bend on. If the internet goes down, my lights still turn on.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-08.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-08.webp" alt="Must Be Agile: sticky notes on a planning board" title="Must be agile"></picture></p>
-<p>Home automation is never done. Rooms get used differently, people move in and out, and new devices show up. Whatever you build has to be cheap to change.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-09.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-09.webp" alt="Node-RED flow for Garage Cool Off logic" title="Garage Cool Off flow: checks if the door is closed before running the fan"></picture></p>
-<p>The garage cooling flow starts from a manual trigger and checks whether the door is closed. From there it opens the door, waits, flips the fan on, or sends a notification if cooling is already running. It’s a small flow and it has kept the garage from baking more than once.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-10.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-10.webp" alt="Node-RED garage sensor flow feeding Grafana, plus an Opens counter and On Status chart" title="Garage door sensor state feeding Grafana, with an opens-count and on-status history"></picture></p>
-<p>The door sensor and reed switch both report into a transform step that sets a global <code>garage-closed</code> flag and logs to Grafana. Below that is the chart from a few real days: 21 opens, with spikes showing when each one happened. Most people skip this part, and it’s the part that tells me whether I left the garage open without opening an app.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-11.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-11.webp" alt="Node-RED scheduled injects feeding a Garden Water Pump node" title="Check automations: four scheduled triggers feeding the garden water pump"></picture></p>
-<p>Four scheduled triggers all point at the same pump node. It’s easy to end up with five automations fighting over one device. Every so often I look at the flow and ask whether they still make sense together.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-12.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-12.webp" alt="Captain Jack Sparrow meme: The Rules, more of what you'd call guidelines than actual rules" title="The Rules: more of what you'd call guidelines than actual rules"></picture></p>
-<p>I’ve broken every one of these rules plenty of times. They’re guidelines.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-13.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-13.webp" alt="Node-RED logo, a Phillips Hue IFTTT-style applet, and an Alexa routine editor" title="Node-RED, a community applet for blinking Hue lights on low phone battery, and an Alexa routine"></picture></p>
-<p>Here are three ways to say “event in, action out.” Node-RED is my main tool. Alexa routines and IFTTT-style community applets cover the cases where I don’t want to build something from scratch.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-14.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-14.webp" alt="MQTT publish/subscribe diagram with a temperature sensor, broker, and two subscribers" title="MQTT: one publisher, one broker, two subscribers getting the same message"></picture></p>
-<p>MQTT is what keeps the pieces decoupled. The temperature sensor publishes and doesn’t care who’s listening. A phone and a backend system can both subscribe to the same topic, and the sensor needs no extra logic. The sprinkler controller in <a href="https://docodethatmatters.com/automate-sprinkler-with-tasmota/">the Tasmota post</a> is built on the same pattern.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-15.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-15.webp" alt="Sonoff Mini Wi-Fi DIY smart switch and a Node-RED fireplace flow" title="A Sonoff Mini wired into the fireplace, controlled from a UI node and an Alexa trigger"></picture></p>
-<p>The Sonoff Mini is small enough to hide inside the fireplace’s existing wiring. The flow lets either the dashboard or Alexa flip it. It makes the “memorable automations” list later because a fake fire you can turn on by voice makes a good party trick.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-16.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-16.webp" alt="Sprinkler controller wiring, a 3D PCB render, the Tasmota web UI, scheduled nodes, and a bare PCB layout" title="The sprinkler build end to end: enclosure wiring, PCB design, Tasmota UI, schedule flow, and the bare board"></picture></p>
-<p>The whole sprinkler build fits on one slide: the relay and ESP module in the enclosure, the 3D board render, the Tasmota UI with BME280 sensor readings, the Node-RED schedule feeding the pump, and the finished PCB layout. <a href="https://docodethatmatters.com/automate-sprinkler-with-tasmota/">The sprinkler post</a> has the full writeup, including why I picked Tasmota over custom firmware.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-17.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-17.webp" alt="The Rules Guidelines Recap bullet list" title="The rules, guidelines, recap: don't swap the new way in before the old way is gone, no internet no problem, must be agile, check automations, exceptions must be exceptional"></picture></p>
-<p>The recap slide is the whole talk in five lines. I break the first one (don’t introduce a new way while removing the old way) carelessly more often than the others, and I regret it every time. The last one keeps the other four honest. “I was in a hurry” doesn’t count as exceptional.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-18.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-18.webp" alt="Memorable Home Automations bullet list" title="A grab bag: heart-rate light blinking, fireplace sim, rain-skip watering, phone-presence garage, AWS services, 3D printer status lights"></picture></p>
-<p>The highlight reel: lights that blink when my heart rate is too low, sprinklers that skip watering if rain is coming, a garage that opens when my phone shows up but the car doesn’t, light and water for an indoor garden, an air quality sensor that kicks on a fan, backyard landscaping lighting, living room LED strips that shift between warm and cool, washer and dryer notifications based on power usage instead of a vendor app, 3D printer status lights, AC and heating monitoring, and a pile of AWS services (Alexa, Polly, S3, IoT, Cognito) stitched together along the way. The Nest integration gets a eulogy: “until Google broke the API.” Every home automation person writes that sentence eventually.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t1-19.webp"><img src="https://docodethatmatters.com/images/home-automation/t1-19.webp" alt="Questions? Feedback!" title="Closing slide for talk one: Questions? Feedback!"></picture></p>
-<p>That was talk one. Almost everything on the “memorable automations” slide later picked up a new failure mode or got replaced, which is why there’s a sequel.</p>
-<h2 id="talk-two-home-automation-the-sequel">Talk Two: Home Automation, The Sequel</h2>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-01.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-01.webp" alt="Home Automation, The Sequel" title="Title slide for the follow-up talk: Home Automation, The Sequel"></picture></p>
-<p>Enough time passed between the two talks that I had a different list of problems to talk about.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-02.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-02.webp" alt="Meme: When robots take over the world, Marvin the android saying he could calculate your chance of survival but you won't like it" title="When robots take over the world: a nod to how much more is now automated"></picture></p>
-<p>More devices means more decisions made without me in the loop. That’s a little unsettling, though mostly harmless.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-03.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-03.webp" alt="Recap section divider" title="Recap"></picture></p>
-<p>First, a quick pass back through what talk one covered.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-04.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-04.webp" alt="Connected Everything collage, reused from talk one" title="The same Connected Everything slide from talk one, as the recap anchor"></picture></p>
-<p>Same slide as before, with more icons on it now.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-05.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-05.webp" alt="A printer-pickup note taped to a pole, a Samsung fridge showing a certificate warning, and a Camp Chef grill WiFi controller" title="IoT in the wild: a handwritten printer note, a fridge throwing a cert error, a smart grill controller"></picture></p>
-<p>Everyone else is living this too. A fridge’s smart display throws a TLS certificate error. A grill controller needs Wi-Fi to tell you the temperature. Someone taped a note to a pole about an internet-connected printer they forgot to log out of. These are real devices.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-06.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-06.webp" alt="The Rules bullet list recap" title="The Rules, restated: keep existing functionality, IoT must work without internet, be flexible, review periodically, exceptions must be exceptional"></picture></p>
-<p>These are the must and should rules from talk one with slightly tighter wording. I restated them because part of the audience hadn’t seen the first talk.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-07.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-07.webp" alt="What has changed? That's why I'm here today" title="What has changed? That's why I'm here today"></picture></p>
-<p>The rules stayed the same. The conditions they had to survive got harder.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-08.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-08.webp" alt="Einstein quote: We cannot solve our problems with the same thinking we used when we created them" title="We cannot solve our problems with the same thinking we used when we created them"></picture></p>
-<p>A lot of my original setup assumed one person lived in the house. When that stopped being true, I had to patch a single-user system into a multi-user one, and the next few slides are what that looked like.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-09.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-09.webp" alt="Some of those problems: more foot traffic, more keys needed, longer absences, water flooding" title="Some of those problems: more foot traffic, more people needing keys, longer trips away, and a water flooding scare"></picture></p>
-<p>More people means more foot traffic and more physical keys to manage. Longer trips away raised the stakes on anything that could fail without anyone noticing. A water flooding scare is what finally got me to take leak and presence detection seriously.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-10.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-10.webp" alt="Captain Jack Sparrow meme again: The Extended Rules, still guidelines" title="The Extended Rules: still guidelines"></picture></p>
-<p>Same joke with a new rule set. The first rules came after year one. These came after year five.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-11.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-11.webp" alt="The Extended Rules bullet list" title="The extended rules: APIs with logs, central config, multiple interaction methods, routines, pub/sub, battery-life minimums"></picture></p>
-<p>These are rules 6 through 11 at the top of this post. I wrote them after the house went from one person to several.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-12.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-12.webp" alt="Examples section divider" title="Examples"></picture></p>
-<p>Next up are the concrete builds, which is my favorite part of any talk.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-13.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-13.webp" alt="A DIY motorized outdoor rig, a UV grow light over plant leaves, and a purple UV strip under cabinets" title="New builds: a motorized outdoor device, a plant grow light, and a closet UV sanitizing light"></picture></p>
-<p>A motor-and-PVC-pipe rig for outdoor lighting, a UV grow light clipped onto a houseplant, and a UV strip under the cabinets for passive sanitizing. Each one solves a small, specific problem, and that’s where home automation earns its keep.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-14.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-14.webp" alt="Sprinkler build collage, reused from talk one" title="The sprinkler build again, still running the same way years later"></picture></p>
-<p>Same sprinkler slide as talk one. It’s back because it’s one of the few builds that never needed a rewrite.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-15.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-15.webp" alt="A wall-mounted presence sensor, a robot vacuum on carpet, and an AirGradient air quality sensor kit with dashboard" title="New sensors: a wall-mounted presence unit, a robot vacuum, and a DIY AirGradient air quality kit"></picture></p>
-<p>A sensor that sits on a credenza, a robot vacuum that does the floors without anyone asking, and an AirGradient kit I assembled from a CO2 sensor, a particulate sensor, and a microcontroller, with its own small dashboard. The air quality kit has given me the most peace of mind of anything here.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-16.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-16.webp" alt="Wall-mounted tablet dashboard next to a Nest thermostat set to 80" title="The wall dashboard: garage, locks, lights, all on one screen next to the thermostat"></picture></p>
-<p>This dashboard has replaced more apps in the house than anything else. It has a garage door toggle, a side door unlock, a front lock toggle, all lights on or off, brightness sliders, a coffee bar color picker, and a warm-to-cool slider for the living room. It all runs on one cheap tablet mounted next to the thermostat, so nobody has to dig through five apps.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-17.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-17.webp" alt="A large wall-mounted TV with warm backlighting glowing against the wall" title="Bias lighting behind the TV, automated to match whatever's on screen"></picture></p>
-<p>The ambient lighting behind the TV is tied into the same automation system instead of having its own remote. It’s a small change with a big quality-of-life payoff.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-18.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-18.webp" alt="A Schlage deadbolt with a physical key and a black touchscreen smart lock with multiple unlock methods" title="Two generations of smart lock: a retrofit deadbolt and a full touchscreen keypad lock"></picture></p>
-<p>Smart locks came out of the “more people, more keys” problem from a few slides back. The newer lock takes a password, the app, a keycard, or a mechanical key, so everyone in the house can use whatever they’re comfortable with.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-19.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-19.webp" alt="Hardware section divider" title="Hardware"></picture></p>
-<p>The next few slides are the parts bin, for anyone who wants to build this themselves.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-20.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-20.webp" alt="ESP32 D1 mini board, a dual-outlet smart plug, and a Raspberry Pi 4" title="Core compute: an ESP32 D1 mini, a smart plug, and a Raspberry Pi 4"></picture></p>
-<p>The ESP32 D1 mini handles anything custom. The smart plug is the off-the-shelf shortcut when I don’t need custom. The Pi 4 runs Node-RED and Grafana.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-21.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-21.webp" alt="A 100ft RGB LED strip kit, a tray of TO-220 power transistors, and relay modules with header pins" title="LED strips, power transistors, and relay modules for anything that needs switching"></picture></p>
-<p>LED strips for ambient lighting, power transistors for higher-current loads, and small relay modules so a microcontroller can switch mains voltage safely.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-22.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-22.webp" alt="A resistor kit, a DIY wire and cable color kit, and an electrolytic capacitor kit" title="The passive components drawer: resistors, color-coded wire, and capacitors"></picture></p>
-<p>The rest of the bin: a resistor assortment, color-coded wire so I can trace a circuit later, and a capacitor kit for smoothing and timing.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-23.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-23.webp" alt="Software bullet list: NodeRed, Grafana, Tasmota, Telegram, Python, Javascript, Vendor specific Apps" title="The software stack: Node-RED, Grafana, Tasmota, Telegram, Python, JavaScript, and whatever vendor app I can't avoid"></picture></p>
-<p>Node-RED handles flow logic and Grafana gives me visibility. Tasmota is the firmware on anything I flash myself, Telegram sends notifications, and Python or JavaScript fills in the glue code that doesn’t fit cleanly into a flow.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-24.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-24.webp" alt="Node-RED flow for the Garage tab with sensors, Tasmota topics, Telegram notifications, and light counters" title="The current garage flow: sensors, Tasmota commands, Telegram alerts, and a light-on counter"></picture></p>
-<p>Here’s the garage flow today. The door sensor and reed switch feed a transform into Grafana and a global closed state. Toggle nodes publish straight to Tasmota command topics. Notifications fork to a Telegram sender and an audio chime, and a light-on counter resets at midnight. The editor tabs across the top (Lights, Sensors, Garage, Sprinkler, NFC Tags, Door Lock Security) show how much has grown since the single garage cooling flow in talk one.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-25.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-25.webp" alt="Grafana dashboard grid with humidity, temp, dew point, pressure, gas, air quality, energy, opens, and on-status panels" title="The full Grafana dashboard: climate, energy, and device activity all on one screen"></picture></p>
-<p>I check this dashboard when I want to know if everything is okay. Humidity, temperature, dew point, pressure, and gas readings are on one side, and energy usage, door opens, and on-status history are on the other. I built it because I got tired of guessing.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-26.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-26.webp" alt="UX section divider" title="UX"></picture></p>
-<p>Dashboards and Grafana panels work for me. Everyone else in the house just wants the light on.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-27.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-27.webp" alt="Close-up of the wall dashboard status screen, a sheet of NFC tags with a QR code, and an Echo Dot" title="Interaction methods: the wall dashboard up close, NFC tags and a QR code, and an Echo Dot"></picture></p>
-<p>Here’s the “multiple ways to interact” rule in hardware. The wall tablet is for whoever is standing near it. NFC tags and a QR code give a tap-to-trigger shortcut, and the Echo Dot is for anyone who would rather talk to the house.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-28.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-28.webp" alt="Tools section divider" title="Tools"></picture></p>
-<p>Last section: the tools I use to build and debug all of the above.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-29.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-29.webp" alt="A soldering iron and stand, a 3D printer mid-print, a digital multimeter, and a precision screwdriver kit" title="The workbench: a soldering iron, a 3D printer, a multimeter, and a screwdriver kit"></picture></p>
-<p>A soldering iron for permanent connections, a 3D printer for enclosures and brackets you can’t buy, a multimeter for when something isn’t working, and a precision screwdriver kit for devices the manufacturer didn’t want opened.</p>
-<p><picture><source type="image/webp" srcset="https://docodethatmatters.com/images/home-automation/t2-30.webp"><img src="https://docodethatmatters.com/images/home-automation/t2-30.webp" alt="Questions? Feedback!" title="Closing slide for talk two: Questions? Feedback!"></picture></p>
-<p>That’s both talks, ten-plus years apart. The rules barely changed between them, while the list of problems they had to handle kept growing.</p>
-<p>A third talk is coming, and this one is built around agentic use cases. The same rules still apply when an AI agent is the one flipping the switches, and I expect a few new ones once it is.</p>
-<h2 id="what-readers-told-me">What readers told me</h2>
-<p>I shared the “no internet, no problem” rule on LinkedIn and asked for the most pointless internet dependency people had found in a device. Dozens of people answered. A Hacker News thread added more. Here’s what came back.</p>
-<h3 id="everyone-has-one">Everyone has one</h3>
-<p>Most examples were basic functions locked behind an app, an account, or a server:</p>
-<ul>
-<li>A fridge whose temperature can’t be changed because of a bug in the manufacturer’s phone app.</li>
-<li>A TV that can’t even switch inputs when the internet is down, and another that has to be signed in before it works as a plain HDMI monitor. One reader’s older smart TV has dead apps but still works as a regular TV, which is how a device should fail.</li>
-<li>A heating system whose app doesn’t work from the local network.</li>
-<li>A kitchen vent and a dishwasher that need the internet even when you control them from Home Assistant.</li>
-<li>A smart plug that can’t be set up on an isolated network.</li>
-<li>Noise-cancelling headphones that search for a Bluetooth device forever, so you can’t just turn on the noise cancelling.</li>
-<li>Synthesizers and MIDI keyboards that need a cloud login for first use or firmware updates.</li>
-<li>A meat thermometer that only worked through its app and stopped working when the company went out of business.</li>
-</ul>
-<p>The meat thermometer bothers me most. The hardware outlived the company, and it stopped working anyway.</p>
-<h3 id="rules-readers-added">Rules readers added</h3>
-<ul>
-<li>Offline first, with the internet for extras. A device should do its main job on its own.</li>
-<li>Treat every third-party dependency as a risk. APIs change, so plan a local fallback or a clear degraded mode. One mobile developer works the same way: the core action works offline or from cache, and only the extras wait for a connection.</li>
-<li>Decide what must work offline. My answer is turning things on and off, temperature and safety controls, and anything a guest has to use without learning an app. As one reader said, if a visitor can’t turn something on or adjust the temperature without an app account, the design has failed.</li>
-<li>A stricter version of my first two rules: everything core works with the Wi-Fi or the automation server shut down, and smart features never take away the dumb ones. The wall switch should control the light directly and let automation flip it. A switch that only sends a request to the automation fails. That reader says my sprinkler controller fails this bar too. The only sprinkler controller they’d found with a local API and full control on the device itself was RainMachine, which is gone.</li>
-<li>Clean up when you throw things away. Remove a connected printer from your account first. An abandoned connected device can be an easy way in for an attacker.</li>
-</ul>
-<h3 id="practical-tips">Practical tips</h3>
-<ul>
-<li>Use local protocols. One reader recommends Zigbee and Z-Wave over Wi-Fi, because a switch that doesn’t need the cloud tends to behave the same year after year. Another uses Zigbee for the smart plugs that can’t be set up without internet.</li>
-<li>Let an LLM find the firmware. One reader buys the cheapest hardware that does the job, ignores reviews that complain about the app, and asks an LLM for local-first custom firmware once it arrives. That has worked for their switches, a thermostat, an air quality monitor, a thermometer, and a window fan. They’d have paid about 2.5x for hardware that was local out of the box.</li>
-<li>Old Nest thermostats have a way out. <a href="https://nolongerevil.com/">No Longer Evil</a> is open source firmware for Nest Gen 1 and Gen 2 thermostats.</li>
-<li>Smart TVs can be tamed. Reset the TV and never connect it to the network, and the input problem goes away.</li>
-<li>Remote access is the cost of staying local. I use Tailscale on the router and keep the individual devices off the tailnet. One reader ran OpenVPN on OpenWrt, which worked but felt clunky, and is now trying Tailscale.</li>
-<li>There’s a gap to fill. One reader would happily pay for a pre-built, open “works with everything” Raspberry Pi image with MQTT. DietPi and OpenWrt come close and have a small footprint, but you need some understanding to get going. Another wanted a hub that ships with the house, like a water heater or a router. Home Assistant sells hub hardware that’s close to that.</li>
-<li>Right to repair is the bigger fight. Readers pointed to the right-to-repair movement and groups like the <a href="https://www.fulu.org/">FULU Foundation</a>, which work to keep companies from locking you out of what you bought.</li>
-</ul>
-<h3 id="counterpoints">Counterpoints</h3>
-<p>Connectivity has real uses. A connected meat thermometer lets you watch the game while the steak cooks. The same reader also had an oven decide to update its software in the middle of cooking. One reader pointed out the business model behind all of this: companies would rather sell you a service than a product. Another expects the shift away from internet-connected devices to come from resilience worries rather than consumer complaints, since enough connected homes make a target. And one skips connected appliances entirely, keeping only computers and phones online.</p>
-<h2 id="devices-ive-used">Devices I’ve used</h2>
-<p><small>(This section has Amazon affiliate links. If you buy through them, I may earn a small commission at no extra cost to you.)</small></p>
-<p>These are the parts from my home automation builds, grouped by project.</p>
-<h3 id="sprinkler-controller">Sprinkler controller</h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Gear</th><th>Purpose</th><th>Buy</th></tr></thead><tbody><tr><td><a href="https://www.amazon.com/dp/B081CSJV2V?tag=dctm-20">HiLetgo ESP8266 NodeMCU board (3 pack)</a></td><td>Wi-Fi microcontroller that runs Tasmota</td><td><a href="https://www.amazon.com/dp/B081CSJV2V?tag=dctm-20">Amazon</a></td></tr><tr><td><a href="https://amzn.to/3oTJUZj">SSD1306 OLED screen</a></td><td>Status display for the sprinkler state</td><td><a href="https://amzn.to/3oTJUZj">Amazon</a></td></tr><tr><td><a href="https://www.amazon.com/dp/B00HV974KC?tag=dctm-20">Inkbird SSR-40DA solid state relay</a></td><td>Switches the 24 VAC sprinkler valve</td><td><a href="https://www.amazon.com/dp/B00HV974KC?tag=dctm-20">Amazon</a></td></tr><tr><td><a href="https://amzn.to/365HD4Z">BME280 sensor</a></td><td>Temperature, humidity and pressure</td><td><a href="https://amzn.to/365HD4Z">Amazon</a></td></tr><tr><td><a href="https://amzn.to/3DcQpiY">24 VAC power supply</a></td><td>Powers the sprinkler valve</td><td><a href="https://amzn.to/3DcQpiY">Amazon</a></td></tr></tbody></table>
-<h3 id="lights-switches-and-plugs">Lights, switches and plugs</h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Gear</th><th>Purpose</th><th>Buy</th></tr></thead><tbody><tr><td><a href="https://amzn.to/435hVLR">Martin Jerry smart dimmer switch (Tasmota pre-flashed)</a></td><td>Wall light switch that runs Tasmota out of the box</td><td><a href="https://amzn.to/435hVLR">Amazon</a></td></tr><tr><td><a href="https://amzn.to/49xMQnw">Martin Jerry humidity fan switch</a></td><td>Runs the bathroom fan when humidity gets too high</td><td><a href="https://amzn.to/49xMQnw">Amazon</a></td></tr><tr><td><a href="https://www.amazon.com/dp/B08TNF4835?tag=dctm-20">Sonoff S31 smart plug</a></td><td>Power watchdog for the cable modem</td><td><a href="https://www.amazon.com/dp/B08TNF4835?tag=dctm-20">Amazon</a></td></tr><tr><td><a href="https://amzn.to/3sW2QaW">Serial-to-USB adapter</a></td><td>Connects an ESP8266 to your PC for flashing Tasmota</td><td><a href="https://amzn.to/3sW2QaW">Amazon</a></td></tr></tbody></table>
-<h3 id="garage-door">Garage door</h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Gear</th><th>Purpose</th><th>Buy</th></tr></thead><tbody><tr><td><a href="https://amzn.to/2RMxQc5">Raspberry Pi 3</a></td><td>Runs Docker and the web API</td><td><a href="https://amzn.to/2RMxQc5">Amazon</a></td></tr><tr><td><a href="https://www.amazon.com/dp/B00E0NTPP4?tag=dctm-20">SunFounder 2-channel 5V relay module</a></td><td>Simulates the button press to toggle the door</td><td><a href="https://www.amazon.com/dp/B00E0NTPP4?tag=dctm-20">Amazon</a></td></tr><tr><td><a href="https://amzn.to/2pShUrK">LiftMaster wired control panel (78LM, replaces the 41A5273-1)</a></td><td>Bypasses the anti-tamper wiring</td><td><a href="https://amzn.to/2pShUrK">Amazon</a></td></tr></tbody></table>
-<h3 id="around-the-house">Around the house</h3>
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-<table><thead><tr><th>Gear</th><th>Purpose</th><th>Buy</th></tr></thead><tbody><tr><td><a href="https://www.amazon.com/dp/B0CP7S3117?tag=dctm-20">GL.iNet Flint 2 router (GL-MT6000)</a></td><td>Runs OpenWrt and an MQTT broker locally</td><td><a href="https://www.amazon.com/dp/B0CP7S3117?tag=dctm-20">Amazon</a></td></tr><tr><td><a href="https://amzn.to/4zcyjcj">Cheap tablet</a></td><td>Mounted on the wall as the dashboard</td><td><a href="https://amzn.to/4zcyjcj">Amazon</a></td></tr><tr><td><a href="https://amzn.to/4pQVtk9">Lefant robot vacuum</a></td><td>Cleans the floors</td><td><a href="https://amzn.to/4pQVtk9">Amazon</a></td></tr></tbody></table></section></article></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Show HN: Valencia, Spain in Sim City/Isometric View (224 pts)]]></title>
-            <link>https://tinyvalencia.com/</link>
-            <guid>50441518</guid>
-            <pubDate>Tue, 10 Nov 2026 15:12:16 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://tinyvalencia.com/">https://tinyvalencia.com/</a>, See on <a href="https://news.ycombinator.com/item?id=50441518">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div id="about">
-  
-  <h2>Tiny València</h2>
-  <p data-i18n-html="aboutIntro">An isometric pixel-art map of València, in the spirit of SimCity and of
-    <a href="https://isometric.nyc/" target="_blank" rel="noopener">Isometric NYC</a>.
-    Every building is a real one, drawn from above at the same angle, block by block.</p>
-  <p data-i18n-html="aboutProgress">The whole municipal term is painted, from the huerta to the Albufera, except a few small
-    huerta exclaves where there's no 3D imagery to paint from. <span id="updated"></span></p>
-  <h3 data-i18n="howTitle">How it's made</h3>
-  <p data-i18n-html="how">Real 3D city data is rendered from a fixed isometric camera. An image model trained on a
-    hand-picked pixel-art style then repaints it, tile by tile, each tile continuing its painted
-    neighbours so the city stays seamless. The sea, the port basins and the Albufera are drawn in
-    the same style.</p>
-  <h3 data-i18n="moveTitle">Getting around</h3>
-  <ul data-i18n-html="move">
-    <li><b>Drag</b> to move, <b>scroll</b> or <b>pinch</b> to zoom, <b>double-click</b> to zoom in</li>
-    <li><kbd>R</kbd> somewhere random · <kbd>H</kbd> whole map · <kbd>F</kbd> full screen · <kbd>/</kbd> search · <kbd>G</kbd> play</li>
-    <li>The address bar always holds the current view, so any link you copy opens right here.</li>
-  </ul>
-  <h3 data-i18n="data">Data</h3>
-  <p data-i18n-html="credits">Buildings © Dirección General del Catastro · Aerial photo &amp; terrain © IGN (PNOA, MDT05),
-    CC BY 4.0 · Roads, boundary, coast &amp; search © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>
-    contributors, ODbL · 3D reference: Google Photorealistic 3D Tiles via Cesium ion.</p>
-</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[The Hardest Tarball? (147 pts)]]></title>
-            <link>https://stoppels.ch/2026/11/07/the-hardest-tarball.html</link>
-            <guid>50441338</guid>
-            <pubDate>Tue, 10 Nov 2026 15:00:39 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://stoppels.ch/2026/11/07/the-hardest-tarball.html">https://stoppels.ch/2026/11/07/the-hardest-tarball.html</a>, See on <a href="https://news.ycombinator.com/item?id=50441338">Hacker News</a></p>
-<div id="readability-page-1" class="page"><section>
-
-<p><em>Nov 7th, 2026</em></p>
-<p>Here is a curiosity: an archive that can be constructed using a single GNU tar invocation, that is extracted in 8 distinct ways depending on what tool you use.</p>
-<pre><code>$ printf hello &gt; file
-$ touch empty
-$ tar --format=pax --pax-option='delete=?time,size:=512' \
-      --transform='s,^\./file$,café,' \
-      -cf hardest.tar file ./file empty</code></pre>
-<p>It creates an archive <code>hardest.tar</code> from three files <code>file ./file empty</code> in sequence, where <code>file</code> is repeated so that GNU tar stores the second one as a hard link, and <code>empty</code> is empty. Exploiting the unique path of the second entry, the hard link is renamed to <code>café</code>. This triggers tar to create a pax header to store the file name as UTF-8. We add a <code>size=512</code> record to the pax header, which overrides the default <code>size=0</code> from the hard link. The value 512 is not a coincidence: it is exactly the size of a tar header.</p>
-<p>Visually, this archive has the following structure, with two basic interpretations based on whether a hard link can have a size or not.</p>
-<p><img src="https://stoppels.ch/2026/11/07/fig-hardest.svg" width="827" height="149" alt="The structure of hardest.tar, with two basic interpretations based on whether a hard link can have a size or not."></p>
-<p>Now, POSIX says that data blocks for a hard link <em>“may be included”</em> in pax archives, but the implications of this are not entirely clear. So the 512 bytes after the hard link are its data, and not the header of <code>empty</code> as we archived it? How can a hard link have different contents from its previous counterpart <code>file</code>?</p>
-<h2>Extracting it</h2>
-<p>This archive gives by far the richest and most surprising results I've encountered so far when extracting it with well-known tar utilities and libraries. The results below were produced using the latest releases of all packages at the time of writing.</p>
-<h3>GNU tar, BusyBox, Python, Go and Perl</h3>
-<p>This group is reasonable in principle: they ignore the size on the hard link, and extract <code>file</code>, its hard link <code>café</code>, and <code>empty</code>.</p>
-<h3>bsdtar</h3>
-<p>This is the system <code>tar</code> utility of macOS, which is closer to POSIX in spirit regarding the concept of size on hard links, and writes the 512 bytes into the hard link. The end result is that <code>file</code> now contains the tar header of <code>empty</code>.</p>
-<h3>7-Zip, node-tar, tar-fs, and Rust's tar &amp; astral-tokio-tar</h3>
-<p>This group agrees with bsdtar that the 512 bytes are data of the hard link, but doesn't write them into the hard link. Instead, they skip forward over the data, and you are left with just <code>file</code> and <code>café</code>, without <code>empty</code>.</p>
-<h3>Java's Commons Compress</h3>
-<p>This is where you begin to need more imagination. Because <code>café</code> contains data, a <i>separate</i> file is created that contains the header of <code>empty</code> as data, while <code>file</code> keeps its original contents.</p>
-<h3>PHP's PharData</h3>
-<p>Makes <code>café</code> a separate, empty file, and also extracts <code>empty</code>. Why not?</p>
-<h3>RubyGems</h3>
-<p>Does not extract <code>café</code> at all, but to make up for it, it creates an empty directory <code>PaxHeaders</code> next to <code>file</code> and <code>empty</code>.</p>
-<h3>R</h3>
-<p>R has an entirely different approach: it extracts <code>empty</code> with 512 null bytes. It mistakenly applies the size to <code>empty</code> instead of the hard link, and those 512 bytes are from an end-of-archive marker.</p>
-<h3>Bonus: Haskell</h3>
-<p>Haskell's tar would be exactly like GNU tar, if only it did not have string decoding issues, which turn the file <code>café</code> into <code>cafÃ©</code> on disk (in the year 2026, this is not a rendering quirk of your browser).</p>
-<h3>.NET, Julia and uv's tar-codec</h3>
-<p>These implementations reject the tarball. I believe this is the best thing you can do, even if it's technically not POSIX-compliant.</p>
-
-<h2>More of this</h2>
-<p>This tarball is one of 134 tricky tarballs that I'm collecting and categorizing in my test suite <a href="https://github.com/haampie/tar-minefield">haampie/tar-minefield</a>, developed since the last post. Its website <a href="https://stoppels.ch/tar/">https://stoppels.ch/tar</a> features a big table that shows how implementations deal with all these cases, as well as detailed info per test case. A variant from the tarball of this post <a href="https://stoppels.ch/tar/F35.html">is included as a test case</a>.</p>
-<p>If you'd like to discuss this, send me an email at <em>firstname[at]lastname.ch</em>.</p>
-</section></div>]]></description>
         </item>
     </channel>
 </rss>
