@@ -4,12 +4,580 @@
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Wed, 11 Nov 2026 06:30:37 GMT</lastBuildDate>
+        <lastBuildDate>Wed, 11 Nov 2026 07:30:04 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[After 7 months, Glasswing overwelms maintainers with underwhelming findings (373 pts)]]></title>
+            <title><![CDATA[Protecting SSH Keys with macOS Secure Enclave (106 pts)]]></title>
+            <link>https://gatezh.com/posts/macos-secure-enclave-ssh-keys/</link>
+            <guid>50449748</guid>
+            <pubDate>Wed, 11 Nov 2026 04:28:57 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://gatezh.com/posts/macos-secure-enclave-ssh-keys/">https://gatezh.com/posts/macos-secure-enclave-ssh-keys/</a>, See on <a href="https://news.ycombinator.com/item?id=50449748">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div itemprop="articleBody"><p>I’ve been paranoid about my SSH keys for a while now. They just sit there in <code>~/.ssh/</code>, protected by nothing but file permissions. Any malicious script that gets access to my filesystem could just copy them and get into all my servers.
+Also, there have been many stories out there online about fake interview assignments that asked to clone a repo and run it on your local machine.
+This is one of the reasons I switched completely to using devcontainers, but even that was not really enough for me (and it shouldn’t be enough for you or anybody else really).</p><p>So I finally decided to do something about it.</p><h2 id="tldr">TL;DR</h2><p>I have decided to <strong>NOT</strong> go with the native macOS Secure Enclave approach (using only out-of-the-box tools) because it ended up plain ugly and I can’t live with that. However, it is a fully functional, working solution that I would definitely use otherwise.</p><h2 id="the-options">The Options</h2><p>After some research, I found several ways to protect SSH keys:</p><ul><li><strong>Native macOS Secure Enclave</strong> — no third-party apps, built into the OS</li><li><strong>Secretive</strong> — third-party app that stores keys in Secure Enclave</li><li><strong>YubiKey</strong> — hardware security key with FIDO2 support</li><li><strong>1Password / Bitwarden</strong> — store keys in an encrypted vault, use their SSH agent</li></ul><p>I already use 1Password, but I might switch to something else in the future. Bitwarden recently added SSH key support (even on the free tier!), but it’s still a software solution — the keys are encrypted at rest but decrypted in memory when used.</p><p>What I really wanted was hardware-backed security. The private key should literally be impossible to extract, even if my Mac is fully compromised.</p><p>That left me with YubiKey or Secure Enclave. I have a YubiKey 5C, but I wanted to try the native approach first — no extra hardware to carry around, no third-party apps to maintain.</p><h2 id="what-is-secure-enclave-ssh">What is Secure Enclave SSH?</h2><p>Since macOS Sequoia (and Tahoe), macOS supports SSH keys backed by the Secure Enclave, a security subsystem on the Mac’s chip that is isolated from the main processor. The private key is created inside it and never leaves.</p><p>When you SSH somewhere, your Mac asks the Secure Enclave to sign the authentication challenge. If you enable Touch ID, you have to approve each signing operation. The actual private key never exists in memory or on disk.</p><p>The workflow is surprisingly similar to regular SSH keys:</p><table><thead><tr><th>Aspect</th><th>Regular SSH Key</th><th>Secure Enclave Key</th></tr></thead><tbody><tr><td>Where private key lives</td><td><code>~/.ssh/id_ed25519</code> (a file)</td><td>Secure Enclave</td></tr><tr><td>What’s on disk</td><td>Actual private key</td><td>Just a reference (useless without this Mac)</td></tr><tr><td>Setup on remote server</td><td>Copy public key to <code>authorized_keys</code></td><td>Same</td></tr><tr><td>Connecting</td><td>Just works</td><td>Touch ID prompt, then works</td></tr></tbody></table><h2 id="setting-it-up">Setting It Up</h2><h3 id="step-1-create-the-secure-enclave-key">Step 1: Create the Secure Enclave Key</h3><p>macOS provides the <code>sc_auth</code> command (Smart Card Authentication) to manage CryptoTokenKit identities. Despite the name, it works with Secure Enclave too.</p><div><pre tabindex="0"><code data-lang="bash"><span><span>sc_auth create-ctk-identity -l <span>"ssh-MacBook"</span> -k p-256-ne -t bio
+</span></span></code></pre></div><p>Breaking this down:</p><ul><li><code>-l "ssh-MacBook"</code> — a label for your reference (only visible locally)</li><li><code>-k p-256-ne</code> — NIST P-256 curve, <strong>n</strong>on-<strong>e</strong>xportable (the key can never leave Secure Enclave)</li><li><code>-t bio</code> — require <strong>bio</strong>metric (Touch ID) for every use</li></ul><p>You’ll be prompted for Touch ID to create the key.</p><h4 id="problem-1-touch-id-error">Problem 1: Touch ID Error</h4><p>When I first ran this command, I got a scary error:</p><pre tabindex="0"><code>Error: Error Domain=NSOSStatusErrorDomain Code=-25293 "Failed to generate keypair"
+(errKCAuthFailed / errSecAuthFailed: / Authorization/Authentication failed.)
+UserInfo={..., NSUnderlyingError=... "Failed to get bio catacomb UUID for user 502." ...}
+</code></pre><p>Turns out my Touch ID enrollment got reset somehow. After re-enrolling my fingerprint in <strong>System Settings → Touch ID &amp; Password</strong>, the command worked fine.</p><p>You can verify the key was created:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>sc_auth list-ctk-identities
+</span></span></code></pre></div><p>Output:</p><pre tabindex="0"><code>Key Type Public Key Hash                          Prot Label       Common Name  Valid To          Valid
+p-256-ne A71277F0BC5825A7B3576D014F31282A866EF3BC bio  ssh-MacBook ssh-MacBook  2027-01-26, 10:18 YES
+</code></pre><h3 id="step-2-export-the-key-handle">Step 2: Export the Key Handle</h3><p>Now we need to create a “key handle” file that SSH can use. This is NOT the private key — it’s just a reference that tells SSH “go ask the Secure Enclave to sign this.”</p><div><pre tabindex="0"><code data-lang="bash"><span><span>ssh-keygen -w /usr/lib/ssh-keychain.dylib -K -N <span>""</span>
+</span></span></code></pre></div><p>When prompted for PIN, just press Enter (it’s not used for biometric keys). Touch ID will pop up. This creates <code>id_ecdsa_sk_rk</code> and <code>id_ecdsa_sk_rk.pub</code> in your current directory.</p><p>Move them to your SSH directory:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>mv id_ecdsa_sk_rk* ~/.ssh/
+</span></span></code></pre></div><h3 id="step-3-configure-ssh-to-use-the-secure-enclave-provider">Step 3: Configure SSH to Use the Secure Enclave Provider</h3><p>Add this to your <code>~/.zshrc</code> (or <code>~/.bashrc</code>):</p><div><pre tabindex="0"><code data-lang="bash"><span><span>export SSH_SK_PROVIDER<span>=</span>/usr/lib/ssh-keychain.dylib
+</span></span></code></pre></div><p>Reload your shell:</p><h4 id="problem-2-outdated-commands-everywhere">Problem 2: Outdated Commands Everywhere</h4><p>If you search for “macOS Secure Enclave SSH” online, you’ll find a lot of guides telling you to run <code>ssh-add -K</code>. Don’t. It’s deprecated:</p><pre tabindex="0"><code>WARNING: The -K and -A flags are deprecated and have been replaced
+         by the --apple-use-keychain and --apple-load-keychain
+         flags, respectively.
+</code></pre><p>And even the new flags don’t work for Secure Enclave keys — they’re for the traditional macOS Keychain, not CryptoTokenKit. The <code>SSH_SK_PROVIDER</code> environment variable is the correct approach.</p><h3 id="step-4-get-your-public-key">Step 4: Get Your Public Key</h3><div><pre tabindex="0"><code data-lang="bash"><span><span>cat ~/.ssh/id_ecdsa_sk_rk.pub
+</span></span></code></pre></div><p>Output:</p><pre tabindex="0"><code>sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTIt... ssh:
+</code></pre><p>That <code>ssh:</code> at the end is the FIDO2 application ID — it’s part of the key, not a comment. You can add your own comment after it when copying to <code>authorized_keys</code>:</p><pre tabindex="0"><code>sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTIt... ssh: macbook-secure-enclave
+</code></pre><h3 id="step-5-copy-to-your-server">Step 5: Copy to Your Server</h3><div><pre tabindex="0"><code data-lang="bash"><span><span>ssh-copy-id -i ~/.ssh/id_ecdsa_sk_rk.pub user@your-server
+</span></span></code></pre></div><p>Or manually paste the public key (with your comment) into <code>~/.ssh/authorized_keys</code> on the server.</p><h3 id="step-6-configure-sshconfig">Step 6: Configure ~/.ssh/config</h3><h4 id="problem-3-ssh-doesnt-find-the-key">Problem 3: SSH Doesn’t Find the Key</h4><p>After setting everything up, I tried to SSH… and it asked for my password.</p><p>The verbose output (<code>ssh -vvv</code>) showed SSH was only trying my old RSA key:</p><pre tabindex="0"><code>debug1: Offering public key: /Users/sergii/.ssh/id_rsa RSA SHA256:...
+</code></pre><p>The problem: SSH doesn’t automatically look for files named <code>id_ecdsa_sk_rk</code>. It only auto-discovers standard names like <code>id_rsa</code>, <code>id_ed25519</code>, <code>id_ecdsa</code>.</p><p>The fix is to explicitly add it to your <code>~/.ssh/config</code>:</p><div><pre tabindex="0"><code data-lang="bash"><span><span>Host *
+</span></span><span><span>    IdentityFile ~/.ssh/id_ecdsa_sk_rk
+</span></span><span><span>    IdentityFile ~/.ssh/id_rsa
+</span></span><span><span>    IdentityFile ~/.ssh/id_ed25519
+</span></span></code></pre></div><p>SSH tries identity files in order, so put the Secure Enclave key first if you want it to be the default.</p><p>⚠️ <strong>Note:</strong> If you’re using 1Password’s SSH agent (<code>IdentityAgent</code>), it might conflict with this setup. I had to comment it out while testing.</p><h3 id="step-7-test-it">Step 7: Test It</h3><p>You should get a Touch ID prompt, then connect.</p><h2 id="the-ugly-touch-id-prompt">The Ugly Touch ID Prompt</h2><figure><img src="https://gatezh.com/cdn-cgi/image/format=auto,width=auto/posts/macos-secure-enclave-ssh-keys/images/Touch%20ID%20prompt.png" alt="Touch ID prompt" loading="lazy"><figcaption>Touch ID prompt</figcaption></figure><p>One thing I’m not thrilled about: the Touch ID dialog says <strong>“ctccardtoken needs to authenticate to continue”</strong> instead of something friendly like “SSH wants to use your key.”</p><p>This is because the prompt comes from CryptoTokenKit — a low-level framework that Apple hasn’t polished for end-user SSH. If this bothers you, <strong>Secretive</strong> provides a much nicer UI while still using Secure Enclave under the hood.</p><h2 id="why-touch-id-for-everything">Why Touch ID for Everything?</h2><p>I initially thought about creating two keys — one with Touch ID for “important” servers, one without for convenience (like Git operations).</p><p>But then I realized: without <code>-t bio</code>, malware could use my key silently. With <code>-t bio</code>, I always know when something is using my SSH key. A few extra taps per day is a small price for that visibility.</p><p>So my recommendation if you’re planning to store your SSH keys this way: just use <code>-t bio</code> for everything. If it ever gets annoying, you can always create a second key later.</p><h2 id="the-catch-no-backups">The Catch: No Backups</h2><p>Secure Enclave keys are tied to your specific Mac. If your Mac dies, the keys die with it.</p><p>That’s by design: the key can’t be exported, so it can’t be backed up either. Keep more than one key instead. Add your Secure Enclave key AND a backup key (from a YubiKey, or another Mac) to your servers’ <code>authorized_keys</code>. If one device is lost, you still have access via the other.</p><h2 id="final-thoughts">Final Thoughts</h2><p>It seems to be a proper way to store your SSH keys securely, and it is way better than storing them on your hard drive.</p><p>With the implementation above you get:</p><ul><li>✅ Private key literally cannot be stolen (it’s in hardware)</li><li>✅ Every SSH operation requires Touch ID (I know when my key is used)</li><li>✅ No third-party apps needed</li><li>✅ Works with existing <code>authorized_keys</code> workflow</li></ul><p>However, I’ve been somewhat surprised by the ugliness of the UI. Not sure why Apple released such an unpolished thing. In each and every presentation they have a section on security (where their Apple logo becomes an Apple lock), so I was expecting an actual aesthetically appealing look for their security features. It is definitely not the case. My sense of beauty is not compatible with this ugliness, so I will be looking into other solutions to store my SSH keys in Secure Enclave such as <a href="https://github.com/maxgoedjen/secretive" target="_blank" rel="noopener noreferrer">Secretive</a>.</p><p>I also still need a backup option in case anything happens to my Mac.</p></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[A great old-timey game-programming hack (2013) (116 pts)]]></title>
+            <link>https://blog.moertel.com/posts/2013-12-14-great-old-timey-game-programming-hack.html</link>
+            <guid>50448921</guid>
+            <pubDate>Wed, 11 Nov 2026 01:56:31 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://blog.moertel.com/posts/2013-12-14-great-old-timey-game-programming-hack.html">https://blog.moertel.com/posts/2013-12-14-great-old-timey-game-programming-hack.html</a>, See on <a href="https://news.ycombinator.com/item?id=50448921">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div itemprop="articleBody">
+<p>A long time ago, when I was a college undergrad, I spent some time working on computer video games.
+This was in the 8-bit PC era, when the gaming hardware was almost impossibly slow by today’s standards.</p>
+<p>It might not surprise you, then, to learn that game programmers of yore did all sorts of crazy things to make their games run at playable speeds.
+Crazy, crazy things.</p>
+<p>This is a story about one of those things.</p>
+<p>While I’ve done my best to recall the important details, I may have gotten some things wrong.
+If I have, please forgive me.
+It was a long time ago.</p>
+<p>(<em>Note: This post contains some small images as inline-data URLs that some feed readers apparently don’t handle well. If you can’t see the images in your feed, click through to the original article to see them.</em>)</p>
+<p><em>Update 2013-12-16: There have been lots of great comments about this story on <a href="https://news.ycombinator.com/item?id=6913467">Hacker News</a> and <a href="http://www.reddit.com/r/programming/comments/1t05uy/a_great_oldtimey_gameprogramming_hack/">Proggit</a>, as well as <a href="http://blog.moertel.com/posts/2013-12-14-great-old-timey-game-programming-hack.html#disqus_thread">here on the blog</a>. Thanks for sharing, everyone!</em></p>
+<h3 id="the-set-up">The set-up</h3>
+<p>A friend of mine, a gifted programmer, was nearly finished with a new game.
+Somehow, he had squeezed into a 1980’s-era PC, pretty faithfully, what was at the time a graphically impressive coin-op game popular at the arcades.</p>
+<p>The only problem was that his version of the game was unplayable.
+It was too slow, and the choppy motion broke the player’s immersion.
+It was after all a side-scroller.</p>
+<p>My friend, who had been working on the game while also taking a full load of college courses, was starting to seem a little frazzled.
+Fearing that he had missed some easy optimization, he asked me to take a look at the code.</p>
+<p>I did. But there was no easy optimization to be had.</p>
+<p>The code was <em>tight</em>.
+Everywhere I looked, he had already done all the things I could think of.
+Loops had been unrolled.
+Unneeded draws had been eliminated.
+All evidence of waste had vanished.</p>
+<p>And, with them, our hopes of an easy fix.</p>
+<p>But what about a hard fix?
+A crazy fix?</p>
+<p>Well, that was always a possibility.</p>
+<p>Before I get to the crazy stuff, however, I should back up and explain how graphics hardware worked back then.</p>
+<h3 id="how-graphics-hardware-worked-back-then">How graphics hardware worked back then</h3>
+<p>Here’s the quick version:
+The graphics hardware didn’t do jack squat.</p>
+<p>On the PC in question, if you wanted to draw something onto the screen, you had to do that yourself, byte by byte.
+No texture mappers, no blitters.
+Just bytes.
+Bytes that you had to move yourself.</p>
+<p>Fun.</p>
+<p>My friend’s game spent most of its time redrawing the background.
+(Again: side-scroller.)
+For every frame, it had to draw nearly a screen’s worth of background tiles, shifted for the player’s position.</p>
+<p>If my memory serves me, each tile was 28 by 28 pixels.
+Each pixel was one of 16 colors, taking half a byte to represent.
+Therefore, tiles were represented in memory as 28 contiguous rows of 14 bytes each.
+The first 14 bytes represented the first row, the second 14 bytes the second row, and so on.</p>
+<p>The screen, however, was 320 pixels wide by 240 pixels high.
+In memory, then, a screen buffer was laid out as 240 contiguous rows of 160 bytes each.</p>
+<p>So when copying a tile at address <em>X</em> onto a screen buffer location starting at address <em>Y</em>, you had to copy 28 rows.
+To copy each row, you had to copy 14 bytes.
+Fortunately, the processor for this game was a 6809, which had a few 16-bit index registers and delightful “auto-increment” addressing modes (sort of like applying the postfix <code>++</code> operator to pointers in C).
+That meant you could copy 4 pixels at a time while advancing both the <em>X</em> and <em>Y</em> registers in passing:</p>
+<pre><code>    LDU ,X++     ; read a 2-byte word (= 4 pixels) from source tile
+    STU ,Y++     ; write it to screen buffer</code></pre>
+<p>To copy a full row, you had to do that seven times, so you might sandwich those lines within a 7-count loop:</p>
+<pre><code>    LDB #7       ; remaining words &lt;- tile width in words
+@LOOP
+    LDU ,X++     ; read a 2-byte word (= 4 pixels) from source tile
+    STU ,Y++     ; write it to screen buffer
+    DECB         ; reduce remaining-word count
+    BNE @LOOP    ; loop while words remain</code></pre>
+<p>When you were done copying the row, you needed to advance the destination pointer <em>Y</em> so that it pointed to the starting address for the next row you would draw into the screen buffer.
+Since the screen buffer was 160 bytes wide and a tile was only 14 bytes wide, that meant you had to add their difference to <em>Y</em>:</p>
+<pre><code>    LEAY 160-14,Y</code></pre>
+<p>And, just like that, you have copied a row onto the screen.</p>
+<p>That’s one.
+To copy a full tile, you need to do the same thing 28 times.
+So, in turn, you sandwich <em>that</em> code within a 28-count loop.</p>
+<p>Putting it all together, and giving names to the important numbers, you might end up with a subroutine like this:</p>
+<pre><code>;;; important constants
+
+SCRW = 160          ; screen-buffer width in bytes (= 320 4-bit pixels)
+TILW =  14          ; background-tile width in bytes (= 28 4-bit pixels)
+TILH =  28          ; background-tile height in rows
+WOFF = SCRW - TILW  ; s-b offset from end of one tile row to start of next
+
+
+COPYTILE
+;;;
+;;; Copy a 28x28 background tile into a screen buffer.
+;;; Arguments:
+;;;   X = starting address of background tile
+;;;   Y = starting address of destination in screen buffer
+;;;
+    LDA #TILH               ; remaining rows &lt;- tile height
+@COPYROW
+    LDB #TILW/2             ; remaining words &lt;- tile width in words
+@LOOP
+    LDU ,X++                ; read a word (= 4 pixels) from source tile
+    STU ,Y++                ; write it to screen buffer
+    DECB                    ; reduce remaining-word count
+    BNE @LOOP               ; loop while words remain
+    ;;
+    LEAY WOFF,Y             ; advance dst ptr to start of next dst row
+    DECA                    ; reduce remaining-row count
+    BNE @COPYROW            ; loop while rows remain
+    ;;
+    RTS                     ; done! return to caller</code></pre>
+<p>And that code would be fine.</p>
+<p>If you didn’t care about speed.</p>
+<h3 id="caring-about-speed">Caring about speed</h3>
+<p>Knowing that the game is probably going to spend most of its time running that code, you do what any good programmer would: start counting cycles.
+Here’s the inner loop again, with setup and finishing, annotated with cycle counts:</p>
+<pre><code>    LDB #TILW/2             ; 2 cycles (set-up)
+@LOOP
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    DECB                    ; 2
+    BNE @LOOP               ; 3
+    ;;
+    LEAY WOFF,Y             ; 8 (finishing)</code></pre>
+<p>Looking at those counts within the loop, you’re not likely to miss that you’re burning 21 cycles to copy just 4 pixels.
+To copy a full row, then, works out to 2 cycles + (7 iterations) * (21 cycles/iteration) + 8 cycles = 157 cycles.
+Ouch.</p>
+<p>But this isn’t your first time at the keyboard.
+You know what to do.
+Unroll that loop!</p>
+<pre><code>    LDU ,X++                ; 8 cycles
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LDU ,X++                ; 8
+    STU ,Y++                ; 8
+    LEAY WOFF,Y             ; 8 (finishing)</code></pre>
+<p>Now, with the loop overhead reduced to zero – you’ve even eliminated the set-up – each row takes only 7 * (8 + 8) + 8 = 120 cycles.
+That’s a 30-percent speed-up.
+Pretty good.</p>
+<p>And that’s where most programmers probably would have left it.</p>
+<p>But not my friend.</p>
+<p>He knew that those <code>++</code> operations were costly, 3 cycles apiece.
+And, with the loop unrolled, he also knew exactly where each word to be read or written was located with respect to <em>X</em> or <em>Y</em>.
+So he cleverly replaced those 3-cycle post-increments with exact offsets.
+They cost only 1 cycle apiece, and the 0 offset is actually free:</p>
+<pre><code>    LDU  ,X                 ; 5 cycles
+    STU  ,Y                 ; 5
+    LDU 2,X                 ; 6
+    STU 2,Y                 ; 6
+    LDU 4,X                 ; 6
+    STU 4,Y                 ; 6
+    LDU 6,X                 ; 6
+    STU 6,Y                 ; 6
+    LDU 8,X                 ; 6
+    STU 8,Y                 ; 6
+    LDU 10,X                ; 6
+    STU 10,Y                ; 6
+    LDU 12,X                ; 6
+    STU 12,Y                ; 6
+    LEAX TILW,X             ; 8 (finishing)
+    LEAY SCRW,Y             ; 8 (finishing)</code></pre>
+<p>With his optimizations, the cycle count per row had been reduced to (5 + 5) + 6 * (6 + 6) + (8 + 8) = 98 cycles.
+Compared to the original code, that’s 60 percent faster:</p>
+<pre><code>original_speed  = (1*row) / (157*cycle)
+optimized_speed = (1*row) /  (98*cycle)
+
+speed_up  =  optimized_speed / original_speed - 1  =  157 / 98 - 1  =  0.60.</code></pre>
+<p>Putting it all together – and, again, I’m going by memory so the code might have been slightly different – the copy-tile subroutine looked something like this, and it copied a full tile, all 28 rows, in a lean 2893 cycles:</p>
+<pre><code>COPYTILE2
+;;;
+;;; Copy a 28x28 screen tile into a screen buffer.
+;;; Arguments:
+;;;   X = starting address of background tile
+;;;   Y = starting address of destination in screen buffer
+;;; Execution time:
+;;;   4 + 28 * (82 + 8 + 8 + 2 + 3) + 5 = 2893 cycles
+;;;
+    LDA #TILH      ; initialize row count (4 cycles)
+    ;;
+@COPY1
+    ;; unroll inner loop (copies one row of 28 pixels in 82 cycles)
+    LDU ,X         ; (1) read 4 pixels (5 cycles)
+    STU ,Y         ;     write 4 pixels (5 cycles)
+    LDU 2,X        ; (2) (6 cycles)
+    STU 2,Y        ;     (6 cycles)
+    LDU 4,X        ; (3) ...
+    STU 4,Y        ;     ...
+    LDU 6,X        ; (4)
+    STU 6,Y        ;
+    LDU 8,X        ; (5)
+    STU 8,Y        ;
+    LDU 10,X       ; (6)
+    STU 10,Y       ;
+    LDU 12,X       ; (7)
+    STU 12,Y       ;
+    ;;
+    LEAX TILW,X    ; advance src to start of next row (8 cycles)
+    LEAY SCRW,Y    ; advance dst to start of next row (8 cycles)
+    DECA           ; reduce remaining count by one (2 cycles)
+    BNE @COPY1     ; loop while rows remain (3 cycles)
+    ;;
+    RTS            ; done!  return to caller (5 cycles)</code></pre>
+<p>This code, all in all, was 60% faster than the naive <code>COPYTILE</code> code we started out with.</p>
+<p>But that wasn’t fast enough.
+Not nearly.</p>
+<p>So when my friend showed me his code and asked if I could make it faster, I really wanted to help him.
+I really wanted to be able to answer yes.</p>
+<p>But I had to answer no.
+I hated giving that answer.
+But, studying the code, I couldn’t see any way to speed it up.</p>
+<p>And yet, the hook was set.</p>
+<p>Later, I couldn’t get the problem out of my head.
+Maybe I had missed something.
+I had grown up on Apple II computers and their 6502 processors.
+My friend’s code, however, was for the 6809.
+Maybe it afforded optimizations that I didn’t know about.</p>
+<p>With renewing optimism, I dialed into the university’s library to access the card catalog.
+(These were the days before the World Wide Web.)
+Through a VT220 terminal emulator, I searched for books about the 6809.</p>
+<p>There was one.
+A 6809 microprocessor manual.
+It was in the engineering library.
+Luckily, I was an engineering student and had sign-out privileges.</p>
+<p>Just like that, I was off to the library.</p>
+<h3 id="a-crazy-idea">A crazy idea</h3>
+<p>When I got to the engineering library, I found the book right where it was supposed to be, looking a little beat up:</p>
+<p><a href="https://archive.org/details/bitsavers_motorola68_13419254/mode/2up"><em>The MC6809-MC6809E Microprocessor Programming Manual</em></a>.</p>
+<p>Not bothering to find a chair, I flipped through the pages standing, looking for some oddball, 6809-specific instruction that might throw a lot of bytes and throw them fast.
+Page after page, though, turned up nothing.</p>
+<p>Then I came upon <a href="https://archive.org/details/bitsavers_motorola68_13419254/page/n99/mode/2up?q=pshs">PSHS</a>.
+“Push registers on the hardware stack.”</p>
+<p>On my beloved 6502, if you wanted to save registers on the stack, you had to do it one register at a time and, even then, by transferring them through the accumulator.
+It was slow and expensive.
+So I had learned to avoid the stack when speed mattered.</p>
+<p>But on the 6809 you could save <em>all</em> of the registers – or any subset of them – with <em>a single instruction</em>.
+And, amazingly, it cost a mere 5 cycles, plus 1 cycle more per byte pushed.</p>
+<p>Since the processor had three 16-bit general-purpose registers – <em>D</em>, <em>X</em>, and <em>Y</em> – I could load them up and then use a single <code>PSHS</code> instruction to write 6 bytes in just 11 cycles.
+The corresponding pull instruction, <a href="https://archive.org/details/bitsavers_motorola68_13419254/page/n101/mode/2up?q=puls"><code>PULS</code></a>, had the same low cost.</p>
+<p>Further, the 6809 had <em>two</em> stack registers, <em>S</em> and <em>U</em>.
+I could use one as a source pointer and the other as a destination pointer.
+In theory, with a single <code>PULS</code>/<code>PSHU</code> pair, I could copy 6 bytes in 22 cycles.</p>
+<p>That’s crazy, crazy fast.</p>
+<p>Excitement mounting, I headed for the front desk and reached for my student ID.
+I was going to sign out that wonderful little book for further study.</p>
+<h3 id="a-crazy-plan">A crazy plan</h3>
+<p>Walking back to the dorms, I formed my plan.</p>
+<p>I would save the <em>S</em> and <em>U</em> registers somewhere, and then point <em>S</em> at the background tile and <em>U</em> at the screen buffer.
+Then I would pull from <em>S</em> and push to <em>U</em>, copying 6 bytes at a time, using <em>D</em>, <em>X</em>, and <em>Y</em> as go-betweens.
+To copy the 14 bytes that make up a row would require three such iterations, which unrolled would be about 60 cycles.</p>
+<p>When I reached my room, I found a piece of paper and sketched it out:</p>
+<pre><code>    PULS D,X,Y    ; first 6 bytes    11 cycles
+    PSHU D,X,Y    ;                  11
+    PULS D,X,Y    ; second 6 bytes   11
+    PSHU D,X,Y    ;                  11
+    PULS D        ; final 2 bytes     7
+    PSHU D        ;                   7
+    LEAU -WOFF,U  ; advance dst ptr   8</code></pre>
+<p>Just 66 cycles, including the after-row adjustment to <em>U</em> that prepares it for the next row.
+(Note that the adjustment is now negative.)
+For comparison, the naive row-copy loop that we looked at earlier took 157 cycles to do the same thing.
+And my friend’s optimized code took 98.
+Already, this crazy idea was looking like a big win.</p>
+<p>Still, that last <code>PULS</code>/<code>PSHU</code> pair!
+What a clunker.
+It was needed to handle the final two bytes per row, since the rows were 28 pixels = 14 bytes wide, and 6 doesn’t divide 14 evenly.</p>
+<p><em>That darn remainder of 2 bytes!</em></p>
+<p>If only the game had used 24-by-24 tiles instead…
+But it hadn’t, so I pored through the manual, looking for a way to lower the cost of that inevitable last pair.</p>
+<p>And then, by surprise, I struck gold!
+It was another 6809 oddity, the <em>DP</em> register.</p>
+<p>On the 6502 and most 8-bit processors of the era, the lowest 256 bytes of memory was called the <em>zero page</em>.
+The zero page was special because its memory locations had single-byte addresses and could be accessed with shorter and usually faster instructions.</p>
+<p>The 6809’s designers took this idea one step further.
+They let you use the <em>DP</em> register to designate <em>any</em> page as the zero page, which they called the “direct page.”</p>
+<p>But none of my byte-slinging instructions needed to use the direct page.
+That meant I could use the <em>DP</em> register as an additional one-byte go-between.
+Now I could copy 7 bytes per pull-push pair!</p>
+<p>And 14 <em>is</em> evenly divisible by 7.</p>
+<p>With this change, I could copy a whole 28-pixel row and advance to the next in just 5 instructions:</p>
+<pre><code>    PULS D,X,Y,DP  ; first 7 bytes    12 cycles
+    PSHU D,X,Y,DP  ;                  12
+    PULS D,X,Y,DP  ; second 7 bytes   12
+    PSHU D,X,Y,DP  ;                  12
+    LEAU -WOFF,U   ; advance dst ptr   8</code></pre>
+<p>56 cycles!
+Fifty. Six. Cycles.</p>
+<p>That bit of code made me feel just <em>awesome</em>.
+I had managed to harness every single available register on the machine for byte-slinging!
+<em>D</em>, <em>X</em>, <em>Y</em>, <em>U</em>, <em>S</em>, and even the oddball <em>DP</em> – they were all fully engaged.</p>
+<p>I was feeling great about this solution.</p>
+<p>Except for just one thing…</p>
+<h3 id="ill-have-a-little-more-crazy-please">I’ll have a little more crazy, please</h3>
+<p>If you’re acquainted with stacks, you may have noticed a subtle flaw in my brilliant plan:</p>
+<p><em>Pushes and pulls work in opposite directions.</em></p>
+<p>See, I lied about that little block of code I just showed you.
+It didn’t <em>actually</em> copy one row from a background tile onto the screen.
+What it actually did was break the row into two 7-byte blocks – I’ll call them “septets” – and then draw them onto the screen <em>swapped</em>.</p>
+<p>Recall that tile rows were laid out sensibly in memory as 14 contiguous bytes, like this:</p>
+<pre><code>+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+| 0   1   2   3   4   5   6   7   8   9   A   B   C   D |
++---+---+---+---+---+---+---+---+---+---+---+---+---+---+</code></pre>
+<p>So when you pulled-and-pushed a row onto the screen in 7-byte septets, it would get horizontally split like this:</p>
+<pre><code>+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
+| 7   8   9   A   B   C   D | 0   1   2   3   4   5   6 |
++---+---+---+---+---+---+---+---+---+---+---+---+---+---+</code></pre>
+<p>The first septet was now second, and the second now first.
+Note, however, that the bytes within each septet were unchanged; they retained their original ordering.</p>
+<p>Further, if you ran the row-copy code multiple times, the vertical stack of rows you copied would end up being upside down.
+That’s because the code uses pushes to write the rows onto the screen.
+Pushes move the stack pointer toward lower addresses, and lower addresses correspond to screen lines higher up on the display.</p>
+<p>To visualize the havoc that this row-reversal and septet-swapping would wreak, let’s say that you had the following 28-by-28 tile, representing a key:</p>
+<p><img src="data:image/gif;base64,R0lGODlhHAAcAIQQAE88FHZNAH19crB7ApCAT5+BNL6bN8+iIN2sEMqwavTGIfDNTfbbcPflmPbsvPz43v///////////////////////////////////////////////////////////////yH5BAEKABAALAAAAAAcABwAAAXOICSOZGmeaKqupeK6iMGiytI4TcMshjCTisZjSGzwfqLg0JEoJBwPY+KnYCwNBULB8GQcpiwFlDkYEATbHOIwUywThsOBABjkFogZ4uHA5eQEdg54en05OQxrCGpsLIs6hwwuDH8yjjoMmZkLlEYGBI6aopl3cz4qB5ScozsLBwWnKakNCK0Lt7cHWLEoswi4CGXCWSypiQvCA0gjA5kwysvMmQjP0SLNiS8DAdbNeM/c0QOKwWXh4tQKBwEAANYiAenr7yMBA3Lb9Pr7PyEAOw==" alt="A pixel-art image of a key."></p>
+<p>If you had used 28 applications of my row-copy code to draw it onto the screen, you would have ended up with this not-a-key:</p>
+<p><img src="data:image/gif;base64,R0lGODlhHAAcAIQQAE88FHZNAH19crB7ApCAT5+BNL6bN8+iIN2sEMqwavTGIfDNTfbbcPflmPbsvPz43v///////////////////////////////////////////////////////////////yH5BAEKABAALAAAAAAcABwAAAXQICSOZGmeaKquZTAcxxCwaoAoyjHT6HDnAQCAZ/IdEIiBckccDRiLX5LZhDwZP4VMNKhepV1IUqksEFZXXFK0aLsPhoJAdWBgF2S7Hro4yOkMDQhue3YNDX0Ecyl1glCFC4GIBmeAiIaHDDiScCwIeoeZCEeHozQIDQwOoTAEAw0OUaeHDgkGrQCviAinDr4JSooFBqUHpw8OyHEEwwkODAcJNAoP1cgJBc4PiNLTyQ3W1pNECgwPCguwmQsGizwKDRA48wgGVSIK9/r7/P0sIQA7" alt="A distorted pixel-art image of a key; the original image has been reflected across its horizontal axis, cut in half from top to bottom, and had its left and right halves swapped."></p>
+<p>So . . . <em>that</em> was a problem.</p>
+<p>But this problem, too, had an elegant solution!</p>
+<p>To review:</p>
+<ul>
+<li>the rows were upside down</li>
+<li>the septets within each row were swapped</li>
+<li>but the bytes within each septet were unchanged</li>
+</ul>
+<p>The breakthrough was to see “upside down” and “swapped” as two instances of the same thing. <em>Reversal.</em></p>
+<p>Reversal has this handy property: it’s an <a href="http://en.wikipedia.org/wiki/Involution_(mathematics)"><em>involution</em></a>.
+Reverse something twice, and you get back the original.
+With this in mind, I reasoned that if the tiles were pre-processed to reverse their rows and then the septets within the rows, the tiles would end up looking fine when they hit the screen.
+The mangling that occurred during copying and pre-processing would, in effect, undo each other.</p>
+<p>Working it out on paper, I also discovered that the pre-processing step could ignore the rows and just treat the tiles as one long, linear sequence of septets.<a href="#fn1" id="fnref1" role="doc-noteref"><sup>1</sup></a>
+To see why this is so, let’s consider a small tile of 2 rows of 2 septets each:</p>
+<pre><code>+---+---+
+| a   b |
++---+---+
+| c   d |
++---+---+</code></pre>
+<p>In memory, it would be laid out in row-major order, that is, as 4 sequential septets:</p>
+<pre><code>+---+---+---+---+
+| a   b | c   d |
++---+---+---+---+</code></pre>
+<p>So, reversing the rows and then swapping the septets within each row is the same as just reversing the septet order in memory:</p>
+<pre><code>+---+---+                  +---+---+                  +---+---+
+| a   b |                  | c   d |                  | d   c |
++---+---+        =======&gt;  +---+---+        =======&gt;  +---+---+
+| c   d |        reverse   | a   b |        swap      | b   a |
++---+---+        rows      +---+---+        septets   +---+---+
+
++---+---+---+---+          +---+---+---+---+          +---+---+---+---+
+| a   b | c   d |          | c   d | a   b |          | d   c | b   a |
++---+---+---+---+          +---+---+---+---+          +---+---+---+---+</code></pre>
+<p>So the solution to the mangling problem turned out to be a simple, one-time pre-processing step:
+Just break each tile into septets and reverse their order.</p>
+<p>Knowing that the mangling problem could be solved, I was feeling good about my overall idea.
+I couldn’t see any other problems, so I sketched out a new copy-tile subroutine to present to my friend.
+Since the row-copy logic was now just 5 instructions, I used it 4 times, unrolling the sole remaining loop a bit.
+Now, instead of copying 28 single rows, I copied 7 quad-rows.</p>
+<p>The code looked something like this:</p>
+<pre><code>COPYTILE3
+;;;
+;;; Copy a 28x28 screen tile into a screen buffer.
+;;; Arguments:
+;;;   X = starting address of *septet-reversed* background tile
+;;;   Y = starting address of destination in screen buffer
+;;; Execution time:
+;;;   34 + 7 * (224 + 7 + 3) + 7 + 10 = 1689 cycles
+;;;
+    ;; setup:  34 cycles
+    PSHS U,DP      ; save U and DP (8 cycles)
+    STS &gt;SSAVE     ; save S (7 cycles)
+    ;;
+    LDA #TILH/4    ; initial quad-row count (2 cycles)
+    STA &gt;ROWCT     ; (5 cycles)
+    ;;
+    LEAS ,X                    ; initialize src ptr (4 cycles)
+    LEAU (TILH-1)*SCRW+TILW,Y  ; initialize dst ptr (8 cycles)
+    ;;
+@COPY1
+    ;; copy four rows of 28 pixels in 4 * (48 + 8) = 224 cycles
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    LEAU -WOFF,U
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    LEAU -WOFF,U
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    LEAU -WOFF,U
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    PULS X,Y,D,DP
+    PSHU X,Y,D,DP
+    LEAU -WOFF,U
+    ;;
+    DEC &gt;ROWCT     ; reduce remaining quad-row count by one (7 cycles)
+    BNE @COPY1     ; loop while quad-rows remain (3 cycles)
+    ;;
+    LDS  &gt;SSAVE    ; restore S (7 cycles)
+    PULS U,DP,PC   ; restore regs and return to caller (10 cycles)
+
+SSAVE ZMD  1       ; stash for saving S while drawing
+ROWCT ZMB  1       ; var: remaining rows to copy</code></pre>
+<p>Adding up the cycles, the total was just 1689.
+I had shaved almost 1200 cycles off of my friend’s code.
+That’s a 70 percent speed-up!</p>
+<p>Beaming, I went to show my friend.</p>
+<h3 id="the-acid-test">The acid test</h3>
+<p>When I caught up with my friend and said I’d figured out how to make the copy-tile routine 70% faster, his face lit up.
+When I explained about the whole septets-and-mangling thing, though, his face unlit, doubts rising.
+But when I showed him the code, he got it.
+It clicked.</p>
+<p>“Let’s try it out!” he said.</p>
+<p>In about a half hour’s work, he had the code integrated into the game.
+After a rebuild and reboot, the game was loading.</p>
+<p>The title screen came up.</p>
+<p>He was into the game.</p>
+<p>And . . .</p>
+<p><em>Holy crap!</em></p>
+<p>The game seemed amazingly fast.
+In truth, it was probably only a third to a half faster, but that was enough.
+Some important perceptual threshold had been crossed.
+The game-play was now smooth, natural.
+You could feel the difference.</p>
+<p>We just sat there, playing the game and grinning.
+It was a good day.</p>
+<p>But it would not last.</p>
+<h3 id="in-for-a-penny-.-.-.">In for a penny . . .</h3>
+<p>A few days after the speed problem was behind us – or so we thought – the game’s finishing touches were applied.
+One of those finishing touches was sampled sound effects.
+This required feeding byte-sized morsels to the audio-output DAC a few thousand times each second.
+To schedule the feedings, my friend had turned on a hardware-clocked interrupt.</p>
+<p>Worked like a charm.
+The sounds sounded great, and everything was perfect.</p>
+<p>Except for one thing.</p>
+<p>After playing into the game one night, we noticed that some of the tiles were getting corrupted.
+The more we played, the more corruption we saw.</p>
+<p><em>Oh, no.</em></p>
+<p>Something very bad was happening.</p>
+<p>And then it hit us.</p>
+<p>What happens if an interrupt goes off during the copy-tile routine?</p>
+<p>The processor, to prepare for calling the interrupt handler, would push its current state onto the system stack.
+But, during the copy-tile routine, <em>there was no system stack</em>.
+The system-stack register <em>S</em> had been commandeered.
+And where was it pointing?
+Right into the memory buffer that held the reference tiles!</p>
+<p>Oops.</p>
+<p>We slumped.
+After all that effort, to think that our all-important speed-up was causing memory corruption…</p>
+<p>Needing a break, we walked to an all-night diner near campus to eat and think.
+Over pancakes and bacon, scrapple and grilled stickies, we talked through the problem.</p>
+<p>There were only two stack registers, and without commandeering both of them, the copy-tile routine wouldn’t be nearly as fast.
+There was no way, then, to return the <em>S</em> register to the system without losing our hard-won speed.
+But there was also no way that we could get reliable sound without using interrupts.</p>
+<p>One way or another, then, interrupts were going to be triggered.
+And, when they were, if copy-tile was running, whatever <em>S</em> was pointing to was going to get hammered.</p>
+<p>“How can we prevent the corruption?” I asked.</p>
+<p>We sat there, ignoring our food, the question hanging in the air.</p>
+<p>Suddenly, my friend slapped the table.
+He had it.</p>
+<p>“Don’t prevent it!” he said.</p>
+<p>“What?” I asked.</p>
+<p>“Don’t prevent the corruption,” he explained.
+“Let it happen.
+Just not to the reference tiles.”</p>
+<p>It was simple, really.
+He continued:</p>
+<p>“Just swap <em>S</em> and <em>U</em> in the copy-tile routine.
+<em>U</em> will point at the reference tiles, and <em>S</em> at the screen buffer.
+If an interrupt goes off, the corruption will happen where <em>S</em> is pointing – <em>on the screen.</em>
+The corruption will last only until we redraw the next frame.”</p>
+<p>“That’s brilliant!” I said.</p>
+<p>Eager to try his solution, we quickly finished our meal.</p>
+<h3 id="in-for-a-pound">. . . In for a pound</h3>
+<p>Walking back to the dorms, though, it bothered us that players might see screen glitches, even if for just a frame.
+We both felt that there had to be some way to make the hack perfect, if only we could find it.</p>
+<p>Later that night, we found it.</p>
+<p>Again, it was simple once we saw it.
+All we had to do was change the tile ordering.
+Instead of placing the tiles onto the screen from top to bottom, left to right, we would go right to left, bottom to top.
+In other words, from high addresses to low addresses.</p>
+<p>That way, when an interrupt went off and corrupted the memory locations immediately before the tile we were currently drawing, the corruption would be fixed when the very next tile was drawn.
+And since tile-drawing took place in a buffer that wasn’t displayed until it was fully drawn (and the vertical refresh had occurred), nobody would ever see the corruption.<a href="#fn2" id="fnref2" role="doc-noteref"><sup>2</sup></a></p>
+<p>It was the perfect hack!</p>
+<h3 id="to-the-old-days">To the old days!</h3>
+<p>And that’s the way things were.
+The challenge wasn’t overwhelming complexity, as it is today.
+The challenge was cramming your ideas into machines so slow, so limited that most ideas didn’t fit.</p>
+<p>You had to bang your ideas around, twist them, turn them, searching for something, <em>anything</em> that would help you squeeze them into the machine.
+Sometimes you found it, and you got one step closer to realizing your ideas.
+Sometimes you didn’t.</p>
+<p>But the search was always instructive.</p>
+<p>In this case, the search yielded several small victories that, together, solved the problem.
+But when you consider all the things we had to do to make that darn game fast enough, it does seem crazy.</p>
+<p>We started with a tile-copying subroutine whose core was a hand-tuned, unrolled loop of machine instructions.
+Then, to buy a 70-percent speed-up:</p>
+<ol type="1">
+<li>We replaced this subroutine with a very special manifestation of insanity that commandeered both stack pointers and used pulls and pushes, and every single available register, to draw tiles <em>upside down and horizontally broken</em>.</li>
+<li>Then we pre-processed the tiles so that drawing them would actually <em>fix</em> them.</li>
+<li>But then – <em>dammit!</em> – interrupts that occurred during drawing could corrupt the reference tiles.</li>
+<li>So, to protect the reference tiles, we corrupted the screen buffer instead.</li>
+<li>But that corruption would be visible.</li>
+<li>So we changed the tile-placement order to repair – <em>on the fly</em> – any corruption that might have occurred, before it could ever be displayed.</li>
+<li>And it all worked!</li>
+</ol>
+<p>We did <em>that.</em>
+For 70 percent.</p>
+<p>And it was <em>so</em> worth it.</p>
+<h3 id="tell-em-if-you-got-em">Tell ’em if you got ’em</h3>
+<p>Anyway, I wanted to share that story with you for two reasons.</p>
+<p>The first is that it’s a fun story.
+It’s one my earliest memories of struggling with a messy computing problem and, through dogged persistence, zeroing in on a solution that was both effective and elegant.
+The result was powerfully satisfying.</p>
+<p>The struggle, I learned, is worth it.</p>
+<p>The second reason is to encourage you to tell your stories.
+I know that, “back in the day,” most video games probably gave rise to many stories like this one.
+I’d love to hear them.
+But too many of them are lost, having faded out of memory before anyone thought to preserve them.</p>
+<p>If you have a story, please don’t wait.
+Tell it.
+Every day you wait, it gets harder.</p>
+<p>Tell it.</p>
+<section id="footnotes" role="doc-endnotes">
+<hr>
+<ol>
+<li id="fn1"><p>Exercise: Prove that for all finite sequences of finite sequences, applying (<em>reverse</em> ⋅ <em>concat</em>) is the same as applying (<em>concat</em> ⋅ <em>reverse</em> ⋅ <em>map</em> <em>reverse</em>).<a href="#fnref1" role="doc-backlink">↩︎</a></p></li>
+<li id="fn2"><p>We also had to make sure that nothing valuable was stored in the memory locations just before a screen buffer.
+They could, in theory, also be corrupted if an interrupt occurred while placing the top-left septet of the top-left corner tile.
+This septet’s address corresponded to the start of the buffer.<a href="#fnref2" role="doc-backlink">↩︎</a></p></li>
+</ol>
+</section>
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[After 7 months, Glasswing overwelms maintainers with underwhelming findings (385 pts)]]></title>
             <link>https://www.vulncheck.com/blog/anthropic-glasswing-november-update</link>
             <guid>50447074</guid>
             <pubDate>Tue, 10 Nov 2026 22:17:56 GMT</pubDate>
@@ -18,7 +586,7 @@
 Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made public and just 217 have been marked fixed.<!--]--></li><li><!--[-->Since September, Anthropic has added nearly 12,000 findings while recording just 15 additional fixes, widening the gap between discovery and remediation.<!--]--></li><li><!--[-->Roughly 1,654 findings (4.4%) have been marked as duplicates, nearly eight times the number fixed, and another 419 have been withdrawn.<!--]--></li><li><!--[-->Anthropic’s claimed true positive rate has risen from 90.8% to 94.2%, raising questions about how it accounts for duplicates and withdrawn findings.<!--]--></li><li><!--[-->Anthropic’s OSS Scanner shifts validation work to maintainers, with curl rejecting 19 of 34 published reports as vulnerabilities, confirming six as low severity and leaving nine awaiting assessment. Also putting Anthropic's true positive rates into question.<!--]--></li><!--]--></ul><p><!--[-->We're seven months into Anthropic's flagship Project Glasswing, and it's time for another update on the results. I've been tracking the project to see whether its claims are overhyped or grounded in reality.<!--]--></p><p><!--[-->As we all recall, Anthropic launched Project Glasswing on April 7th, claiming, "We have identified thousands of additional high- and critical-severity vulnerabilities that we are working on responsibly disclosing to open source maintainers." What surprised me was how little evidence the project offered, which made me wonder whether this was more of an overhyped marketing campaign.<!--]--></p><p><!--[-->That said, we shouldn't overlook that AI is an effective tool for finding vulnerabilities. But that story goes well beyond any single frontier model's capabilities.<!--]--></p><p><!--[-->If you're just catching up, this builds on my earlier posts:<!--]--></p><p><!--[-->So let's look at the results…<!--]--></p><p><!--[-->I started tracking Anthropic's discovered vulnerabilities on April 17th, shortly after launch, in an open source repo called <a href="https://github.com/patrickmgarrity/Anthropic-Credited-CVEs" rel="nofollow"><!--[--><!--[--><!--[-->Anthropic Credited CVEs<!--]--><!--]--><!--]--></a>. The goal was to see whether Anthropic's claims lived up to the hype. This was before Anthropic launched its own <a href="https://red.anthropic.com/2026/cvd/ledger/" rel="nofollow"><!--[--><!--[--><!--[-->disclosure ledger<!--]--><!--]--><!--]--></a>, which is only updated in infrequent bulk batches.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-credited-cves.png" alt="anthropic credited cves" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->My repo tracks every vulnerability attributable to Anthropic using CVE records, GHSAs, Linux kernel commits, and Anthropic's own ledger. I also manually audit advisories to catch CVEs that might otherwise get overlooked.<!--]--></p><p><!--[-->After seven months, I've tracked 442 CVEs attributable to Anthropic. That's an average of just 63 per month. Out of the 93,450 CVEs published this year, that's only about 0.5% of all CVEs.<!--]--></p><p><!--[-->For comparison, Anthropic's own public ledger lists just 217 fixed vulnerabilities, so I've tracked more than twice as many as Anthropic has disclosed itself.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-exploited.png" alt="Anthropic exploited vulnerabilties" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->You may recall that Glasswing launched with the message that we'd entered the Mythos era of vulnerability discovery. But are these vulnerabilities actually useful to attackers? To find out, I've been tracking Anthropic-discovered CVEs against VulnCheck KEV. So far, only 2 of the 442 have been exploited in the wild, just 0.45%. (CVE-2026-61500 and CVE-2026-26980)<!--]--></p><p><!--[-->When Anthropic first launched its ledger in May, it reported 23,019 findings and a 90.8% true positive rate. As of its most recent update on November 2nd, there are 37,966 findings and just 217 fixes. That looks like a staggering failure to me, but let's take a closer look.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/anthropic-ledger-november-update.png" alt="Anthropic November Ledger Update" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->Of the 37,966 findings Anthropic reports, only 7,349 (19.4%) have been made public. Just 217 of those have been marked fixed. The more glaring number is that 4.4% (1,654) of the project's findings have already been marked as duplicates, 7.5x more duplicates than fixes. On top of that, 419 findings have been withdrawn. It seems odd that the ledger now claims a 94.2% true positive rate, up from 90.8% at launch, when more findings have been withdrawn or marked as duplicates than fixed, likely a feedback loop missing to the triage rates listed as “True Positives”.<!--]--></p><p><!--[-->The trend since my September update is even more telling:<!--]--></p><div><table><!--[--><thead><!--[--><tr><!--[--><th><!--[--><!--]--></th><th><!--[-->September 8<!--]--></th><th><!--[-->November 2<!--]--></th><th><!--[-->Change<!--]--></th><!--]--></tr><!--]--></thead><tbody><!--[--><tr><!--[--><td><!--[-->Total findings<!--]--></td><td><!--[-->26,153<!--]--></td><td><!--[-->37,966<!--]--></td><td><!--[-->+11,813<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Made public<!--]--></td><td><!--[-->2,736 (10.5%)<!--]--></td><td><!--[-->7,349 (19.4%)<!--]--></td><td><!--[-->+4,613<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Fixed<!--]--></td><td><!--[-->202<!--]--></td><td><!--[-->217<!--]--></td><td><!--[-->+15<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Withdrawn<!--]--></td><td><!--[-->245<!--]--></td><td><!--[-->419<!--]--></td><td><!--[-->+174<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Duplicates<!--]--></td><td><!--[-->2<!--]--></td><td><!--[-->1,670<!--]--></td><td><!--[-->+1,668<!--]--></td><!--]--></tr><tr><!--[--><td><!--[-->Claimed true positive rate<!--]--></td><td><!--[-->91.4%<!--]--></td><td><!--[-->94.2%<!--]--></td><td><!--[-->+2.8 pts<!--]--></td><!--]--></tr><!--]--></tbody><!--]--></table></div><p><!--[-->In two months, Anthropic added nearly 12,000 findings and fixed just 15 more. Duplicates went from two to thousands, which is exactly what I warned about in September: the longer findings sit, the more likely someone else finds and fixes them first. I don't know how anyone can read these numbers as anything but damning.<!--]--></p><p><!--[-->You may also notice a correction in my visual. There appears to be a bug on Anthropic's ledger that inflates the number of findings marked as disclosed. Check for yourself using the "disclosed" filter.<!--]--></p><p><!--[-->Having humans triage every finding clearly didn't scale, and Anthropic has said as much. In its <a href="https://www.anthropic.com/research/launching-opt-in-vuln-finding-service-for-open-source" rel="nofollow"><!--[--><!--[--><!--[-->OSS Scanner launch post<!--]--><!--]--><!--]--></a> on October 8th, Anthropic said it had found more than 29,000 candidate vulnerabilities but had manually reviewed only about 6,000, and that it remains "bottlenecked on our human capacity to validate these findings." It had also already sent nearly 5,000 unverified reports to maintainers who asked for everything in bulk.<!--]--></p><p><!--[-->So with the Glasswing open source initiative hitting a wall, launching a self-service <a href="https://github.com/anthropics/oss-scanner" rel="nofollow"><!--[--><!--[--><!--[-->OSS Scanner<!--]--><!--]--><!--]--></a> that projects can opt into makes sense. Maintainers can now request a scan and triage the findings themselves. Anthropic is upfront that these reports are "fully model-generated, without human review or triage" and that "it is possible reports will be incorrect or invalid."<!--]--></p><p><!--[-->In other words, the triage bottleneck didn't go away. It moved to the maintainers. If the true positive rate is really as high as Anthropic claims, that shouldn't be a problem.<!--]--></p><p><!--[-->Three days ago, <a href="https://www.linkedin.com/in/danielstenberg/" rel="nofollow"><!--[--><!--[--><!--[-->Daniel Stenberg<!--]--><!--]--><!--]--></a>, who maintains curl, <a href="https://www.linkedin.com/feed/update/urn:li:share:7524224297595269120/" rel="nofollow"><!--[--><!--[--><!--[-->announced<!--]--><!--]--><!--]--></a> that the project had received a batch of 45 vulnerability reports from Anthropic. Anthropic rated only one as medium severity and the rest as low. Daniel is moving them over to GitHub at a deliberate pace "to soften the impact for the team," with plans to have them all published by the end of the week. This gives us a rare look at what Anthropic's findings look like once a maintainer actually validates them.<!--]--></p><p><!--[-->Of the 34 reports published so far, 19 have been marked as not a vulnerability, 6 have been confirmed as low severity, and 9 are still awaiting assessment. That puts the false positive rate at 55.9% so far, and only 17.6% of findings have been confirmed, all of them low severity. That's a lot of work dumped on open source maintainers for a small handful of low-impact bugs, and when a maintainer has to pace reports just to protect his team, that says plenty about the burden.<!--]--></p><p><!--[--><!--[--><!----><!----><!--[--><img src="https://www.vulncheck.com/blog/anthropic-glasswing-november-update/curl-vulns-none.png" alt="Curl Vulnerabilities" width="100%" type="button" aria-haspopup="dialog" aria-expanded="false" data-state="closed"><!--v-if--><!--]--><!--]--><!--]--></p><p><!--[-->This also isn't new for curl. Back in May, Daniel <a href="https://daniel.haxx.se/blog/2026/05/11/mythos-finds-a-curl-vulnerability/" rel="nofollow"><!--[--><!--[--><!--[-->wrote<!--]--><!--]--><!--]--></a> that five Mythos findings boiled down to a single confirmed vulnerability.<!--]--></p><p><!--[-->It's a far cry from the 94.2% true positive rate Anthropic currently claims on its ledger. It also undercuts the "high- and critical-severity" framing Glasswing launched with. In September, I found that Claude rated 91.5% of ledger findings as critical or high, while maintainers rated only 51.3% that way. I'm curious whether other open source projects are seeing the same thing.<!--]--></p><p><!--[-->curl took a bold move by deciding to publish low and medium vulnerabilities findings publicly as issues for full transparency and we encourage other open source maintainers to follow their lead.<!--]--></p><p><!--[-->AI is a valuable tool for finding vulnerabilities, and I'm not discounting that. But seven months in, the evidence still doesn't match the launch narrative. The CVEs are a sliver of this year's total, almost none are being exploited, fixes have stalled while duplicates and withdrawals pile up, and the triage burden is shifting onto the open source maintainers Glasswing promised to help. The receipts keep coming in. They still don't reconcile.<!--]--></p><p><!--[-->VulnCheck is helping organizations not just to solve the vulnerability prioritization challenge - we’re working to help equip any product manager, CSIRT/PSIRT or SecOps team and Threat Hunting team to get faster and more accurate with infinite efficiency using VulnCheck solutions.<!--]--></p><p><!--[-->We knew that we needed better data, faster across the board, in our industry. So that’s what we deliver to the market. We’re going to continue to deliver key insights on vulnerability management, exploitation and major trends we can extrapolate from our dataset to continuously support practitioners.<!--]--></p><p><!--[-->Are you interested in learning more? If so, VulnCheck's <a href="https://vulncheck.com/product/exploit-intelligence" rel="nofollow"><!--[--><!--[--><!--[-->Exploit &amp; Vulnerability Intelligence<!--]--><!--]--><!--]--></a> has broad threat actor coverage. Register and demo our data today.<!--]--></p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple has new Mac app coming to make running local AI models easy (137 pts)]]></title>
+            <title><![CDATA[Apple has new Mac app coming to make running local AI models easy (173 pts)]]></title>
             <link>https://9to5mac.com/2026/11/10/apple-has-new-mac-app-coming-to-make-running-local-ai-models-easy/</link>
             <guid>50446520</guid>
             <pubDate>Tue, 10 Nov 2026 21:25:03 GMT</pubDate>
@@ -127,7 +695,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
 	<div><p><em>FTC: We use income earning auto affiliate links.</em> <a href="https://9to5mac.com/about/#affiliate">More.</a></p><p><a href="https://bit.ly/3XgoDyD"><img src="https://9to5mac.com/wp-content/uploads/sites/6/2026/11/Gemini_Text_Image_Agnostic_750x150-1.png" alt="" width="750" height="150"></a></p></div>				</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Six Math Essentials by Terence Tao (203 pts)]]></title>
+            <title><![CDATA[Six Math Essentials by Terence Tao (214 pts)]]></title>
             <link>https://teorth.github.io/tao-web/six-math-essentials.html</link>
             <guid>50446246</guid>
             <pubDate>Tue, 10 Nov 2026 20:58:44 GMT</pubDate>
@@ -144,7 +712,7 @@ Of Anthropic’s 37,966 reported findings, only 7,349 (19.4%) have been made pub
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Toyota brand Scion is back and it's going to sell a kei truck in America (429 pts)]]></title>
+            <title><![CDATA[Toyota brand Scion is back and it's going to sell a kei truck in America (442 pts)]]></title>
             <link>https://www.theautopian.com/scion-is-back-and-its-going-to-sell-a-freaking-kei-truck-in-america/</link>
             <guid>50445401</guid>
             <pubDate>Tue, 10 Nov 2026 19:50:46 GMT</pubDate>
@@ -200,7 +768,464 @@ Then $\Scal_x$, the set of answers the verifier accepts, isn’t the same as the
 <label> imperfect verifier</label></p></figure><p>This visualization also shows why scaling up RL (generating more samples and longer samples) makes reward hacking more likely. The more extensively we “fuzz” the verifier, the more likely we’ll find a path that lands in the misspecified region of $\Scal_x$. Once the model finds this shortcut, training pushes the model towards similar behavior.</p><h2 id="so-what-objective-is-reasoning-solving">So what objective is reasoning solving?<a href="#so-what-objective-is-reasoning-solving" aria-label="Link to this section">#</a></h2><p>Reasoning isn’t actually solving any objective at all. A path is not guaranteed to converge to the correct answer. It’s only in aggregate, over the distribution of paths, do we get a high probability of success.</p><p>RL training directly raises the success probability $p_x$, by spending a lot of compute on searching for successful paths and then training the model to reproduce them. Thinking longer helps because training taught the model to use the extra tokens, not because generating more tokens is intrinsically better. The cost of sampling during RL is amortized into the weights. At inference time the model is likely to succeed with a single sample, but any individual sample is not guaranteed to succeed.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Starlink Mini 2 (361 pts)]]></title>
+            <title><![CDATA[A comprehensive study of how fingerprintable users are (105 pts)]]></title>
+            <link>https://fingerprinting.study/</link>
+            <guid>50444684</guid>
+            <pubDate>Tue, 10 Nov 2026 19:03:54 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://fingerprinting.study/">https://fingerprinting.study/</a>, See on <a href="https://news.ycombinator.com/item?id=50444684">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+
+  
+
+  <p>
+    Tom Ritter<sup>1</sup>, Fatih Kilic<sup>2</sup>, Frederik
+    Braun<sup>1</sup>, Elisa Luo<sup>3</sup>, Geoffrey M.
+    Voelker<sup>3</sup>, Stefan Savage<sup>3</sup>, Christoph
+    Kerschbaumer<sup>1</sup>
+  </p>
+  <p>
+    <sup>1</sup>Mozilla Corporation &nbsp;·&nbsp; <sup>2</sup>University
+    of Toronto &nbsp;·&nbsp; <sup>3</sup>UC San Diego
+  </p>
+
+  <p>
+    This is the companion site to a study Mozilla ran on browser
+    fingerprinting. With the help of almost 25 million Firefox release
+    users, we measured how identifiable browsers really are, found which
+    characteristics make them unique, and used that to design the
+    fingerprinting protections that shipped in Firefox 143. Here you can
+    read the paper and its key findings, browse the full appendix data
+    the PDF had no room for, download the privacy-preserving aggregate
+    data and analysis code, learn how the data was collected, and run an
+    interactive test that compares your own browser against the measured
+    population. If you have a question the data could answer, there is
+    also a discussion board for proposing follow-up research.
+  </p>
+
+  <p>
+    Browser fingerprinting is a known tracking mechanism on the modern
+    web, but its real-world effectiveness toward users has been hard
+    to measure. To build robust protections, we measured uniqueness
+    across a large, unbiased population, to determined what individual
+    metrics cause users to be unique.
+    These measurements used multiple privacy preserving technologies,
+    like <abbr title="Oblivious OHTTP">OHTTP</abbr>, to ensure that
+    no individual users can be identified or tracked across the web.
+    The protections we built into Firefox avoid web compatibility
+    problems while dropping the percentage of uniquely identifiable
+    users from 75% to 46%.
+  </p>
+
+  
+
+  <figure>
+    <picture>
+      <source srcset="https://fingerprinting.study/assets/figures/protection_chain.dark.png" media="(prefers-color-scheme: dark)">
+      <img src="https://fingerprinting.study/assets/figures/protection_chain.light.png" width="2100" height="1080" alt="Line chart. The share of users with a unique fingerprint
+                falls as each of the protections Firefox 143 shipped is
+                added, for three modeled fingerprinters. Fingerprint Pro
+                falls from 75.7% to 46.8%, Signifyd from 60.9% to 38.5%,
+                and Akamai from 18.2% to 9.0%.">
+    </picture>
+    <figcaption>
+      Shows the percentage of users seen as unique by three commercial
+      fingerprinters. Each step adds one protection on top of all the ones
+      before it, weighted across the four operating systems.
+    </figcaption>
+  </figure>
+
+  <h2 id="abstract">Paper abstract</h2>
+  <div>
+    <p>
+      Web browser fingerprinting has become a key tracking mechanism on
+      the modern web, yet its real-world effectiveness and which of the
+      existing mitigations offer value at scale remain insufficiently
+      understood.
+    </p>
+    <p>
+      In this paper, we present a large-scale study of browser
+      fingerprinting based on real-world telemetry from almost 25 million
+      Firefox release users. This dataset enables us to quantify user
+      uniqueness at population scale and identify which characteristics
+      contribute most to this uniqueness.
+    </p>
+    <p>
+      Our analysis shows fingerprintability is largely driven by a small
+      set of high-impact characteristics and their combinations, rather
+      than the accumulation of many independent measurements. Building on
+      these insights, we propose and evaluate fingerprinting protections
+      based on their impact on uniqueness and cohort structure, and design
+      data-driven mitigations.
+    </p>
+    <p>
+      These protections, shipped in Firefox 143, reduce the fraction of
+      uniquely identifiable users from 75% to 46% while maintaining web
+      compatibility, demonstrating that practical reductions in
+      fingerprintability are achievable in a mainstream browser.
+    </p>
+  </div>
+
+  <h2 id="findings">Our key findings</h2>
+  <div>
+    <p>
+      Here's what we want to present to you with this paper and the
+      broader scope of our work.
+    </p>
+
+    <dl>
+      <dt>
+        Uniqueness is caused by a small number of metrics - not one or
+        thirty
+      </dt>
+      <dd>
+        <p>
+          Fingerprinting test sites have a seemingly endless list of
+          measurements they can pull from your browser. If a user has a
+          unique fingerprint, it is typically not because of a single
+          measurement, but it is <em>also</em> not because of 20 or 30
+          measurements. <strong>It is a small number of metrics that make
+          users unique</strong>.
+        </p>
+
+          <p>
+            In fact, it's very close to the
+            <a href="https://en.wikipedia.org/wiki/Pareto_principle">80/20
+            rule</a>. Specifically, of all the users seen as unique by
+            Fingerprint Pro (the most discerning fingerprinter we model) -
+            80% of them are unique after only 8 metrics - while the
+            fingerprinter collects a total of over 50 metrics. Signifyd
+            collects more metrics, but identifies fewer users as unique:
+            80% of the users it sees as unique will be identified after 9
+            metrics despite collecting over 80.
+          </p>
+      </dd>
+
+      <dt>The numbers only mean anything per operating system</dt>
+      <dd>
+        <p>
+          Whenever someone cites a single percentage when describing "How
+          many users are unique" - you should be suspicious. Because
+          <strong>this collapses multiple different populations that
+          behave very differently</strong>.
+        </p>
+
+          <p>
+            Firstly, as a baseline, your operating system is always going
+            to be exposed to a fingerprinter. We are always working within
+            the constraint of web compatibility, and lying about the
+            user's operating system breaks shortcut keys and gives
+            you the wrong downloads among other problems. So if
+            we <em>know</em> the website is going to learn your real OS
+            anyway, we can use it to segment the population and analyze it
+            separately.
+          </p>
+
+          <p>
+            And when you do you see that each operating system behaves
+            differently because they have different important metrics.
+            Admittedly, it's very difficult to give a concise summary of
+            work and also provide four sets of numbers - so even we fall
+            prey to the trap of providing a single number, as we did in
+            the prior paragraph. But <em>every time</em> we have a single
+            percentage, somewhere we have that number broken down by
+            operating system, and in doing so, you will see that each
+            behaves differently.
+          </p>
+      </dd>
+
+      <dt>Entropy is not the measurement you want</dt>
+      <dd>
+        <p>
+          It's so, so easy to take all the results for a metric and just
+          calculate Shannon entropy - it's a standard yardstick in this
+          literature. But as we show - <strong>a high Shannon entropy does not
+          reliably predict fingerprinting impact</strong>.
+        </p>
+      </dd>
+
+      <dt>Cohort size, not just uniqueness</dt>
+      <dd>
+        <p>
+          Previous analyses calculated how many people were unique, but
+          they did not analyze the <em>other</em> people - the ones who
+          weren't. All those other people might be 1 million users who
+          share one fingerprint or 500,000 distinct fingerprints shared by
+          2 people each - that's quite the difference. 
+        </p>
+          <p>
+            We use the
+            <a href="https://en.wikipedia.org/wiki/Diversity_index">Simpson
+            Index</a> (aka the
+            <a href="https://en.wikipedia.org/wiki/Herfindahl%E2%80%93Hirschman_index">Herfindahl–Hirschman
+            Index</a>) to quantify that difference and compare different
+            sets of cohorts (shared fingerprints). This lets us compare
+            how effective different fingerprinting defenses are based not
+            just on how much uniqueness they eliminate but how much they
+            collapse groups of users into each other.
+          </p>
+          <p>
+           For example, two different protections can each lower the share
+           of unique users by about 2.1 percentage points. But one improves
+           the cohort score by 56%, while another raises it by only 13%. 
+           <strong>Judged on uniqueness alone, two defenses can look equally
+           effective; while the cohort improvement varies significantly.</strong>
+          </p>
+      </dd>
+
+      <dt>The same protection performs very differently per platform</dt>
+      <dd>
+        <p>
+          Protections are not uniformly impactful, and the variation is
+          not small. As an example, clamping the available screen
+          resolution takes 25.3 percentage points off cumulative macOS
+          uniqueness but between 0 and 3 points off the other three
+          platforms. Averaged across all users, that 25-point drop 
+          shrinks to 3.5 - <strong>a protection that matters enormously to one
+          platform can look marginal in the aggregate</strong>.
+        </p>
+
+        <p>
+          This is yet another reason why it's so important to segment and
+          analyze data on a per-operating-system basis.
+        </p>
+      </dd>
+
+      <dt>Standardization and randomization go hand-in-hand</dt>
+      <dd>
+        <p>
+          Making users report the same values makes them look more alike,
+          but it never makes everyone look the same. Some users will still
+          stand out, and that gets worse on websites with small visitor
+          populations. Standardization improves the situation, but it
+          should still be paired with randomization. Randomization is very
+          strong when it works, but can always be detected and bypassed.
+          <strong>Neither can carry the burden of providing privacy on its
+          own.</strong>
+        </p>
+      </dd>
+
+      <dt>The data shows why values differ, not just that they do</dt>
+      <dd>
+        <p>
+          Correlating fingerprinting values with users' hardware and other
+          characteristics let us identify why certain measurements differed
+          between users. <strong>Knowing the root cause lets us build
+          protections that reach much further, and protect small groups of
+          users who would otherwise stand out as a minority.</strong>
+        </p>
+        <p>
+          Addressing these differences has already produced more consistent
+          outputs for
+          <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2046791">image
+          rendering</a>,
+          <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2036977">Web
+          Audio</a>, and
+          <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=2037094">mathematical
+          operations</a> on Android, with more root causes being investigated.
+        </p>
+      </dd>
+
+      <dt>Users don't connect website breakage to the setting</dt>
+      <dd>
+        <p>
+          <strong>Breakage from a strict mode is delayed, and the delay hides the cause.</strong>
+          Turning on a stricter mode is a one-time act - but the broken website
+          arrives later and nothing connects the two. From the user's
+          perspective, this website doesn't work in Firefox and they have
+          no idea why and are frustrated. Report after report we see
+          people posting for help, confused - despite having taken
+          specific action to enable a hidden setting opting them into
+          strict fingerprinting protections.
+        </p>
+      </dd>
+
+      <dt>Protections that ship have to keep the web working</dt>
+      <dd>
+        <p>
+          Users don't realize that a setting they changed caused the breakage,
+          and don't know how to fix it - so a protection that breaks the web
+          breaks the browser along with it.
+          We selected and tuned mitigations on both measured impact
+          <em>and</em> compatibility. <strong>For a default, compatibility
+          isn't a trade-off against privacy - it's a precondition for it.</strong>
+        </p>
+      </dd>
+
+      <dt>The hard part is finding what breaks</dt>
+      <dd>
+        <p>
+          The web is vast, and even the most innocuous change is likely to break
+          something somewhere. Some breakage can be anticipated, which helps
+          design, testing, and detection. <strong>The other breakage gets fixed only if a
+          chain of luck holds: someone has to recognize the breakage, report it,
+          reproduce it on the right hardware, and get it to the right
+          person.</strong>
+        </p>
+      </dd>
+
+      <dt>We are deliberately not publishing everything we could</dt>
+      <dd>
+        <p>
+          Commercial fingerprinters evolve continuously, and they borrow
+          openly from the community that studies them. Sites built to
+          teach people about fingerprinting - CreepJS among them - get
+          picked up and used outright by fingerprinting products.
+        </p>
+        <p>
+          So we have been deliberately conservative. There are analyses
+          this dataset would support that we have not run, data we could
+          have released that we have not, and offensive angles on this
+          work that we have not pursued. That is a choice rather than an
+          oversight: <strong>we would rather leave a question open than make it
+          easier to build a better fingerprinter</strong>.
+        </p>
+      </dd>
+    </dl>
+  </div>
+
+  <h2 id="test">Test your own browser</h2>
+  <div>
+    <p>
+      This interactive test re-implements individual measurements as close
+      as possible to how Firefox's own collection code performed them,
+      runs in your browser, and compares each result against the published
+      aggregate data. For every characteristic you can see your value and how many
+      of the ~25 million measured browsers share it - overall and within
+      your operating system.
+    </p>
+    
+    <p>
+        The test runs entirely in your browser. All comparisons happen
+        locally, against our static reference files.
+        No data is stored or submitted to us.
+      </p>
+    <p>
+      If the test, or anything else on this site, looks wrong, please
+      <a href="https://github.com/tomrittervg/fingerprinting_paper_artifacts/issues">report it as an issue on GitHub</a>.
+      For a problem with the test, include the diagnostics from its
+      <strong>Copy diagnostics</strong> button, or, if you would rather
+      not post your measured values publicly, email them to
+      <a href="mailto:tom@ritter.vg">tom@ritter.vg</a>.
+    </p>
+  </div>
+
+  <h2 id="paper">Paper</h2>
+  <div>
+    <p>
+      <!-- TODO: add the camera-ready PDF, DOI and citation once published. -->
+      The extended version of the paper is available as a PDF.
+    </p>
+    
+  </div>
+
+  <h2 id="appendix">Full appendix data</h2>
+  <div>
+    <p>
+      The paper's appendices contain a wealth of data locked behind a
+      reasonable page limit and PDF formatting. This full data page
+      carries all of it - every rank for every operating system and
+      all three modeled services, the complete protection chains,
+      and the paper's figures regenerated at print resolution.
+    </p>
+    
+  </div>
+
+  <h2 id="datacollection">Data collection</h2>
+  <div>
+    <p>
+      Our measurements come from Firefox telemetry, specifically the 
+      <code>user-characteristics</code> ping, a dedicated telemetry ping.
+      Unlike normal telemetry pings that are sent regularly, this ping
+      must be explicitly enabled (which has happened twice, once in 2025
+      and once in 2026), and sends one data report before becoming dormant
+      again.
+    </p>
+    <p>
+      This ping carries no client ID, only a UUID unique to the ping used
+      to de-duplicate users. It cannot be keyed to any other telemetry
+      submissions. It is submitted over <a href="https://www.rfc-editor.org/rfc/rfc9458">Oblivious HTTP</a>
+      (OHTTP): a relay operated independently of Mozilla forwards the
+      encrypted submission, so the relay can see the sender's IP address but
+      not the contents, and Mozilla receives the contents but not the IP
+      address. Access to the collected data was restricted to four authorized
+      Mozilla employees. The data was retained for 90 days and has since been deleted.
+    </p>
+    
+  </div>
+
+  <h2 id="data">Aggregate data &amp; analysis code</h2>
+  <div>
+    <p>
+      We release four types of data: 
+    </p>
+    <ol>
+      <li>A list of fingerprints generated for different phases of protections, per modeled fingerprinter, with the user's OS and locale unmasked.</li>
+      <li>Aggregate tables of the frequency of value per metric, split by OS</li>
+      <li>Aggregate tables of the frequency of value per metric, correlated by other metrics' values, again split by OS</li>
+      <li>A detailed analysis of rendered canvas images that allows comparison</li>
+    </ol>
+
+    <p>
+      In the fingerprint lists, the fingerprints cannot be recreated from
+      a website measuring user characteristics, due to the way the telemetry
+      was collected. After being generated, the files were shuffled to a new ordering,
+      and any locale occurring fewer than 100 times was anonymized.
+    </p>
+    <p>
+      In the aggregate tables, any value observed fewer
+      than 100 times within a single per-OS population is withheld - so
+      the published data describes cohorts, never individuals.
+    </p>
+    <p>
+      In the canvas comparison, raw canvas renderings are provided, but they
+      are devoid of any connection to other user data. Any unique canvas rendering
+      is not provided; only the hash.
+    </p>
+    <p>
+      For verification and exploration, the code used to process the data and 
+      perform different analyses is available for review. It additionally contains
+      the specific fingerprinting scripts captured, reverse engineered, and
+      modeled for the paper.
+    </p>
+    
+  </div>
+
+  <h2 id="followups">Future Research</h2>
+  <div>
+    <p>
+      Far more can be asked of this dataset than we have asked. Some of it
+      we chose not to pursue, some of it we simply did not think of, and
+      some of it is a better fit for someone who is not us.
+    </p>
+    <p>
+      There is a discussion board for proposing follow-up analyses. Two
+      kinds are worth posting:
+    </p>
+    <ul>
+      <li>
+        <strong>Answerable from the published aggregate data.</strong>
+        Anyone can run these - the per-operating-system
+        distributions are released, and the analysis toolkit is open. Post
+        the question anyway, so the work is not duplicated and so the
+        result lands somewhere others can find it.
+      </li>
+      <li>
+        <strong>Needs the raw data.</strong> These we would have to run
+        ourselves, since the underlying ping data is not something we can
+        ever release. Describe what you want to know and why! To be clear,
+        we <em>do not have the raw data anymore</em> but it is possible we
+        will perform a re-collection in the future which we could analyze.
+        We cannot promise to run everything, and some questions we will
+        decline because we do not wish to help build a better fingerprinter.
+      </li>
+    </ul>
+    
+  </div>
+
+</div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Starlink Mini 2 (373 pts)]]></title>
             <link>https://starlink.com/mini-2</link>
             <guid>50444129</guid>
             <pubDate>Tue, 10 Nov 2026 18:22:32 GMT</pubDate>
@@ -208,7 +1233,7 @@ Then $\Scal_x$, the set of answers the verifier accepts, isn’t the same as the
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Synaptics patent claims stop work on DisplayLink drivers (358 pts)]]></title>
+            <title><![CDATA[Synaptics patent claims stop work on DisplayLink drivers (369 pts)]]></title>
             <link>https://lwn.net/SubscriberLink/1102549/acbc92e00cee3a3f/</link>
             <guid>50443824</guid>
             <pubDate>Tue, 10 Nov 2026 18:02:02 GMT</pubDate>
@@ -472,7 +1497,7 @@ free-software developers and users.</p>
 </main></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Get your coding agent off ~2019 JavaScript, onto modern web primitives (328 pts)]]></title>
+            <title><![CDATA[Show HN: Get your coding agent off ~2019 JavaScript, onto modern web primitives (341 pts)]]></title>
             <link>https://github.com/GoogleChrome/modern-web-guidance</link>
             <guid>50443812</guid>
             <pubDate>Tue, 10 Nov 2026 18:01:15 GMT</pubDate>
@@ -1486,7 +2511,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 </article></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Claude Whiteboards, Claude Sheets, and Claude Data (170 pts)]]></title>
+            <title><![CDATA[Claude Whiteboards, Claude Sheets, and Claude Data (189 pts)]]></title>
             <link>https://claude.com/resources/articles/sheets-whiteboards-data</link>
             <guid>50443716</guid>
             <pubDate>Tue, 10 Nov 2026 17:55:07 GMT</pubDate>
@@ -1494,7 +2519,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 <div id="readability-page-1" class="page"><div><p>Today we’re launching Claude Whiteboards and Claude Sheets in beta, and <a href="https://claude.com/resources/articles/dashboards-and-motion" target="_blank" rel="noopener noreferrer">Claude Dashboards<span lang="en" data-export-skip=""> (opens in new tab)</span></a> becomes generally available as Claude Data. Whiteboards is a shared board where your team brainstorms with Claude, Sheets is a spreadsheet Claude builds and edits with you, and Claude Data adds data stories, certified queries, and live sharing. These are available on all paid plans.</p><figure><p data-youtube-id="YewAJPawE7I"><iframe src="https://www.youtube-nocookie.com/embed/YewAJPawE7I?enablejsapi=1&amp;rel=0&amp;playsinline=1&amp;modestbranding=1" title="Demo of new Claude Artifacts: a team and Claude build a whiteboard, spreadsheet, and dashboard for a holiday pie launch." allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" sandbox="allow-scripts allow-same-origin allow-presentation allow-popups" allowfullscreen=""></iframe></p></figure><p>Working with Claude on a project often meant moving the output over to another tool or program, where Claude didn’t have live access to follow progress and changes. Now, your documents, boards, sheets, and dashboards can stay in Claude, with access for your team to continue editing together. When ready, you can bring the outputs directly into tools from our partners and continue working there.</p><h2 id="claude-whiteboards">Claude Whiteboards</h2><p>Many people use Claude as a thought partner, but brainstorming with it has typically meant copy-pasting the results elsewhere so you can then start brainstorming or collaborating with your coworkers. Now, you can talk through a messy plan out loud with Claude, and Claude can turn it into a board with a timeline with owners and dates, so you and your team can collaborate in real time. In a retro meeting, for example, everyone can add their notes, and Claude can group them by theme and draft the action items for each person. You can focus on any part of the board by dragging a box around it and asking Claude questions. When you’re done brainstorming, Claude can turn the board into a doc or deck, or bring it into tools like Lucid, Miro, or Vani by Zoho, where you can continue working on it with your team.</p><h2 id="claude-sheets">Claude Sheets</h2><p>Claude can now generate spreadsheets with tabs, formulas, formatting, and drop-downs, often from just a prompt like asking for a campaign tracker or a hiring budget. It can edit in the cells, outlining each new edit so you can track changes. You can share sheets with your team, so you and Claude can work on them together.</p><p>For now, sheets have simple spreadsheet functionality, but we are working on adding more. When you need the full functionality of Excel, you can export your file to .xlsx or CSV, or use <a href="https://claude.com/claude-for-microsoft-365" target="_blank" rel="noopener noreferrer">Claude for Excel<span lang="en" data-export-skip=""> (opens in new tab)</span></a>. You can also continue working in partner tools including Airtable, Asana, monday.com, and Smartsheet.</p><h2 id="claude-data">Claude Data</h2><p><a href="https://claude.com/resources/articles/dashboards-and-motion" target="_blank" rel="noopener noreferrer">Claude Dashboards<span lang="en" data-export-skip=""> (opens in new tab)</span></a> launched in beta in October, enabling teams to ask quick questions of their company’s data in tools like Amazon Redshift, BigQuery, and ClickHouse. Starting today, it’s generally available as Claude Data. We changed the name because the way companies use their data is broader than dashboards, and the product now covers how they work more broadly. Certified queries and live sharing are in beta. Here are some ways teams can use Claude Data:</p><ul><li><strong>Create certified definitions of metrics. </strong>Your data team can certify the queries everyone should use, so you don’t end up building or working on dashboards with conflicting data. Charts built on these metrics carry a "certified" badge showing they’re certified.</li><li><strong>Craft stories</strong> <strong>from data.</strong> You can work with Claude in Claude Data to draft data stories or narrated videos from your metrics, for you to review before sharing.</li><li><strong>Share current numbers with</strong> <strong>everyone.</strong> With live sharing, your colleagues can see up-to-date numbers when they open a shared dashboard, even if they don’t have access to the connectors that keep that data current. Viewers see the results of the queries you’ve approved, and can’t run others with your access.</li><li><strong>Match your look-and-feel. </strong>Design systems are now supported in Claude Data.</li><li><strong>Get faster loading with caching. </strong>Previously, every dashboard would reload on every load. Now, dashboards support caching, and refresh cadences can be set on a per-dashboard basis.</li><li><strong>Track changes over time. </strong>Claude Data now has tracked changes, so you can see who has made edits and roll back to a specific version if needed.</li></ul><p>Our partners for Claude Data include Amplitude, Mixpanel, Omni, PostHog, and Sigma.</p><p>Starting today, <a href="https://claude.com/resources/articles/interactive-connectors-full-tool" target="_blank" rel="noopener noreferrer">interactive connectors<span lang="en" data-export-skip=""> (opens in new tab)</span></a> can open as full apps beside your conversation or in full screen, so you can work in tools like Adobe, Atlassian, Box, and Notion yourself, or ask Claude to make changes with you.</p><h2 id="getting-started">Getting started</h2><p>Claude Whiteboards, Sheets, and Data work on web, desktop, and mobile. Claude Data needs a data connector, such as a warehouse or CRM.</p><p><strong>For admins:</strong> On Team plans, all three are on by default. On Enterprise plans, Claude Whiteboards and Sheets are off by default, and Claude Data turns on by default on November 19, 2026. You can change these anytime in Organization settings &gt; Artifacts.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Val Town is winding down (355 pts)]]></title>
+            <title><![CDATA[Val Town is winding down (361 pts)]]></title>
             <link>https://blog.val.town/winding-down</link>
             <guid>50443427</guid>
             <pubDate>Tue, 10 Nov 2026 17:31:14 GMT</pubDate>
@@ -1537,7 +2562,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 <p>Steve Krouse</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[AMD's Zen 6 Family: Feeding the Beast (215 pts)]]></title>
+            <title><![CDATA[AMD's Zen 6 Family: Feeding the Beast (221 pts)]]></title>
             <link>https://chipsandcheese.com/p/amds-zen-6-family-feeding-the-beast</link>
             <guid>50443090</guid>
             <pubDate>Tue, 10 Nov 2026 17:02:32 GMT</pubDate>
@@ -1545,7 +2570,7 @@ codex plugin add modern-web-guidance@googlechrome</pre></div>
 <div id="readability-page-1" class="page"><div dir="auto"><p>Hello you fine Internet folks,</p><p>Today we’re looking at AMD’s next-generation Zen 6 CPU core family. We’ll explore the changes from Zen 5 and what the differences between Zen 6 and Zen 6c tell us about AMD’s approach to microarchitecture.</p><p>Hope y’all enjoy!</p><div><p><span>From a bird's eye view, Zen 6 is the natural evolution of Zen5, with the expansion of many OoO structures and iterative improvements found throughout the core.</span></p><p><span>Digging in deeper however tells a different story, with AMD heavily re-working several parts of the core, reminding me of the changes from Zen 1 to Zen 2.</span></p></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!R25V!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!R25V!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 424w, https://substackcdn.com/image/fetch/$s_!R25V!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 848w, https://substackcdn.com/image/fetch/$s_!R25V!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!R25V!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 1456w" sizes="100vw"><img src="https://substackcdn.com/image/fetch/$s_!R25V!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png" width="1456" height="995" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/ff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:995,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:260708,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:false,&quot;topImage&quot;:true,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!R25V!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 424w, https://substackcdn.com/image/fetch/$s_!R25V!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 848w, https://substackcdn.com/image/fetch/$s_!R25V!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!R25V!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fff0ea2d4-ea2d-440b-ad51-1bc99a695511_2022x1382.png 1456w" sizes="100vw" fetchpriority="high"></picture></div></a></figure></div><p>At a high level the changes AMD made to the integer schedules stand out, returning to a layout reminiscent of Zen 3 and Zen 4.</p><p>Zen 5 had the best direction predictor of any core we have measured and Zen 6 seemingly builds upon that same direction predictor.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!LKuF!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!LKuF!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 424w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 848w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 1272w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!LKuF!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp" width="1365" height="762" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:762,&quot;width&quot;:1365,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!LKuF!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 424w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 848w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 1272w, https://substackcdn.com/image/fetch/$s_!LKuF!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F91946bdf-c5e2-4c04-b8f1-b332854c24d7_1365x762.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!P8g0!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!P8g0!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 424w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 848w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 1272w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!P8g0!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png" width="1300" height="625" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:625,&quot;width&quot;:1300,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!P8g0!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 424w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 848w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 1272w, https://substackcdn.com/image/fetch/$s_!P8g0!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F9971593c-59b3-49bf-b0e3-37a2c468992e_1300x625.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><div><p><span>The biggest difference we do see is in what happens once the direction predictor gets overwhelmed. Both cores hit that wall in about the same place and past it, the predictor is left guessing at random data, so the time per branch mostly reflects how long the core takes to recover from a wrong guess. </span></p><p><span>That plateau sits at roughly 3.5 to 4 ns of extra time per branch on Zen 5 and roughly 3 to 3.5 ns on Zen 6 so Zen 6 is paying less for each branch it gets wrong, which speaks to AMD reducing the latency of a branch mispredict compared to Zen 5.</span></p></div><p>Zen 6 has also improved the ability of the core to do 2 branches per cycle with Zen 6 able to do 2 branches per cycle within the L1 instruction cache.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!oG7B!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!oG7B!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 424w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 848w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 1272w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!oG7B!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png" width="977" height="526" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:526,&quot;width&quot;:977,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!oG7B!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 424w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 848w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 1272w, https://substackcdn.com/image/fetch/$s_!oG7B!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F92cb7d6d-0772-42c7-9200-b5c2dd4c93bb_977x526.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>When the footprint exceeds the L1i, then it falls to just a single branch per cycle for the rest of the BTB except for the 64B test which goes up to 4 cycles per branch for the L2 BTB.</p><p>When comparing the BTB of Zen 6 to Zen 5, Zen 6 appears to have focused on improving the speed of the BTB compared to beefing up the capacity.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!24kn!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!24kn!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 424w, https://substackcdn.com/image/fetch/$s_!24kn!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 848w, https://substackcdn.com/image/fetch/$s_!24kn!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 1272w, https://substackcdn.com/image/fetch/$s_!24kn!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!24kn!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png" width="1456" height="579" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:579,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:112639,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!24kn!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 424w, https://substackcdn.com/image/fetch/$s_!24kn!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 848w, https://substackcdn.com/image/fetch/$s_!24kn!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 1272w, https://substackcdn.com/image/fetch/$s_!24kn!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F1cac7812-c368-4eba-8911-f8e31f3e59dd_2307x917.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The accuracy of Zen 6’s Branch Predictor Unit is very similar to Zen 5’s while also being faster which is a good thing considering that Zen 5 already had a very accurate Branch Predictor.</p><p>Zen 6 carries forward the same dual decode cluster schema that Zen 5 introduced but, unlike Zen 5 where a single thread could only effectively use a single decode cluster, now with Zen 6 a single thread can use both decode clusters.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!0X5u!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!0X5u!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 424w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 848w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 1272w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!0X5u!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png" width="1417" height="709" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:709,&quot;width&quot;:1417,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!0X5u!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 424w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 848w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 1272w, https://substackcdn.com/image/fetch/$s_!0X5u!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F362e75a6-f958-4fde-be89-f692cabd76d0_1417x709.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>Outside of the L1i, Zen 6 looks very similar to Zen 5’s behavior on the instruction side of things.</p><p>The execution engine of Zen 6 is overall very similar to Zen 5, but there are some important differences to be mindful of.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!O9I-!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!O9I-!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 424w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 848w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 1272w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!O9I-!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp" width="1365" height="1184" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/f142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:1184,&quot;width&quot;:1365,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!O9I-!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 424w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 848w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 1272w, https://substackcdn.com/image/fetch/$s_!O9I-!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ff142a3ba-44cd-4928-a9b3-bbd87d6c2d22_1365x1184.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>On the integer side, Zen 6 brings back Zen 4’s NOP pairing behavior, retiring up to 16 NOPs per cycle. Zen 6 also comes closer to theoretical peak throughput for simple integer instructions than Zen 5, sustaining 5.96 64-bit adds per cycle against Zen 5’s 5.25 with the same six ALUs.</p><p>AMD has reduced the number of integer multiply units from three to two, with PDEP and PEXT throughput also falling from three instructions per cycle to two. According to AMD, Zen 5’s third integer multiply unit did not justify its area cost.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!e2zc!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!e2zc!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 424w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 848w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 1272w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!e2zc!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png" width="1418" height="738" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:738,&quot;width&quot;:1418,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:56925,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!e2zc!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 424w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 848w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 1272w, https://substackcdn.com/image/fetch/$s_!e2zc!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8dfd7d9a-3bee-408d-b28d-ed8cd3be6bc9_1418x738.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>On the vector side, the floating-point units are unchanged, with Zen 6 still handling two 512-bit FADDs, FMULs, or FMAs per cycle. The change is in VNNI, where Zen 6 doubles the number of units from two to four and our 512-bit VNNI test goes from 1.99 to 3.88 instructions per cycle, with Zen 6c matching it. VNNI instructions are useful for operations like calculating the inner loop of quantized inference as well as for video codecs using them for video filters as well.</p><p>Moving over to the other notable change, Zen 5 could already perform four per cycle, but our test shows only two of them could be vector loads, regardless of if they were 256 or 512 bit loads. Zen 6 raises 256-bit loads to four per cycle on both cores while leaving 512-bit loads at two, so both widths now reach the same 128 bytes per cycle which matters because most shipped vector code still targets AVX1/2.</p><p>In the past the difference between the Classic cores and the Dense cores in terms of the architecture were, for all intents and purposes, functionally identical with the biggest changes being in the number of cores on a CCD and the amount of L3 cache per core. With the Zen 6 family, that has changed.</p><p>Starting inside of the core, the changes occur after micro-op dispatch and seemingly end after the load queue.</p><div><figure><div data-component-name="Image2ToDOM"><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!bjoI!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 424w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 848w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 1272w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!bjoI!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png" width="1456" height="174" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/b906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:174,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:81402,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!bjoI!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 424w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 848w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 1272w, https://substackcdn.com/image/fetch/$s_!bjoI!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb906e342-aadb-45ef-9f80-716e6f69feb2_2191x262.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></figure></div><p>The main differences between Zen 6 and Zen 6c lie in the capacities of their out-of-order structures. Several of these structures are larger on Zen 6c, allowing it to keep more work in flight and absorb more latency than Zen 6. The reorder buffer grows from 576 to 640 entries, the integer register file from 288 to 352, the vector scheduler from 138 to 180, and the load queue from 280 to 330.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!_Lrh!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!_Lrh!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 424w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 848w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!_Lrh!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png" width="1456" height="990" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/a1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:990,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:259194,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!_Lrh!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 424w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 848w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!_Lrh!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa1159fcc-3ba0-4ab3-957a-b444fff2038c_2032x1382.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The differences suggest that AMD is specializing the two designs. Zen 6 appears tuned for high frequency, while Zen 6c has more capacity to tolerate comparatively high memory latency.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!Tce3!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!Tce3!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 424w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 848w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!Tce3!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png" width="1456" height="990" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:990,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:226060,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!Tce3!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 424w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 848w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 1272w, https://substackcdn.com/image/fetch/$s_!Tce3!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F631c910d-0976-4d8a-9f7c-16188456e5cc_2032x1382.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>Zen 6 and Zen 6c use 12-core and 32-core CCDs, respectively, but both provide 4 MB of L3 cache per core. That gives the 12-core CCD 48 MB of L3 cache and the 32-core CCD 128 MB.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!naz1!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!naz1!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 424w, https://substackcdn.com/image/fetch/$s_!naz1!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 848w, https://substackcdn.com/image/fetch/$s_!naz1!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 1272w, https://substackcdn.com/image/fetch/$s_!naz1!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!naz1!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png" width="1417" height="768" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/b33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:768,&quot;width&quot;:1417,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:82929,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!naz1!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 424w, https://substackcdn.com/image/fetch/$s_!naz1!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 848w, https://substackcdn.com/image/fetch/$s_!naz1!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 1272w, https://substackcdn.com/image/fetch/$s_!naz1!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fb33907f2-c445-46cd-b7d3-942814d9da4a_1417x768.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!noA_!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!noA_!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 424w, https://substackcdn.com/image/fetch/$s_!noA_!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 848w, https://substackcdn.com/image/fetch/$s_!noA_!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 1272w, https://substackcdn.com/image/fetch/$s_!noA_!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!noA_!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png" width="1417" height="767" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/d46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:767,&quot;width&quot;:1417,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!noA_!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 424w, https://substackcdn.com/image/fetch/$s_!noA_!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 848w, https://substackcdn.com/image/fetch/$s_!noA_!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 1272w, https://substackcdn.com/image/fetch/$s_!noA_!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fd46fd82d-44d2-426b-86fa-bc7e865729ef_1417x767.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>L3 latency has increased from about 47 cycles on Zen 5 to 55 cycles on Zen 6 and 66 cycles on Zen 6c. The larger caches and greater number of mesh stops likely contribute to the increase. In nanoseconds, Zen 6’s higher clock hides most of the increase, at 10.7 ns against 10.3 ns on the Zen 5-based EPYC 9355P, while Zen 6c’s lower clock and larger CCX put it at 16.4 ns.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!ZqTi!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!ZqTi!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 424w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 848w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 1272w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!ZqTi!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png" width="1417" height="708" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:708,&quot;width&quot;:1417,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:86436,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!ZqTi!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 424w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 848w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 1272w, https://substackcdn.com/image/fetch/$s_!ZqTi!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F85e4f4a3-ad42-4e77-aa6e-6d8612854e66_1417x708.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!AsrM!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!AsrM!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 424w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 848w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 1272w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!AsrM!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png" width="1418" height="709" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:709,&quot;width&quot;:1418,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:80926,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!AsrM!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 424w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 848w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 1272w, https://substackcdn.com/image/fetch/$s_!AsrM!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F69556c91-5e6a-4b60-8a02-1b667633b8b2_1418x709.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>Moving over to bandwidth, we see that Zen 6 fixes Zen 5’s odd L2 bandwidth behavior, where a core pulled only about 42 bytes per cycle across most of the L2’s capacity, in Zen 6 the read path now reliably delivers 64 bytes per cycle. The rest of the cache hierarchy is largely unchanged in bandwidth per cycle.</p><p>Store-to-load forwarding is seemingly unchanged from Zen 5 and is where the behavior of Zen 6 and Zen 6c re-unify.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!QoPw!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!QoPw!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 424w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 848w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 1272w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!QoPw!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp" width="1365" height="407" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:407,&quot;width&quot;:1365,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:391308,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/webp&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!QoPw!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 424w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 848w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 1272w, https://substackcdn.com/image/fetch/$s_!QoPw!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F73e67dfc-f241-4f8f-8adc-621a4f73a3b1_1365x407.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a><figcaption>EPYC 9686F (Zen 6) STLF test</figcaption></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!Cwp0!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!Cwp0!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 424w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 848w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 1272w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!Cwp0!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp" width="1456" height="434" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:434,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:641514,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/webp&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!Cwp0!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 424w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 848w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 1272w, https://substackcdn.com/image/fetch/$s_!Cwp0!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F10a0e23e-f215-4434-b5be-b47e239850c3_1536x458.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a><figcaption>EPYC 9996 (Zen 6c) STLF test</figcaption></figure></div><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!ZGc8!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!ZGc8!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 424w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 848w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 1272w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!ZGc8!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp" width="1456" height="708" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/fb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:708,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:22668,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/webp&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!ZGc8!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 424w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 848w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 1272w, https://substackcdn.com/image/fetch/$s_!ZGc8!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Ffb80deba-7b37-43c3-a0a8-a30c8fbc768a_2718x1321.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a><figcaption>Zen 5 STLF test</figcaption></figure></div><p>A 32-bit load from the same address as a 64-bit store completes with effectively zero latency which lets Zen 6 handle two dependent store-load pairs per cycle. Loads fully contained within the store complete in 7 cycles regardless of alignment with partial overlaps costing 14 cycles, matching Zen 5.</p><p>The EPYC 9686F is near the top of our estimated single-threaded SPEC CPU 2026 results. It roughly matches the Ryzen 9 9950X3D2, AMD’s highest-end client CPU from the previous generation, in integer rate and beats it in floating-point rate. At a matched 4.1 GHz, the 9686F leads the 9950X3D2 by about 4% in integer and 11% in floating point, despite the X3D part’s much larger L3.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!GPq_!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!GPq_!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 424w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 848w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 1272w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!GPq_!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp" width="1456" height="756" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/a7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:756,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;https://media.discordapp.net/attachments/809099718189121536/1569240935466803300/image.png?ex=6af2bd02&amp;is=6af16b82&amp;hm=1233642c0815dc5a6265c7be59547965aa82df42f26fcb8e10f63055f641f2d8&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2616&amp;height=1359&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="https://media.discordapp.net/attachments/809099718189121536/1569240935466803300/image.png?ex=6af2bd02&amp;is=6af16b82&amp;hm=1233642c0815dc5a6265c7be59547965aa82df42f26fcb8e10f63055f641f2d8&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2616&amp;height=1359" title="https://media.discordapp.net/attachments/809099718189121536/1569240935466803300/image.png?ex=6af2bd02&amp;is=6af16b82&amp;hm=1233642c0815dc5a6265c7be59547965aa82df42f26fcb8e10f63055f641f2d8&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2616&amp;height=1359" srcset="https://substackcdn.com/image/fetch/$s_!GPq_!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 424w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 848w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 1272w, https://substackcdn.com/image/fetch/$s_!GPq_!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fa7e2762f-c9ce-4fd2-ad96-5209f2b7d9b7_1744x906.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The EPYC 9996 is no slouch either. It roughly matches the previous-generation EPYC 9575F in single-threaded performance, despite running at lower clocks and having four times as many cores. It also edges out NVIDIA’s Vera in integer and leads it by about 20% in floating point.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!Sxqq!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!Sxqq!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 424w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 848w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 1272w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!Sxqq!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png" width="1456" height="582" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:582,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:112427,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!Sxqq!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 424w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 848w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 1272w, https://substackcdn.com/image/fetch/$s_!Sxqq!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F876774f6-7ec0-4b2e-bedf-338b28bfd808_2302x920.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The EPYC 9686F leads on almost every subtest and finishes about 18% ahead of the EPYC 9996 in both suites. It scores 6.20 versus 5.25 in integer and 10.6 versus 8.99 in floating point, with some of its largest leads in 714.cpython, 766.femflow, and 772.marian.</p><p>Against the Zen 5-based EPYC 9575F, the 9996 scores 5.25 versus 5.13 in integer and 8.99 versus 9.01 in floating point while running about 900 MHz slower. The 9996 also edges out the 9686F in 721.gcc and 765.roms, two subtests where the 9686F’s higher clock provides no advantage.</p><div><figure><div data-component-name="Image2ToDOM"><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!MAal!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 424w, https://substackcdn.com/image/fetch/$s_!MAal!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 848w, https://substackcdn.com/image/fetch/$s_!MAal!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 1272w, https://substackcdn.com/image/fetch/$s_!MAal!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!MAal!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png" width="1456" height="334" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/e1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:334,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:303294,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!MAal!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 424w, https://substackcdn.com/image/fetch/$s_!MAal!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 848w, https://substackcdn.com/image/fetch/$s_!MAal!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 1272w, https://substackcdn.com/image/fetch/$s_!MAal!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2Fe1956404-6e80-42f0-82fd-9322502a842c_5005x1148.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></figure></div><p>Top-down breakdowns of pipeline slots on the two Zen 6 chips show where the 9686F’s lead comes from. The integer-rate profiles look almost identical in core-bound subtests. In 750.sealcrypto, 710.omnetpp, 735.gem5, and 753.ns3, retiring slots account for nearly the same share on both chips, with differences of less than one percentage point.</p><p>Memory-heavy subtests show larger gaps. Moving from the EPYC 9996 to the EPYC 9686F, backend memory stalls rise from 37.9% to 50.0% of pipeline slots in 729.abc, from 19.0% to 34.1% in 723.llvm, and from 24.8% to 33.2% in 708.sqlite. The share of retiring slots falls accordingly. Zen 6c’s lower clock and larger shared L3 cache may help explain its lower memory-stall share.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!a7Y6!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!a7Y6!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 424w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 848w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 1272w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!a7Y6!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp" width="1456" height="423" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:423,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:null,&quot;alt&quot;:&quot;https://media.discordapp.net/attachments/1329409886676848660/1569271555379175535/image.png?ex=6af2d986&amp;is=6af18806&amp;hm=cdc4d18e51b664a0098b0958ffe6992b13c9f835fa23072ae98cc20e3f1f9375&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2997&amp;height=870&quot;,&quot;title&quot;:null,&quot;type&quot;:null,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:null,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="https://media.discordapp.net/attachments/1329409886676848660/1569271555379175535/image.png?ex=6af2d986&amp;is=6af18806&amp;hm=cdc4d18e51b664a0098b0958ffe6992b13c9f835fa23072ae98cc20e3f1f9375&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2997&amp;height=870" title="https://media.discordapp.net/attachments/1329409886676848660/1569271555379175535/image.png?ex=6af2d986&amp;is=6af18806&amp;hm=cdc4d18e51b664a0098b0958ffe6992b13c9f835fa23072ae98cc20e3f1f9375&amp;=&amp;format=webp&amp;quality=lossless&amp;width=2997&amp;height=870" srcset="https://substackcdn.com/image/fetch/$s_!a7Y6!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 424w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 848w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 1272w, https://substackcdn.com/image/fetch/$s_!a7Y6!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F94b61755-8643-479d-bac2-83a81c1582e1_2997x870.webp 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The floating-point profiles look similar for most subtests. The retiring share in 731.astcenc, 772.marian, and 767.nest differs by about one percentage point or less, and 709.cactus spends over half its slots stalled on front-end bandwidth on both chips.</p><p>The larger gaps again appear in memory-heavy subtests. Moving from the EPYC 9996 to the EPYC 9686F, backend memory stalls rise from 42.5% to 55.3% of slots in 765.roms, from 60.9% to 67.6% in 749.fotonik3d, and from 17.8% to 33.8% in 782.lbm. These are also tests where the 9686F’s higher clock helps least: it trails the 9996 in 765.roms, roughly ties in 749.fotonik3d, and leads by about 11% in 782.lbm, despite clocking up to roughly 29% higher.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!q4cv!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!q4cv!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 424w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 848w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 1272w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!q4cv!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png" width="1456" height="428" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:428,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:139397,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!q4cv!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 424w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 848w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 1272w, https://substackcdn.com/image/fetch/$s_!q4cv!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F8a4638d3-0fca-4cbe-a9c8-6e170555a4d1_2935x863.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>Running the 9686F at 4.1 GHz to match the 9996 removes the clock advantage, and the overall picture flips: the 9686F scores 4.92 and 8.64 at that clock, putting Zen 6c about 6.7% ahead per clock in integer and 4% in floating point. At the same clock speed, Zen 6 and Zen 6c look almost identical in core-bound integer subtests. In 750.sealcrypto, retiring slots account for 67.3% of the total on the EPYC 9686F versus 67.6% on the EPYC 9996.The floating-point profiles also look similar in several subtests at matched clocks. Both chips spend over half their pipeline slots stalled on frontend bandwidth in 709.cactus. Their retiring shares differ by about two percentage points in 722.palm and 766.femflow.</p><p>The 9686F still spends a larger share of its pipeline slots stalled on memory. Backend memory stalls account for 50.3% versus 42.5% on the 9996 in 765.roms, 24.9% versus 17.8% in 782.lbm, and 63.3% versus 60.9% in 749.fotonik3d. Zen 6c’s 128 MB L3 cache is likely serving more of these requests than Zen 6’s 48 MB cache, reducing the need to access main memory.</p><p>The clearest difference is in frontend latency stalls, which account for a much larger share of slots on the 9686F in subtests with large codebases. In 727.cppcheck, that share is 35.2% versus 16.6% on the 9996; in 721.gcc, it is 25.8% versus 10.0%. With clock speed matched and both designs sharing the same frontend, those stalls most likely reflect differences in the cache and memory hierarchy.</p><div><figure><a target="_blank" href="https://substackcdn.com/image/fetch/$s_!l7sZ!,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png" data-component-name="Image2ToDOM"><div><picture><source type="image/webp" srcset="https://substackcdn.com/image/fetch/$s_!l7sZ!,w_424,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 424w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_848,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 848w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_1272,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 1272w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_1456,c_limit,f_webp,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 1456w" sizes="auto, 100vw"><img src="https://substackcdn.com/image/fetch/$s_!l7sZ!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png" width="1456" height="427" data-attrs="{&quot;src&quot;:&quot;https://substack-post-media.s3.amazonaws.com/public/images/0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png&quot;,&quot;srcNoWatermark&quot;:null,&quot;fullscreen&quot;:null,&quot;imageSize&quot;:null,&quot;height&quot;:427,&quot;width&quot;:1456,&quot;resizeWidth&quot;:null,&quot;bytes&quot;:125841,&quot;alt&quot;:null,&quot;title&quot;:null,&quot;type&quot;:&quot;image/png&quot;,&quot;href&quot;:null,&quot;belowTheFold&quot;:true,&quot;topImage&quot;:false,&quot;internalRedirect&quot;:&quot;https://chipsandcheese.com/i/223653783?img=https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png&quot;,&quot;isProcessing&quot;:false,&quot;align&quot;:null,&quot;offset&quot;:false}" alt="" srcset="https://substackcdn.com/image/fetch/$s_!l7sZ!,w_424,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 424w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_848,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 848w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_1272,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 1272w, https://substackcdn.com/image/fetch/$s_!l7sZ!,w_1456,c_limit,f_auto,q_auto:good,fl_progressive:steep/https%3A%2F%2Fsubstack-post-media.s3.amazonaws.com%2Fpublic%2Fimages%2F0e773bb0-2977-4a0b-9a1c-ded7975bf1e8_2929x858.png 1456w" sizes="auto, 100vw" loading="lazy"></picture></div></a></figure></div><p>The floating-point profiles also look similar in several subtests at matched clocks. Both chips spend over half their pipeline slots stalled on frontend bandwidth in 709.cactus. Their retiring shares differ by about two percentage points in 722.palm and 766.femflow.</p><p>The 9686F still spends a larger share of its pipeline slots stalled on memory. Backend memory stalls account for 50.3% versus 42.5% on the 9996 in 765.roms, 24.9% versus 17.8% in 782.lbm, and 63.3% versus 60.9% in 749.fotonik3d. Zen 6c’s 128 MB L3 cache is likely serving more of these requests than Zen 6’s 48 MB cache, reducing the need to access main memory.</p><p>The Zen 6 Family improves upon its predecessor in various ways, an upgraded frontend allows one thread to utilize both decoders, while a faster branch predictor makes it more forgiving on misses, all tied together with larger OoO structures allowing it to better hide memory stalls. All of this coming together to provide a generational uplift from Zen 5.</p><p>However, I think the more interesting change is the split between Zen 6 and Zen 6c. The classic and dense cores now differ within the out-of-order engine, with Zen 6 appearing tuned for higher clocks and Zen 6c providing more capacity to absorb latency. The shared foundation is still clear, but those differences make the choice between them more dependent on workload behavior.</p><p>The performance results are encouraging as well with the estimated single-threaded SPEC CPU 2026 scores, the EPYC 9686F leads the Zen 5-based EPYC 9575F by about 21% in integer and 18% in floating point. The EPYC 9996 roughly matches the 9575F despite running about 900 MHz slower which are strong results for both core designs.</p><p>AMD’s answer to the classic-versus-dense question used to be the same core at two densities but now with Zen 6 it is two cores, each shaped for where it will run. That now  leaves me wondering what AMD will do with the Zen 7 Family and if we will see even more specialization of the same basic core design or if we will see a larger split of the designs.</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[.name Grandfathered (761 pts)]]></title>
+            <title><![CDATA[.name Grandfathered (784 pts)]]></title>
             <link>https://neil.fraser.name/news/2026/11/10/</link>
             <guid>50442736</guid>
             <pubDate>Tue, 10 Nov 2026 16:37:44 GMT</pubDate>
@@ -1606,7 +2631,7 @@ We won!</p>
 </tbody></div><p>Legal yada yada: My views do not necessarily represent those of my employer or my goldfish.</p></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Tailscale's DNS IPv6 spells out "Tailscale" (131 pts)]]></title>
+            <title><![CDATA[Tailscale's DNS IPv6 spells out "Tailscale" (133 pts)]]></title>
             <link>https://www.reddit.com/r/Tailscale/comments/1xsr24r/tailscales_dns_ipv6_spells_out_tailscale_easter/</link>
             <guid>50442691</guid>
             <pubDate>Tue, 10 Nov 2026 16:34:45 GMT</pubDate>
@@ -1614,7 +2639,7 @@ We won!</p>
 &lt;Unparsable&gt;]]></description>
         </item>
         <item>
-            <title><![CDATA[Blender 5.3 released with Gaussian Splat support (456 pts)]]></title>
+            <title><![CDATA[Blender 5.3 released with Gaussian Splat support (459 pts)]]></title>
             <link>https://www.blender.org/download/releases/5-3/</link>
             <guid>50442426</guid>
             <pubDate>Tue, 10 Nov 2026 16:15:43 GMT</pubDate>
@@ -2757,7 +3782,7 @@ We won!</p>
 	</div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Gemini 4 Carbon is now available (282 pts)]]></title>
+            <title><![CDATA[Gemini 4 Carbon is now available (283 pts)]]></title>
             <link>https://blog.google/innovation-and-ai/models-and-research/gemini-models/gemini-4-carbon-now-available/</link>
             <guid>50442303</guid>
             <pubDate>Tue, 10 Nov 2026 16:07:15 GMT</pubDate>
@@ -3507,7 +4532,7 @@ We won!</p>
   </article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Announcing .NET 11 (135 pts)]]></title>
+            <title><![CDATA[Announcing .NET 11 (160 pts)]]></title>
             <link>https://devblogs.microsoft.com/dotnet/announcing-dotnet-11/</link>
             <guid>50442225</guid>
             <pubDate>Tue, 10 Nov 2026 16:01:27 GMT</pubDate>
@@ -5679,14 +6704,6 @@ Couldn't get https://www.theatlantic.com/magazine/2026/12/location-tracking-apps
 		<h2>Post navigation</h2>
 		
 	</nav>            </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Fireworks AI security breach impacts Notion and their customers (148 pts)]]></title>
-            <link>https://www.notion.com/help/security-incident-involving-a-third-party-ai-vendor</link>
-            <guid>50437106</guid>
-            <pubDate>Tue, 10 Nov 2026 07:19:38 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.notion.com/help/security-incident-involving-a-third-party-ai-vendor">https://www.notion.com/help/security-incident-involving-a-third-party-ai-vendor</a>, See on <a href="https://news.ycombinator.com/item?id=50437106">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><section><header></header></section><section><section><header><span><a data-analytics-event="click_cta" href="https://www.notion.com/help/security-incident-involving-a-third-party-ai-vendor#faq">Jump to FAQs</a></span></header></section><hr><div><article><p>This notice is about the security incident at one of our vendors, Fireworks AI, that may impact some Notion workspaces. For the latest on the Fireworks AI incident, see their <a href="https://fireworks.ai/security/bulletins/october-2026-security-incident-update" target="_self" rel="nofollow" data-analytics-name="rich_text_link_official security updates here" data-analytics-event="click_link"><span>official security updates here</span></a>.</p><p>Following an investigation by the Notion security team, we have determined that &lt;1% of Notion workspaces may have been affected by the Fireworks security incident. Some unattributable chat sessions with Notion AI may have been exposed in this incident. “Unattributable” means the chats weren't labeled with who wrote them or which workspace they came from, and the transcripts did not contain tool call results. Beyond what’s in the chat transcript itself, there’s no information tying the chat back to a workspace, user, or company. No other data from within the workspace is affected.</p><div><p><h4><strong>What is Fireworks AI and how we used them</strong></h4></p></div><p>Fireworks is one of the most-used global AI infrastructure platforms powering tens of thousands of customers, and used by hundreds of thousands of developers. We used Fireworks for classification jobs to help customers understand their own AI usage through a feature in Notion called <a href="https://www.notion.com/help/notion-ai-settings-overview#insights" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Insights" data-analytics-event="click_link"><span>Insights</span></a>, and we used them as a general inference provider to serve open-weight models inside our product. The Insights feature has been disabled as we investigate this incident, and we are no longer serving open-weight models through Fireworks.</p><div><p><h4><strong>What happened and how we addressed it</strong></h4></p></div><p>We learned from Fireworks about potential incidents earlier this month, and we shut down all connections to their systems out of an abundance of caution.</p><p>On November 6, Fireworks notified us that malicious actors may have accessed potential customer data. Our team immediately began another internal investigation. On November 8, Fireworks confirmed this new dataset for us. </p><p>Upon analysis of the new data, we discovered that it included unattributable Notion AI chat transcripts used for the Insights feature. Chats weren't labeled with who wrote them or which workspace they came from, and the transcripts did not contain any tool call results. Beyond the words in the chat transcripts themselves, the data contained no information that could specifically identify the workspace, user, or company. </p><p>No other Notion data from your workspace is affected, and we continue to monitor this incident. </p><p><strong>If neither you nor your workspace owner has heard from us, that means your workspace is not affected, and no action is needed right now.</strong></p><p>For the workspaces impacted by the Fireworks AI incident (&lt;1% of the Notion workspaces), we have contacted the workspace owners. Affected customers will be able to retrieve and review the affected data securely inside their workspace.</p><p>For the workspaces affected by the Fireworks AI incident, workspace owners can view the affected data by going to their workspace sidebar → <code>?</code>  → <code>Security incident review</code>. </p><p>To review and download your affected data, open this link in a desktop browser<!-- --> and make sure you’re using the latest version of Notion. This data is not accessible on mobile. </p><div><p><h4>Workspace owners on Enterprise plans can access:</h4></p></div><div><ul><li><p>A CSV of your workspace’s data affected by the incident. Only workspace owners can see this data. </p></li><li><p>An annotated CSV of the same affected workspace data with additional metadata, such as the user associated with each chat transcript, to help you understand and run your own analysis of the impact. These added annotations and metadata were not exposed as part of the incident. Additional annotated fields are marked with <code>__metadata</code> or <code>__analysis</code> respectively. Only workspace owners can see this data.</p></li><li><p><strong>Note:</strong> These resources are only available if you have managed members for your workspace. Reach out to your account team if you have questions. </p></li></ul></div><div><p><h4>Workspace owners on all other plan types can access:</h4></p></div><div><ul><li><p>A page that includes a link they can share with affected members to review their own data.</p></li></ul></div><div><p><h4>For <!-- -->other workspace roles<!-- -->: </h4></p></div><div><ul><li><p>Workspace owners can provide a link to members so members can see their own affected data.</p></li><li><p>Once shared, the link will provide members with a CSV of only the member's own data<strong> </strong>affected by the incident. </p></li></ul></div><p><strong>We recommend that you treat this data as if it were exposed. </strong>If you or anyone on your team pasted sensitive information like passwords, API keys, or other credentials into Notion AI during this timeframe, we recommend rotating them right away.</p></article></div><hr><section><header><h2>FAQs</h2></header><div><article id="faq"><details><summary><p>What is Fireworks and how did Notion use them?</p></summary><div><article><p><a href="https://fireworks.ai/" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Fireworks AI" data-analytics-event="click_link"><span>Fireworks AI</span></a> is one of the most used global AI infrastructure platforms powering tens of thousands of customers and used by hundreds of thousands of developers.</p><p>As of November 3rd, we have disconnected our systems from Fireworks, deleted all data in the Fireworks system, and stopped sending all data and traffic to Fireworks. We have also halted all training runs.</p><p>We previously used Fireworks for classification jobs to help customers understand their own AI usage through a feature in Notion called <a href="https://www.notion.com/help/notion-ai-settings-overview#insights" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Insights" data-analytics-event="click_link"><span>Insights</span></a> and as a general inference provider to serve open-weight models inside our product.</p></article></div></details><details><summary><p>What does “unattributable” mean? Could the conversations still contain sensitive information?</p></summary><div><article><p>Following an investigation by the Notion security team, we have determined that &lt;1% of Notion workspaces may have been affected by the Fireworks security incident. Some unattributable chat sessions with Notion AI may have been exposed.</p><p>"Unattributable" means the chats weren't labeled with who wrote them or which workspace they came from. The transcripts also did not contain tool call results (e.g., Notion page content, or external data pulled in by Notion AI.) Beyond what’s in the chat transcript itself, there’s no information tying the chat back to specific workspaces, users, or companies. No other data from within your workspace is affected.</p><p>As a precaution, we recommend that you treat this unattributable data as if it were exposed. If anyone on your team pasted sensitive information like passwords, API keys, or other credentials into Notion AI during this timeframe, we recommend rotating them right away.</p></article></div></details><details><summary><p>How did Notion use Fireworks with the Learning and Early Access Program (LEAP)? </p></summary><div><article><p>Customers in the <a href="https://www.notion.com/help/notion-ai-leap-program-faqs" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Learning and Early Access Program" data-analytics-event="click_link"><span>Learning and Early Access Program</span></a> (LEAP) volunteer their data to help Notion test new AI technology. In the past, we used this volunteered data to experiment with training task-specific models on Fireworks.</p></article></div></details><details><summary><p>Where can I learn more about Notion’s security practices?</p></summary><div><article><p>Visit our <a href="https://www.notion.com/security" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Security page" data-analytics-event="click_link"><span>Security page</span></a> for an overview of Notion’s security and privacy practices. For more information on security policies, security audit reports, penetration test results, and additional resources, visit the <a href="https://trust.notion.com/" target="_self" rel="nofollow" data-analytics-name="rich_text_link_Notion Trust Center" data-analytics-event="click_link"><span>Notion Trust Center</span></a>.</p></article></div></details></article></div></section></section></div></div>]]></description>
         </item>
     </channel>
 </rss>
