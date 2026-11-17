@@ -1,15 +1,196 @@
+(ignoring known css parsing error)
+(ignoring known css parsing error)
+(ignoring known css parsing error)
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0">
     <channel>
         <title>HN100 - Readable Contents</title>
         <link>https://hn.algolia.com/api/v1/search_by_date?tags=%28story,poll%29&amp;numericFilters=points%3E100</link>
         <description>Uses Readability to add bodies to the RSS feed</description>
-        <lastBuildDate>Tue, 17 Nov 2026 21:30:17 GMT</lastBuildDate>
+        <lastBuildDate>Tue, 17 Nov 2026 22:30:22 GMT</lastBuildDate>
         <docs>https://validator.w3.org/feed/docs/rss2.html</docs>
         <generator>https://github.com/jpmonette/feed</generator>
         <language>en</language>
         <item>
-            <title><![CDATA[Israel vs. Wikipedia (136 pts)]]></title>
+            <title><![CDATA[Java4Shell: RCE in OpenJDK when processing Base64 (177 pts)]]></title>
+            <link>https://calif.io/java4shell/</link>
+            <guid>50538240</guid>
+            <pubDate>Tue, 17 Nov 2026 21:11:28 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://calif.io/java4shell/">https://calif.io/java4shell/</a>, See on <a href="https://news.ycombinator.com/item?id=50538240">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div>
+          <article id="technical-writeup">
+            <div>
+              <h2>The Tail of Base64</h2>
+              <p>By Quang Luong</p>
+              <dl></dl>
+<p>On affected OpenJDK builds, malformed Base64 data can cause a constant-value overwrite of allocated heap memory. Through remote Heap Feng Shui, we turn that overwrite into a heap leak and remote code execution.</p>
+<h3 id="discovery">Discovery</h3>
+<p>A few months back, I was developing a 0-click exploit on a certain phone vendor. The bug was constrained: it is a linear out-of-bounds write and we have no way to bypass ASLR. I almost considered it unexploitable until I audited the Android Runtime. Turns out, it has some predictable memory allocation pattern and if you align the registers from the starting memory corruption just right you can make the runtime interpret attacker's bytecode.</p>
+
+<p>After completing that exploit chain, inspired (and bored), I decided to look into some thing completely different. So I pulled the official JVM implementation (OpenJDK HotSpot) and started auditing. Java is a mature platform, so I was aware that having a "good" bug here would be hard, but I wanted to give it my best attempt anyway.</p>
+<p>Recalling my earlier lesson that complex systems and code crossing multiple boundaries are difficult to get right, I focused the audit on the JIT compiler, intrinsics, widely accessible APIs, and cryptography. Well, more precisely, I told Codex to look at those areas like any serious security researcher in 2026. To be honest, I didn't expect to find anything trivially exploitable, perhaps only some logic flaws or side-channel issues.</p>
+<p>Most early results Codex brought me were slops, either unreachable or the requirement of exploitation is not realistic at all. This looks like a gamble I am going to lose. But you know what, fortune favors the bold. So I just prompted harder...</p>
+<p>Eventually, Codex brought me a finding for a memory corruption in the Base64 decoder itself. I came looking for copper and found gold, through sheer persistence. But wait, is it really gold, or just fool's gold?</p>
+
+<h3 id="the-vulnerability">The vulnerability</h3>
+<p>The issue lies in OpenJDK HotSpot's x86-64 Base64 intrinsic. C2 is the most aggressive JIT compiler in the Java Virtual Machine. Specifically, if you trigger a function repeatedly, then it will compile that function into native code. Even then, ordinary native code itself is not fast enough. Modern CPUs have specialized instructions that allow processing data even faster. HotSpot uses them in optimized routines called intrinsics. The x86-64 Base64 intrinsic miscalculated the padded tail's store mask, causing an out-of-bounds write.</p>
+<p>The x86-64 Base64 intrinsic iterates through the input in 256-byte blocks; if it is less than 256, then it will do so in 64-byte blocks. When the input is less than 64 bytes, it uses <code>evmovdqub</code>, the intrinsic for the <code>VMOVDQU8</code> instruction. This instruction takes a 64-bit mask that decides which bytes are read from or written to memory. The mask is first calculated from the input and output length, then updated to reflect the number of padding bytes (<code>'='</code>) in the Base64-encoded string. This is shown in the following (pseudocode):</p>
+<div><pre><code>// Zero High Bits Starting with Specified Bit Position
+input_mask := bzhiq(-1, input_length)
+output_len := (input_length / 4) * 3
+
+// handle padding
+if input[input_length - 1] == '=':
+    output_len -= 1
+    input_mask &gt;&gt;= 1
+    if input[input_length - 2] == '=':
+        output_len -= 1
+        input_mask &gt;&gt;= 1
+
+output_mask := bzhiq(-1, output_len)</code></pre></div>
+<p>In the above code, if the remaining <code>input</code> is of the form <code>=, ==, X=, X==, XY=</code>, or <code>===</code>, then <code>output_len</code> will be computed as zero. However, since there is padding, <code>output_len</code> is decremented, resulting in an underflowed value of <code>-1</code> or <code>-2</code>. Since <code>bzhiq(-1, output_len)</code> doesn’t change any bits if <code>output_len &gt;= 64</code>, this results in <code>output_mask == -1u64</code>.</p>
+<p>Later the code uses <code>evmovdqub</code> to read and write multiple bytes at a time. For a write, if the mask bit is <code>1</code>, the byte at that index in the vector register is written to memory. So when <code>output_mask == -1u64</code>, all <code>64</code> bytes are written during the following operation:</p>
+<div><pre><code>evmovdqub(
+	Address(dest, dp) /* Address: destination address addr */,
+	k1 /* k1 == output_mask */,
+	tmp /* XMMRegister src register/value to write */,
+	true,
+	Assembler::AVX_512bit /* vector length */
+);</code></pre></div>
+<p>The generated stub returns the number of bytes it successfully decoded, and returns early when it detects invalid input. The remaining bytes are handled by the Java code, which throws <code>IllegalArgumentException</code> if the input is invalid.</p>
+<p>At runtime, the decoded buffer length is calculated as <code>(ceil(inp_len / 4) * 3) - padding</code>. When the bug is triggered, with <code>65</code> bytes (<code>[64 bytes] + '='</code>) as input, that calculation allocates a <code>50</code>-byte buffer. During decoding the bug makes <code>output_mask == -1</code> for <code>evmovdqub</code>, so <code>64</code> bytes are written starting at offset <code>48</code>, an out-of-bounds write past the end of the buffer.</p>
+<p>On OpenJDK 17, the trigger input is <code>'A' * 128 + '='</code> instead of <code>'A' * 64 + '='</code>, because the length threshold to reach the code path is higher.</p>
+<h3 id="exploitation-strategy">Exploitation strategy</h3>
+<p>The Base64 bug was gold, but not the type that sits on the riverbed waiting to be panned out. It was the type that was deep, dark, and hard to access. While we had memory corruption, exploiting it looked difficult, perhaps even borderline unexploitable, since it only wrote fixed bytes to the heap. Only the landing position of the out-of-bounds write is controllable.</p>
+<p>We get the following 64 bytes write starting from the position in buffer where the remaining sets of Base64 decoded bytes would have been written to:</p>
+<ul>
+<li>Full controlled write to byte 0 (in bound)</li>
+<li>4-bit controlled write to byte 1 (in bound)</li>
+<li>Uncontrolled write to bytes [2, 63]. For bytes <code>48..63</code>, the value will always be <code>0x9a</code>.</li>
+</ul>
+<p>The uncontrolled out-of-bounds write turned out not to be a big problem. We reused a common JavaScript engine exploitation primitive, the classic technique of overwriting a buffer length.</p>
+<p>We call the buffer whose length we overwrite the <code>writer</code>. Once its length is corrupted, it keeps accepting our chosen bytes, so if we place another array or object after it, we can corrupt that neighbor with all of our chosen values. That upgrades the fixed write into a bounded, chosen-value linear write.</p>
+<p>If we then corrupt another array's length and its data is copied back into the response, we have built a heap disclosure primitive, the <code>reader</code>, from the out-of-bounds read. At this point, before any code execution, we already had JavaBleed, the ability to leak contents from the Java heap, which may hold PII, private keys, other secret keys, and tokens.</p>
+<p>From the <code>writer</code> and <code>reader</code>, the rest of this write-up builds the full attack. We repair the objects the linear write damaged to keep the JVM running, mount data-only attacks on application logic, and escalate the bounded write into arbitrary writes that reach the Code Cache and JVM hooks for code execution.</p>
+<p>But first things first, we need to align the heap to our advantage.</p>
+
+<h3 id="heap-feng-shui-grooming">Heap Feng Shui (Grooming)</h3>
+<p><a href="https://docs.oracle.com/en/java/javase/17/gctuning/garbage-first-g1-garbage-collector1.html" target="_blank" rel="noopener noreferrer">G1 divides the heap into fixed-size regions</a>. Before the region arithmetic matters, the critical arrays have to leave their threads' private allocation ranges.</p>
+<p>HotSpot normally gives each Java thread a <a href="https://docs.oracle.com/en/java/javase/21/docs/specs/man/java.html#advanced-garbage-collection-options-for-java" target="_blank" rel="noopener noreferrer">thread-local allocation buffer (TLAB)</a>, a private slice of Eden. Objects created by different request threads advance different cursors, which gives us no useful order between a Base64 decoder in one TLAB and a writer in another.</p>
+<p>The first grooming layer controls the allocation route. The critical array's size and the space left in the worker's TLAB decide whether HotSpot refills that TLAB or takes the attacker-preferred <a href="https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/hotspot/share/gc/shared/memAllocator.cpp#L268-L360" target="_blank" rel="noopener noreferrer">outside-TLAB allocation path</a>.</p>
+<p>The second layer controls the layout. However, we do not choose how G1 allocates memory, and we don't know the current heap state. To approach this limitation, Calif used the tried and tested method of Spray and Pray.</p>
+<p>Object sizes and padding fix offsets inside region-sized spans. We spray several live writer and reader pairs to give the decoder output several possible neighbors. When its region lands immediately below a writer region, the widened reader produces a larger application response. We discard misses and retry until successful.</p>
+<p>One early challenge during exploit development was that the AI would get stuck during heap grooming primitive development. In order to save tokens and time, Calif wrote a small heap tracer and visualizer to give the agent information about the heap state, combined with our expertise on specific cases.</p>
+<h3 id="remote-heap-feng-shui">Remote Heap Feng Shui</h3>
+<p>In order to perform remote grooming, each request data would be sent up until the critical heap allocation would occur. By ensuring the data that was previously sent had a TCP acknowledgement, the exploit would have control over the allocations up to date. Once we were confident our data so far is buffered on the target, we then sent the rest, completing the http request. This allows both heap allocation control and more precise schedule as delivering small network packets is more stable than big ones.</p>
+
+<p>The exact allocation and free order schedule belongs to the targeted application profile, while we are able to control the adding, writer, reader, and decoder pieces.</p>
+<p>The current attack is sensitive to network conditions, like RTT and jitter. Low, stable round-trip times are preferred for a more reliable attack. In our controlled environment, we performed this attack over the internet through public IP addresses instead of just assuming perfect laboratory conditions. For the current attack path to achieve optimal stability and reliability in exploitation, Calif turned to physics and utilized money to solve the problem, rather than experimenting with TCP/IP stack configuration. In other words, Calif rented another VM in the same region as our target.</p>
+<h3 id="warm-up-rehearsal-and-retries">Warm-up, rehearsal, and retries</h3>
+<p>To summarize the chain so far, we will warm up the Base64 decoder to C2 tier. We can rehearse the exploit run to calibrate timing and responses against the target before causing corruption to occur. Once the required information has been obtained, we can trigger the vulnerability. Incorrect placement could cause the JVM to crash, but in many instances, we can simply try again.</p>
+<dl><p><dt>WARM</dt><dd>Run valid decodes until the JIT selects the affected fast path. No memory is corrupted.</dd></p><p><dt>REHEARSE</dt><dd>Optional safe round for calibration.</dd></p><p><dt>TRIGGER</dt><dd>Send the malformed tail. If the objects line up, the fixed spill enlarges the writer.</dd></p><p><dt>DISCLOSE</dt><dd>Continue the writer so chosen bytes enlarge the reader, then collect the response-derived heap bytes.</dd></p><p><dt>REPAIR</dt><dd>Use the disclosed originals to restore temporary headers and untouched neighbors when the chain has a repair path.</dd></p><p><dt>FINISH</dt><dd>Make the application-specific change and verify it through a live request.</dd></p></dl>
+<h3 id="limitations">Limitations</h3>
+<p><strong>Request streaming.</strong> Some current grooming profiles need partial request bodies to reach the application. A proxy that waits for the complete body removes their release timing. <a href="https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_request_buffering" target="_blank" rel="noopener noreferrer">nginx buffers request bodies by default</a>.</p>
+<p>Request buffering is not a general mitigation. Elasticsearch runs from one complete request, so this setting does not stop that chain. After a configured <a href="https://nginx.org/en/docs/http/websocket.html" target="_blank" rel="noopener noreferrer">WebSocket upgrade</a>, later frames pass through a tunnel and request-body buffering no longer applies to them.</p>
+<p><strong>Application profiles.</strong> There is no universal payload. Each chain needs a decoder route, a live writer, a returned reader or another feedback path, a heap layout, and an application action. Every target needs a bespoke profile. The exploit is not a universal point-and-shoot.</p>
+<h3 id="poc">PoC</h3>
+<p>Here is a self-contained proof of concept. It warms the Base64 decoder until the vulnerable intrinsic is used, then decodes the malformed <code>64 × "A" + "="</code> input into a 4096-byte array. On an affected JDK it prints <code>REPRODUCED</code>: the decoder rejects the input, but 62 bytes (offsets 50 to 111) past the decoded output have already been overwritten. Every write lands inside a real array, so the trigger is safe to run.</p>
+<div><pre><code>import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Base64;
+
+/** Bounded standalone trigger: every write stays inside a real 4096-byte array. */
+public final class Base64Trigger {
+    private static volatile int sink;
+
+    public static void main(String[] args) {
+        Base64.Decoder decoder = Base64.getDecoder();
+        byte[] valid = "A".repeat(64).getBytes(StandardCharsets.US_ASCII);
+        byte[] malformed = ("A".repeat(64) + "=").getBytes(StandardCharsets.US_ASCII);
+        byte[] target = new byte[4096];
+
+        for (int i = 0; i &lt; 200_000; i++) {
+            sink += decoder.decode(valid, target);
+        }
+
+        Arrays.fill(target, (byte) 0x5a);
+        boolean rejected = false;
+        try {
+            decoder.decode(malformed, target);
+        } catch (IllegalArgumentException expected) {
+            rejected = true;
+        }
+
+        int changed = 0;
+        int first = -1;
+        int last = -1;
+        for (int i = 50; i &lt; target.length; i++) {
+            if (target[i] != (byte) 0x5a) {
+                changed++;
+                if (first &lt; 0) first = i;
+                last = i;
+            }
+        }
+
+        System.out.println("runtime=" + System.getProperty("java.runtime.version"));
+        System.out.println("vm=" + System.getProperty("java.vm.name"));
+        System.out.printf("rejected=%s changed=%d first=%d last=%d%n",
+            rejected, changed, first, last);
+
+        if (!rejected || changed != 62 || first != 50 || last != 111) {
+            System.err.println("NOT REPRODUCED");
+            System.exit(1);
+        }
+        System.out.println("REPRODUCED");
+    }
+}</code></pre></div>
+<p>We are holding back the application-specific exploits for now. This write-up covers the vulnerability and the general exploitation technique. The weaponized chains for individual products stay private until everyone has had a chance to upgrade. We will publish them later.</p>
+<h3 id="affected-products">Affected products</h3>
+<p>Java4Shell affects OpenJDK from version 17.0.6 or newer.</p>
+<p>Because they are built from OpenJDK, the following Java distributions are also vulnerable:</p>
+<ul>
+<li>Amazon Corretto</li>
+<li>Eclipse Temurin</li>
+<li>Microsoft Build of OpenJDK</li>
+<li>Azul Zulu</li>
+<li>BellSoft Liberica</li>
+<li>SAP SapMachine</li>
+<li>Red Hat OpenJDK</li>
+<li>Oracle OpenJDK</li>
+<li>Oracle Java SE</li>
+<li>Oracle GraalVM for JDK</li>
+</ul>
+<p>According to Oracle, the following Oracle Java SE versions are vulnerable: 8u511b33-perf, 17.0.21.0.3, 21.0.13.0.3, 25.0.5.0.3, 27.0.1.0.3. We thank Oracle for providing this information ahead of publication time.</p>
+<p>Because the vulnerable code is hardware-specific, Java4Shell also requires an x86-64 processor with AVX-512 VBMI support. ARM64 CPUs are not affected.</p>
+<p>These mainstream CPU families meet the hardware requirements:</p>
+<ul>
+<li>Intel Xeon: Ice Lake, Sapphire Rapids, Emerald Rapids, Granite Rapids</li>
+<li>AMD EPYC and Ryzen: Zen 4 or newer</li>
+</ul>
+<p>On Linux, you can check whether your CPU is vulnerable with this command:</p>
+<div><pre><code>grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx512f|avx512bw|avx512vbmi|bmi2)$'</code></pre></div>
+<p>The output must include all four flags.</p>
+<h3 id="recommendations">Recommendations</h3>
+<p>OpenJDK released <a href="https://openjdk.org/groups/vulnerability/advisories/2026-11-17" target="_blank" rel="noopener noreferrer">a security advisory</a> and Oracle released <a href="https://www.oracle.com/security-alerts/cspunov2026.html" target="_blank" rel="noopener noreferrer">a patch</a> at 1:00pm PT on Nov 17, 2026.</p>
+<p>All Java users should update immediately.</p>
+<p>You can also mitigate Java4Shell by starting OpenJDK with either:</p>
+<ul>
+<li><code>-XX:-UseBASE64Intrinsics</code> to disable hardware-accelerated Base64 encoding and decoding, or</li>
+<li><code>-XX:UseAVX=2</code> to disable AVX-512. Apply this flag only on x86-64 hosts. OpenJDK on ARM doesn't recognize it and will fail to start.</li>
+</ul>
+<h3 id="credits">Credits</h3>
+<p>Research, write-up and exploits by Quang Luong.</p>
+<p>Exploit improvement by Jenish Rakholiya.</p>
+<p>Artwork by Michal Zalewski.</p>
+
+            </div>
+          </article>
+
+
+        </div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[Israel vs. Wikipedia (148 pts)]]></title>
             <link>https://techforpalestine.org/wikipedia-report</link>
             <guid>50537441</guid>
             <pubDate>Tue, 17 Nov 2026 20:10:03 GMT</pubDate>
@@ -48,7 +229,7 @@ This is a living document. We update it when corrections or new information come
 </p> </div> <!-- Press (band): contact and downloadable material --> <div aria-labelledby="press-heading"> <h2 id="press-heading">Press</h2>  </div> <!-- Related T4P projects -->  <div aria-labelledby="report-cta-heading"> <p>Tech for Palestine is a member-driven organization that brings together people, skills and resources. Through technology and collaboration, our members build tools and solutions that support the movement for Palestine.</p><p>These projects include: protest apps, tools for boycotting, support for Palestinian students &amp; businesses, ethical tech alternatives, and many more.</p>  </div> </main>   </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[jQuery 4.1.0 (136 pts)]]></title>
+            <title><![CDATA[jQuery 4.1.0 (180 pts)]]></title>
             <link>https://github.com/jquery/jquery/releases/tag/4.1.0</link>
             <guid>50537156</guid>
             <pubDate>Tue, 17 Nov 2026 19:50:40 GMT</pubDate>
@@ -110,7 +291,7 @@ This is a living document. We update it when corrections or new information come
 </ul></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[350 years ago, this man discovered that light has a finite speed (124 pts)]]></title>
+            <title><![CDATA[350 years ago, this man discovered that light has a finite speed (169 pts)]]></title>
             <link>https://www.sciencenorway.no/culture-history-history-of-science/350-years-ago-this-man-discovered-that-light-has-a-finite-speed/2737969</link>
             <guid>50536813</guid>
             <pubDate>Tue, 17 Nov 2026 19:25:27 GMT</pubDate>
@@ -207,7 +388,7 @@ This is a living document. We update it when corrections or new information come
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Solid 2.0 (129 pts)]]></title>
+            <title><![CDATA[Solid 2.0 (160 pts)]]></title>
             <link>https://www.solidjs.com/blog/solid-2-0-the-long-hold/</link>
             <guid>50536387</guid>
             <pubDate>Tue, 17 Nov 2026 18:56:17 GMT</pubDate>
@@ -217,7 +398,7 @@ This is a living document. We update it when corrections or new information come
 </blockquote></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Phrack 73 Released (147 pts)]]></title>
+            <title><![CDATA[Phrack 73 Released (195 pts)]]></title>
             <link>https://phrack.org/issues/73/introduction_md</link>
             <guid>50535992</guid>
             <pubDate>Tue, 17 Nov 2026 18:31:25 GMT</pubDate>
@@ -243,7 +424,7 @@ ANTISPAM in the subject or face the mighty /dev/null demon!
 </pre></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[MAI Code 2 and Code 2 Flash (191 pts)]]></title>
+            <title><![CDATA[MAI Code 2 and Code 2 Flash (222 pts)]]></title>
             <link>https://microsoft.ai/news/introducing-mai-code-2-and-mai-code-2-flash/</link>
             <guid>50535885</guid>
             <pubDate>Tue, 17 Nov 2026 18:25:13 GMT</pubDate>
@@ -260,7 +441,7 @@ ANTISPAM in the subject or face the mighty /dev/null demon!
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Apple Services Down (511 pts)]]></title>
+            <title><![CDATA[Apple Services Down (556 pts)]]></title>
             <link>https://developer.apple.com/system-status/</link>
             <guid>50535238</guid>
             <pubDate>Tue, 17 Nov 2026 17:47:14 GMT</pubDate>
@@ -270,7 +451,7 @@ ANTISPAM in the subject or face the mighty /dev/null demon!
 		</p></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[GPT‑6.2 Astra and Sol (848 pts)]]></title>
+            <title><![CDATA[GPT‑6.2 Astra and Sol (937 pts)]]></title>
             <link>https://openai.com/index/introducing-gpt-6-2-astra-sol/</link>
             <guid>50535230</guid>
             <pubDate>Tue, 17 Nov 2026 17:46:43 GMT</pubDate>
@@ -278,7 +459,7 @@ ANTISPAM in the subject or face the mighty /dev/null demon!
 Couldn't get https://openai.com/index/introducing-gpt-6-2-astra-sol/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Nvidia stopped disclosing Singapore sales as revenues hit $104B (202 pts)]]></title>
+            <title><![CDATA[Nvidia stopped disclosing Singapore sales as revenues hit $104B (260 pts)]]></title>
             <link>https://www.ft.com/content/dbde7a30-548c-4f9d-a4be-7898a0c24dcf</link>
             <guid>50534631</guid>
             <pubDate>Tue, 17 Nov 2026 17:12:06 GMT</pubDate>
@@ -286,7 +467,7 @@ Couldn't get https://openai.com/index/introducing-gpt-6-2-astra-sol/: Error: Req
 Couldn't get https://www.ft.com/content/dbde7a30-548c-4f9d-a4be-7898a0c24dcf: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[NSA Internal Network Down (331 pts)]]></title>
+            <title><![CDATA[NSA Internal Network Down (333 pts)]]></title>
             <link>https://www.reuters.com/technology/highly-classified-us-national-security-communications-network-is-down-cnn-2026-11-17/</link>
             <guid>50533089</guid>
             <pubDate>Tue, 17 Nov 2026 15:50:48 GMT</pubDate>
@@ -294,7 +475,7 @@ Couldn't get https://www.ft.com/content/dbde7a30-548c-4f9d-a4be-7898a0c24dcf: Er
 Couldn't get https://www.reuters.com/technology/highly-classified-us-national-security-communications-network-is-down-cnn-2026-11-17/: Error: Request failed with status code 401]]></description>
         </item>
         <item>
-            <title><![CDATA[Highly classified US national security communications network goes down (322 pts)]]></title>
+            <title><![CDATA[Highly classified US national security communications network goes down (371 pts)]]></title>
             <link>https://www.cnn.com/2026/11/17/politics/highly-classified-national-security-communications-network-goes-down</link>
             <guid>50532849</guid>
             <pubDate>Tue, 17 Nov 2026 15:38:28 GMT</pubDate>
@@ -302,7 +483,7 @@ Couldn't get https://www.reuters.com/technology/highly-classified-us-national-se
 Couldn't get https://www.cnn.com/2026/11/17/politics/highly-classified-national-security-communications-network-goes-down: Error: Request failed with status code 451]]></description>
         </item>
         <item>
-            <title><![CDATA[Show HN: Alloy CSS, dialogs, menus and tabs that work with JavaScript off (155 pts)]]></title>
+            <title><![CDATA[Show HN: Alloy CSS, dialogs, menus and tabs that work with JavaScript off (160 pts)]]></title>
             <link>https://alloyhtml.com/example.html</link>
             <guid>50532385</guid>
             <pubDate>Tue, 17 Nov 2026 15:07:09 GMT</pubDate>
@@ -625,7 +806,7 @@ Couldn't get https://www.cnn.com/2026/11/17/politics/highly-classified-national-
       </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Pentagon fails 9th financial audit in a row (104 pts)]]></title>
+            <title><![CDATA[Pentagon fails 9th financial audit in a row (105 pts)]]></title>
             <link>https://thehill.com/policy/defense/6224597-pentagon-fails-ninth-audit/</link>
             <guid>50532315</guid>
             <pubDate>Tue, 17 Nov 2026 15:02:53 GMT</pubDate>
@@ -633,7 +814,7 @@ Couldn't get https://www.cnn.com/2026/11/17/politics/highly-classified-national-
 Couldn't get https://thehill.com/policy/defense/6224597-pentagon-fails-ninth-audit/: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[What is the best harness for each model? (291 pts)]]></title>
+            <title><![CDATA[What is the best harness for each model? (303 pts)]]></title>
             <link>https://runta.com/blog/introducing-frontierharness-eval-v1-1/</link>
             <guid>50532191</guid>
             <pubDate>Tue, 17 Nov 2026 14:53:43 GMT</pubDate>
@@ -807,7 +988,82 @@ Verifier: FAILED test_tasks_cancel_above_max_concurrent
 </ul></div></article></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[We don't need more apps. We need better open source (333 pts)]]></title>
+            <title><![CDATA[Java4Shell: pre-auth RCE flaw in Java 17 puts servers at risk (CVE-2026-114938) (102 pts)]]></title>
+            <link>https://www.aikido.dev/blog/java-17-rce-vulnerability-cve-2026-114938</link>
+            <guid>50532118</guid>
+            <pubDate>Tue, 17 Nov 2026 14:48:03 GMT</pubDate>
+            <description><![CDATA[<p>URL: <a href="https://www.aikido.dev/blog/java-17-rce-vulnerability-cve-2026-114938">https://www.aikido.dev/blog/java-17-rce-vulnerability-cve-2026-114938</a>, See on <a href="https://news.ycombinator.com/item?id=50532118">Hacker News</a></p>
+<div id="readability-page-1" class="page"><div><div><div><p>Published on:</p><p>Nov 17, 2026</p></div><div id="test" fs-toc-element="contents" fs-toc-offsettop="8rem"><h2>TL;DR</h2><ul role="list"><li>Java4Shell (CVE-2026-114938), a reported unauthenticated remote code execution flaw has been reported in Java 17, 21, 25 and 27 releases before the patched builds below, rated 9.2 under CVSS 4.0.</li><li>Oracle released patched builds on November 17, 2026. Java SE 8 and 11 are not affected by this CVE.</li><li>Update every Java line you run to the patched build in the table below,</li><li><strong>To find out if you are affected, click "Am I affected?" on </strong><a href="https://app.aikido.dev/dashboard" data-wf-native-id-path="2fc8390a-56f5-8c71-4985-68a0f08553da" data-wf-ao-click-engagement-tracking="true" data-wf-element-id="2fc8390a-56f5-8c71-4985-68a0f08553da"><strong>the Aikido dashboard.</strong></a></li></ul><h2>Which Java versions and builds are affected?</h2><div>
+  <table>
+    <thead>
+      <tr>
+        <th>Product</th>
+        <th>Affected version range</th>
+        <th>Fixed version</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Oracle Java SE 8</td>
+        <td>Not affected</td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td>Oracle Java SE 11</td>
+        <td>Not affected</td>
+        <td>—</td>
+      </tr>
+      <tr>
+        <td>Oracle Java SE 17</td>
+        <td>Java 17 releases before 17.0.21.1</td>
+        <td>17.0.21.1</td>
+      </tr>
+      <tr>
+        <td>Oracle Java SE 21</td>
+        <td>Java 21 releases before 21.0.13.1</td>
+        <td>21.0.13.1</td>
+      </tr>
+      <tr>
+        <td>Oracle Java SE 25</td>
+        <td>Java 25 releases before 25.0.5.1</td>
+        <td>25.0.5.1</td>
+      </tr>
+      <tr>
+        <td>Oracle Java SE 27</td>
+        <td>Java 27 releases before 27.0.1.1</td>
+        <td>27.0.1.1</td>
+      </tr>
+      <tr>
+        <td>Eclipse Temurin</td>
+        <td>Java 17 through 17.0.21+9; Java 21 through 21.0.13; Java 25 through 25.0.5+8, including earlier releases within each branch</td>
+        <td>No confirmed fix</td>
+      </tr>
+      <tr>
+        <td>Amazon Corretto</td>
+        <td>Java 17 through 17.0.21.0.11; Java 21 through 21.0.13.0.11; Java 25 through 25.0.5.0.10; Java 27 through 27.0.1.0.11, including earlier releases within each branch</td>
+        <td>17.0.21.1.2, 21.0.13.1.2, 25.0.5.1.2, 27.0.1.1.4¹</td>
+      </tr>
+      <tr>
+        <td>Oracle GraalVM for JDK</td>
+        <td>CVE-specific affected range not confirmed</td>
+        <td>Not confirmed</td>
+      </tr>
+      <tr>
+        <td>Oracle GraalVM Enterprise Edition</td>
+        <td>CVE-specific affected range not confirmed</td>
+        <td>Not confirmed</td>
+      </tr>
+      <tr>
+        <td>Oracle JavaFX</td>
+        <td>Not affected by this CVE; separately listed under CVE-2026-86144</td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+</div><p>All Java builds Oracle lists as affected, with the patched builds from Oracle's November 17, 2026 release notes.</p><ul role="list"><li>Reports tie CVE-2026-114938 to the Java 17 line only, affecting all versions before 17.0.21.1. Oracle's list covers its whole November update, so treat every Java line you run as in scope.</li><li>Oracle’s November update also fixes other Java flaws, including in Java SE 8 and 11, so keep every Java line you run up to date.</li></ul><p>Java builds to check:</p><ul role="list"><li>Oracle Java SE (JDK and JRE)</li><li>Oracle GraalVM for JDK and GraalVM Enterprise Edition</li><li>Oracle JavaFX</li><li>OpenJDK builds from other vendors, such as Eclipse Temurin, Amazon Corretto, Azul Zulu, the Microsoft Build of OpenJDK and the Red Hat build of OpenJDK</li><li>Linux distribution packages such as openjdk-17</li><li>JDKs bundled inside applications and container base images</li></ul><h2>How to fix Java4Shell</h2><ul role="list"><li><strong>Update to the patched build for your Java line.</strong> Use the table above.</li><li><strong>Use your vendor's fixed build.</strong> If you run Temurin, Corretto, Zulu or a distribution package, wait for that vendor's fixed version, which may carry a different build number.</li><li><strong>Not sure where you run Java?</strong> See the next section.</li></ul><h2>Am I affected by Java4Shell?</h2><ul role="list"><li><strong>You are in scope if you run Java 17, 21, 25 or 27 before the fixed version in the table above. </strong>That includes bundled JDKs and container base images.</li><li><strong>To find out if you are affected, click "Am I affected?" on the Aikido home page.</strong> It checks your environment for this vulnerability, so you do not need to track down every Java runtime by hand.</li><li><strong>Start with internet-facing services.</strong> Anything reachable from outside is the likeliest to be hit once details are public.</li></ul><p>Java4Shell is the name given to CVE-2026-114938. Early reports describe it as an unauthenticated remote code execution flaw in all Java 17 versions before 17.0.21.1, rated 9.2 (Critical) under CVSS 4.0. Oracle scores Java flaws under CVSS 3.1, where its highest Java SE score this month is 8.1, so the two figures may describe different issues. For reference, 9.2 under CVSS 4.0 is the same score PHP2Shell carries.</p><p>Further technical details are expected after Oracle's patch release. Until then, the vulnerable component and the conditions for exploitation are not public. We will update this post when they are.</p><h2>Is Java4Shell being exploited?</h2><p>As of November 17, we have seen no reports of exploitation in the wild. Technical details are due later today, and exploitation can follow quickly once details are public, so patch now. We will update this post if that changes.</p><h2>FAQ</h2><p><strong>What is Java4Shell?</strong> The name given to CVE-2026-114938, a reported unauthenticated remote code execution flaw in Java 17 rated 9.2 under CVSS 4.0.</p><p><strong>Which Java versions are affected? </strong>Java 17, 21, 25 and 27 releases before 17.0.21.1, 21.0.13.1, 25.0.5.1 and 27.0.1.1. Java SE 8 and 11 are not affected by this CVE.</p><p><strong>Has Oracle released a patch?</strong> Yes. Oracle released patched builds on November 17, 2026. They are listed in the table above. OpenJDK vendors ship on their own schedules.</p><p><strong>Is Java4Shell being exploited?</strong> We have seen no reports of exploitation as of November 17.</p><p><strong>Is there a workaround?</strong> None has been published that we are aware of. Patching is the fix.</p><p><strong>How do I know if I am affected?</strong> Click "Am I affected?" on the Aikido dashboard.</p></div></div><div><div data-cta="false-positives"><div><p>Tired of false positives? <br>Try Aikido like <span>100k others.</span></p></div><a data-wf-native-id-path="0df5606c-c271-14ee-e5b2-a8d4b4628ae9" data-wf-ao-click-engagement-tracking="true" data-wf-element-id="0df5606c-c271-14ee-e5b2-a8d4b4628ae9" href="https://app.aikido.dev/login"><p>Start Now</p></a></div><div data-cta="walkthrough"><div><p>Get a personalized walkthrough</p><p>Trusted by 100k+ teams</p></div><a data-wf-native-id-path="e21d0934-3b02-b09c-fdb3-d1c4ff64c3f9" data-wf-ao-click-engagement-tracking="true" data-wf-element-id="e21d0934-3b02-b09c-fdb3-d1c4ff64c3f9" href="https://www.aikido.dev/book/demo"><p>Book Now</p></a></div><div data-cta="idors"><div><p>Scan your app for IDORs and real attack paths</p><p>Trusted by 100k+ teams</p></div><a data-wf-native-id-path="636437a0-7b3d-30e4-9b5f-e7fbb5d37b45" data-wf-ao-click-engagement-tracking="true" data-wf-element-id="636437a0-7b3d-30e4-9b5f-e7fbb5d37b45" href="https://app.aikido.dev/login"><p>Start&nbsp;Scanning</p></a></div><div data-cta="pentest"><div><p>See how AI pentests your app</p><p>Trusted by 100k+ teams</p></div><a data-wf-native-id-path="59b2a05a-9d4a-d50d-ca83-427378d5f111" data-wf-ao-click-engagement-tracking="true" data-wf-element-id="59b2a05a-9d4a-d50d-ca83-427378d5f111" href="https://app.aikido.dev/login"><p>Start Testing</p></a></div></div><div fs-list-element="list" role="list"><div role="listitem"><div><div><p>•</p><p>Vulnerabilities &amp; Threats</p></div><h2>Two malicious agent-framework releases hit PyPI in 33 minutes</h2><p>Two malicious agent-framework releases on PyPI ran a credential stealer on every Python start, targeting Azure, Azure DevOps, and GitHub Actions secrets.</p></div><div><p><img loading="lazy" src="https://cdn.prod.website-files.com/642adcaf364024552e71df01/6836b17027f911d14ce42ba7_arrow%20right.svg" alt=""></p></div></div><div role="listitem"><div><div><p>•</p><p>Vulnerabilities &amp; Threats</p></div><h2>Critical Apache HTTP Server vulnerability can allow remote code execution (CVE-2026-119618)</h2><p>CVE-2026-119618 is a critical mod_http2 RCE in Apache HTTP Server 2.4.55 to 2.4.70. See who is affected, how to fix it, and how to disable HTTP/2.</p></div><div><p><img loading="lazy" src="https://cdn.prod.website-files.com/642adcaf364024552e71df01/6836b17027f911d14ce42ba7_arrow%20right.svg" alt=""></p></div></div><div role="listitem"><div><div><p>•</p><p>Vulnerabilities &amp; Threats</p></div><h2>wfx-loot campaign pushes CI secret stealer to tens of thousands of repositories</h2><p>A wave of compromised accounts are pushing a CI secret stealer. See if you’re affected, what it steals, and what to rotate.</p></div><div><p><img loading="lazy" src="https://cdn.prod.website-files.com/642adcaf364024552e71df01/6836b17027f911d14ce42ba7_arrow%20right.svg" alt=""></p></div></div></div><div><h2>Get secure today, <br>quickly and for free.</h2><p>Secure your code, cloud, and runtime in one central system.<br>Connect a repo to discover what the reasoning agents find in your codebase.</p><p>No credit card required | Scan results in 32 seconds.</p></div></div></div>]]></description>
+        </item>
+        <item>
+            <title><![CDATA[We don't need more apps. We need better open source (335 pts)]]></title>
             <link>https://jordankrueger.com/blog/better-open-source-not-more-apps/</link>
             <guid>50532086</guid>
             <pubDate>Tue, 17 Nov 2026 14:45:36 GMT</pubDate>
@@ -854,7 +1110,7 @@ Verifier: FAILED test_tasks_cancel_above_max_concurrent
 </ul></div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Loopholes Are for Assholes (165 pts)]]></title>
+            <title><![CDATA[Loopholes Are for Assholes (166 pts)]]></title>
             <link>https://actsofvolition.com/2026/11/loopholes-are-for-assholes/</link>
             <guid>50531761</guid>
             <pubDate>Tue, 17 Nov 2026 14:20:32 GMT</pubDate>
@@ -904,7 +1160,7 @@ Verifier: FAILED test_tasks_cancel_above_max_concurrent
 </div></div>]]></description>
         </item>
         <item>
-            <title><![CDATA[Baidu, Xiaomi CEOs warn of growing gap between AI hype and returns (177 pts)]]></title>
+            <title><![CDATA[Baidu, Xiaomi CEOs warn of growing gap between AI hype and returns (182 pts)]]></title>
             <link>https://www.scmp.com/tech/big-tech/article/3374774/baidu-xiaomi-ceos-warn-growing-gap-between-ai-hype-and-returns</link>
             <guid>50531751</guid>
             <pubDate>Tue, 17 Nov 2026 14:19:59 GMT</pubDate>
@@ -912,7 +1168,7 @@ Verifier: FAILED test_tasks_cancel_above_max_concurrent
 Couldn't get https://www.scmp.com/tech/big-tech/article/3374774/baidu-xiaomi-ceos-warn-growing-gap-between-ai-hype-and-returns: Error: Request failed with status code 403]]></description>
         </item>
         <item>
-            <title><![CDATA[Regulatory Capture by Anthropic Through METR (136 pts)]]></title>
+            <title><![CDATA[Regulatory Capture by Anthropic Through METR (137 pts)]]></title>
             <link>https://nitter.cf/kevinnbass/status/2099621874279817638</link>
             <guid>50530450</guid>
             <pubDate>Tue, 17 Nov 2026 12:21:57 GMT</pubDate>
@@ -2985,59 +3241,6 @@ Even today, tons of games don’t properly handle gamma across their textures an
 <p>Optional diagnostic data is therefore enabled by default, at least in the US setup I tested. If you did not opt out of it during installation or disable optional diagnostic data later, it is still enabled and your coding agent usage data is being uploaded. You can decline optional diagnostics during setup or turn off <strong>Send optional diagnostic data</strong> later under <strong>Settings → Privacy &amp; security → Diagnostics &amp; feedback</strong>. Microsoft’s <a href="https://support.microsoft.com/en-us/windows/privacy/diagnostics-feedback-and-privacy-in-windows">diagnostics and privacy guide</a> explains how to change it.</p>
 
       </div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[How to Break into Security, Ptacek Edition (2012) (119 pts)]]></title>
-            <link>https://krebsonsecurity.com/2012/06/how-to-break-into-security-ptacek-edition/</link>
-            <guid>50524225</guid>
-            <pubDate>Mon, 16 Nov 2026 22:19:23 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://krebsonsecurity.com/2012/06/how-to-break-into-security-ptacek-edition/">https://krebsonsecurity.com/2012/06/how-to-break-into-security-ptacek-edition/</a>, See on <a href="https://news.ycombinator.com/item?id=50524225">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div>
-												<p>At least once a month, sometimes more, readers write in to ask how they can break into the field of computer security. Some of the emails are from people in jobs that have nothing to do with security, but who are fascinated enough by the field to contemplate a career change. Others are already in an information technology position but are itching to segue into security. I always respond with my own set of stock answers, but each time I do this, I can’t help but feel my advice is incomplete, or at least not terribly well-rounded.</p>
-<p><a href="https://krebsonsecurity.com/wp-content/uploads/2012/06/howtobreakintosecurity.png"><img decoding="async" title="howtobreakintosecurity" src="https://krebsonsecurity.com/wp-content/uploads/2012/06/howtobreakintosecurity-285x111.png" alt="" width="285" height="111" srcset="https://krebsonsecurity.com/wp-content/uploads/2012/06/howtobreakintosecurity-285x111.png 285w, https://krebsonsecurity.com/wp-content/uploads/2012/06/howtobreakintosecurity.png 372w" sizes="(max-width: 285px) 100vw, 285px"></a>I decided to ask some of the brightest minds in the security industry today what advice they’d give. Almost everyone I asked said they, too, frequently get asked the very same question, but each had surprisingly different takes on the subject. Today is the first installment in a series of responses to this question. When the last of the advice columns have run, I’ll create an archive of them all that will be anchored somewhere prominently on the home page. That way, the next time someone asks how they can break into security, I’ll have more to offer than just my admittedly narrow perspectives on the matter.</p>
-<p>Last month, I interviewed <strong>Thomas Ptacek</strong>, founder of <a title="matasano.com" href="http://www.matasano.com/" target="_blank">Matasano Security</a>, about how companies could beef up password security in the wake of a week full of news about password leaks at <strong>LinkedIn</strong> and other online businesses. <a title="How Companies Can Beef Up Password Security" href="http://krebsonsecurity.com/2012/06/how-companies-can-beef-up-password-security/" target="_blank">Ptacek’s provocative advice</a> generated such a huge amount of reader interest and further discussion that I thought it made sense to begin this series with his thoughts:</p>
-<p><strong>Ptacek:</strong> “Information security is one of the most interesting, challenging, and, if you do it carefully, rewarding fields in the technology industry. It’s one of the few technology jobs where the most fun roles are well compensated. If you grew up dreaming of developing games, the laws of supply and demand teach a harsh lesson early in your career: game development jobs are often tedious and usually pay badly. But if you watched “Sneakers” and ideated a life spent breaking or defending software, great news: infosec can be more fun in real life, and it’s fairly lucrative.<span id="more-15594"></span></p>
-<p>I’m a software developer. I try to look at security through the lens of computer science. To me, the most attractive thing about the field is the opportunity it provides to work with lots of different concepts at lots of different levels. Computer security might be the best way to work professionally with compiler theory, or to spend time understanding computer microarchitecture, or to apply advanced mathematics.</p>
-<p>Other people get involved in security for different reasons, and those reasons are probably equally valid. Some people really like the “good guys / bad guys” narrative that comes with security. Some people see security as an opportunity to save the world. Other people are drawn to the competitive nature of the field: at the higher levels, it really is a cat-and-mouse game. It also comes closer to meritocracy than most of technology: you can either break in or you can’t; your defenses either work or they don’t.</p>
-<p>But for me, it’s just one of the best development jobs you can get, and with that in mind, here’s my advice for people interested in pursuing a career in it.</p>
-<p><em>First: I want you to learn how to program.</em> Clearly, you can get through college and get a good-paying steady job without ever learning to love programming. But no one factor gives you as much control over your career, as much of an ability to write your own ticket, as the ability to solve problems using programming languages. A lot of very smart technology professionals have concluded that they just don’t enjoy writing software. Those people should reconsider. Try different languages, or different application domains, but find a way to make programming stick in your head.</p>
-<p><em>Second: the best jobs in our field are in application security.</em> You can get good steady work designing firewall deployments, setting up desktop agents, or responding to incidents. But all those roles are fundamentally reacting to what’s happening in appsec. The next generation of security products — along with the org charts of security teams at the savviest companies — are being designed now, by accident, by application security practitioners.</p>
-<p>Appsec roles are roles that involve attacking software or devising fixes and countermeasures for those attacks. Two good ways to “come up” in appsec: become a penetration tester, or contribute to (or start) a secure software development practice in your company.</p>
-<p>A good way to move into penetration testing: grab some industry standard tools and use an <a title="aws.amazon.com/ec2/" href="http://aws.amazon.com/ec2/" target="_blank">Amazon EC2</a> account to set up a “shooting range” to attack. Some of the best-known tools are available for free: the <a title="http://www.tenable.com/products/nessus" href="http://www.tenable.com/products/nessus" target="_blank">Nessus scanner</a>, for instance, while not an application security tool, is free and can land you a network penetration testing role that you can use as a springboard to breaking applications.</p>
-<p>When people reach out to Matasano asking how to get a foot in the door attacking software, we have a few simple steps to offer:</p>
-<p>0. Learn to love programming in at least one language. The C Programming Language has the most cachet in application security, but for this step-by-step list, Java or Python or Ruby will do fine.</p>
-<p>1. Grab a copy of&nbsp; <a title="http://www.amazon.com/The-Web-Application-Hackers-Handbook/dp/1118026470/ref=pd_sim_b_1/191-9509128-5792759" href="http://www.amazon.com/The-Web-Application-Hackers-Handbook/dp/1118026470/ref=pd_sim_b_1/191-9509128-5792759" target="_blank">The Web Application Hacker’s Handbook</a>.</p>
-<p>2. Go to the “previous releases” archive at <strong>WordPress.org</strong> and grab very old versions of WordPress; install them at EC2.</p>
-<p>3. Download <a title="https://www.owasp.org/index.php/WebScarab_Getting_Started" href="https://www.owasp.org/index.php/WebScarab_Getting_Started" target="_blank">OWASP WebScarab</a> or <a title="http://portswigger.net/burp/download.html" href="http://portswigger.net/burp/download.html" target="_blank">Burp Suite Free Edition</a>, both of which are free, and use them to find bugs in ancient WordPress.</p>
-<p>If you’re already in an IT role, and want to come up on the defensive side of appsec, try to position yourself near custom software development. Most large firms build “line of business” applications. As a rule, building “line of business” isn’t particularly fun. But defending those apps can be; sometimes, the most boring applications turn out to be surprisingly sensitive.</p>
-<p>And the good news for doing appsec in BigCo’s: most companies have very immature security programs. If you can get a role in QA, or in what the cool kids are calling “DevOps”, you can end up with a lot of influence in security. At Matasano, we’ve watched lots of ops people successfully transition to appsec and senior security management just by instituting basic security testing processes on their company’s software.</p>
-<p>To me, the whole field boils down to studying, understanding, and manipulating technology. Like most software security practices, we’ve gotten our hands dirty with a fascinating cross-section of the whole technology industry. We’ve written attack tools that target the control registers of device chipsets, we’ve done custom RF work, we’ve written low-level debuggers for different CPU architectures, and we’ve seen and beaten up on products built in almost every programming language and every platform you can imagine. If crawling through the ventilation ducts of the world’s most important technology is something you think might make you tick like we do… well, appsec! Learn to code. Spend a couple days Starbucks money on an EC2 account and deploy some broken apps to break. Find opportunities to practice in your job.</p>
-<p>And, uh, come talk to us? People like you are hard to find!”</p>
-											</div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[United Airlines experiencing a widespread system outage, airline says (249 pts)]]></title>
-            <link>https://www.cnn.com/2026/11/16/us/united-airlines-outage</link>
-            <guid>50524165</guid>
-            <pubDate>Mon, 16 Nov 2026 22:14:38 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.cnn.com/2026/11/16/us/united-airlines-outage">https://www.cnn.com/2026/11/16/us/united-airlines-outage</a>, See on <a href="https://news.ycombinator.com/item?id=50524165">Hacker News</a></p>
-Couldn't get https://www.cnn.com/2026/11/16/us/united-airlines-outage: Error: Request failed with status code 451]]></description>
-        </item>
-        <item>
-            <title><![CDATA[Spamhaus new email sender requirements in November (134 pts)]]></title>
-            <link>https://www.spamhaus.org/sender-guidelines/</link>
-            <guid>50523784</guid>
-            <pubDate>Mon, 16 Nov 2026 21:47:19 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.spamhaus.org/sender-guidelines/">https://www.spamhaus.org/sender-guidelines/</a>, See on <a href="https://news.ycombinator.com/item?id=50523784">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><div><!--[--><div data-testid="helo-notice"><p><span>Note</span></p><p>Starting in <strong>November 2026</strong>, we are gradually rolling out a requirement for every sending IP to have a valid HELO, a reverse DNS (PTR) record, and a matching A record. Use the HELO checker below to see whether the DNS meets our best practices, and follow the guidelines to avoid being listed.</p></div><div data-testid="minimum-requirements"><p>Guidance for senders, mail admins, and postmasters on meeting Spamhaus's sending requirements. All senders must meet these minimum email sending requirements to avoid being listed.</p><ol><!--[--><li data-testid="minimum-requirement"><div><p>Use confirmed opt-in (COI) for all subscribers</p><p><span>Each recipient should confirm their address by clicking a link in a confirmation email. If no confirmation is received, do not send email to that address. Purchased, rented and harvested lists are the most common source of spam trap hits, and hitting traps is one of the fastest routes to a listing.</span> <a href="#3-permission-and-list-hygiene--permission">See section</a></p></div></li><li data-testid="minimum-requirement"><div><p>Publish forward-confirmed reverse DNS for every sending IP</p><p><span>Every sending IP must have a reverse DNS entry pointing to a fully qualified domain name (FQDN). That hostname must, in turn, resolve back to the same sending IP address. This is known as forward-confirmed reverse DNS (FCrDNS). An IP with missing or mismatched reverse DNS is treated as suspicious and is one of the most common reasons for an IP to be considered for listing.</span> <a href="#1-infrastructure-and-dns--reverse-dns-rdns">See section</a></p></div></li><li data-testid="minimum-requirement"><div><p>Use a HELO/EHLO hostname that resolves to the sending IP</p><p><span>The hostname the server announces in the HELO/EHLO command must resolve to the IP it is connecting from, and must stay consistent across connections from that IP. Placeholder values, hosting-provider defaults, and hostnames that vary between connections are treated as signals of misconfiguration or compromise and can result in a listing.</span> <a href="#1-infrastructure-and-dns--helo-ehlo">See section</a></p></div></li><li data-testid="minimum-requirement"><div><p>Meet the IPv6 allocation and reverse DNS minimum</p><p><span>If sending over IPv6, the sending address must fall within an allocation of /64 or larger (a /64 is the standard block size we recommend assigning), and that space must have valid reverse DNS. IPv6 ranges without reverse DNS or with allocations smaller than /64 are often misused by spammers.</span> <a href="#1-infrastructure-and-dns--ip-space-and-routing">See section</a></p></div></li><li data-testid="minimum-requirement"><div><p>Authenticate mail with <a href="https://www.spamhaus.org/glossary/#spf-sender-policy-framework">SPF</a>, <a href="https://www.spamhaus.org/glossary/#dkim-domainkeys-identified-mail">DKIM</a> and <a href="https://www.spamhaus.org/glossary/#dmarc-domain-based-message-authentication-reporting-and-conformance">DMARC</a></p><p><span>Publish SPF and DMARC records for every sending domain, sign every outbound message with a signature, and align the DKIM sending domain with the domain in the message's <a href="https://www.rfc-editor.org/info/rfc5322/">RFC 5322</a> From address. Authentication is one of the signals that shapes reputation, so gaps here make a listing more likely when other signals are weak.</span> <a href="#2-authentication">See section</a></p></div></li><!--]--></ol><p><a href="https://www.spamhaus.org/sender-guidelines/esp-large-senders/" data-testid="minimum-requirements-esp"><span>Operating an Email Server Provider (ESP) or other shared sending infrastructure? <strong>See the ESPs and Large Senders guidelines</strong></span></a></p></div><div id="dns-checker"><form><p>Check your HELO and DNS setup</p><p>Enter your sending IP to check its HELO and DNS setup against our guidelines. Results may not be available for all IPs and some queries might not provide results for internal policy reasons. You can also check the current HELO by sending an email to <a href="mailto:helocheck@abuseat.org">helocheck@abuseat.org</a>.</p></form></div><!--]--></div><!--[--><div><div id="1-infrastructure-and-dns"><h2>1. Infrastructure and DNS</h2><p>All sending infrastructure must have the following DNS and mailserver configuration. Failure to do so can result in IPs being listed on the Email Spam IPs (CSS) or compromised IPs (XBL) zones.</p><!----><!----><!----><!----><!--[--><div data-testid="subsection" data-v-d40881f4="" id="1-infrastructure-and-dns--from-domain-envelope-from"><p data-v-d40881f4=""> How to check </p><p data-v-d40881f4="">Run <code>dig TXT &lt;envelope sender domain&gt;</code> and confirm an SPF record is returned and includes the sending IPs.</p></div><!--]--><!----></div><hr></div><div><div id="2-authentication"><h2>2. Authentication</h2><p>Authentication is how receiving mail servers verify that emails are authorized to send from the domain. Without SPF, DKIM, and DMARC properly configured, the domain is exposed to spoofing and phishing, and emails are more likely to be rejected or flagged by Spamhaus.</p><!----><!----><!----><!----><!--[--><div data-testid="subsection" data-v-d40881f4="" id="2-authentication--dkim-domainkeys-identified-mail"><p data-v-d40881f4=""> How to check </p><p data-v-d40881f4="">Run <code>dig TXT &lt;selector&gt;._domainkey.&lt;domain&gt;</code> (the selector is set in the ESP's DKIM setup page) and confirm a DKIM key, starting <code>v=DKIM1</code>, is returned.</p></div><!--]--><!----></div><hr></div><div><div id="3-permission-and-list-hygiene"><h2>3. Permission and List Hygiene</h2><p>Send email only to people who want to receive it. Once the technical infrastructure is in place, the next step is building a legitimate list of email addresses from people who have provided explicit permission to receive the email. Lack of permission is one of the most common reasons for being listed by Spamhaus.</p><!----><!----><!----><!----><!--[--><!--]--><!----></div><hr></div><div><div id="4-sending-best-practices"><h2>4. Sending best practices</h2><p>How email is sent matters as much as what is sent. Warming the IP and domain, maintaining a consistent volume, using trusted links and domains within emails, and providing clear, legitimate ways to opt-out of emails will help improve overall deliverability.</p><!----><!----><!----><!----><!--[--><!--]--><!----></div><hr></div><div><div id="5-ip-and-domain-reputation"><h2>5. IP and Domain Reputation</h2><div><!--[--><p>The reputation of the <a href="https://www.spamhaus.org/ip-reputation/">IP</a> and <a href="https://www.spamhaus.org/domain-reputation/">domain</a> as seen by Spamhaus can be checked via our <a href="https://check.spamhaus.org/">reputation checker</a>.</p><p>Spamhaus looks at multiple signals before assigning a reputation score, and a strong negative signal can outweigh the absence of positive ones — so following all email best practices consistently is essential.</p><p>Factors that influence reputation include: the service provider, the IP neighbourhood, the infrastructure the IPs are associated with, the upstream networks that connect to internet backbones, and the IP or domain's history — when it was first seen, when it was last used, and how it was used.</p><!--]--></div><!----><!----><!----><!----><!--[--><!----><!----><!--]--><div data-testid="how-to-check" data-v-d40881f4=""><p data-v-d40881f4=""> How to check </p><div data-v-d40881f4=""><!--[--><p>Run the domain through the <a href="https://www.spamhaus.org/domain-reputation/">Reputation Checker</a> to get more insights.</p><p>Note: We do not accept requests for explanations of the attributes shown here or requests to reset reputation.</p><!--]--></div></div></div><hr></div><div><div id="6-esps-large-senders"><h2>6. ESPs &amp; Large Senders</h2><p>ESPs and shared infrastructure hosts are responsible for the email sent via their infrastructure. Hosting abusive senders will negatively impact the reputation of shared domains and infrastructure.</p><!----><p><a href="https://www.spamhaus.org/sender-guidelines/esp-large-senders/" data-testid="section-link">Read the ESP &amp; Large Sender guidelines <i></i></a></p><!----><!----><!--[--><!----><!----><!--]--><!----></div><hr></div><!--]--><!--[--><section id="tools-and-resources" data-testid="postmaster-tools"><h2>Spamhaus Tools &amp; Resources</h2><!----><p><!--[--><a href="https://www.spamhaus.org/sender-guidelines/#dns-checker" data-testid="postmaster-tool"><span><span>DNS Tools</span><span>Check your HELO and DNS setup</span></span></a><a href="https://www.spamhaus.org/ip-reputation/" data-testid="postmaster-tool"><span><span>IP Reputation</span><span>Check if an IP is listed</span></span></a><a href="https://www.spamhaus.org/domain-reputation/" data-testid="postmaster-tool"><span><span>Domain Reputation</span><span>Check if a domain is listed</span></span></a><!--]--></p></section><!--]--></div></div>]]></description>
-        </item>
-        <item>
-            <title><![CDATA[BugMeNot Has Closed (684 pts)]]></title>
-            <link>https://www.bugmenot.com/</link>
-            <guid>50523601</guid>
-            <pubDate>Mon, 16 Nov 2026 21:32:17 GMT</pubDate>
-            <description><![CDATA[<p>URL: <a href="https://www.bugmenot.com/">https://www.bugmenot.com/</a>, See on <a href="https://news.ycombinator.com/item?id=50523601">Hacker News</a></p>
-<div id="readability-page-1" class="page"><div><p>Thanks to everyone who envisioned a better internet.</p></div></div>]]></description>
         </item>
     </channel>
 </rss>
